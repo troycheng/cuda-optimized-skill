@@ -4,7 +4,7 @@
 All K branches share the same method combination (from methods.json) but
 differ in hyperparameters (tile size, num_stages, num_warps, etc.).
 
-Claude generates K kernels under iterv{i}/branches/b{1..K}/kernel.<ext>.
+The agent generates K kernels under iterv{i}/branches/b{1..K}/kernel.<ext>.
 
 This script:
   1. Compiles all K kernels (can be parallelized)

@@ -171,7 +171,7 @@ def render(state_path: str, out_path: str) -> None:
 
     lines.append("## Retrospective")
     lines.append("")
-    lines.append("_Claude will fill this section in:_")
+    lines.append("_The agent will fill this section in:_")
     lines.append("")
     lines.append("- Which optimizations moved the needle and why (tie to ncu + attribution evidence).")
     lines.append("- Which ones were no-ops or regressions, and plausible reasons.")

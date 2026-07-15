@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single-method ablation for attribution.
 
-For each method applied in the champion kernel, this script expects Claude
+For each method applied in the champion kernel, this script expects the agent
 to have generated an ablated kernel (champion minus that one method) under
   iterv{i}/ablations/{method_id}/kernel.<ext>
 

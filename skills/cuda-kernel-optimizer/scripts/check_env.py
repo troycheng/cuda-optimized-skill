@@ -154,7 +154,7 @@ def main() -> None:
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(env, f, indent=2, ensure_ascii=False)
 
-    # Also print a compact summary to stdout so Claude / the user can eyeball it
+    # Also print a compact summary to stdout for the agent and user to inspect.
     print(json.dumps({
         "gpu": env["gpus"][0].get("name") if env["gpus"] else None,
         "sm_arch": env["primary_sm_arch"],

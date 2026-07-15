@@ -4,7 +4,7 @@
 Subcommands:
   setup       Steps 0-2: env check, preflight, init, seed baseline, profile+roofline for iter 1
   open-iter   Prepare an iteration: profile best → ncu_top → roofline → axis budgets
-              (Claude then writes K branch kernels + methods.json + analysis.md)
+              (the agent then writes K branch kernels + methods.json + analysis.md)
   close-iter  Steps 3e-3j: branch explore → champion → ncu champion → ablate → sass → update
   finalize    Step 4: emit summary.md
 """
@@ -132,7 +132,7 @@ def cmd_setup(args):
         "env": env_json,
         "early_stop": early_stop,
         "next_step": (
-            "Claude should now read iterv1/roofline.json (for axis budgets), "
+            "The agent should now read iterv1/roofline.json (for axis budgets), "
             "iterv1/ncu_top.json, and state.json, then write "
             f"iterv1/branches/b{{1..K}}/kernel.<ext>, iterv1/methods.json, "
             "and iterv1/analysis.md. "
@@ -190,7 +190,7 @@ def cmd_open_iter(args):
         "branches_dir": branches_dir,
         "num_branches": num_branches,
         "next_step": (
-            f"Claude should read iterv{args.iter}/roofline.json and ncu_top.json, "
+            f"The agent should read iterv{args.iter}/roofline.json and ncu_top.json, "
             f"write {num_branches} branch kernels under iterv{args.iter}/branches/b{{1..{num_branches}}}/kernel.<ext>, "
             f"plus iterv{args.iter}/methods.json and iterv{args.iter}/analysis.md. "
             f"Then run: orchestrate.py close-iter --run-dir {args.run_dir} --iter {args.iter}"
@@ -229,7 +229,7 @@ def cmd_close_iter(args):
         print(json.dumps({
             "iter": args.iter,
             "status": "all_branches_failed",
-            "guidance": "Claude should fix the kernels and retry close-iter.",
+            "guidance": "The agent should fix the kernels and retry close-iter.",
         }, indent=2))
         sys.exit(2)
     if branch_result.returncode != 0:
@@ -257,7 +257,7 @@ def cmd_close_iter(args):
             "iter": args.iter,
             "status": "validation_failed",
             "bench_json": bench_json,
-            "guidance": "Claude should fix the kernel and re-run close-iter.",
+            "guidance": "The agent should fix the kernel and re-run close-iter.",
         }, indent=2))
         sys.exit(2)
 

@@ -1,9 +1,9 @@
 ---
 name: cuda-kernel-optimizer
-description: Iteratively optimize a CUDA/CUTLASS/Triton kernel against a reference implementation using ncu-guided reasoning. Use this skill whenever the user asks to optimize, speed up, or improve the performance of a .cu kernel (CUDA or CUTLASS) or a Triton/Python kernel file, especially when they provide a baseline operator and a reference, mention "ncu", "Nsight Compute", "iterative optimization", "kernel tuning", or ask Claude to "make this kernel faster". The skill drives a multi-iteration roofline-guided optimization loop: profile with ncu → compute roofline gaps → allocate axis budgets → pick methods by priority scan → generate K branch candidates → validate + benchmark → select champion → ablation attribution → SASS verification → update global state. Each iteration's artifacts (kernel, CoT analysis, ncu-rep) are persisted under a timestamped run folder, and a final summary is emitted.
+description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, or Triton kernel against a reference implementation, especially for requests involving Nsight Compute, kernel benchmarking, roofline analysis, branch exploration, ablation, or SASS verification."
 ---
 
-# CUDA Kernel Iterative Optimizer (v2 — Roofline-Driven)
+# CUDA Kernel Iterative Optimizer (v2.1)
 
 ## What this skill does
 
@@ -49,8 +49,8 @@ If any of these are missing, ask the user once — briefly — then proceed.
      b. extract top compute/mem/latency            → ncu_top.json
      c. roofline.py: compute Δ_c, Δ_m, Δ_l        → roofline.json + axis_budget
         if near_peak (all Δ < 0.15) → early stop
-     d. Claude picks methods (b_axis per axis, cap=2) → analysis.md (CoT)
-     e. Claude writes K branch kernels (same methods, diff hyperparams)
+     d. Agent selects methods (b_axis per axis, cap=2) → analysis.md (decision record)
+     e. Agent writes K branch kernels (same methods, diff hyperparams)
      f. branch_explore.py: compile + bench all K   → select champion
      g. if champion FAIL: regenerate (max 3 retries)
      h. ncu profile champion (--set full)          → iterv{i}/kernel.ncu-rep
@@ -61,7 +61,7 @@ If any of these are missing, ask the user once — briefly — then proceed.
 ```
 
 Steps (a), (b), (c), (f), (h), (i), (j) are **deterministic** — run via scripts.
-Steps (d) and (e) are **where Claude thinks** — follow the reasoning rules in `references/optimization_catalog.md` and `references/ncu_metrics_guide.md`.
+Steps (d) and (e) require evidence-backed agent decisions. Follow the selection rules in `references/optimization_catalog.md` and `references/ncu_metrics_guide.md`.
 
 ---
 
@@ -171,7 +171,7 @@ Writes `iterv{i}/roofline.json`:
 
 **Budget allocation rule**: proportional to Δ, rounded, cap per axis = 2, total = 3. If all Δ < 0.15 → `near_peak: true` → **early stop**.
 
-### 3c. Select methods (Claude reasons here)
+### 3c. Select methods (agent decision)
 
 **Read** (in this order):
 1. `references/optimization_catalog.md` — priority-ordered catalog
@@ -191,7 +191,7 @@ For each axis with `b_axis > 0`, scan the catalog **from P1 downward**. For each
 
 Select the **first method that passes all four checks**. Continue scanning until `b_axis` methods are selected for that axis. If `b_axis >= 2`, after collecting all candidates that pass checks, rank by **trigger strength** and take the top `b_axis`.
 
-**Produce** exactly **B methods** (sum of axis budgets, typically 3). For each, write Chain-of-Thought.
+**Produce** exactly **B methods** (sum of axis budgets). For every selected method, record the observed metric, applicable hardware capability, expected effect, validation command, and rejection condition. Do not request or persist hidden reasoning.
 
 **Hard constraints**:
 1. If `memory.multi_stage_pipeline` (P5) and `latency.async_pipeline` (P3) are both selected, they count as one — replace one with next applicable method on that axis.
@@ -202,7 +202,7 @@ Select the **first method that passes all four checks**. Continue scanning until
 
 Save to `iterv{i}/analysis.md` using the template in `templates/iteration_report.md`.
 
-### 3d. Generate K branch kernels (Claude writes code)
+### 3d. Generate K branch kernels (agent writes code)
 
 All K branches share the **same method combination** from step 3c. They differ in **hyperparameters and implementation details**:
 - Tile sizes (BLOCK_M, BLOCK_N, BLOCK_K)
@@ -224,7 +224,7 @@ Compiles and benchmarks all K branches (no ncu). Selects champion = fastest vali
 
 ### 3f. Repair on validation failure (up to 3 retries per iteration)
 
-If champion fails correctness, Claude rewrites and re-runs 3e.
+If the champion fails correctness, the agent rewrites it and re-runs 3e.
 
 ### 3g. Profile champion with ncu (FULL report — mandatory)
 
@@ -296,7 +296,7 @@ python <skill>/scripts/summarize.py \
 
 ---
 
-## Reasoning references
+## Decision references
 
 - **`references/optimization_catalog.md`** — Catalog of optimization methods by axis, with algorithmic methods section.
 - **`references/ncu_metrics_guide.md`** — How to read ncu output and map bottleneck signatures.
@@ -312,7 +312,7 @@ python <skill>/scripts/summarize.py \
 - **Triton + `@triton.autotune`** → hard-code config before profiling.
 - **Champion chosen but all methods have near-zero attribution** → the speedup came from hyperparameter change, not methods. Record in analysis.md.
 - **SASS signature missing but kernel is faster** → nvcc took a different path. Mark method as `implementation_failed` but keep the kernel if it's faster.
-- **Branch explore: all K branches fail validation** → Claude must rewrite with different approach.
+- **Branch explore: all K branches fail validation** → the agent must rewrite with a different approach.
 - **Early stop triggered** → all Δ < 0.15, kernel is near roofline. Report to user.
 
 ---
@@ -328,7 +328,7 @@ python <skill>/scripts/summarize.py \
 │   └── bench.json
 ├── iterv1/
 │   ├── kernel.<ext>          (champion)
-│   ├── analysis.md           (roofline + methods + CoT)
+│   ├── analysis.md           (roofline + evidence-backed method decisions)
 │   ├── methods.json
 │   ├── roofline.json
 │   ├── best_input.ncu-rep    (profile of best going INTO this iter)

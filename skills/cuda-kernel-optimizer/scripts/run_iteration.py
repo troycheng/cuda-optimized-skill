@@ -6,7 +6,7 @@ Subcommands:
   benchmark       Run benchmark.py on iterv{i}/kernel.<ext>.
 
 Both write JSON under the appropriate directory. `benchmark` additionally
-captures stderr so Claude can inspect it on validation failure.
+captures stderr so the agent can inspect it on validation failure.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "methods.json",
-  "description": "Produced by Claude each iteration. Method count equals sum of axis budgets from roofline.json (typically 3, range 1-6). Consumed by scripts/state.py update.",
+  "description": "Produced by the agent each iteration. Method count equals the sum of axis budgets from roofline.json. Consumed by scripts/state.py update.",
   "type": "object",
   "required": ["iter", "methods"],
   "properties": {
