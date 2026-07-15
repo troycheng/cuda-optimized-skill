@@ -73,7 +73,7 @@ Run the env probe **before** doing anything else:
 python <skill>/scripts/check_env.py --out ./env.json
 ```
 
-It records: GPU name + compute capability (SM arch), nvcc path + version, ncu path + version, CUTLASS include dir (if detectable), CUDA driver, torch + triton versions, GPU peak FLOPS and bandwidth (for roofline). If **ncu is not available** or the user is not running as root / lacks `--access=all` perf counters, warn the user explicitly — the skill can degrade to benchmark-only mode, but ncu-guided reasoning is significantly weaker without it.
+It records GPU name and compute capability, nvcc and ncu versions, CUTLASS include paths, CUDA driver, and Python library versions. `ncu --query-metrics` only proves that metric metadata is available; counter permission remains unknown until a real target profile succeeds. If ncu is unavailable or a target profile reports a permission error, warn the user and degrade to benchmark-only mode.
 
 ## Step 0b — Preflight the baseline + ref contract
 
@@ -308,7 +308,7 @@ python <skill>/scripts/summarize.py \
 
 - **Benchmark crashes** → check `bench.json` `"error"` field.
 - **ncu reports all-zero metrics** → permissions issue or launch filter miss.
-- **`can_read_counters: false` in env.json** → warn user; degrade gracefully.
+- **Target profile reports counter permission failure** → warn the user; degrade gracefully. Do not infer permission from `ncu --query-metrics`.
 - **Triton + `@triton.autotune`** → hard-code config before profiling.
 - **Champion chosen but all methods have near-zero attribution** → the speedup came from hyperparameter change, not methods. Record in analysis.md.
 - **SASS signature missing but kernel is faster** → nvcc took a different path. Mark method as `implementation_failed` but keep the kernel if it's faster.

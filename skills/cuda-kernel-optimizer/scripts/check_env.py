@@ -65,18 +65,27 @@ def _detect_nvcc() -> dict:
 def _detect_ncu() -> dict:
     path = shutil.which("ncu")
     if not path:
-        return {"available": False, "path": None, "version": None, "can_read_counters": None}
+        return {
+            "available": False,
+            "path": None,
+            "version": None,
+            "metrics_query_available": None,
+            "can_read_counters": None,
+        }
     rc, out, _ = _run([path, "--version"])
     version = out.strip().splitlines()[0] if out else None
-    # Heuristic: try a tiny query against --query-metrics to see if profiling works at all
+    # This checks metric metadata only. Counter permissions require a real profile.
     rc2, _, err2 = _run([path, "--query-metrics"], timeout=5)
-    can_read = rc2 == 0
+    metrics_query_available = rc2 == 0
     return {
         "available": True,
         "path": path,
         "version": version,
-        "can_read_counters": can_read,
-        "note": None if can_read else (err2.strip()[:400] or "ncu query failed — perf counters may require elevated permissions"),
+        "metrics_query_available": metrics_query_available,
+        "can_read_counters": None,
+        "note": None if metrics_query_available else (
+            err2.strip()[:400] or "ncu metric metadata query failed"
+        ),
     }
 
 
@@ -160,6 +169,7 @@ def main() -> None:
         "sm_arch": env["primary_sm_arch"],
         "nvcc": env["nvcc"].get("version"),
         "ncu": env["ncu"].get("available"),
+        "ncu_metrics_query_available": env["ncu"].get("metrics_query_available"),
         "ncu_can_read_counters": env["ncu"].get("can_read_counters"),
         "cutlass": env["cutlass"].get("available"),
         "torch": env["libs"].get("torch", {}).get("version"),

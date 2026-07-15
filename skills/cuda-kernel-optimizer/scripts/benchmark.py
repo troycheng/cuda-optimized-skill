@@ -401,6 +401,16 @@ def _time_iterations(fn, warmup: int, repeat: int, cuda=None) -> list[float]:
     return samples
 
 
+def _profile_target_once(fn, profiler, cuda) -> None:
+    """Profile exactly one target invocation inside an explicit CUDA range."""
+    profiler.cudaProfilerStart()
+    try:
+        fn()
+        cuda.synchronize()
+    finally:
+        profiler.cudaProfilerStop()
+
+
 
 def _stats(times_ms: list):
     avg = sum(times_ms) / len(times_ms)
@@ -745,7 +755,7 @@ def _setup_backend(solution_file, backend, dim_values, ptr_size_override, arch, 
 # ---------------------------------------------------------------------------
 
 
-def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc", backend="auto", validation_seeds=None):
+def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc", backend="auto", validation_seeds=None, profile_only=False):
     """Main benchmark pipeline."""
     _require_torch()
     resolved_backend = infer_backend(solution_file, backend)
@@ -827,6 +837,22 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
     result["ptr_elems"] = state["ptr_elems"]
     result["total_ptr_bytes"] = state["total_ptr_bytes"]
     result["correctness"]["output_tensor_count"] = len(state["output_specs"])
+
+    if profile_only:
+        for _ in range(warmup):
+            state["callable"]()
+        torch.cuda.synchronize()
+        _reset_tensor_inputs(state)
+        _profile_target_once(
+            state["callable"],
+            profiler=torch.cuda.cudart(),
+            cuda=torch.cuda,
+        )
+        result["profile_only"] = True
+        result["profiled_launches"] = 1
+        _write_json_out(json_out, result)
+        print(json.dumps({"profile_only": True, "profiled_launches": 1}, indent=2))
+        return
 
     if not state["output_specs"] and has_ref:
         print("\n[warn] No output tensors detected. Nothing to validate.", file=sys.stderr)
@@ -1058,6 +1084,11 @@ def main():
                              "Overrides --seed for validation (--seed is still used for single-shot timing).")
     parser.add_argument("--json-out", type=str, default="", help="Optional path to write structured benchmark results as JSON")
     parser.add_argument("--nvcc-bin", type=str, default="nvcc", help="NVCC executable or full path")
+    parser.add_argument(
+        "--profile-only",
+        action="store_true",
+        help="After setup and warm-up, profile exactly one target launch inside a CUDA profiler range",
+    )
 
     args, unknown = parser.parse_known_args()
 
@@ -1099,6 +1130,7 @@ def main():
         nvcc_bin=args.nvcc_bin,
         backend=args.backend,
         validation_seeds=validation_seeds,
+        profile_only=args.profile_only,
     )
 
 

@@ -302,40 +302,61 @@ def _aggregate_across_kernels(rows: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _build_profile_command(
+    *,
+    ncu_bin: str,
+    rep_path: str,
+    benchmark_py: str,
+    solution: str,
+    dims: dict,
+    warmup: int,
+    launch_count: int,
+    ptr_size: int = 0,
+    python_executable: str | None = None,
+) -> list[str]:
+    if launch_count != 1:
+        raise ValueError("target-bounded profiling requires launch_count=1")
+    cmd = [
+        ncu_bin,
+        "--set", "full",
+        "--profile-from-start", "off",
+        "--launch-count", "1",
+        "--target-processes", "all",
+        "-o", rep_path,
+        "-f",
+    ]
+    cmd += [
+        python_executable or sys.executable,
+        benchmark_py,
+        solution,
+        "--profile-only",
+        "--warmup", str(warmup),
+        "--repeat", "1",
+    ] + _ptr_size_argv(ptr_size) + _dims_argv(dims)
+    return cmd
+
+
 def _run_ncu_profile(
     *,
     ncu_bin: str,
     rep_path: str,
     benchmark_py: str,
     solution: str,
-    ref_file: str,
     dims: dict,
-    backend: str,
     ptr_size: int,
     warmup: int,
-    repeat: int,
     launch_count: int,
-    no_kernel_filter: bool,
 ) -> tuple[int, str]:
-    cmd = [
-        ncu_bin,
-        "--set", "full",
-        "-o", rep_path,
-        "-f",
-        "--target-processes", "all",
-        "--launch-count", str(launch_count),
-    ]
-    # Do not filter by a fixed kernel name here. CUDA wrappers often launch a
-    # device kernel whose symbol is unrelated to the exported host `solve`
-    # entrypoint, and library-backed implementations (for example cuBLAS) use
-    # internal kernel names entirely. We instead profile the launches and let
-    # the CSV import path select the dominant kernel by duration.
-
-    cmd += [
-        sys.executable, benchmark_py, solution,
-        "--warmup", str(warmup),
-        "--repeat", str(repeat),
-    ] + _ptr_size_argv(ptr_size) + _dims_argv(dims)
+    cmd = _build_profile_command(
+        ncu_bin=ncu_bin,
+        rep_path=rep_path,
+        benchmark_py=benchmark_py,
+        solution=solution,
+        dims=dims,
+        ptr_size=ptr_size,
+        warmup=warmup,
+        launch_count=launch_count,
+    )
 
     print(f"[ncu profile] {' '.join(cmd)}", file=sys.stderr)
     try:
@@ -487,10 +508,11 @@ def main() -> None:
     p.add_argument("--which", required=True, choices=["best_input", "kernel"])
     p.add_argument("--benchmark", default=_BUNDLED_BENCHMARK,
                    help="Path to benchmark.py (default: bundled)")
-    p.add_argument("--launch-count", type=int, default=3)
-    p.add_argument("--warmup", type=int, default=1)
-    p.add_argument("--repeat", type=int, default=3)
-    p.add_argument("--no-kernel-filter", action="store_true")
+    p.add_argument("--launch-count", type=int, choices=[1], default=1,
+                   help="Profile exactly one launch inside the explicit CUDA profiler range")
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--repeat", type=int, default=1, help=argparse.SUPPRESS)
+    p.add_argument("--no-kernel-filter", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ncu-bin", type=str, default="")
     p.add_argument("--promote-if-best", action="store_true",
                    help="When --which=kernel, if this kernel is the current best, "
@@ -551,14 +573,10 @@ def main() -> None:
         rep_path=rep_path,
         benchmark_py=os.path.abspath(args.benchmark),
         solution=solution,
-        ref_file=state["ref_file"],
         dims=state.get("dims", {}),
-        backend=backend,
         ptr_size=state.get("ptr_size", 0),
         warmup=args.warmup,
-        repeat=args.repeat,
         launch_count=args.launch_count,
-        no_kernel_filter=args.no_kernel_filter,
     )
     log_path = os.path.join(iter_dir, f"{os.path.splitext(rep_name)[0]}.ncu.log")
     with open(log_path, "w", encoding="utf-8") as f:

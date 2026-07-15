@@ -114,7 +114,12 @@ def render(state_path: str, out_path: str) -> None:
     lines.append("")
     lines.append(f"- GPU: **{gpu.get('name', '?')}** ({gpu.get('sm_arch','?')}, cc {gpu.get('compute_capability','?')})")
     lines.append(f"- nvcc: `{env.get('nvcc',{}).get('version','?')}`")
-    lines.append(f"- ncu: `{env.get('ncu',{}).get('version','?')}` (can_read_counters={env.get('ncu',{}).get('can_read_counters')})")
+    ncu = env.get("ncu", {})
+    lines.append(
+        f"- ncu: `{ncu.get('version', '?')}` "
+        f"(metrics_query_available={ncu.get('metrics_query_available')}, "
+        f"can_read_counters={ncu.get('can_read_counters')})"
+    )
     lines.append(f"- cutlass include: `{env.get('cutlass',{}).get('include_dir','—')}`")
     lines.append("")
 
