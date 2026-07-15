@@ -76,8 +76,9 @@ Tests run without a GPU unless explicitly marked as GPU integration tests.
   target range.
 - Budget-allocation tests covering one-axis, near-zero, tie, and cap cases.
 - Metric parsing fixtures for long-form and wide-form Nsight Compute CSV.
-- Architecture-capability tests that prevent SM120 from inheriting SM100-only
-  TMA/TMEM/WGMMA features.
+- Architecture-capability tests that require an explicit feature set per SM:
+  SM120/SM121 TMA and `tcgen05` paths are represented where supported, while
+  SM100a-only features are not inherited by numeric SM ordering.
 - Static reference checks for removed deprecated or fork-only API claims.
 
 GPU end-to-end validation remains a separate check because this macOS host has
