@@ -17,6 +17,8 @@ When --ref is omitted:
   Benchmarks the target kernel/module only.
 """
 
+from __future__ import annotations
+
 import re
 import os
 import sys
@@ -26,9 +28,37 @@ import glob
 import subprocess
 import ctypes
 import argparse
+import statistics
 import importlib.util
 from pathlib import Path
-import torch
+
+torch = None
+
+
+def _require_torch():
+    """Import PyTorch only when a GPU operation is requested."""
+    global torch, DTYPE_MAP
+    if torch is None:
+        try:
+            import torch as torch_module
+        except ImportError as exc:
+            raise RuntimeError(
+                "PyTorch with CUDA support is required to run a benchmark; "
+                "install it in the active Python environment."
+            ) from exc
+        torch = torch_module
+        DTYPE_MAP = {
+            "float*": torch.float32,
+            "double*": torch.float64,
+            "int*": torch.int32,
+            "long*": torch.int64,
+            "short*": torch.int16,
+            "char*": torch.int8,
+            "unsigned char*": torch.uint8,
+            "unsigned short*": getattr(torch, "uint16", torch.int16),
+            "unsigned int*": getattr(torch, "uint32", torch.int32),
+        }
+    return torch
 
 # ---------------------------------------------------------------------------
 # Type tables
@@ -54,17 +84,7 @@ SUPPORTED_TYPES = {
     "short": ("short", ctypes.c_short),
 }
 
-DTYPE_MAP = {
-    "float*": torch.float32,
-    "double*": torch.float64,
-    "int*": torch.int32,
-    "long*": torch.int64,
-    "short*": torch.int16,
-    "char*": torch.int8,
-    "unsigned char*": torch.uint8,
-    "unsigned short*": getattr(torch, "uint16", torch.int16),
-    "unsigned int*": getattr(torch, "uint32", torch.int32),
-}
+DTYPE_MAP = {}
 
 INT_TYPES = {"int", "long", "size_t", "unsigned int"}
 
@@ -112,6 +132,7 @@ def parse_solve_signature(cu_file: str):
 
 def detect_arch(device_index: int | None = None) -> str:
     """Auto-detect GPU compute capability and return sm_XX string."""
+    _require_torch()
     if torch.cuda.is_available():
         if device_index is None:
             device_index = torch.cuda.current_device()
@@ -356,29 +377,34 @@ def _color(text: str, ok: bool) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _time_iterations(fn, warmup: int, repeat: int) -> list:
+def _time_iterations(fn, warmup: int, repeat: int, cuda=None) -> list[float]:
     """Run fn for warmup + repeat iterations and return per-iter ms timings."""
+    if warmup < 0:
+        raise ValueError("warmup must be non-negative")
+    if repeat <= 0:
+        raise ValueError("repeat must be positive")
+    cuda = cuda or _require_torch().cuda
+
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    cuda.synchronize()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
+    samples = []
     for _ in range(repeat):
+        start_event = cuda.Event(enable_timing=True)
+        end_event = cuda.Event(enable_timing=True)
+        start_event.record()
         fn()
-    end_event.record()
-    torch.cuda.synchronize()
-
-    avg_ms = start_event.elapsed_time(end_event) / repeat
-    return [avg_ms] * repeat
+        end_event.record()
+        end_event.synchronize()
+        samples.append(float(start_event.elapsed_time(end_event)))
+    return samples
 
 
 
 def _stats(times_ms: list):
     avg = sum(times_ms) / len(times_ms)
-    med = sorted(times_ms)[len(times_ms) // 2]
+    med = statistics.median(times_ms)
     return avg, med, min(times_ms), max(times_ms)
 
 
@@ -721,6 +747,7 @@ def _setup_backend(solution_file, backend, dim_values, ptr_size_override, arch, 
 
 def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc", backend="auto", validation_seeds=None):
     """Main benchmark pipeline."""
+    _require_torch()
     resolved_backend = infer_backend(solution_file, backend)
     has_ref = bool(ref_file)
 
@@ -989,6 +1016,20 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
 # ---------------------------------------------------------------------------
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generic operator benchmark (CUDA/CUTLASS/Triton, with optional validation)",
@@ -1003,8 +1044,8 @@ def main():
     parser.add_argument("solution_file", help="Path to solution file (.cu or .py)")
     parser.add_argument("--backend", type=str, default="auto", choices=["auto", "cuda", "cutlass", "triton"], help="Backend type")
     parser.add_argument("--ref", type=str, default="", help="Path to reference .py file; enables validation + reference benchmark")
-    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations (default: 10)")
-    parser.add_argument("--repeat", type=int, default=20, help="Benchmark iterations (default: 20)")
+    parser.add_argument("--warmup", type=_nonnegative_int, default=10, help="Warmup iterations (default: 10)")
+    parser.add_argument("--repeat", type=_positive_int, default=20, help="Benchmark iterations (default: 20)")
     parser.add_argument("--ptr-size", type=int, default=0, help="Override element count for all CUDA/CUTLASS pointer buffers")
     parser.add_argument("--arch", type=str, default="", help="GPU arch, e.g. sm_90 (auto-detected if omitted)")
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index (default: 0)")
@@ -1028,7 +1069,11 @@ def main():
         else:
             print(f"Warning: ignoring unknown arg '{item}'", file=sys.stderr)
 
-    torch.cuda.set_device(args.gpu)
+    try:
+        torch_module = _require_torch()
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    torch_module.cuda.set_device(args.gpu)
     arch = args.arch if args.arch else detect_arch(args.gpu)
 
     validation_seeds = None
@@ -1059,5 +1104,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
