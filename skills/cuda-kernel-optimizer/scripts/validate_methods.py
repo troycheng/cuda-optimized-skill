@@ -28,11 +28,19 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
-def _parse_sm_arch(arch: str | None) -> int:
+def _normalize_sm_arch(arch: str | None) -> str | None:
     if not arch:
-        return 0
-    m = re.match(r"sm_(\d+)", arch)
-    return int(m.group(1)) if m else 0
+        return None
+    match = re.fullmatch(r"sm_(\d+)", arch.strip().lower())
+    return f"sm_{match.group(1)}" if match else None
+
+
+def _missing_required_features(registry: dict, arch: str | None, method: dict) -> list[str]:
+    required = set(method.get("required_features", []))
+    if not required:
+        return []
+    available = set(registry.get("arch_feature_map", {}).get(arch, []))
+    return sorted(required - available)
 
 
 def _higher_priority_ids(registry: dict, axis: str, priority: int) -> list[tuple[str, int]]:
@@ -62,7 +70,7 @@ def validate(
 
     # Detect sm_arch
     gpus = state.get("env", {}).get("gpus", [{}])
-    detected_sm = _parse_sm_arch(gpus[0].get("sm_arch") if gpus else None)
+    detected_arch = _normalize_sm_arch(gpus[0].get("sm_arch") if gpus else None)
 
     # Load roofline budget if available
     iter_num = methods_data.get("iter", 1)
@@ -134,9 +142,14 @@ def validate(
         if reg["priority"] != priority:
             errors.append(f"{prefix}: P{priority} != registry P{reg['priority']} for '{mid}'")
 
-        # arch compatibility
-        if reg["min_sm"] > detected_sm > 0:
-            errors.append(f"{prefix}: '{mid}' requires sm_{reg['min_sm']}+ but have sm_{detected_sm}")
+        # Architecture compatibility is exact and feature-based. Numeric SM
+        # ordering is not a valid proxy across Blackwell product families.
+        missing_features = _missing_required_features(registry, detected_arch, reg)
+        if missing_features:
+            errors.append(
+                f"{prefix}: '{mid}' requires unavailable features {missing_features} "
+                f"on {detected_arch or 'unknown architecture'}"
+            )
 
         # already selected?
         selected_ids = {item.get("id") for item in state.get("selected_methods", [])}
@@ -164,7 +177,10 @@ def validate(
         higher = _higher_priority_ids(registry, axis, priority)
         skipped = m.get("skipped_higher", [])
         skipped_ids_set = {s.get("id") for s in skipped}
-        valid_reasons = {"already_selected", "arch_incompatible", "skip_condition", "no_trigger"}
+        valid_reasons = {
+            "already_selected", "arch_incompatible", "feature_unavailable",
+            "skip_condition", "no_trigger",
+        }
 
         for hid, hpri in higher:
             if hid in all_submitted_ids:

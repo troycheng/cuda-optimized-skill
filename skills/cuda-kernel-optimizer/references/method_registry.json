@@ -1,7 +1,7 @@
 {
-  "$schema_note": "Machine-readable mirror of optimization_catalog.md (v4). Methods globally re-ranked by actual importance = typical speedup × applicability probability × non-substitutability. 63 methods total: compute P1-P22, memory P1-P22, latency P1-P19.",
-  "$version": "4.0",
-  "$changelog": "v4 (2026-04-21): Added 12 high-value methods (FA3 pingpong, DeepGEMM two-level accum, warp-aggregated atomics, stream-K, EVT fusion, etc.). Major re-ranking: vectorized_access P7→P4; launch_config P6→P4; bank_conflict P10→P8; ldmatrix P11→P9; persistent_kernel P6→P5; online_recomputation P5→P7. Added required_features[] for per-arch gating and complements[] for FA3-style compound methods.",
+  "$schema_note": "Machine-readable mirror of optimization_catalog.md (v4.1). Architecture features are explicit per SM and are never inherited by numeric SM ordering. 63 methods total: compute P1-P22, memory P1-P22, latency P1-P19.",
+  "$version": "4.1",
+  "$changelog": "v4.1 (2026-07-15): Added explicit SM103, SM110, SM120, and SM121 capability sets; removed WGMMA inheritance from non-Hopper Blackwell targets; enabled TMA and native block-scaled MMA routing for SM120/SM121; required exact feature validation.",
   "methods": {
     "compute.tensor_core": {
       "axis": "compute", "priority": 1, "min_sm": 70,
@@ -101,7 +101,7 @@
       "name": "NVFP4 / MXFP8 / MXFP6 块缩放精度",
       "trigger_metric": "sm__pipe_tensor_op_hmma_cycles_active.pct_of_peak",
       "trigger_good": 60, "trigger_bad": 20, "trigger_direction": "low_is_bad",
-      "required_features": ["tcgen05", "tmem", "block_scaling"],
+      "required_features": ["block_scaling"],
       "reference_impl": "CUTLASS examples/72-79 (Blackwell narrow-precision)",
       "typical_speedup": "2x vs FP8 on Blackwell"
     },
@@ -606,7 +606,10 @@
     "sm_86": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence"],
     "sm_89": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3"],
     "sm_90": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "wgmma", "mbarrier", "cluster", "dsmem", "pdl", "warp_specialization"],
-    "sm_100": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "wgmma", "mbarrier", "cluster", "dsmem", "pdl", "warp_specialization", "tcgen05", "tmem", "block_scaling", "clc"],
-    "sm_120": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3"]
+    "sm_100": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "mbarrier", "cluster", "dsmem", "pdl", "warp_specialization", "tcgen05", "tmem", "block_scaling", "clc"],
+    "sm_103": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "mbarrier", "cluster", "dsmem", "pdl", "warp_specialization", "tcgen05", "tmem", "block_scaling", "clc"],
+    "sm_110": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "mbarrier", "cluster", "dsmem", "pdl", "warp_specialization", "tcgen05", "tmem", "block_scaling", "clc"],
+    "sm_120": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "mbarrier", "cluster", "warp_specialization", "block_scaling", "clc"],
+    "sm_121": ["tensor_core", "ldmatrix", "cp_async", "l2_persistence", "fp8_e4m3", "tma", "mbarrier", "cluster", "warp_specialization", "block_scaling", "clc"]
   }
 }

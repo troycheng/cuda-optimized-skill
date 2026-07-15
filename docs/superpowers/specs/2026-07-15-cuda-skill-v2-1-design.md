@@ -59,10 +59,12 @@ profile, branch, benchmark, attribute, and verify generated code.
 - Mark non-upstream arguments such as `acc_promote_cycles` as fork-specific and
   capability-gated.
 - Extend architecture capabilities for SM103, SM110, SM120, and SM121 without
-  treating numeric SM ordering as feature inheritance.
+  treating numeric SM ordering as feature inheritance. SM120/SM121 use current
+  CUTLASS TMA and native block-scaled MMA paths, not SM100 TCGen05/TMEM or
+  Hopper WGMMA.
 - Add CUTLASS 4.6 and CuTe DSL routing while retaining compatible C++ guidance.
-- Document CUDA 13.3 and Nsight Compute 13.3 as the current validation targets,
-  not hard minimum requirements.
+- Document CUDA 13.3 and Nsight Compute 2026.2.1 as the current validation
+  targets, not hard minimum requirements.
 
 ## Test design
 
@@ -77,8 +79,9 @@ Tests run without a GPU unless explicitly marked as GPU integration tests.
 - Budget-allocation tests covering one-axis, near-zero, tie, and cap cases.
 - Metric parsing fixtures for long-form and wide-form Nsight Compute CSV.
 - Architecture-capability tests that require an explicit feature set per SM:
-  SM120/SM121 TMA and `tcgen05` paths are represented where supported, while
-  SM100a-only features are not inherited by numeric SM ordering.
+  SM120/SM121 TMA and native block-scaled MMA paths are represented, while
+  TCGen05/TMEM, WGMMA, and other family-specific features are not inherited by
+  numeric SM ordering.
 - Static reference checks for removed deprecated or fork-only API claims.
 
 GPU end-to-end validation remains a separate check because this macOS host has

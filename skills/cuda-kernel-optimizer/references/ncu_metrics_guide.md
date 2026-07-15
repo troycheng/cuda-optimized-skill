@@ -205,11 +205,11 @@
 
 ## Notes
 
-1. **Metric names** are for Nsight Compute 2024.3+. Older NCU versions may use slightly different names.
-2. **sm_90+**: includes H100/H200 (sm_90), Blackwell (sm_100). GeForce RTX 50xx is **sm_120** and **does not have TMA/TMEM/WGMMA** despite being newer.
-3. **sm_100+**: includes B100/B200 (sm_100). **Not** RTX 5090 (sm_120) — different feature set.
+1. **Metric names** must be queried from the installed Nsight Compute build. `ncu --query-metrics` reports metadata availability, not counter permission; a real target profile establishes access.
+2. **Architecture capabilities are explicit**: SM90 uses WGMMA; SM100/103/110 use TCGen05/TMEM; SM120/121 use a separate native MMA family and current CUTLASS TMA schedules. Never infer features from numeric SM ordering.
+3. **SM120/121** do not inherit SM100 TCGen05/TMEM or SM90 WGMMA. They do have current CUTLASS SM120/121 TMA and block-scaled MMA paths when the exact toolkit/library target supports them.
 4. **mixed precision** → always re-validate atol/rtol after switching.
 5. **FP8 fast_accum vs two_level_accum** → mutually exclusive; check application tolerance first.
 6. **Stream-K vs Split-K** → mutually exclusive; pick based on whether you want work-stealing (Stream-K) or simple K-parallel (Split-K).
 7. **Pingpong WG + Intra-WG pipeline** → complementary (FA3 uses both); but count as one latency slot when combined.
-8. When in doubt, check `sm_arch` explicitly: H200=sm_90, B200=sm_100, RTX 5090=sm_120.
+8. When in doubt, read `references/compatibility.md`, check the exact `sm_arch`, query the installed APIs, compile a minimal target-specific kernel, and verify SASS.

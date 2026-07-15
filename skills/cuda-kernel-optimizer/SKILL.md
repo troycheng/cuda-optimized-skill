@@ -179,12 +179,13 @@ Writes `iterv{i}/roofline.json`:
 ### 3c. Select methods (agent decision)
 
 **Read** (in this order):
-1. `references/optimization_catalog.md` — priority-ordered catalog
-2. `iterv{i}/roofline.json` — axis budgets and bound classification
-3. `iterv{i}/ncu_top.json` — current bottleneck metrics
-4. `state.json` — `best_file`, `selected_methods`, `effective_methods`, `ineffective_methods`
-5. The current `best_file` source code
-6. `references/ncu_metrics_guide.md` — metric → root cause mapping
+1. `references/compatibility.md` — current API and explicit architecture capability rules
+2. `references/optimization_catalog.md` — priority-ordered catalog
+3. `iterv{i}/roofline.json` — axis budgets and bound classification
+4. `iterv{i}/ncu_top.json` — current bottleneck metrics
+5. `state.json` — `best_file`, `selected_methods`, `effective_methods`, `ineffective_methods`
+6. The current `best_file` source code
+7. `references/ncu_metrics_guide.md` — metric → root cause mapping
 
 **Selection rule — BUDGET-AWARE PRIORITY SCAN**:
 
@@ -303,6 +304,7 @@ python <skill>/scripts/summarize.py \
 
 ## Decision references
 
+- **`references/compatibility.md`** — Validated versions, public APIs, and exact per-architecture routing.
 - **`references/optimization_catalog.md`** — Catalog of optimization methods by axis, with algorithmic methods section.
 - **`references/ncu_metrics_guide.md`** — How to read ncu output and map bottleneck signatures.
 - **`references/sass_signatures.json`** — Expected SASS instruction patterns per method.

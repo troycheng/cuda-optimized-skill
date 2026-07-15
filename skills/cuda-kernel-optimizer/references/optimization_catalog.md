@@ -30,8 +30,8 @@
   for priority = P1, P2, P3, ...:
     method = catalog[axis][priority]
     if method.id ∈ selected_methods:              → 跳过(已试过)
-    if detected_sm < method.min_sm:                → 跳过(架构不够)
-    if not required_features ⊆ arch_feature_map:   → 跳过(特性不满足)
+    features = arch_feature_map[detected_sm]        → 精确读取，不按 SM 数字继承
+    if not required_features ⊆ features:            → 跳过(特性不满足)
     if method.skip_condition 成立:                  → 跳过(记录原因)
     if method.trigger_condition 不匹配 ncu:        → 跳过(瓶颈不在这)
     else:                                          → 选中,停止扫描
@@ -45,8 +45,8 @@
 - **典型收益**: 8-16× on GEMM kernels
 - **触发条件**: `sm__pipe_tensor_op_hmma_cycles_active.pct_of_peak < 20%`（应为 GEMM/conv/attention 类算子）
 - **跳过条件**: 算子不包含矩阵乘加语义（纯 elementwise / reduction / scan），或 Tensor Core 利用率已 > 60%
-- **CUDA**: 将标量 `a[i]*b[j]` 累加替换为 `mma.sync` PTX 或 `nvcuda::wmma` fragment。sm_70/75: HMMA m16n8k8；sm_80/89: HMMA m16n8k16；sm_90: WGMMA m64nNk16；sm_100: tcgen05.mma + TMEM
-- **CUTLASS**: `OpClassTensorOp` MMA Atom。Ampere `SM80_16x8x16`；Hopper `WGMMA`；Blackwell `tcgen05.mma` + TMEM
+- **CUDA**: 将标量 `a[i]*b[j]` 累加替换为目标架构支持的矩阵指令。sm_70/75 使用 HMMA m16n8k8；sm_80/89 使用 HMMA m16n8k16；sm_90 使用 WGMMA；sm_100/103/110 使用 TCGen05 + TMEM；sm_120/121 使用各自的 MMA/块缩放路径，不能复用 SM100 TCGen05/TMEM。
+- **CUTLASS**: 优先让 Collective Builder / CuTe MMA Atom 按精确架构选择路径。Hopper 用 WGMMA；SM100 家族与 SM120 家族必须使用各自显式 schedule。
 - **Triton**: 确保 `tl.dot` 输入为 FP16/BF16/FP8；`input_precision="tf32"` 折中
 - **验证**: SASS 中出现 `HMMA`/`WGMMA`/`HGMMA`/`UMMA`；tensor op utilization 上升
 
@@ -63,9 +63,9 @@
 - **典型收益**: 1.5-3× on Hopper attention
 - **触发条件**: barrier + long_scoreboard 都非平凡；GEMM/attention 类；所有 warp 既搬数据又算
 - **跳过条件**: 非 GEMM 类；sm < 80
-- **CUDA**: producer warp 发 TMA load + mbarrier arrive；consumer warp 做 WGMMA/tcgen05。producer `setmaxnreg.dec 40`，consumer `setmaxnreg.inc 232`。Ping-pong: 2 个 consumer 交替执行不同 tile
-- **CUTLASS (Hopper)**: `TmaWarpSpecialized` / `TmaWarpSpecializedCooperative` / `TmaWarpSpecializedPingpong`
-- **Triton**: `num_consumer_groups=2, num_buffers_warp_spec=3`；编译器自动 task partition
+- **CUDA**: 在 `tma` + `mbarrier` 能力存在时，让 producer 发起 TMA load，consumer 使用该架构的矩阵路径；不要把 WGMMA、TCGen05 或 TMEM跨架构继承。`setmaxnreg` 也必须先查精确架构能力。
+- **CUTLASS**: Hopper 使用 `TmaWarpSpecialized*`；SM120/121 使用 `KernelTmaWarpSpecialized*Sm120` 等显式 schedule。
+- **Triton**: 上游公开路径是 `tl.range(..., warp_specialize=True)`，当前只支持 Blackwell 上的简单 matmul loop；Gluon warp specialization 仍按实验能力探测，并检查生成代码。
 - **验证**: producer barrier stall 极低；consumer TC 利用率提升；SASS 出现 `SETMAXREG`
 
 ### P4: `compute.launch_config` — Launch Configuration / Tile Shape *(MOVED UP from P6)*
@@ -120,7 +120,7 @@
 - **跳过条件**: 精度宽松场景（已用 P10 fast accumulation）；非 FP8 kernel
 - **CUDA**: 每 N 条 WGMMA FP8 累加到 FP16/FP32 registers → CUDA core 提升到 FP32 累加 → 写回。DeepGEMM 典型 N=4
 - **CUTLASS**: 手动实现（CUTLASS 3.x fast-accum 路径为相反方向，需禁用）
-- **Triton**: 需 `tl.dot(..., out_dtype=tl.float32, acc_promote_cycles=N)` 扩展
+- **Triton**: `acc_promote_cycles` 是 **fork-specific** 扩展，不在上游 `tl.dot` 签名中。使用前通过 `inspect.signature` 探测；上游环境采用显式分段累加 fallback。
 - **冲突**: `compute.fp8_fast_accumulation_mode` (P10)
 - **验证**: FP8 kernel 相对误差 < 0.5%；WGMMA 利用率略降
 
@@ -136,9 +136,9 @@
 
 ### P11: `compute.block_scaled_precision` — NVFP4 / MXFP8 / MXFP6 块缩放精度
 - **典型收益**: 2× vs FP8 on Blackwell
-- **触发条件**: sm_100+；kernel 使用 FP16/BF16 但精度允许 FP8/FP6/FP4 + 块缩放；内存带宽受限
-- **跳过条件**: sm < 100；精度要求严格；已在 P2 mixed_precision 中切换到 FP8
-- **CUDA**: `tcgen05.mma kind::mxf8f6f4` / `kind::mxf4nvf4`；每 16-32 个元素共享 UE8M0/UE4M3 缩放因子；CUDA-core 二级累加（promotion）
+- **触发条件**: 精确架构能力包含 `block_scaling`；kernel 使用 FP16/BF16 但精度允许 FP8/FP6/FP4 + 块缩放；内存带宽受限
+- **跳过条件**: `block_scaling` 不可用；精度要求严格；已在 P2 mixed_precision 中切换到 FP8
+- **CUDA**: SM100/103/110 路由到 TCGen05/TMEM 块缩放；SM120/121 路由到其原生 `mma` block-scale 变体。每 16-32 个元素共享缩放因子；两条路径不可互换。
 - **CUTLASS**: `OpClassBlockScaledTensorOp`；example 67 (FP8 block-scaled), 72 (Blackwell narrow-prec), 79a-c (GeForce NVFP4/MXFP8)
 - **Triton**: Blackwell Triton 3.x block-scaled 支持
 - **验证**: SASS 出现 `UMMA`/`QGMMA`；`dram__bytes.sum` 大幅下降；**必须验证 atol/rtol**
@@ -191,7 +191,7 @@
 - **触发条件**: SASS 中 `a*b` 和 `+c` 是两条独立指令；`--use_fast_math` 可接受
 - **跳过条件**: 精度要求严格
 - **CUDA**: `__fmaf_rn()`；`--use_fast_math`；除法 → `a * __frcp_rn(b)` (4×-16×)
-- **Triton**: 编译器自动 FMA；`allow_tf32=True`
+- **Triton**: 编译器自动 FMA；矩阵乘路径使用 `input_precision="tf32"`，不要使用已弃用的 `allow_tf32`
 - **验证**: 指令数减少；latency 下降
 
 ### P18: `compute.lop3_bit_manipulation` — lop3 三目逻辑反量化
@@ -280,7 +280,7 @@
 - **CUDA (sm_80+)**: `cp.async.cg.shared.global` / `cp.async.ca`
 - **CUDA (sm_90+)**: TMA `cp.async.bulk.tensor` 硬件 DMA + `mbarrier`
 - **CUTLASS**: `MainloopSm80CpAsync`；`MainloopSm90Tma*`
-- **Triton**: 编译器自动；`tl.make_block_ptr` 触发 TMA
+- **Triton**: TMA 路径使用 `tl.make_tensor_descriptor` 或 host tensor descriptor，并检查生成代码；`tl.make_block_ptr` 只表达 block pointer，不能单独证明 TMA 已启用
 - **验证**: SASS 出现 `LDGSTS`/`CP.ASYNC`/`TMA_LOAD`；`Stall Long Scoreboard` 下降
 
 ### P6: `memory.multi_stage_pipeline` — 双缓冲 / 多级流水线
@@ -678,14 +678,11 @@
 
 1. **同方法 id 不跨轴重复**: `memory.multi_stage_pipeline`（P6）与 `latency.async_pipeline`（P1）本质相同
 2. **三方法正交**: `analysis.md` "Orthogonality check" 显式验证
-3. **arch 兜底 (v4 精细化)**:
-   - sm<70 → 无 TC
-   - sm<75 → 无 ldmatrix
-   - sm<80 → 无 cp.async / L2 persistence
-   - sm<89 → 无 FP8
-   - sm<90 → 无 TMA/WGMMA/Cluster/DSMEM/PDL/mbarrier
-   - sm<100 → 无 tcgen05/TMEM/CLC/block-scaling
-   - sm=120 (RTX 5090) → 有 FP8 但**无 TMA/WGMMA**（特殊例外）
+3. **arch 兜底 (v4.1)**：只读取 `method_registry.json` 中精确的 `arch_feature_map`，禁止通过 `sm_120 > sm_100` 之类的数字比较继承能力。特别注意：
+   - SM90 是 Hopper WGMMA 路径。
+   - SM100/103/110 是 TCGen05/TMEM 路径，不继承 WGMMA。
+   - SM120/121 当前 CUTLASS 有显式 TMA warp-specialized 和 block-scaled MMA 路径，但不具备 SM100 TCGen05/TMEM，也不具备 Hopper WGMMA。
+   - 未登记架构上的特性默认不可用，先探测编译器、PTX 与库支持再扩展映射。
 4. **有效方法不重选**: 可选其升级版（如 `memory.epilogue_fusion` → `memory.epilogue_visitor_tree_fusion`）
 5. **无效方法禁选**: 除非 ncu 根本性变化
 6. **耦合规则** (v4 扩充):

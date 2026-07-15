@@ -55,7 +55,7 @@
     "compute.block_scaled_precision": {
       "sass_patterns": ["UMMA", "QGMMA"],
       "require_any": true,
-      "note": "Blackwell tcgen05 MMA (UMMA) or FP8 wgmma (QGMMA) with block-scaled operands"
+      "note": "Architecture-specific Blackwell block-scaled Tensor Core path; interpret the matched opcode using the exact SM capability map"
     },
     "compute.tf32_emulation_3xtf32_bf16x6": {
       "sass_patterns": ["HMMA\\.16816\\.F32\\.TF32", "WGMMA.*tf32"],
