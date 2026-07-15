@@ -6,7 +6,11 @@
 
 ---
 
-## Roofline Analysis (from `roofline.json`)
+## Bottleneck and Roofline Evidence (from `roofline.json`)
+
+- **Analysis model**: {{analysis_model}}
+- **Evidence quality**: {{analysis_quality}}
+- **Roofline ridge / arithmetic intensity**: {{ai_ridge}} / {{arithmetic_intensity}}
 
 | Axis | Δ (gap) | Utilization | Budget |
 |------|---------|-------------|--------|
@@ -33,7 +37,7 @@
 
 ## Diagnosis
 
-_Which axis is the dominant bottleneck right now? Cite specific metric values. Explain how the roofline budget allocation reflects this diagnosis._
+_Which evidenced axis is the dominant bottleneck right now? Cite specific metric values, call out missing evidence, and explain how the budget reflects this diagnosis._
 
 > Example:
 > `sm__pipe_tensor_op_hmma_cycles_active...pct_of_peak = 8.4%` on a GEMM signals tensor cores barely used — compute Δ = 0.92. Simultaneously `smsp__warp_issue_stalled_long_scoreboard...pct = 61%` → latency Δ = 0.61. Memory bandwidth at 43% → Δ_m = 0.57. Budget: compute=2, memory=0, latency=1. Attack compute and latency; memory already near limit.
@@ -73,7 +77,7 @@ _(only if B=3 methods; omit if axis budget is 0)_
 
 ## Orthogonality check
 
-_Verify: (1) no pair is the same optimization under two names, (2) coupled pairs (memory.P5 + latency.P3) not both selected, (3) all arch-compatible, (4) axis distribution matches roofline budget._
+_Verify: (1) no pair is the same optimization under two names, (2) coupled pairs (memory.P5 + latency.P3) not both selected, (3) all arch-compatible, (4) axis distribution matches the evidence budget._
 
 ## Excluded candidates (higher-priority methods that were skipped)
 

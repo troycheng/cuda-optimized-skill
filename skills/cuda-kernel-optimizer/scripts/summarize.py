@@ -66,14 +66,15 @@ def _timeline_table(state: dict) -> str:
 
 def _roofline_table(state: dict) -> str:
     rows = [
-        "| Iter | Bound | Δ_compute | Δ_memory | Δ_latency | Budget (c,m,l) |",
-        "|------|-------|-----------|----------|-----------|----------------|",
+        "| Iter | Quality | Bound | Δ_compute | Δ_memory | Δ_latency | Budget (c,m,l) |",
+        "|------|---------|-------|-----------|----------|-----------|----------------|",
     ]
     for r in state.get("roofline_history", []):
         budget = r.get("axis_budget", {})
         budget_str = f"({budget.get('compute','-')},{budget.get('memory','-')},{budget.get('latency','-')})"
         rows.append(
             f"| {r['iter']} "
+            f"| {r.get('analysis_quality', '?')} "
             f"| {r.get('bound', '?')} "
             f"| {r.get('delta_compute', '?')} "
             f"| {r.get('delta_memory', '?')} "

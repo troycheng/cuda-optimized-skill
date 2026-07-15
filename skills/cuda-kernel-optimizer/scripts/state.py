@@ -263,6 +263,8 @@ def cmd_update(args: argparse.Namespace) -> None:
             "delta_compute": roofline.get("delta_compute"),
             "delta_memory": roofline.get("delta_memory"),
             "delta_latency": roofline.get("delta_latency"),
+            "analysis_model": roofline.get("analysis_model"),
+            "analysis_quality": roofline.get("analysis_quality"),
             "bound": roofline.get("bound"),
             "axis_budget": roofline.get("axis_budget"),
         })

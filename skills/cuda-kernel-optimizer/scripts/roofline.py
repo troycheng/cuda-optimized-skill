@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compute roofline gaps and allocate axis budgets for the current iteration.
+"""Compute evidence-aware bottleneck gaps and allocate method budgets.
 
-Reads ncu_top.json and env.json, computes Δ_c / Δ_m / Δ_l (pure
-observable ratios with NO tunable parameters), allocates per-axis method
-budgets proportionally with a per-axis cap of 2 and total B=3.
+Utilization metrics provide heuristic compute, memory, and latency gaps. A
+measured Roofline result is emitted only when explicit device peaks, workload
+FLOPs, transferred bytes, and kernel time are all available.
 
 Writes iterv{i}/roofline.json.
 """
@@ -19,39 +19,36 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# GPU peak specs (fallback table when env.json lacks bandwidth/flops info).
-# Values in TFLOPS (FP16 tensor) and GB/s.
+# Explicit GPU and workload inputs
 # ---------------------------------------------------------------------------
 
-_GPU_SPECS: dict[str, dict] = {
-    # sm_arch -> {peak_flops_tflops_fp16, peak_bw_gbs}
-    "sm_70": {"peak_flops_tflops": 125,  "peak_bw_gbs": 900},   # V100
-    "sm_75": {"peak_flops_tflops": 65,   "peak_bw_gbs": 672},   # T4
-    "sm_80": {"peak_flops_tflops": 312,  "peak_bw_gbs": 2039},  # A100 SXM
-    "sm_86": {"peak_flops_tflops": 150,  "peak_bw_gbs": 936},   # A6000
-    "sm_89": {"peak_flops_tflops": 330,  "peak_bw_gbs": 1008},  # L40S / 4090
-    "sm_90": {"peak_flops_tflops": 990,  "peak_bw_gbs": 3350},  # H100 SXM
-}
-
-# Default fallback
-_DEFAULT_SPEC = {"peak_flops_tflops": 200, "peak_bw_gbs": 1500}
-
-
 def _get_gpu_spec(env: dict) -> dict:
-    """Extract or look up peak FLOPS and bandwidth."""
+    """Read caller-provided peak FLOPS and bandwidth without guessing."""
     gpus = env.get("gpus") or [{}]
     gpu = gpus[0]
-    sm = gpu.get("sm_arch", "sm_80")
+    return {
+        "peak_flops_tflops": _positive_float(gpu.get("peak_flops_tflops")),
+        "peak_bw_gbs": _positive_float(gpu.get("peak_bw_gbs")),
+    }
 
-    spec = _GPU_SPECS.get(sm, _DEFAULT_SPEC).copy()
 
-    # Allow env.json to override if check_env.py populated these
-    if "peak_flops_tflops" in gpu:
-        spec["peak_flops_tflops"] = gpu["peak_flops_tflops"]
-    if "peak_bw_gbs" in gpu:
-        spec["peak_bw_gbs"] = gpu["peak_bw_gbs"]
+def _positive_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 and math.isfinite(parsed) else None
 
-    return spec
+
+def _get_workload(ncu_top: dict) -> dict:
+    workload = ncu_top.get("workload") or {}
+    return {
+        "flops": _positive_float(workload.get("flops", ncu_top.get("workload_flops"))),
+        "bytes": _positive_float(workload.get("bytes", ncu_top.get("workload_bytes"))),
+        "kernel_time_ms": _positive_float(
+            workload.get("kernel_time_ms", ncu_top.get("kernel_time_ms"))
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +64,7 @@ def _safe_float(v, default=0.0) -> float:
         return default
 
 
-def _find_metric(ncu_top: dict, patterns: list[str], axis: str = None) -> float:
+def _find_metric(ncu_top: dict, patterns: list[str], axis: str = None) -> float | None:
     """Find the first matching metric value from ncu_top.json axes."""
     axes_to_search = [axis] if axis else ["compute", "memory", "latency"]
     for ax in axes_to_search:
@@ -76,23 +73,35 @@ def _find_metric(ncu_top: dict, patterns: list[str], axis: str = None) -> float:
             name = m.get("metric", m.get("name", ""))
             for pat in patterns:
                 if pat in name:
-                    return _safe_float(m.get("value", 0.0))
-    return 0.0
+                    value = _safe_float(m.get("value"), default=None)
+                    if value is not None:
+                        return value
+    return None
 
 
 def compute_deltas(ncu_top: dict, env: dict) -> dict:
     """Compute Δ_c, Δ_m, Δ_l from ncu_top.json metrics.
 
-    All values are pure ratios of observables — no tunable parameters.
+    Missing metrics are represented as missing evidence, not as a full gap.
     """
     degraded = ncu_top.get("degraded", False)
 
     if degraded:
-        # No real ncu data — use uniform gaps
         return {
-            "delta_compute": 0.50,
-            "delta_memory": 0.50,
-            "delta_latency": 0.50,
+            "delta_compute": 0.0,
+            "delta_memory": 0.0,
+            "delta_latency": 0.0,
+            "compute_util_pct": None,
+            "memory_util_pct": None,
+            "max_stall_pct": None,
+            "evidence_axes": {"compute": False, "memory": False, "latency": False},
+            "analysis_model": "utilization_gap",
+            "analysis_quality": "unavailable",
+            "ai_ridge": None,
+            "arithmetic_intensity": None,
+            "achieved_tflops": None,
+            "achieved_bandwidth_gbs": None,
+            "roofline_bound": None,
             "degraded": True,
         }
 
@@ -109,16 +118,23 @@ def compute_deltas(ncu_top: dict, env: dict) -> dict:
         "sm__throughput",
     ], "compute")
 
-    # Use the best available compute utilization metric
-    compute_util = max(tensor_pct, fp32_pct, sm_throughput) / 100.0
-    delta_c = max(0.0, 1.0 - compute_util)
+    compute_values = [v for v in (tensor_pct, fp32_pct, sm_throughput) if v is not None]
+    compute_util = max(compute_values) / 100.0 if compute_values else None
+    delta_c = max(0.0, 1.0 - compute_util) if compute_util is not None else 0.0
 
     # --- Memory gap ---
-    dram_throughput_pct = _find_metric(ncu_top, [
+    dram_throughput_value = _find_metric(ncu_top, [
         "dram__throughput",
         "gpu__compute_memory_throughput",
-    ], "memory") / 100.0
-    delta_m = max(0.0, 1.0 - dram_throughput_pct)
+    ], "memory")
+    dram_throughput_pct = (
+        dram_throughput_value / 100.0 if dram_throughput_value is not None else None
+    )
+    delta_m = (
+        max(0.0, 1.0 - dram_throughput_pct)
+        if dram_throughput_pct is not None
+        else 0.0
+    )
 
     # --- Latency gap ---
     # Take the maximum stall percentage across all stall types
@@ -135,25 +151,76 @@ def compute_deltas(ncu_top: dict, env: dict) -> dict:
             v = _safe_float(m.get("value", 0.0))
             stall_metrics.append(min(max(v, 0.0), 100.0))
 
-    if stall_metrics:
-        max_stall_pct = max(stall_metrics) / 100.0
-    else:
-        max_stall_pct = 0.5  # Default if no stall data
+    max_stall_pct = max(stall_metrics) / 100.0 if stall_metrics else None
+    delta_l = (
+        min(1.0, max(0.0, max_stall_pct))
+        if max_stall_pct is not None
+        else 0.0
+    )
 
-    delta_l = min(1.0, max(0.0, max_stall_pct))
+    evidence_axes = {
+        "compute": compute_util is not None,
+        "memory": dram_throughput_pct is not None,
+        "latency": max_stall_pct is not None,
+    }
 
-    # --- Determine bound ---
+    # A true Roofline classification requires explicit device and workload data.
     spec = _get_gpu_spec(env)
-    ai_ridge = (spec["peak_flops_tflops"] * 1e12) / (spec["peak_bw_gbs"] * 1e9)
+    workload = _get_workload(ncu_top)
+    measured_inputs = [
+        spec["peak_flops_tflops"],
+        spec["peak_bw_gbs"],
+        workload["flops"],
+        workload["bytes"],
+        workload["kernel_time_ms"],
+    ]
+    measured = all(value is not None for value in measured_inputs)
+
+    ai_ridge = None
+    arithmetic_intensity = None
+    achieved_tflops = None
+    achieved_bandwidth_gbs = None
+    roofline_bound = None
+    if measured:
+        ai_ridge = (
+            spec["peak_flops_tflops"] * 1e12
+            / (spec["peak_bw_gbs"] * 1e9)
+        )
+        arithmetic_intensity = workload["flops"] / workload["bytes"]
+        seconds = workload["kernel_time_ms"] / 1000.0
+        achieved_tflops = workload["flops"] / seconds / 1e12
+        achieved_bandwidth_gbs = workload["bytes"] / seconds / 1e9
+        roofline_bound = "compute" if arithmetic_intensity >= ai_ridge else "bandwidth"
+
+    if measured:
+        analysis_quality = "measured_roofline"
+        analysis_model = "roofline"
+    elif any(evidence_axes.values()):
+        analysis_quality = "heuristic"
+        analysis_model = "utilization_gap"
+    else:
+        analysis_quality = "unavailable"
+        analysis_model = "utilization_gap"
 
     return {
         "delta_compute": round(delta_c, 4),
         "delta_memory": round(delta_m, 4),
         "delta_latency": round(delta_l, 4),
-        "compute_util_pct": round(compute_util * 100, 2),
-        "memory_util_pct": round(dram_throughput_pct * 100, 2),
-        "max_stall_pct": round(max_stall_pct * 100, 2),
-        "ai_ridge": round(ai_ridge, 2),
+        "compute_util_pct": round(compute_util * 100, 2) if compute_util is not None else None,
+        "memory_util_pct": round(dram_throughput_pct * 100, 2) if dram_throughput_pct is not None else None,
+        "max_stall_pct": round(max_stall_pct * 100, 2) if max_stall_pct is not None else None,
+        "evidence_axes": evidence_axes,
+        "analysis_model": analysis_model,
+        "analysis_quality": analysis_quality,
+        "ai_ridge": round(ai_ridge, 4) if ai_ridge is not None else None,
+        "arithmetic_intensity": (
+            round(arithmetic_intensity, 4) if arithmetic_intensity is not None else None
+        ),
+        "achieved_tflops": round(achieved_tflops, 4) if achieved_tflops is not None else None,
+        "achieved_bandwidth_gbs": (
+            round(achieved_bandwidth_gbs, 4) if achieved_bandwidth_gbs is not None else None
+        ),
+        "roofline_bound": roofline_bound,
         "degraded": False,
     }
 
@@ -173,80 +240,39 @@ TIE_BREAK_ORDER = ["memory", "latency", "compute"]
 def allocate_budget(delta_c: float, delta_m: float, delta_l: float) -> dict:
     """Allocate method budget per axis.
 
-    Rules:
-      - Proportional to Δ, rounded
-      - Per-axis cap = 2
-      - Total = 3
-      - At least 2 axes covered (consequence of cap=2 with total=3)
-      - Axes with Δ < 0.10 get 0 (negligible gap)
+    Allocate up to three methods proportionally across evidenced gaps, with a
+    per-axis cap of two. Zero and negligible gaps never receive a method.
     """
     deltas = {"compute": delta_c, "memory": delta_m, "latency": delta_l}
 
-    # Zero out negligible axes
-    for axis in deltas:
-        if deltas[axis] < 0.10:
-            deltas[axis] = 0.0
+    eligible = {axis: gap for axis, gap in deltas.items() if gap >= 0.10}
+    budgets = {"compute": 0, "memory": 0, "latency": 0}
+    if not eligible:
+        return budgets
 
-    total_delta = sum(deltas.values())
+    target_budget = min(TOTAL_BUDGET, MAX_PER_AXIS * len(eligible))
+    total_delta = sum(eligible.values())
+    raw = {
+        axis: target_budget * gap / total_delta
+        for axis, gap in eligible.items()
+    }
+    for axis in eligible:
+        budgets[axis] = min(MAX_PER_AXIS, int(math.floor(raw[axis])))
 
-    # Edge case: all deltas are negligible
-    if total_delta < 0.01:
-        return {"compute": 1, "memory": 1, "latency": 1}
-
-    # Proportional allocation (float)
-    raw = {axis: TOTAL_BUDGET * deltas[axis] / total_delta for axis in deltas}
-
-    # Round to integers
-    budgets = {axis: int(round(raw[axis])) for axis in deltas}
-
-    # Step 1: Cap at MAX_PER_AXIS
-    overflow = 0
-    for axis in budgets:
-        if budgets[axis] > MAX_PER_AXIS:
-            overflow += budgets[axis] - MAX_PER_AXIS
-            budgets[axis] = MAX_PER_AXIS
-
-    # Step 2: Redistribute overflow to non-saturated axes, ordered by Δ
-    for axis in sorted(deltas, key=lambda a: -deltas[a]):
-        if overflow <= 0:
+    tie_rank = {axis: len(TIE_BREAK_ORDER) - i for i, axis in enumerate(TIE_BREAK_ORDER)}
+    while sum(budgets.values()) < target_budget:
+        candidates = [axis for axis in eligible if budgets[axis] < MAX_PER_AXIS]
+        if not candidates:
             break
-        if budgets[axis] < MAX_PER_AXIS:
-            room = MAX_PER_AXIS - budgets[axis]
-            take = min(overflow, room)
-            budgets[axis] += take
-            overflow -= take
-
-    # Step 3: Fix total to exactly TOTAL_BUDGET
-    current = sum(budgets.values())
-    while current != TOTAL_BUDGET:
-        if current < TOTAL_BUDGET:
-            # Add 1 to axis with highest fractional remainder that isn't capped
-            best_axis = None
-            best_remainder = -1.0
-            for axis in TIE_BREAK_ORDER:
-                if budgets[axis] < MAX_PER_AXIS:
-                    remainder = raw[axis] - budgets[axis]
-                    if remainder > best_remainder:
-                        best_remainder = remainder
-                        best_axis = axis
-            if best_axis is None:
-                # All axes capped — shouldn't happen with cap=2, B=3
-                break
-            budgets[best_axis] += 1
-        else:
-            # Remove 1 from axis with lowest fractional remainder
-            worst_axis = None
-            worst_remainder = 999.0
-            for axis in reversed(TIE_BREAK_ORDER):
-                if budgets[axis] > 0:
-                    remainder = raw[axis] - budgets[axis]
-                    if remainder < worst_remainder:
-                        worst_remainder = remainder
-                        worst_axis = axis
-            if worst_axis is None:
-                break
-            budgets[worst_axis] -= 1
-        current = sum(budgets.values())
+        best_axis = max(
+            candidates,
+            key=lambda axis: (
+                raw[axis] - budgets[axis],
+                eligible[axis],
+                tie_rank[axis],
+            ),
+        )
+        budgets[best_axis] += 1
 
     return budgets
 
@@ -279,20 +305,28 @@ def run(state_path: str, iteration: int) -> dict:
     dl = deltas["delta_latency"]
 
     # Check near-peak
-    near_peak = (dc < NEAR_PEAK_THRESHOLD and
+    evidence_axes = deltas.get("evidence_axes", {})
+    complete_evidence = all(
+        evidence_axes.get(axis, False)
+        for axis in ("compute", "memory", "latency")
+    )
+    near_peak = (complete_evidence and
+                 dc < NEAR_PEAK_THRESHOLD and
                  dm < NEAR_PEAK_THRESHOLD and
                  dl < NEAR_PEAK_THRESHOLD)
 
-    # Determine primary bound
-    max_delta = max(dc, dm, dl)
+    # Determine primary bound only from axes that actually have evidence.
+    axis_gaps = {"compute": dc, "memory": dm, "latency": dl}
+    evidenced_gaps = {
+        axis: gap for axis, gap in axis_gaps.items() if evidence_axes.get(axis, False)
+    }
     if near_peak:
         bound = "near_peak"
-    elif max_delta == dc:
-        bound = "compute"
-    elif max_delta == dm:
-        bound = "bandwidth"
+    elif not evidenced_gaps:
+        bound = "unknown"
     else:
-        bound = "latency"
+        primary_axis = max(evidenced_gaps, key=evidenced_gaps.get)
+        bound = "bandwidth" if primary_axis == "memory" else primary_axis
 
     # Allocate budgets
     axis_budget = allocate_budget(dc, dm, dl)

@@ -13,11 +13,11 @@ Given:
 - kernel dimension arguments (e.g. `--M=4096 --N=4096 --K=4096`),
 - optional iteration count `N` (default **3**), `ncu_num` (default **5**), and `branches` (default **4**),
 
-the skill runs a **roofline-guided, branch-and-select iterative optimization loop** and produces a timestamped directory of per-iteration artifacts plus a final summary.
+the skill runs an **evidence-guided, branch-and-select iterative optimization loop** and produces a timestamped directory of per-iteration artifacts plus a final summary.
 
 ## Key point
 
-1. **Roofline-driven axis budget**: compute/memory/latency axis budgets are allocated proportionally to measured Δ gaps, with a per-axis cap of 2. 
+1. **Evidence-aware axis budget**: compute/memory/latency budgets come from available utilization metrics. The result is labeled heuristic unless explicit peaks, workload FLOPs, transferred bytes, and kernel time support a measured Roofline model.
 2. **Branch-and-Select**: each iteration generates K candidate kernels (hyperparameter/implementation variants), benchmarks all, selects champion. 
 3. **Ablation attribution**: after selecting champion, each method is individually ablated to determine its actual contribution.
 4. **SASS verification**: `cuobjdump --dump-sass` confirms claimed optimizations actually appear in generated code.
@@ -144,7 +144,7 @@ python <skill>/scripts/profile_ncu.py \
 
 Writes `iterv{i}/best_input.ncu-rep` (full ncu report) and `iterv{i}/ncu_top.json`.
 
-### 3b. Compute roofline gaps and axis budgets
+### 3b. Compute bottleneck evidence and axis budgets
 
 ```bash
 python <skill>/scripts/roofline.py \
@@ -157,19 +157,24 @@ Reads `ncu_top.json` + `env.json`, computes:
 - `Δ_m` = bandwidth utilization gap
 - `Δ_l` = max stall percentage
 
+Missing metrics remain missing evidence; they are not converted into synthetic gaps. A measured Roofline classification is added only when explicit peak and workload inputs are present.
+
 Writes `iterv{i}/roofline.json`:
 ```jsonc
 {
   "delta_compute": 0.85,
   "delta_memory": 0.60,
   "delta_latency": 0.55,
+  "analysis_model": "utilization_gap",
+  "analysis_quality": "heuristic",
+  "ai_ridge": null,
   "bound": "compute",
   "near_peak": false,
   "axis_budget": {"compute": 1, "memory": 1, "latency": 1}
 }
 ```
 
-**Budget allocation rule**: proportional to Δ, rounded, cap per axis = 2, total = 3. If all Δ < 0.15 → `near_peak: true` → **early stop**.
+**Budget allocation rule**: proportional to evidenced Δ values, cap per axis = 2, total up to 3. Zero or negligible gaps receive no budget. Early stop is allowed only when all three axes have evidence and all Δ values are below 0.15.
 
 ### 3c. Select methods (agent decision)
 
