@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -393,20 +394,41 @@ def _declared_dependencies(source: _FileSnapshot) -> tuple[str, ...]:
 
 def _read_python_bundle(path) -> _PythonBundle:
     source = _stable_file_snapshot(path, "workload adapter")
-    root = source.path.parent.resolve()
+    root = source.path.parent.resolve(strict=True)
     dependencies = []
     for relative in _declared_dependencies(source):
         dependency_path = Path(relative)
         if dependency_path.is_absolute():
             raise ValueError("workload dependency must be relative")
-        candidate = Path(os.path.abspath(root / dependency_path))
+        if ".." in dependency_path.parts:
+            raise ValueError(
+                f"workload dependency escapes adapter directory: {relative}"
+            )
+        candidate = root
         try:
-            candidate.relative_to(root)
+            for component in dependency_path.parts:
+                if component in ("", "."):
+                    continue
+                candidate = candidate / component
+                info = os.lstat(candidate)
+                if stat.S_ISLNK(info.st_mode):
+                    raise ValueError(
+                        f"workload dependency must not contain symlinks: {relative}"
+                    )
+            resolved = candidate.resolve(strict=True)
+        except ValueError:
+            raise
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"workload dependency file does not exist: {relative}"
+            ) from error
+        try:
+            resolved.relative_to(root)
         except ValueError as error:
             raise ValueError(
                 f"workload dependency escapes adapter directory: {relative}"
             ) from error
-        snapshot = _stable_file_snapshot(candidate, "workload dependency")
+        snapshot = _stable_file_snapshot(resolved, "workload dependency")
         dependencies.append((relative, snapshot))
     return _PythonBundle(source=source, dependencies=tuple(dependencies))
 
@@ -923,14 +945,6 @@ def run_once(adapter, *, candidate, role: str, case: dict) -> dict:
                 raise ValueError("workload validation failed")
             raw_benchmark = adapter.benchmark(lifecycle_candidate)
             benchmark = _validate_benchmark_result(raw_benchmark)
-            objective = validate_objective(adapter.metrics())
-            return {
-                "role": normalized_role,
-                "case": copy.deepcopy(normalized_case),
-                "validation": validation,
-                "benchmark": benchmark,
-                "objective": objective,
-            }
         except BaseException as error:
             primary = error
             raise
@@ -941,6 +955,14 @@ def run_once(adapter, *, candidate, role: str, case: dict) -> dict:
                 if primary is None:
                     raise
                 _record_cleanup_failure(primary, cleanup_error)
+    objective = validate_objective(adapter.metrics())
+    return {
+        "role": normalized_role,
+        "case": copy.deepcopy(normalized_case),
+        "validation": validation,
+        "benchmark": benchmark,
+        "objective": objective,
+    }
 
 
 def _is_secret_name(name: str) -> bool:
@@ -1010,33 +1032,55 @@ def _drain_pipe(stream, capture: _BoundedCapture) -> None:
             pass
 
 
-def _signal_process_group(process, signal_number: int) -> None:
+def _signal_process_group(process_group: int, signal_number: int) -> None:
     try:
-        os.killpg(process.pid, signal_number)
+        os.killpg(process_group, signal_number)
     except (ProcessLookupError, PermissionError):
         pass
 
 
-def _stop_process_group(process) -> None:
-    _signal_process_group(process, signal.SIGTERM)
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_process_group(process, process_group: int) -> None:
+    _signal_process_group(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + _PROCESS_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _process_group_exists(process_group):
+            break
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    if _process_group_exists(process_group):
+        _signal_process_group(process_group, signal.SIGKILL)
     try:
         process.wait(timeout=_PROCESS_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
-        process.wait()
+        _signal_process_group(process_group, signal.SIGKILL)
 
 
 def _finish_readers(threads, streams) -> None:
+    deadline = time.monotonic() + _PROCESS_GRACE_SECONDS
     for thread in threads:
-        thread.join(timeout=1)
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    readers_alive = any(thread.is_alive() for thread in threads)
     for stream in streams:
-        if stream is not None:
+        if stream is not None and not stream.closed:
             try:
-                stream.close()
+                if readers_alive:
+                    os.close(stream.fileno())
+                else:
+                    stream.close()
             except Exception:
                 pass
     for thread in threads:
-        thread.join(timeout=1)
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _command_environment(overrides: Mapping[str, str]) -> tuple[dict, tuple[str, ...]]:
@@ -1188,10 +1232,11 @@ def run_command_once(
             ) from error
         except OSError as error:
             raise RuntimeError(f"failed to execute workload command: {error}") from error
+        process_group = process.pid
         stdout_capture = _BoundedCapture()
         stderr_capture = _BoundedCapture()
         streams = (process.stdout, process.stderr)
-        threads = (
+        reader_threads = (
             threading.Thread(
                 target=_drain_pipe,
                 args=(process.stdout, stdout_capture),
@@ -1203,31 +1248,28 @@ def run_command_once(
                 daemon=True,
             ),
         )
-        for thread in threads:
-            thread.start()
+        started_threads = []
+        timeout_error = None
         try:
+            for thread in reader_threads:
+                thread.start()
+                started_threads.append(thread)
             try:
                 returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired as error:
-                _stop_process_group(process)
-                _finish_readers(threads, streams)
-                raise RuntimeError(
-                    "workload command timed out"
-                    + _diagnostics(
-                        stdout_capture.text(),
-                        stderr_capture.text(),
-                        secret_values=secret_values,
-                    )
-                ) from error
-        except BaseException:
-            if process.poll() is None:
-                _stop_process_group(process)
-            else:
-                _signal_process_group(process, signal.SIGTERM)
-            _finish_readers(threads, streams)
-            raise
-        _signal_process_group(process, signal.SIGTERM)
-        _finish_readers(threads, streams)
+                timeout_error = error
+        finally:
+            _stop_process_group(process, process_group)
+            _finish_readers(started_threads, streams)
+        if timeout_error is not None:
+            raise RuntimeError(
+                "workload command timed out"
+                + _diagnostics(
+                    stdout_capture.text(),
+                    stderr_capture.text(),
+                    secret_values=secret_values,
+                )
+            ) from timeout_error
         stdout = stdout_capture.text()
         stderr = stderr_capture.text()
         if returncode != 0:

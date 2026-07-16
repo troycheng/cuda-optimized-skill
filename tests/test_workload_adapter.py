@@ -376,7 +376,7 @@ class PythonLifecycleTests(unittest.TestCase):
 
         self.assertEqual(
             [name for name, _ in events],
-            ["prepare", "validate", "benchmark", "metrics", "cleanup"],
+            ["prepare", "validate", "benchmark", "cleanup", "metrics"],
         )
         self.assertEqual(result["benchmark"], {"latency_ms": 1.2})
         self.assertEqual(result["objective"], _objective())
@@ -1429,6 +1429,45 @@ class SourceIdentityTests(unittest.TestCase):
             finally:
                 outside.unlink(missing_ok=True)
 
+    def test_dependency_rejects_symlink_directory_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter_root = root / "adapter-root"
+            outside = root / "outside"
+            adapter_root.mkdir()
+            outside.mkdir()
+            (outside / "helper.py").write_text("VALUE = 1\n", "utf-8")
+            (adapter_root / "linked").symlink_to(outside, target_is_directory=True)
+            adapter = adapter_root / "workload.py"
+            _write_python_adapter(adapter)
+            adapter.write_text(
+                'WORKLOAD_DEPENDENCIES = ["linked/helper.py"]\n'
+                + adapter.read_text("utf-8"),
+                "utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "dependency|symlink|escape"):
+                self.workloads.normalize_workload(workload=adapter)
+
+    def test_dependency_allows_ordinary_nested_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "helper.py").write_text("VALUE = 1\n", "utf-8")
+            adapter = root / "workload.py"
+            _write_python_adapter(adapter)
+            adapter.write_text(
+                'WORKLOAD_DEPENDENCIES = ["nested/helper.py"]\n'
+                + adapter.read_text("utf-8"),
+                "utf-8",
+            )
+
+            spec = self.workloads.normalize_workload(workload=adapter)
+
+            self.assertEqual(spec.kind, "python")
+            self.assertEqual(len(spec.source_hash), 64)
+
 
 class CommandSecurityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1559,6 +1598,113 @@ class CommandSecurityTests(unittest.TestCase):
                     alive = False
             self.assertFalse(alive, "grandchild survived workload timeout")
 
+    def test_timeout_kills_term_ignoring_grandchild_after_leader_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for attempt in range(3):
+                pid_file = root / f"child-{attempt}.pid"
+                ready_file = root / f"child-{attempt}.ready"
+                runner = _write_executable(
+                    root / f"tree-runner-{attempt}",
+                    """
+                    import signal, subprocess, sys, time
+                    from pathlib import Path
+
+                    def raise_exit():
+                        raise SystemExit(0)
+
+                    signal.signal(signal.SIGTERM, lambda *_: raise_exit())
+                    child_code = (
+                        "import signal, sys, time; from pathlib import Path; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "Path(sys.argv[1]).write_text('ready'); time.sleep(5)"
+                    )
+                    child = subprocess.Popen([sys.executable, "-c", child_code, sys.argv[2]])
+                    while not Path(sys.argv[2]).exists():
+                        time.sleep(0.005)
+                    Path(sys.argv[1]).write_text(str(child.pid))
+                    time.sleep(30)
+                    """,
+                )
+                spec = self.workloads.normalize_workload(
+                    workload_cmd=[str(runner), str(pid_file), str(ready_file)],
+                    objective=self._objective_file(root),
+                )
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    self.workloads.run_command_once(
+                        spec,
+                        candidate="candidate.py",
+                        role="candidate",
+                        case={},
+                        timeout=1.5,
+                    )
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 3.0, f"attempt {attempt} exceeded cleanup bound")
+                self.assertTrue(pid_file.exists())
+                child_pid = int(pid_file.read_text("utf-8"))
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.01)
+                else:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.fail(f"attempt {attempt} left grandchild {child_pid} alive")
+
+    def test_reader_start_failure_still_cleans_process_group_and_pipes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = _write_executable(root / "sleep-runner", "import time; time.sleep(4)\n")
+            spec = self.workloads.normalize_workload(
+                workload_cmd=[str(runner)],
+                objective=self._objective_file(root),
+            )
+            spawned = []
+            real_popen = subprocess.Popen
+
+            def record_process(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                spawned.append(process)
+                return process
+
+            try:
+                with mock.patch.object(
+                    self.workloads.subprocess, "Popen", side_effect=record_process
+                ), mock.patch.object(
+                    self.workloads.threading.Thread,
+                    "start",
+                    side_effect=RuntimeError("thread start failed"),
+                ), self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                    self.workloads.run_command_once(
+                        spec,
+                        candidate="candidate.py",
+                        role="candidate",
+                        case={},
+                        timeout=1,
+                    )
+                self.assertEqual(len(spawned), 1)
+                process = spawned[0]
+                deadline = time.monotonic() + 1.0
+                while process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertIsNotNone(process.poll(), "runner survived reader start failure")
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+            finally:
+                for process in spawned:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=2)
+
 
 class ContextAndStrictJsonTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1581,6 +1727,7 @@ class ContextAndStrictJsonTests(unittest.TestCase):
                 return {"latency_ms": 1.0}
 
             def metrics(self):
+                events.append(("metrics", hasattr(self, "CUDA_OPTIMIZER_CONTEXT")))
                 return _objective()
 
             def cleanup(self):
@@ -1598,9 +1745,13 @@ class ContextAndStrictJsonTests(unittest.TestCase):
         self.assertEqual(result["role"], "candidate")
         self.assertEqual(result["case"], case)
         self.assertEqual(case["batch"], 4)
-        self.assertEqual([name for name, _ in events], ["prepare", "validate", "benchmark", "cleanup"])
+        self.assertEqual(
+            [name for name, _ in events],
+            ["prepare", "validate", "benchmark", "cleanup", "metrics"],
+        )
         self.assertEqual(events[0][1]["case"]["batch"], 4)
-        self.assertEqual(events[-1][1]["case"]["batch"], 99)
+        self.assertEqual(events[-2][1]["case"]["batch"], 99)
+        self.assertFalse(events[-1][1], "metrics received observation context")
         self.assertFalse(hasattr(adapter, "CUDA_OPTIMIZER_CONTEXT"))
 
     def test_case_must_be_json_safe_mapping(self) -> None:
@@ -1632,6 +1783,13 @@ class ContextAndStrictJsonTests(unittest.TestCase):
             "cleanup",
         ):
             self.assertIn(text, template)
+        self.assertIn(
+            "prepare(), validate(), benchmark(), and cleanup()",
+            template,
+        )
+        self.assertIn("normalization/preflight", template)
+        self.assertIn("no candidate, role, or case context", template)
+        self.assertIn("lightweight pure function", template)
 
     def test_objective_and_manifest_reject_duplicate_and_nonfinite_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

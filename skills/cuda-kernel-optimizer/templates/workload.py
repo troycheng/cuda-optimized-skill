@@ -2,7 +2,8 @@
 
 The optimizer cannot infer, download, or manufacture a representative
 end-to-end workload.  This template intentionally raises until the user has
-connected all five lifecycle functions to their own system.
+connected the four observation lifecycle functions and metrics() to their own
+system.
 """
 
 # Optional local Python files whose exact bytes are part of the frozen workload
@@ -15,7 +16,8 @@ WORKLOAD_DEPENDENCIES = []
 def prepare(candidate):
     """TODO: deploy/load ``candidate`` using CUDA_OPTIMIZER_CONTEXT.
 
-    During every lifecycle call, CUDA_OPTIMIZER_CONTEXT is exactly
+    During prepare(), validate(), benchmark(), and cleanup(), the context is
+    exactly
     ``{"role": <trimmed role>, "case": <detached finite JSON object>}``.
     """
     raise NotImplementedError("TODO: prepare the real workload target")
@@ -33,6 +35,11 @@ def benchmark(candidate):
 
 def metrics():
     """TODO: return the explicit optimization objective JSON object.
+
+    The optimizer calls this during normalization/preflight.
+    It receives no candidate, role, or case context.
+    Keep it a lightweight pure function: do not deploy a candidate, run a
+    benchmark, or depend on mutable observation state.
 
     Example shape only (replace metric names and thresholds with real ones):
       {
