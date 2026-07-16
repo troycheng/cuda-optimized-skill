@@ -6,13 +6,17 @@ from __future__ import annotations
 import math
 import random
 import statistics
+from collections.abc import Mapping
 from numbers import Real
 
 
 def _finite_real(value, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite real number")
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite real number") from exc
     if not math.isfinite(parsed):
         raise ValueError(f"{name} must be a finite real number")
     return parsed
@@ -60,7 +64,10 @@ def improvement_pct(baseline: float, candidate: float, direction: str) -> float:
         delta = baseline_value - candidate_value
     else:
         delta = candidate_value - baseline_value
-    return delta / abs(baseline_value) * 100.0
+    improvement = delta / abs(baseline_value) * 100.0
+    if not math.isfinite(improvement):
+        raise ValueError("improvement_pct must be finite")
+    return improvement
 
 
 def bootstrap_median_ci(
@@ -110,16 +117,27 @@ def classify_pairs(
     confidence_value = _validate_confidence(confidence)
     sample_count = _validate_samples(bootstrap_samples, "bootstrap_samples")
 
+    if isinstance(pairs, (str, bytes, bytearray)):
+        raise ValueError("pairs must be a non-string iterable of mappings")
+    try:
+        pair_iterator = iter(pairs)
+    except TypeError as exc:
+        raise ValueError("pairs must be a non-string iterable of mappings") from exc
+
     improvements = []
     invalid_pairs = 0
-    for pair in pairs:
-        if pair.get("valid", True) is not True:
+    for index, pair in enumerate(pair_iterator):
+        if not isinstance(pair, Mapping):
+            raise ValueError(f"pairs[{index}] must be a mapping")
+        if "valid" in pair and type(pair["valid"]) is not bool:
+            raise ValueError(f"pairs[{index}].valid must be a bool")
+        if pair.get("valid", True) is False:
             invalid_pairs += 1
             continue
         if "baseline" not in pair:
-            raise ValueError("baseline is required for every valid pair")
+            raise ValueError(f"pairs[{index}].baseline is required for a valid pair")
         if "candidate" not in pair:
-            raise ValueError("candidate is required for every valid pair")
+            raise ValueError(f"pairs[{index}].candidate is required for a valid pair")
         improvements.append(
             improvement_pct(pair["baseline"], pair["candidate"], direction)
         )
@@ -147,9 +165,13 @@ def classify_pairs(
         samples=sample_count,
         seed=seed,
     )
-    if ci_low >= min_effect:
+    if (min_effect == 0.0 and ci_low > 0.0) or (
+        min_effect > 0.0 and ci_low >= min_effect
+    ):
         status = "confirmed_win"
-    elif ci_high <= -min_effect:
+    elif (min_effect == 0.0 and ci_high < 0.0) or (
+        min_effect > 0.0 and ci_high <= -min_effect
+    ):
         status = "confirmed_loss"
     else:
         status = "inconclusive"

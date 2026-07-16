@@ -67,6 +67,23 @@ class ImprovementPctTests(unittest.TestCase):
             with self.subTest(direction=direction), self.assertRaises(ValueError):
                 paired_stats.improvement_pct(100, 98, direction)
 
+    def test_huge_integers_are_rejected_as_named_value_errors(self) -> None:
+        paired_stats = _load_paired_stats()
+        huge = 10**400
+        for baseline, candidate, parameter in (
+            (huge, 1.0, "baseline"),
+            (1.0, huge, "candidate"),
+        ):
+            with self.subTest(parameter=parameter), self.assertRaisesRegex(
+                ValueError, parameter
+            ):
+                paired_stats.improvement_pct(baseline, candidate, "lower")
+
+    def test_non_finite_computed_improvement_is_rejected(self) -> None:
+        paired_stats = _load_paired_stats()
+        with self.assertRaisesRegex(ValueError, "improvement"):
+            paired_stats.improvement_pct(1e-308, -1e308, "lower")
+
 
 class BootstrapMedianCiTests(unittest.TestCase):
     def test_fixed_seed_is_reproducible_and_bounds_are_ordered(self) -> None:
@@ -127,6 +144,18 @@ class BootstrapMedianCiTests(unittest.TestCase):
             with self.subTest(samples=samples), self.assertRaises(ValueError):
                 paired_stats.bootstrap_median_ci([1.0], samples=samples)
 
+    def test_huge_values_and_confidence_are_named_value_errors(self) -> None:
+        paired_stats = _load_paired_stats()
+        huge = 10**400
+        for values, confidence, parameter in (
+            ([huge], 0.95, "values"),
+            ([1.0], huge, "confidence"),
+        ):
+            with self.subTest(parameter=parameter), self.assertRaisesRegex(
+                ValueError, parameter
+            ):
+                paired_stats.bootstrap_median_ci(values, confidence=confidence)
+
 
 class ClassifyPairsTests(unittest.TestCase):
     def test_lower_two_percent_improvement_is_confirmed_win(self) -> None:
@@ -134,7 +163,7 @@ class ClassifyPairsTests(unittest.TestCase):
         result = paired_stats.classify_pairs(
             [{"baseline": 100.0, "candidate": 98.0} for _ in range(6)],
             direction="lower",
-            min_effect_pct=1.5,
+            min_effect_pct=2.0,
             bootstrap_samples=200,
             seed=3,
         )
@@ -150,7 +179,7 @@ class ClassifyPairsTests(unittest.TestCase):
         result = paired_stats.classify_pairs(
             [{"baseline": 100.0, "candidate": 98.0} for _ in range(6)],
             direction="higher",
-            min_effect_pct=1.5,
+            min_effect_pct=2.0,
             bootstrap_samples=200,
             seed=3,
         )
@@ -178,6 +207,56 @@ class ClassifyPairsTests(unittest.TestCase):
         self.assertLess(result["ci_low_pct"], 0.0)
         self.assertGreater(result["ci_high_pct"], 0.0)
 
+    def test_zero_effect_at_zero_threshold_is_inconclusive(self) -> None:
+        paired_stats = _load_paired_stats()
+        result = paired_stats.classify_pairs(
+            [{"baseline": 100.0, "candidate": 100.0} for _ in range(4)],
+            direction="lower",
+            min_effect_pct=0.0,
+            bootstrap_samples=100,
+            seed=5,
+        )
+
+        self.assertEqual(result["ci_low_pct"], 0.0)
+        self.assertEqual(result["ci_high_pct"], 0.0)
+        self.assertEqual(result["status"], "inconclusive")
+
+    def test_zero_lower_ci_endpoint_is_inconclusive_at_zero_threshold(self) -> None:
+        paired_stats = _load_paired_stats()
+        result = paired_stats.classify_pairs(
+            [
+                {"baseline": 100.0, "candidate": 100.0},
+                {"baseline": 100.0, "candidate": 99.0},
+            ],
+            direction="lower",
+            min_effect_pct=0.0,
+            confidence=0.5,
+            bootstrap_samples=3,
+            seed=16,
+        )
+
+        self.assertEqual(result["ci_low_pct"], 0.0)
+        self.assertGreater(result["ci_high_pct"], 0.0)
+        self.assertEqual(result["status"], "inconclusive")
+
+    def test_zero_upper_ci_endpoint_is_inconclusive_at_zero_threshold(self) -> None:
+        paired_stats = _load_paired_stats()
+        result = paired_stats.classify_pairs(
+            [
+                {"baseline": 100.0, "candidate": 101.0},
+                {"baseline": 100.0, "candidate": 100.0},
+            ],
+            direction="lower",
+            min_effect_pct=0.0,
+            confidence=0.5,
+            bootstrap_samples=3,
+            seed=2,
+        )
+
+        self.assertLess(result["ci_low_pct"], 0.0)
+        self.assertEqual(result["ci_high_pct"], 0.0)
+        self.assertEqual(result["status"], "inconclusive")
+
     def test_invalid_blocks_are_excluded_and_counted(self) -> None:
         paired_stats = _load_paired_stats()
         pairs = [
@@ -195,6 +274,36 @@ class ClassifyPairsTests(unittest.TestCase):
         self.assertEqual(result["valid_pairs"], 1)
         self.assertEqual(result["invalid_pairs"], 2)
         self.assertEqual(result["improvements_pct"], [2.0])
+
+    def test_valid_field_must_be_a_literal_boolean(self) -> None:
+        paired_stats = _load_paired_stats()
+        for valid in (None, 0, 1, "true", "false"):
+            pairs = [{"valid": valid, "baseline": 100.0, "candidate": 98.0}]
+            with self.subTest(valid=valid), self.assertRaisesRegex(
+                ValueError, r"pairs\[0\].*valid"
+            ):
+                paired_stats.classify_pairs(
+                    pairs,
+                    direction="lower",
+                    min_effect_pct=1.0,
+                    bootstrap_samples=10,
+                )
+
+    def test_missing_valid_defaults_true_and_literal_true_is_valid(self) -> None:
+        paired_stats = _load_paired_stats()
+        result = paired_stats.classify_pairs(
+            [
+                {"baseline": 100.0, "candidate": 98.0},
+                {"valid": True, "baseline": 100.0, "candidate": 98.0},
+                {"valid": False},
+            ],
+            direction="lower",
+            min_effect_pct=1.0,
+            bootstrap_samples=10,
+        )
+
+        self.assertEqual(result["valid_pairs"], 2)
+        self.assertEqual(result["invalid_pairs"], 1)
 
     def test_no_valid_pairs_returns_empty_inconclusive_result(self) -> None:
         paired_stats = _load_paired_stats()
@@ -254,6 +363,58 @@ class ClassifyPairsTests(unittest.TestCase):
                     min_effect_pct=min_effect_pct,
                     bootstrap_samples=10,
                 )
+
+    def test_huge_minimum_effect_is_a_named_value_error(self) -> None:
+        paired_stats = _load_paired_stats()
+        with self.assertRaisesRegex(ValueError, "min_effect_pct"):
+            paired_stats.classify_pairs(
+                [{"baseline": 100.0, "candidate": 98.0}],
+                direction="lower",
+                min_effect_pct=10**400,
+                bootstrap_samples=10,
+            )
+
+    def test_pairs_must_be_a_non_string_iterable(self) -> None:
+        paired_stats = _load_paired_stats()
+        for pairs in (None, "not-pairs", b"not-pairs", 123):
+            with self.subTest(pairs=pairs), self.assertRaisesRegex(
+                ValueError, "pairs"
+            ):
+                paired_stats.classify_pairs(
+                    pairs,
+                    direction="lower",
+                    min_effect_pct=0.0,
+                    bootstrap_samples=10,
+                )
+
+    def test_every_pair_must_be_a_mapping_with_its_index_in_the_error(self) -> None:
+        paired_stats = _load_paired_stats()
+        for pair in (None, "not-a-pair", 123, [100.0, 98.0]):
+            with self.subTest(pair=pair), self.assertRaisesRegex(
+                ValueError, r"pairs\[0\]"
+            ):
+                paired_stats.classify_pairs(
+                    [pair],
+                    direction="lower",
+                    min_effect_pct=0.0,
+                    bootstrap_samples=10,
+                )
+
+    def test_pair_generator_is_accepted(self) -> None:
+        paired_stats = _load_paired_stats()
+        pairs = (
+            {"baseline": 100.0, "candidate": candidate}
+            for candidate in (98.0, 98.0)
+        )
+        result = paired_stats.classify_pairs(
+            pairs,
+            direction="lower",
+            min_effect_pct=1.0,
+            bootstrap_samples=10,
+        )
+
+        self.assertEqual(result["valid_pairs"], 2)
+        self.assertEqual(result["status"], "confirmed_win")
 
     def test_classification_validates_bootstrap_parameters(self) -> None:
         paired_stats = _load_paired_stats()
