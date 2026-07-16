@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Paired real-workload measurement and objective evaluation."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+import statistics
+import sys
+from collections.abc import Mapping
+from numbers import Real
+from pathlib import Path
+
+
+# Keep sibling imports reliable for direct CLI and importlib file loading.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import paired_stats  # noqa: E402
+from workload_adapter import (  # noqa: E402
+    WorkloadSpec,
+    run_spec_once,
+    validate_objective,
+)
+
+
+DEFAULT_TIMEOUT = None
+DEFAULT_BOOTSTRAP_SAMPLES = 10000
+_RESULT_FIELDS = {"role", "case", "validation", "benchmark", "objective"}
+
+
+def _nonnegative_int(value, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _positive_int(value, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _finite_real(value, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field} must be a finite real number")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a finite real number") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite real number")
+    return number
+
+
+def _json_copy(value, field: str = "value"):
+    """Return a detached strict JSON value."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field} numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{field} mappings must use string keys")
+            normalized[key] = _json_copy(item, f"{field}.{key}")
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_copy(item, f"{field}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise ValueError(f"{field} must contain only JSON-compatible values")
+
+
+def _attempt_record(attempt: int, status: str, error=None) -> dict:
+    if error is None:
+        return {
+            "attempt": attempt,
+            "status": status,
+            "error_type": None,
+            "error": None,
+        }
+    # Exception text may contain credentials or unbounded command output.  The
+    # type plus attempt number is enough to diagnose retry behavior safely.
+    error_type = type(error).__name__[:128]
+    return {
+        "attempt": attempt,
+        "status": status,
+        "error_type": error_type,
+        "error": "workload attempt failed",
+    }
+
+
+def _validated_observation(raw, *, role: str) -> tuple[dict, bool | dict]:
+    if not isinstance(raw, Mapping):
+        raise ValueError("runner result must be a mapping")
+    missing = sorted(_RESULT_FIELDS - set(raw))
+    if missing:
+        raise ValueError(f"runner result missing required field: {missing[0]}")
+    if raw["role"] != role:
+        raise ValueError("runner result role does not match requested role")
+    validation = raw["validation"]
+    if type(validation) is bool:
+        passed = validation
+    elif isinstance(validation, Mapping) and type(validation.get("valid")) is bool:
+        passed = validation["valid"]
+    else:
+        raise ValueError(
+            "validation must be literal True or a mapping with literal valid"
+        )
+    if not passed:
+        raise ValueError("workload validation failed")
+    if not isinstance(raw["benchmark"], Mapping):
+        raise ValueError("benchmark metrics must be a mapping")
+    if not isinstance(raw["objective"], Mapping):
+        raise ValueError("objective must be a mapping")
+    metrics = _json_copy(raw["benchmark"], "benchmark")
+    normalized_validation = _json_copy(validation, "validation")
+    return metrics, normalized_validation
+
+
+def measure_candidate(
+    workload,
+    candidate,
+    *,
+    role="candidate",
+    case=None,
+    retries=2,
+    timeout=DEFAULT_TIMEOUT,
+    runner=None,
+) -> dict:
+    """Measure one role, retrying ordinary exceptions under one safe contract."""
+    retry_count = _nonnegative_int(retries, "retries")
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("role must be a non-empty string")
+    selected_runner = run_spec_once if runner is None else runner
+    if not callable(selected_runner):
+        raise ValueError("runner must be callable")
+
+    records = []
+    for attempt in range(1, retry_count + 2):
+        try:
+            raw = selected_runner(
+                workload,
+                candidate=copy.deepcopy(candidate),
+                role=role,
+                case=copy.deepcopy(case),
+                timeout=timeout,
+            )
+            metrics, validation = _validated_observation(raw, role=role)
+        except Exception as error:
+            records.append(_attempt_record(attempt, "failed", error))
+            if attempt <= retry_count:
+                continue
+            final_record = records[-1]
+            return {
+                "status": "failed",
+                "role": role,
+                "case": _json_copy(case, "case"),
+                "metrics": None,
+                "validation": None,
+                "attempts": attempt,
+                "attempt_records": records,
+                "failure": {
+                    "error_type": final_record["error_type"],
+                    "error": final_record["error"],
+                },
+            }
+        records.append(_attempt_record(attempt, "success"))
+        return {
+            "status": "measured",
+            "role": role,
+            "case": _json_copy(case, "case"),
+            "metrics": metrics,
+            "validation": validation,
+            "attempts": attempt,
+            "attempt_records": records,
+        }
+
+    raise AssertionError("unreachable")
+
+
+def _failed_evaluation(base: dict, pairs: list[dict], reason: str) -> dict:
+    result = dict(base)
+    result.update(
+        {
+            "status": "workload_failed",
+            "reason": reason,
+            "pairs": pairs,
+            "primary": {
+                "status": "invalid",
+                "statistic": "median_paired_improvement_pct",
+                "estimate_pct": None,
+                "ci_low_pct": None,
+                "ci_high_pct": None,
+            },
+            "constraints": [],
+        }
+    )
+    return result
+
+
+def _metric(metrics: Mapping, name: str, field: str) -> float:
+    if name not in metrics:
+        raise ValueError(f"{field}.{name} is missing")
+    return _finite_real(metrics[name], f"{field}.{name}")
+
+
+def evaluate_pairs(
+    workload,
+    baseline,
+    candidate,
+    *,
+    blocks,
+    retries=2,
+    seed=0,
+    timeout=DEFAULT_TIMEOUT,
+    confidence=0.95,
+    bootstrap_samples=DEFAULT_BOOTSTRAP_SAMPLES,
+    runner=None,
+) -> dict:
+    """Measure randomized AB/BA blocks and evaluate the frozen objective."""
+    block_count = _positive_int(blocks, "blocks")
+    retry_count = _nonnegative_int(retries, "retries")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
+    confidence_value = _finite_real(confidence, "confidence")
+    if not 0.0 < confidence_value < 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    bootstrap_count = _positive_int(bootstrap_samples, "bootstrap_samples")
+    if not hasattr(workload, "objective") or not hasattr(workload, "cases"):
+        raise ValueError("workload must provide objective and cases")
+    objective = validate_objective(workload.objective)
+    objective_snapshot = _json_copy(objective, "objective")
+    cases = tuple(workload.cases)
+    rng = random.Random(seed)
+    pairs = []
+
+    for block in range(block_count):
+        order = rng.choice(("AB", "BA"))
+        case = None if not cases else _json_copy(cases[block % len(cases)], "case")
+        sequence = (
+            (("baseline", baseline), ("candidate", candidate))
+            if order == "AB"
+            else (("candidate", candidate), ("baseline", baseline))
+        )
+        measurements = {}
+        for role, selected_candidate in sequence:
+            measurements[role] = measure_candidate(
+                workload,
+                selected_candidate,
+                role=role,
+                case=case,
+                retries=retry_count,
+                timeout=timeout,
+                runner=runner,
+            )
+        baseline_result = measurements["baseline"]
+        candidate_result = measurements["candidate"]
+        valid = (
+            baseline_result["status"] == "measured"
+            and candidate_result["status"] == "measured"
+        )
+        pair = {
+            "block": block,
+            "order": order,
+            "case": copy.deepcopy(case),
+            "baseline_metrics": copy.deepcopy(baseline_result["metrics"]),
+            "candidate_metrics": copy.deepcopy(candidate_result["metrics"]),
+            "valid": valid,
+            "attempts": {
+                "baseline": baseline_result["attempts"],
+                "candidate": candidate_result["attempts"],
+            },
+            "attempt_records": {
+                "baseline": copy.deepcopy(baseline_result["attempt_records"]),
+                "candidate": copy.deepcopy(candidate_result["attempt_records"]),
+            },
+        }
+        failures = {
+            role: copy.deepcopy(result.get("failure"))
+            for role, result in measurements.items()
+            if result["status"] == "failed"
+        }
+        if failures:
+            pair["failures"] = failures
+        pairs.append(pair)
+
+    base = {
+        "objective": objective_snapshot,
+        "seed": seed,
+        "blocks": block_count,
+        "pairs": pairs,
+    }
+    if any(not pair["valid"] for pair in pairs):
+        return _failed_evaluation(
+            base, pairs, "one or more workload roles exhausted retries"
+        )
+
+    primary = objective["primary_metric"]
+    metric_names = [primary["name"]] + [
+        constraint["name"] for constraint in objective["constraints"]
+    ]
+    numeric = []
+    metric_failed = False
+    for index, pair in enumerate(pairs):
+        values = {"baseline": {}, "candidate": {}}
+        errors = []
+        for metric_name in metric_names:
+            for role, key in (
+                ("baseline", "baseline_metrics"),
+                ("candidate", "candidate_metrics"),
+            ):
+                try:
+                    value = _metric(pair[key], metric_name, key)
+                    if role == "baseline" and value == 0.0:
+                        raise ValueError(f"{key}.{metric_name} must be nonzero")
+                    values[role][metric_name] = value
+                except ValueError as error:
+                    errors.append(str(error)[:512])
+        if errors:
+            pair["valid"] = False
+            pair["metric_errors"] = errors
+            metric_failed = True
+        numeric.append(values)
+    if metric_failed:
+        return _failed_evaluation(base, pairs, "objective metrics are invalid")
+
+    primary_pairs = [
+        {
+            "baseline": values["baseline"][primary["name"]],
+            "candidate": values["candidate"][primary["name"]],
+            "valid": True,
+        }
+        for values in numeric
+    ]
+    primary_statistics = paired_stats.classify_pairs(
+        primary_pairs,
+        direction=primary["direction"],
+        min_effect_pct=objective["min_effect_pct"],
+        confidence=confidence_value,
+        bootstrap_samples=bootstrap_count,
+        seed=seed,
+    )
+
+    constraint_statistics = []
+    for index, constraint in enumerate(objective["constraints"]):
+        name = constraint["name"]
+        cap = constraint["max_regression_pct"]
+        regressions = [
+            (
+                values["candidate"][name] - values["baseline"][name]
+            )
+            / abs(values["baseline"][name])
+            * 100.0
+            for values in numeric
+        ]
+        estimate = statistics.median(regressions)
+        ci_low, ci_high = paired_stats.bootstrap_median_ci(
+            regressions,
+            confidence=confidence_value,
+            samples=bootstrap_count,
+            seed=seed + index + 1,
+        )
+        if ci_high <= cap:
+            status = "passed"
+        elif ci_low > cap:
+            status = "failed"
+        else:
+            status = "inconclusive"
+        constraint_statistics.append(
+            {
+                "name": name,
+                "max_regression_pct": cap,
+                "cap_pct": cap,
+                "estimate_pct": estimate,
+                "ci_low_pct": ci_low,
+                "ci_high_pct": ci_high,
+                "status": status,
+                "values_pct": regressions,
+            }
+        )
+
+    return {
+        **base,
+        "status": "evaluated",
+        "primary": primary_statistics,
+        "constraints": constraint_statistics,
+    }
+
+
+__all__ = ["WorkloadSpec", "evaluate_pairs", "measure_candidate"]
