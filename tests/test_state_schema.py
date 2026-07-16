@@ -140,5 +140,227 @@ class StateSchemaTests(unittest.TestCase):
                 self.assertTrue((run_dir / f"iterv{iteration}").is_dir())
 
 
+class StateDecisionPromotionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = _load_state()
+
+    def _fixture(
+        self,
+        root: Path,
+        *,
+        mode: str,
+        decision_status: object = "inconclusive",
+        candidate_override: str | None = None,
+        write_decision: bool = True,
+        average_ms: float = 0.1,
+    ) -> tuple[argparse.Namespace, Path, Path, dict]:
+        run_dir = root / "run"
+        iter_dir = run_dir / "iterv1"
+        iter_dir.mkdir(parents=True)
+        best = run_dir / "baseline" / "best.py"
+        best.parent.mkdir(parents=True)
+        best.write_text("# best\n", encoding="utf-8")
+        candidate = iter_dir / "kernel.py"
+        candidate.write_text("# candidate\n", encoding="utf-8")
+        state_path = run_dir / "state.json"
+        payload = {
+            "schema_version": 2,
+            "run_dir": str(run_dir),
+            "input_hash": "abc",
+            "budget": {},
+            "candidates": {},
+            "mode": mode,
+            "workload": {"kind": "command"} if mode == "full" else None,
+            "best_file": str(best),
+            "best_metric_ms": 10.0,
+            "best_kernel_statistics": None,
+            "best_workload_statistics": None,
+            "noise_threshold_pct": 2.0,
+            "selected_methods": [],
+            "effective_methods": [],
+            "ineffective_methods": [],
+            "implementation_failed_methods": [],
+            "history": [],
+            "roofline_history": [],
+            "frontier": [],
+        }
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        bench = iter_dir / "bench.json"
+        bench.write_text(
+            json.dumps(
+                {
+                    "correctness": {"passed": True},
+                    "kernel": {"average_ms": average_ms},
+                    "reference": {"average_ms": 20.0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        methods = iter_dir / "methods.json"
+        methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+        decision = iter_dir / "decision.json"
+        statistics = {
+            "statistic": "median_paired_improvement_pct",
+            "estimate_pct": 3.0,
+            "ci_low_pct": 2.0,
+            "ci_high_pct": 4.0,
+            "status": decision_status,
+        }
+        if write_decision:
+            decision.write_text(
+                json.dumps(
+                    {
+                        "status": decision_status,
+                        "candidate_file": candidate_override or str(candidate),
+                        "statistics": statistics,
+                        "workload_statistics": {
+                            **statistics,
+                            "statistic": "median_paired_workload_improvement_pct",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+        args = argparse.Namespace(
+            state=str(state_path),
+            iter=1,
+            kernel=str(candidate),
+            bench=str(bench),
+            methods_json=str(methods),
+            attribution=None,
+            sass_check=None,
+            retries=0,
+            skip_validation=True,
+            allow_ineffective=False,
+            decision=None,
+        )
+        return args, state_path, candidate, payload
+
+    def _run_update(self, args: argparse.Namespace) -> dict:
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.state.cmd_update(args)
+        return json.loads(stdout.getvalue())
+
+    def test_full_mode_inner_kernel_win_does_not_promote_best(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="full", decision_status="confirmed_win"
+            )
+            output = self._run_update(args)
+            updated = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(updated["best_file"], before["best_file"])
+        self.assertEqual(updated["best_metric_ms"], before["best_metric_ms"])
+        self.assertFalse(output["improved"])
+        self.assertEqual(output["status"], "kernel_only_win")
+        self.assertEqual(updated["history"][-1]["status"], "kernel_only_win")
+
+    def test_kernel_only_confirmed_win_promotes_with_kernel_only_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, candidate, _before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            output = self._run_update(args)
+            updated = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(updated["best_file"], str(candidate.resolve()))
+        self.assertTrue(output["improved"])
+        self.assertEqual(output["status"], "kernel_only_win")
+        self.assertEqual(updated["best_kernel_statistics"]["estimate_pct"], 3.0)
+
+    def test_full_mode_end_to_end_win_is_the_only_global_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, candidate, _before = self._fixture(
+                Path(tmp), mode="full", decision_status="end_to_end_win"
+            )
+            output = self._run_update(args)
+            updated = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(updated["best_file"], str(candidate.resolve()))
+        self.assertTrue(output["improved"])
+        self.assertEqual(output["status"], "end_to_end_win")
+        self.assertEqual(
+            updated["best_workload_statistics"]["statistic"],
+            "median_paired_workload_improvement_pct",
+        )
+
+    def test_faster_average_with_non_win_decision_never_promotes(self) -> None:
+        for status in (
+            "inconclusive",
+            "confirmed_loss",
+            "no_confirmed_kernel_win",
+            "workload_failed",
+            "invalid",
+        ):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                args, state_path, _candidate, before = self._fixture(
+                    Path(tmp),
+                    mode="kernel-only",
+                    decision_status=status,
+                    average_ms=0.001,
+                )
+                output = self._run_update(args)
+                updated = json.loads(state_path.read_text("utf-8"))
+                self.assertEqual(updated["best_file"], before["best_file"])
+                self.assertEqual(updated["best_metric_ms"], before["best_metric_ms"])
+                self.assertFalse(output["improved"])
+                self.assertEqual(output["status"], status)
+
+    def test_missing_decision_never_falls_back_to_average(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp),
+                mode="kernel-only",
+                write_decision=False,
+                average_ms=0.001,
+            )
+            with self.assertRaisesRegex(ValueError, "decision.json.*missing"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+
+    def test_malformed_or_unknown_status_is_diagnostic_and_non_mutating(self) -> None:
+        for status in (None, True, 1, 1.5, "surprise_win"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                args, state_path, _candidate, before = self._fixture(
+                    Path(tmp), mode="kernel-only", decision_status=status
+                )
+                with self.assertRaisesRegex(ValueError, "decision.*status"):
+                    self._run_update(args)
+                unchanged = json.loads(state_path.read_text("utf-8"))
+                self.assertEqual(unchanged["best_file"], before["best_file"])
+
+    def test_candidate_path_mismatch_is_rejected_before_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp),
+                mode="kernel-only",
+                decision_status="confirmed_win",
+                candidate_override=str(Path(tmp) / "other.py"),
+            )
+            with self.assertRaisesRegex(ValueError, "candidate_file.*kernel"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+
+    def test_confirmed_win_with_conflicting_statistics_status_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            decision_path = Path(tmp) / "run" / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            decision["statistics"]["status"] = "confirmed_loss"
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "statistics.status.*decision"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+
+
 if __name__ == "__main__":
     unittest.main()

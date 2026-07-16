@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 
 
@@ -33,6 +36,38 @@ def _dims_argv(dims: dict) -> list[str]:
 
 def _ptr_size_argv(ptr_size: int) -> list[str]:
     return ["--ptr-size", str(ptr_size)] if ptr_size and ptr_size > 0 else []
+
+
+def _decision_summary(decision: Mapping) -> dict:
+    """Extract the sole statistic used by kernel decision consumers."""
+    if not isinstance(decision, Mapping):
+        raise ValueError("decision.json must contain a JSON object")
+    statistics = decision.get("statistics")
+    if not isinstance(statistics, Mapping):
+        raise ValueError("decision.json statistics must be a JSON object")
+    required = (
+        "statistic",
+        "estimate_pct",
+        "ci_low_pct",
+        "ci_high_pct",
+        "status",
+    )
+    missing = [field for field in required if field not in statistics]
+    if missing:
+        raise ValueError(f"decision.json statistics missing {missing[0]}")
+    if not isinstance(statistics["statistic"], str) or not statistics[
+        "statistic"
+    ].strip():
+        raise ValueError("decision.json statistics.statistic must be a string")
+    if not isinstance(statistics["status"], str) or not statistics["status"]:
+        raise ValueError("decision.json statistics.status must be a string")
+    for field in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
+        value = statistics[field]
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"decision.json statistics.{field} must be finite")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"decision.json statistics.{field} must be finite")
+    return {field: statistics[field] for field in required}
 
 
 def _run_bench(
@@ -142,6 +177,12 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     )
     # Return the result summary on stdout for the orchestrator to consume
     res = _read(json_out)
+    decision_path = os.path.join(iter_dir, "decision.json")
+    decision_summary = (
+        _decision_summary(_read(decision_path))
+        if os.path.isfile(decision_path)
+        else None
+    )
     summary = {
         "iter": args.iter,
         "kernel": kernel,
@@ -152,6 +193,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         "error": res.get("error"),
         "bench_json": json_out,
         "stderr_log": stderr_out,
+        "decision": decision_summary,
     }
     print(json.dumps(summary, indent=2))
 

@@ -40,10 +40,13 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 
 
@@ -93,6 +96,120 @@ def _write(path: str, payload: dict) -> None:
     atomic_write_json(path, payload)
 
 
+_DECISION_STATUSES = {
+    "confirmed_win",
+    "confirmed_loss",
+    "inconclusive",
+    "no_confirmed_kernel_win",
+    "workload_failed",
+    "invalid",
+    "kernel_only_win",
+    "end_to_end_win",
+    "rejected_compile",
+    "rejected_correctness",
+    "rejected_constraint",
+    "pareto_frontier",
+}
+_WIN_STATUSES = {"confirmed_win", "kernel_only_win", "end_to_end_win"}
+_STATISTIC_FIELDS = (
+    "statistic",
+    "estimate_pct",
+    "ci_low_pct",
+    "ci_high_pct",
+    "status",
+)
+
+
+def _resolved_path(path: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("decision candidate_file and kernel must be non-empty paths")
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
+def _validate_decision_statistics(payload, *, required: bool) -> dict | None:
+    if payload is None and not required:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("decision.json statistics must be a JSON object")
+    missing = [field for field in _STATISTIC_FIELDS if field not in payload]
+    if missing:
+        raise ValueError(
+            f"decision.json statistics missing required field: {missing[0]}"
+        )
+    statistic = payload["statistic"]
+    if not isinstance(statistic, str) or not statistic.strip():
+        raise ValueError("decision.json statistics.statistic must be a string")
+    status = payload["status"]
+    if not isinstance(status, str) or not status:
+        raise ValueError("decision.json statistics.status must be a string")
+    clean = dict(payload)
+    for field in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
+        value = payload[field]
+        if value is None and not required:
+            continue
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"decision.json statistics.{field} must be finite")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"decision.json statistics.{field} must be finite")
+        clean[field] = numeric
+    return clean
+
+
+def _load_decision(
+    path: str, *, candidate_file: str
+) -> tuple[dict, str, dict | None]:
+    if not os.path.isfile(path):
+        raise ValueError(f"decision.json missing: {path}")
+    try:
+        decision = _read(path)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"decision.json is malformed: {error}") from error
+    if not isinstance(decision, Mapping):
+        raise ValueError("decision.json must contain a JSON object")
+    status = decision.get("status")
+    if type(status) is not str or status not in _DECISION_STATUSES:
+        raise ValueError(
+            "decision.json status must be a recognized terminal status"
+        )
+    declared_candidate = decision.get("candidate_file")
+    if _resolved_path(declared_candidate) != _resolved_path(candidate_file):
+        raise ValueError(
+            "decision.json candidate_file does not match the update kernel"
+        )
+    statistics = _validate_decision_statistics(
+        decision.get("statistics"), required=status in _WIN_STATUSES
+    )
+    if status == "confirmed_win" and statistics["status"] != "confirmed_win":
+        raise ValueError(
+            "decision.json statistics.status conflicts with decision status"
+        )
+    return dict(decision), status, statistics
+
+
+def _state_mode(state: dict) -> str:
+    raw = state.get("mode")
+    if raw is None:
+        raw = "full" if state.get("workload") else "kernel-only"
+    if raw == "kernel_only":
+        raw = "kernel-only"
+    if raw not in {"full", "kernel-only"}:
+        raise ValueError("state mode must be full or kernel-only")
+    return raw
+
+
+def _promotion_for(status: str, mode: str) -> tuple[str, bool]:
+    if status == "confirmed_win":
+        return "kernel_only_win", mode == "kernel-only"
+    if status == "kernel_only_win":
+        return status, mode == "kernel-only"
+    if status == "end_to_end_win":
+        if mode != "full":
+            raise ValueError("end_to_end_win requires full mode")
+        return status, True
+    return status, False
+
+
 # ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
@@ -139,6 +256,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "run_dir": run_dir,
         "input_hash": manifest["input_hash"],
         "budget": budget,
+        "mode": "kernel-only",
         "workload": None,
         "baseline_file": baseline_copy,
         "baseline_file_original": baseline,
@@ -200,6 +318,16 @@ def cmd_update(args: argparse.Namespace) -> None:
     bench = _read(args.bench)
     methods = _read(args.methods_json)
 
+    iter_dir = os.path.join(state["run_dir"], f"iterv{args.iter}")
+    decision_path = getattr(args, "decision", None) or os.path.join(
+        iter_dir, "decision.json"
+    )
+    decision, decision_status, decision_statistics = _load_decision(
+        decision_path, candidate_file=args.kernel
+    )
+    mode = _state_mode(state)
+    terminal_status, promote_best = _promotion_for(decision_status, mode)
+
     if not isinstance(methods, dict) or "methods" not in methods:
         sys.exit("methods-json must contain a top-level 'methods' list")
     methods_list = methods["methods"]
@@ -246,17 +374,17 @@ def cmd_update(args: argparse.Namespace) -> None:
         for c in sass.get("checks", []):
             sass_data[c["method_id"]] = c
 
-    # Decide improvement
-    best_before = state.get("best_metric_ms")
-    threshold = 1.0 - (state.get("noise_threshold_pct", 2.0) / 100.0)
-    improved = False
+    # A benchmark average is diagnostic only. Promotion comes exclusively from
+    # the terminal decision and its unified paired statistic.
+    if promote_best and not validation_passed:
+        raise ValueError(
+            "decision.json declares a win for a correctness-failed candidate"
+        )
+    improved = bool(promote_best and validation_passed)
+    kernel_evidence_win = bool(
+        validation_passed and terminal_status in {"kernel_only_win", "end_to_end_win"}
+    )
     speedup_vs_best_before = None
-    if validation_passed and new_ms and new_ms > 0:
-        if best_before is None:
-            improved = True
-        else:
-            speedup_vs_best_before = best_before / new_ms
-            improved = new_ms < best_before * threshold
 
     # Annotate each method
     for m in methods_list:
@@ -283,8 +411,9 @@ def cmd_update(args: argparse.Namespace) -> None:
             m_entry["note"] = f"SASS patterns not found: {sass_info.get('patterns_missing', [])}"
             state["implementation_failed_methods"].append(m_entry)
         elif contributed is True or contributed is None:
-            # Contributed (or no ablation data — assume effective if overall improved)
-            if validation_passed and improved:
+            # Contributed (or no ablation data — assume effective if the
+            # unified kernel evidence is a confirmed win).
+            if kernel_evidence_win:
                 if attr_ms is not None:
                     m_entry["attribution_ms"] = attr_ms
                 if speedup_vs_best_before is not None:
@@ -298,12 +427,17 @@ def cmd_update(args: argparse.Namespace) -> None:
             state["ineffective_methods"].append(m_entry)
 
     # Update best
-    if validation_passed and improved:
-        state["best_file"] = os.path.abspath(args.kernel)
-        state["best_metric_ms"] = new_ms
+    if improved:
+        state["best_file"] = _resolved_path(args.kernel)
+        if new_ms is not None:
+            state["best_metric_ms"] = new_ms
+        state["best_kernel_statistics"] = decision_statistics
+        if terminal_status == "end_to_end_win":
+            state["best_workload_statistics"] = _validate_decision_statistics(
+                decision.get("workload_statistics"), required=True
+            )
 
     # Load roofline data if available
-    iter_dir = os.path.join(state["run_dir"], f"iterv{args.iter}")
     roofline_path = os.path.join(iter_dir, "roofline.json")
     if os.path.isfile(roofline_path):
         roofline = _read(roofline_path)
@@ -326,11 +460,6 @@ def cmd_update(args: argparse.Namespace) -> None:
             fe["methods"] = [m["id"] for m in methods_list]
             state["frontier"].append(fe)
 
-    status = (
-        "improved" if (validation_passed and improved)
-        else "regressed" if validation_passed
-        else "failed_validation"
-    )
     state["history"].append({
         "iter": int(args.iter),
         "kernel_file": os.path.abspath(args.kernel),
@@ -341,18 +470,26 @@ def cmd_update(args: argparse.Namespace) -> None:
         "speedup_vs_ref": (ref_ms / new_ms) if (ref_ms and new_ms and new_ms > 0) else None,
         "speedup_vs_best_before": speedup_vs_best_before,
         "validation_passed": validation_passed,
-        "status": status,
+        "status": terminal_status,
+        "decision_status": decision_status,
+        "statistics": decision_statistics,
+        "decision_json": os.path.abspath(decision_path),
         "retries": int(args.retries),
     })
 
     _write(args.state, state)
     print(json.dumps({
         "iter": args.iter,
-        "status": status,
+        "status": terminal_status,
         "new_ms": new_ms,
         "best_ms": state["best_metric_ms"],
         "improved": improved,
         "speedup_vs_best_before": speedup_vs_best_before,
+        "decision": (
+            {field: decision_statistics[field] for field in _STATISTIC_FIELDS}
+            if decision_statistics is not None
+            else None
+        ),
     }, indent=2))
 
 
@@ -422,6 +559,11 @@ def main() -> None:
     pu.add_argument("--retries", type=int, default=0)
     pu.add_argument("--skip-validation", action="store_true")
     pu.add_argument("--allow-ineffective", action="store_true")
+    pu.add_argument(
+        "--decision",
+        default=None,
+        help="Path to decision.json (default: itervN/decision.json)",
+    )
     pu.set_defaults(func=cmd_update)
 
     pb = sub.add_parser("set-baseline-metric")

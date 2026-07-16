@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Branch-and-Select: compile and benchmark K candidate kernels in parallel.
+"""Branch-and-Select using one paired statistical decision for every candidate.
 
 All K branches share the same method combination (from methods.json) but
 differ in hyperparameters (tile size, num_stages, num_warps, etc.).
 
 The agent generates K kernels under iterv{i}/branches/b{1..K}/kernel.<ext>.
 
-This script:
-  1. Compiles all K kernels (can be parallelized)
-  2. Benchmarks each kernel with validation
-  3. Selects champion = fastest valid kernel
-  4. Copies champion to iterv{i}/kernel.<ext>
-  5. Returns non-champions as frontier candidates in state
+Correctness is checked first. Only correctness-passing candidates enter the
+paired AB/BA timing engine, and only statistically confirmed winners are
+eligible for the shortlist or promotion.
 
 Writes iterv{i}/branch_results.json.
 """
@@ -19,15 +16,36 @@ Writes iterv{i}/branch_results.json.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 
 
 _BUNDLED_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py")
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from paired_benchmark import run_paired  # noqa: E402
+from paired_stats import classify_pairs  # noqa: E402
+
+
+_PAIRED_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
+_STATISTIC_FIELDS = (
+    "statistic",
+    "estimate_pct",
+    "ci_low_pct",
+    "ci_high_pct",
+    "status",
+)
 
 
 def _load_json(path: str) -> dict:
@@ -96,6 +114,103 @@ def _bench_kernel(
     }
 
 
+def _paired_candidate(
+    baseline_file: str,
+    candidate_file: str,
+    *,
+    backend: str,
+    dims: dict,
+    ptr_size: int,
+    arch: str,
+    nvcc_bin: str,
+    seed: int,
+    blocks: int,
+    warmup: int,
+    min_effect_pct: float,
+    confidence: float = 0.95,
+    bootstrap_samples: int = 10000,
+    max_temperature_delta_c: float = 5,
+    max_clock_delta_pct: float = 5,
+) -> dict:
+    """Collect paired samples and return the shared classification payload."""
+    paired = run_paired(
+        baseline_file,
+        candidate_file,
+        backend=backend,
+        dims=copy.deepcopy(dims),
+        ptr_size=ptr_size,
+        arch=arch,
+        nvcc_bin=nvcc_bin,
+        seed=seed,
+        blocks=blocks,
+        warmup=warmup,
+        max_temperature_delta_c=max_temperature_delta_c,
+        max_clock_delta_pct=max_clock_delta_pct,
+    )
+    return classify_pairs(
+        paired["pairs"],
+        direction="lower",
+        min_effect_pct=min_effect_pct,
+        confidence=confidence,
+        bootstrap_samples=bootstrap_samples,
+        seed=seed,
+    )
+
+
+def _finite_statistic(value, field: str, *, required: bool) -> float | None:
+    if value is None and not required:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"statistics.{field} must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"statistics.{field} must be a finite number")
+    return parsed
+
+
+def _validate_statistics(payload) -> dict:
+    """Return a detached, ranking-safe statistics payload."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("statistics must be a mapping")
+    missing = [field for field in _STATISTIC_FIELDS if field not in payload]
+    if missing:
+        raise ValueError(f"statistics missing required field: {missing[0]}")
+    statistic = payload["statistic"]
+    if not isinstance(statistic, str) or not statistic.strip():
+        raise ValueError("statistics.statistic must be a non-empty string")
+    status = payload["status"]
+    if not isinstance(status, str) or status not in _PAIRED_STATUSES:
+        raise ValueError("statistics.status is invalid")
+    numeric_required = status == "confirmed_win"
+    clean = copy.deepcopy(dict(payload))
+    for field in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
+        clean[field] = _finite_statistic(
+            payload[field], field, required=numeric_required
+        )
+    return clean
+
+
+def _state_arch(state: dict) -> str:
+    env = state.get("env") or {}
+    arch = state.get("arch") or env.get("primary_sm_arch")
+    if not arch:
+        gpus = env.get("gpus") or []
+        if gpus and isinstance(gpus[0], Mapping):
+            arch = gpus[0].get("sm_arch")
+    if not isinstance(arch, str) or not arch.strip():
+        raise ValueError("state must provide arch or env.primary_sm_arch")
+    return arch
+
+
+def _state_nvcc_bin(state: dict) -> str:
+    env = state.get("env") or {}
+    nvcc = env.get("nvcc") or {}
+    value = state.get("nvcc_bin") or nvcc.get("path") or "nvcc"
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("state nvcc_bin must be a non-empty string")
+    return value
+
+
 def run(state_path: str, iteration: int, benchmark_py: str = None,
         warmup: int = 10, repeat: int = 20) -> dict:
     state = _load_json(state_path)
@@ -107,6 +222,20 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
     dims = state.get("dims", {})
     ptr_size = state.get("ptr_size", 0)
     num_branches = state.get("branches", 4)
+    baseline_file = state.get("best_file") or state.get("baseline_file")
+    if not isinstance(baseline_file, str) or not baseline_file.strip():
+        raise ValueError("state must provide best_file or baseline_file")
+    budget = copy.deepcopy(state.get("budget") or {})
+    blocks = budget.get("max_pairs", repeat)
+    backend = state.get("backend", "auto")
+    arch = _state_arch(state)
+    nvcc_bin = _state_nvcc_bin(state)
+    seed = state.get("seed", 0)
+    min_effect_pct = state.get("min_effect_pct", 0.5)
+    confidence = state.get("confidence", 0.95)
+    bootstrap_samples = state.get("bootstrap_samples", 10000)
+    max_temperature_delta_c = state.get("max_temperature_delta_c", 5)
+    max_clock_delta_pct = state.get("max_clock_delta_pct", 5)
 
     # Discover branches
     branch_dirs = []
@@ -138,7 +267,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
 
     print(f"[branch_explore] Found {len(branch_dirs)} branches", file=sys.stderr)
 
-    # Benchmark all branches
+    # Correctness-check and then statistically compare all passing branches.
     results = []
     for branch in branch_dirs:
         idx = branch["index"]
@@ -158,9 +287,10 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         median_ms = kernel_stats.get("median_ms")
         ms = median_ms if median_ms is not None else average_ms
 
-        results.append({
+        result = {
             "branch_index": idx,
             "kernel": kernel,
+            "correctness": "passed" if passed else "failed",
             "passed": passed,
             "ms": ms,
             "average_ms": average_ms,
@@ -168,39 +298,73 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "p95_ms": kernel_stats.get("p95_ms"),
             "cv_pct": kernel_stats.get("cv_pct"),
             "error": bench_result.get("error"),
-        })
+            "statistics": None,
+            "status": "rejected_correctness" if not passed else "invalid",
+        }
+
+        if passed:
+            try:
+                statistics = _validate_statistics(
+                    _paired_candidate(
+                        baseline_file,
+                        kernel,
+                        backend=backend,
+                        dims=copy.deepcopy(dims),
+                        ptr_size=ptr_size,
+                        arch=arch,
+                        nvcc_bin=nvcc_bin,
+                        seed=seed,
+                        blocks=blocks,
+                        warmup=warmup,
+                        min_effect_pct=min_effect_pct,
+                        confidence=confidence,
+                        bootstrap_samples=bootstrap_samples,
+                        max_temperature_delta_c=max_temperature_delta_c,
+                        max_clock_delta_pct=max_clock_delta_pct,
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                result["error"] = f"invalid_statistics: {error}"
+            else:
+                result["statistics"] = statistics
+                result["status"] = statistics["status"]
+
+        results.append(result)
 
         status = "PASS" if passed else "FAIL"
         ms_str = f"{ms:.4f} ms" if ms else "N/A"
         print(f"[branch {idx}] {status}  {ms_str}", file=sys.stderr)
 
-    # Select champion: fastest valid branch
-    valid_results = [r for r in results if r["passed"] and r["ms"] is not None]
+    shortlist = sorted(
+        (result for result in results if result["status"] == "confirmed_win"),
+        key=lambda result: result["statistics"]["estimate_pct"],
+        reverse=True,
+    )
 
-    if not valid_results:
+    if not shortlist:
         output = {
             "iter": iteration,
-            "status": "all_branches_failed",
+            "status": "no_confirmed_kernel_win",
             "branches": results,
             "champion": None,
+            "shortlist": [],
+            "frontier": [],
+            "total_branches": len(branch_dirs),
+            "valid_branches": sum(result["passed"] for result in results),
         }
         _write_json(os.path.join(iter_dir, "branch_results.json"), output)
+        _write_json(
+            os.path.join(iter_dir, "decision.json"),
+            {
+                "status": "no_confirmed_kernel_win",
+                "candidate_file": None,
+                "statistics": None,
+            },
+        )
         print(json.dumps(output, indent=2))
-        sys.exit(2)
+        return output
 
-    champion = min(valid_results, key=lambda r: r["ms"])
-    noise_threshold_pct = state.get("noise_threshold_pct", 2.0)
-    for result in valid_results:
-        if champion["ms"] > 0:
-            delta_pct = (result["ms"] - champion["ms"]) / champion["ms"] * 100
-        else:
-            delta_pct = 0.0 if result["ms"] == champion["ms"] else None
-        result["delta_pct_from_champion"] = (
-            round(delta_pct, 6) if delta_pct is not None else None
-        )
-        result["within_noise_of_champion"] = (
-            delta_pct is not None and delta_pct <= noise_threshold_pct
-        )
+    champion = shortlist[0]
 
     # Copy champion kernel to iterv{i}/kernel.<ext>
     champ_kernel = champion["kernel"]
@@ -215,40 +379,30 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
     if os.path.isfile(champ_bench) and os.path.abspath(champ_bench) != os.path.abspath(dest_bench):
         shutil.copy2(champ_bench, dest_bench)
 
-    # Build frontier from non-champion valid results
-    frontier_entries = []
-    for r in valid_results:
-        if r["branch_index"] != champion["branch_index"]:
-            frontier_entries.append({
-                "iter": iteration,
-                "branch_index": r["branch_index"],
-                "kernel": r["kernel"],
-                "ms": r["ms"],
-                "delta_from_champion": round(r["ms"] - champion["ms"], 4),
-                "delta_pct_from_champion": r["delta_pct_from_champion"],
-                "within_noise_of_champion": r["within_noise_of_champion"],
-            })
+    frontier_entries = [copy.deepcopy(item) for item in shortlist[1:]]
 
     output = {
         "iter": iteration,
-        "status": "champion_selected",
-        "champion": {
-            "branch_index": champion["branch_index"],
-            "kernel": dest,
-            "ms": champion["ms"],
-            "average_ms": champion["average_ms"],
-            "median_ms": champion["median_ms"],
-            "p95_ms": champion["p95_ms"],
-            "cv_pct": champion["cv_pct"],
-        },
+        "status": "shortlist_ready",
+        "champion": copy.deepcopy(champion),
+        "shortlist": copy.deepcopy(shortlist),
+        "selected_kernel": dest,
         "branches": results,
         "frontier": frontier_entries,
         "total_branches": len(branch_dirs),
-        "valid_branches": len(valid_results),
-        "noise_threshold_pct": noise_threshold_pct,
+        "valid_branches": sum(result["passed"] for result in results),
     }
 
     _write_json(os.path.join(iter_dir, "branch_results.json"), output)
+    _write_json(
+        os.path.join(iter_dir, "decision.json"),
+        {
+            "status": champion["statistics"]["status"],
+            "candidate_file": os.path.abspath(dest),
+            "source_candidate_file": os.path.abspath(champ_kernel),
+            "statistics": copy.deepcopy(champion["statistics"]),
+        },
+    )
     print(json.dumps(output, indent=2))
     return output
 
@@ -261,7 +415,9 @@ def main():
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--repeat", type=int, default=20)
     args = p.parse_args()
-    run(args.state, args.iter, args.benchmark, args.warmup, args.repeat)
+    output = run(args.state, args.iter, args.benchmark, args.warmup, args.repeat)
+    if output.get("status") == "no_confirmed_kernel_win":
+        sys.exit(2)
 
 
 if __name__ == "__main__":
