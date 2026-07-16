@@ -11,6 +11,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,7 +74,15 @@ def _detect_ncu() -> dict:
             "can_read_counters": None,
         }
     rc, out, _ = _run([path, "--version"])
-    version = out.strip().splitlines()[0] if out else None
+    version = None
+    if rc == 0:
+        for line in out.splitlines():
+            match = re.match(r"\s*Version\s+([^\s]+)", line)
+            if match:
+                version = match.group(1)
+                break
+    if version is None and out:
+        version = out.strip().splitlines()[0]
     # This checks metric metadata only. Counter permissions require a real profile.
     rc2, _, err2 = _run([path, "--query-metrics"], timeout=5)
     metrics_query_available = rc2 == 0
@@ -92,11 +101,35 @@ def _detect_ncu() -> dict:
 def _detect_driver() -> dict:
     path = shutil.which("nvidia-smi")
     if not path:
-        return {"available": False}
-    rc, out, _ = _run([path, "--query-gpu=driver_version,cuda_version", "--format=csv,noheader"])
-    if rc != 0:
-        return {"available": True, "raw": None}
-    return {"available": True, "raw": out.strip()}
+        return {
+            "available": False,
+            "path": None,
+            "driver_versions": [],
+            "max_cuda_version": None,
+        }
+
+    rc, out, _ = _run(
+        [path, "--query-gpu=driver_version", "--format=csv,noheader"]
+    )
+    driver_versions = []
+    if rc == 0:
+        driver_versions = list(
+            dict.fromkeys(line.strip() for line in out.splitlines() if line.strip())
+        )
+
+    header_rc, header, _ = _run([path])
+    max_cuda_version = None
+    if header_rc == 0:
+        match = re.search(r"CUDA Version:\s*([0-9]+(?:\.[0-9]+)*)", header)
+        if match:
+            max_cuda_version = match.group(1)
+
+    return {
+        "available": True,
+        "path": path,
+        "driver_versions": driver_versions,
+        "max_cuda_version": max_cuda_version,
+    }
 
 
 def _detect_cutlass() -> dict:
