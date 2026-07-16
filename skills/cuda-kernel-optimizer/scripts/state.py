@@ -111,6 +111,7 @@ _DECISION_STATUSES = {
     "pareto_frontier",
 }
 _WIN_STATUSES = {"confirmed_win", "kernel_only_win", "end_to_end_win"}
+_EVIDENCE_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
 _STATISTIC_FIELDS = (
     "statistic",
     "estimate_pct",
@@ -126,39 +127,49 @@ def _resolved_path(path: str) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
 
-def _validate_decision_statistics(payload, *, required: bool) -> dict | None:
+def _validate_decision_statistics(
+    payload, *, required: bool, field_name: str = "statistics"
+) -> dict | None:
     if payload is None and not required:
         return None
     if not isinstance(payload, Mapping):
-        raise ValueError("decision.json statistics must be a JSON object")
+        raise ValueError(f"decision.json {field_name} must be a JSON object")
     missing = [field for field in _STATISTIC_FIELDS if field not in payload]
     if missing:
         raise ValueError(
-            f"decision.json statistics missing required field: {missing[0]}"
+            f"decision.json {field_name} missing required field: {missing[0]}"
         )
     statistic = payload["statistic"]
     if not isinstance(statistic, str) or not statistic.strip():
-        raise ValueError("decision.json statistics.statistic must be a string")
+        raise ValueError(
+            f"decision.json {field_name}.statistic must be a string"
+        )
     status = payload["status"]
-    if not isinstance(status, str) or not status:
-        raise ValueError("decision.json statistics.status must be a string")
+    if type(status) is not str or status not in _EVIDENCE_STATUSES:
+        raise ValueError(
+            f"decision.json {field_name}.status must be a known string"
+        )
     clean = dict(payload)
     for field in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
         value = payload[field]
         if value is None and not required:
             continue
         if isinstance(value, bool) or not isinstance(value, Real):
-            raise ValueError(f"decision.json statistics.{field} must be finite")
+            raise ValueError(
+                f"decision.json {field_name}.{field} must be finite"
+            )
         numeric = float(value)
         if not math.isfinite(numeric):
-            raise ValueError(f"decision.json statistics.{field} must be finite")
+            raise ValueError(
+                f"decision.json {field_name}.{field} must be finite"
+            )
         clean[field] = numeric
     return clean
 
 
 def _load_decision(
     path: str, *, candidate_file: str
-) -> tuple[dict, str, dict | None]:
+) -> tuple[dict, str, dict | None, dict | None]:
     if not os.path.isfile(path):
         raise ValueError(f"decision.json missing: {path}")
     try:
@@ -180,11 +191,31 @@ def _load_decision(
     statistics = _validate_decision_statistics(
         decision.get("statistics"), required=status in _WIN_STATUSES
     )
-    if status == "confirmed_win" and statistics["status"] != "confirmed_win":
+    workload_statistics = _validate_decision_statistics(
+        decision.get("workload_statistics"),
+        required=status == "end_to_end_win",
+        field_name="workload_statistics",
+    )
+    if status in _WIN_STATUSES and statistics["status"] != "confirmed_win":
+        raise ValueError(
+            "decision.json statistics.status conflicts with decision status "
+            f"{status}; requires confirmed_win evidence"
+        )
+    if (
+        status == "end_to_end_win"
+        and workload_statistics["status"] != "confirmed_win"
+    ):
+        raise ValueError(
+            "decision.json workload_statistics.status conflicts with decision "
+            "status end_to_end_win; requires confirmed_win evidence"
+        )
+    if status in {"confirmed_loss", "inconclusive", "invalid"} and (
+        statistics is not None and statistics["status"] != status
+    ):
         raise ValueError(
             "decision.json statistics.status conflicts with decision status"
         )
-    return dict(decision), status, statistics
+    return dict(decision), status, statistics, workload_statistics
 
 
 def _state_mode(state: dict) -> str:
@@ -322,7 +353,12 @@ def cmd_update(args: argparse.Namespace) -> None:
     decision_path = getattr(args, "decision", None) or os.path.join(
         iter_dir, "decision.json"
     )
-    decision, decision_status, decision_statistics = _load_decision(
+    (
+        decision,
+        decision_status,
+        decision_statistics,
+        workload_statistics,
+    ) = _load_decision(
         decision_path, candidate_file=args.kernel
     )
     mode = _state_mode(state)
@@ -433,9 +469,7 @@ def cmd_update(args: argparse.Namespace) -> None:
             state["best_metric_ms"] = new_ms
         state["best_kernel_statistics"] = decision_statistics
         if terminal_status == "end_to_end_win":
-            state["best_workload_statistics"] = _validate_decision_statistics(
-                decision.get("workload_statistics"), required=True
-            )
+            state["best_workload_statistics"] = workload_statistics
 
     # Load roofline data if available
     roofline_path = os.path.join(iter_dir, "roofline.json")

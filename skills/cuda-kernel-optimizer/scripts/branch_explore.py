@@ -39,6 +39,7 @@ from paired_stats import classify_pairs  # noqa: E402
 
 
 _PAIRED_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
+_COMPLETED_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive"}
 _STATISTIC_FIELDS = (
     "statistic",
     "estimate_pct",
@@ -340,6 +341,9 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         key=lambda result: result["statistics"]["estimate_pct"],
         reverse=True,
     )
+    completed_comparisons = sum(
+        result["status"] in _COMPLETED_STATUSES for result in results
+    )
 
     if not shortlist:
         output = {
@@ -351,6 +355,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "frontier": [],
             "total_branches": len(branch_dirs),
             "valid_branches": sum(result["passed"] for result in results),
+            "completed_comparisons": completed_comparisons,
         }
         _write_json(os.path.join(iter_dir, "branch_results.json"), output)
         _write_json(
@@ -391,6 +396,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         "frontier": frontier_entries,
         "total_branches": len(branch_dirs),
         "valid_branches": sum(result["passed"] for result in results),
+        "completed_comparisons": completed_comparisons,
     }
 
     _write_json(os.path.join(iter_dir, "branch_results.json"), output)
@@ -416,7 +422,10 @@ def main():
     p.add_argument("--repeat", type=int, default=20)
     args = p.parse_args()
     output = run(args.state, args.iter, args.benchmark, args.warmup, args.repeat)
-    if output.get("status") == "no_confirmed_kernel_win":
+    if (
+        output.get("status") == "no_confirmed_kernel_win"
+        and output.get("completed_comparisons", 0) == 0
+    ):
         sys.exit(2)
 
 

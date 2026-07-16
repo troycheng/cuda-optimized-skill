@@ -150,6 +150,8 @@ class StateDecisionPromotionTests(unittest.TestCase):
         *,
         mode: str,
         decision_status: object = "inconclusive",
+        statistics_status: object = None,
+        workload_statistics_status: object = None,
         candidate_override: str | None = None,
         write_decision: bool = True,
         average_ms: float = 0.1,
@@ -199,24 +201,46 @@ class StateDecisionPromotionTests(unittest.TestCase):
         methods = iter_dir / "methods.json"
         methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
         decision = iter_dir / "decision.json"
+        if statistics_status is None:
+            statistics_status = (
+                "confirmed_win"
+                if decision_status in {"kernel_only_win", "end_to_end_win"}
+                else decision_status
+            )
+        if workload_statistics_status is None:
+            workload_statistics_status = (
+                "confirmed_win"
+                if decision_status == "end_to_end_win"
+                else statistics_status
+            )
         statistics = {
             "statistic": "median_paired_improvement_pct",
             "estimate_pct": 3.0,
             "ci_low_pct": 2.0,
             "ci_high_pct": 4.0,
-            "status": decision_status,
+            "status": statistics_status,
         }
+        has_kernel_statistics = decision_status not in {
+            "no_confirmed_kernel_win",
+            "workload_failed",
+        }
+        has_workload_statistics = decision_status == "end_to_end_win"
         if write_decision:
             decision.write_text(
                 json.dumps(
                     {
                         "status": decision_status,
                         "candidate_file": candidate_override or str(candidate),
-                        "statistics": statistics,
-                        "workload_statistics": {
-                            **statistics,
-                            "statistic": "median_paired_workload_improvement_pct",
-                        },
+                        "statistics": statistics if has_kernel_statistics else None,
+                        "workload_statistics": (
+                            {
+                                **statistics,
+                                "statistic": "median_paired_workload_improvement_pct",
+                                "status": workload_statistics_status,
+                            }
+                            if has_workload_statistics
+                            else None
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -360,6 +384,55 @@ class StateDecisionPromotionTests(unittest.TestCase):
             unchanged = json.loads(state_path.read_text("utf-8"))
 
         self.assertEqual(unchanged["best_file"], before["best_file"])
+
+    def test_terminal_wins_require_confirmed_kernel_and_workload_evidence(self) -> None:
+        cases = (
+            ("confirmed_win", "confirmed_loss", "confirmed_win"),
+            ("kernel_only_win", "confirmed_loss", "confirmed_win"),
+            ("end_to_end_win", "confirmed_loss", "confirmed_win"),
+            ("end_to_end_win", "confirmed_win", "confirmed_loss"),
+        )
+        for decision_status, kernel_status, workload_status in cases:
+            with self.subTest(
+                decision_status=decision_status,
+                kernel_status=kernel_status,
+                workload_status=workload_status,
+            ), tempfile.TemporaryDirectory() as tmp:
+                args, state_path, _candidate, before = self._fixture(
+                    Path(tmp),
+                    mode="full" if decision_status == "end_to_end_win" else "kernel-only",
+                    decision_status=decision_status,
+                    statistics_status=kernel_status,
+                    workload_statistics_status=workload_status,
+                )
+                with self.assertRaisesRegex(ValueError, "confirmed_win evidence"):
+                    self._run_update(args)
+                unchanged = json.loads(state_path.read_text("utf-8"))
+                self.assertEqual(unchanged["best_file"], before["best_file"])
+
+    def test_nested_evidence_status_must_be_a_known_string(self) -> None:
+        for nested_field in ("statistics", "workload_statistics"):
+            for status in (True, 1, 1.5, "surprise_win"):
+                with self.subTest(
+                    nested_field=nested_field, status=status
+                ), tempfile.TemporaryDirectory() as tmp:
+                    kwargs = {
+                        "statistics_status": "confirmed_win",
+                        "workload_statistics_status": "confirmed_win",
+                    }
+                    kwargs[f"{nested_field}_status"] = status
+                    args, state_path, _candidate, before = self._fixture(
+                        Path(tmp),
+                        mode="full",
+                        decision_status="end_to_end_win",
+                        **kwargs,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, rf"{nested_field}\.status"
+                    ):
+                        self._run_update(args)
+                    unchanged = json.loads(state_path.read_text("utf-8"))
+                    self.assertEqual(unchanged["best_file"], before["best_file"])
 
 
 if __name__ == "__main__":

@@ -227,13 +227,31 @@ class BranchExploreTests(unittest.TestCase):
             self.assertEqual(payload, original)
             self.assertEqual(json.loads(state_path.read_text("utf-8")), original)
 
-    def test_cli_keeps_nonzero_exit_for_no_confirmed_candidate(self) -> None:
+    def test_cli_treats_completed_but_unconfirmed_comparison_as_normal(self) -> None:
         branch_explore = _load_branch_explore()
         argv = ["branch_explore.py", "--state", "state.json", "--iter", "1"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(
             branch_explore,
             "run",
-            return_value={"status": "no_confirmed_kernel_win"},
+            return_value={
+                "status": "no_confirmed_kernel_win",
+                "valid_branches": 2,
+                "completed_comparisons": 2,
+            },
+        ):
+            branch_explore.main()
+
+    def test_cli_keeps_nonzero_exit_when_all_branches_fail(self) -> None:
+        branch_explore = _load_branch_explore()
+        argv = ["branch_explore.py", "--state", "state.json", "--iter", "1"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            branch_explore,
+            "run",
+            return_value={
+                "status": "no_confirmed_kernel_win",
+                "valid_branches": 0,
+                "completed_comparisons": 0,
+            },
         ), self.assertRaises(SystemExit) as caught:
             branch_explore.main()
 
@@ -241,6 +259,49 @@ class BranchExploreTests(unittest.TestCase):
 
 
 class RunIterationDecisionSummaryTests(unittest.TestCase):
+    def test_decision_summary_requires_terminal_status_and_candidate_path(self) -> None:
+        run_iteration = _load_run_iteration()
+        statistics = _statistics("confirmed_win", 3.0)
+        invalid = (
+            ({"candidate_file": "kernel.py", "statistics": statistics}, "status"),
+            (
+                {
+                    "status": True,
+                    "candidate_file": "kernel.py",
+                    "statistics": statistics,
+                },
+                "status",
+            ),
+            (
+                {
+                    "status": "surprise_win",
+                    "candidate_file": "kernel.py",
+                    "statistics": statistics,
+                },
+                "status",
+            ),
+            ({"status": "confirmed_win", "statistics": statistics}, "candidate_file"),
+        )
+        for decision, field in invalid:
+            with self.subTest(field=field, decision=decision), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                run_iteration._decision_summary(decision)
+
+    def test_decision_summary_rejects_unknown_or_non_string_evidence_status(self) -> None:
+        run_iteration = _load_run_iteration()
+        for status in (True, 1, "surprise_win"):
+            with self.subTest(status=status), self.assertRaisesRegex(
+                ValueError, "statistics.status"
+            ):
+                run_iteration._decision_summary(
+                    {
+                        "status": "confirmed_win",
+                        "candidate_file": "kernel.py",
+                        "statistics": _statistics(status, 3.0),
+                    }
+                )
+
     def test_benchmark_summary_uses_unified_decision_statistics(self) -> None:
         run_iteration = _load_run_iteration()
         with tempfile.TemporaryDirectory() as tmp:
@@ -290,17 +351,81 @@ class RunIterationDecisionSummaryTests(unittest.TestCase):
                     run_iteration.cmd_benchmark(args)
 
             summary = json.loads(stdout.getvalue())
+            expected = {
+                "statistic": "median_paired_improvement_pct",
+                "estimate_pct": 3.0,
+                "ci_low_pct": 2.75,
+                "ci_high_pct": 3.25,
+                "status": "confirmed_win",
+            }
             self.assertEqual(
-                summary["decision"],
-                {
-                    "statistic": "median_paired_improvement_pct",
-                    "estimate_pct": 3.0,
-                    "ci_low_pct": 2.75,
-                    "ci_high_pct": 3.25,
-                    "status": "confirmed_win",
-                },
+                {field: summary[field] for field in expected}, expected
             )
+            self.assertEqual(summary["decision"], expected)
             self.assertNotIn("improved", summary)
+
+    def test_candidate_benchmark_requires_decision_before_running(self) -> None:
+        run_iteration = _load_run_iteration()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            iter_dir = run_dir / "iterv1"
+            iter_dir.mkdir(parents=True)
+            (iter_dir / "kernel.py").write_text("# kernel\n", encoding="utf-8")
+            state_path = root / "state.json"
+            state_path.write_text(
+                json.dumps({"run_dir": str(run_dir), "ref_file": str(root / "ref.py")}),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "state": str(state_path),
+                    "iter": 1,
+                    "benchmark": str(ROOT / "fake_benchmark.py"),
+                    "warmup": 1,
+                    "repeat": 2,
+                },
+            )()
+            bench = mock.Mock()
+            with mock.patch.object(run_iteration, "_run_bench", bench):
+                with self.assertRaisesRegex(ValueError, "decision.json.*missing"):
+                    run_iteration.cmd_benchmark(args)
+
+            bench.assert_not_called()
+
+    def test_candidate_benchmark_rejects_malformed_decision_before_running(self) -> None:
+        run_iteration = _load_run_iteration()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            iter_dir = run_dir / "iterv1"
+            iter_dir.mkdir(parents=True)
+            (iter_dir / "kernel.py").write_text("# kernel\n", encoding="utf-8")
+            (iter_dir / "decision.json").write_text("{", encoding="utf-8")
+            state_path = root / "state.json"
+            state_path.write_text(
+                json.dumps({"run_dir": str(run_dir), "ref_file": str(root / "ref.py")}),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "state": str(state_path),
+                    "iter": 1,
+                    "benchmark": str(ROOT / "fake_benchmark.py"),
+                    "warmup": 1,
+                    "repeat": 2,
+                },
+            )()
+            bench = mock.Mock()
+            with mock.patch.object(run_iteration, "_run_bench", bench):
+                with self.assertRaisesRegex(ValueError, "decision.json.*malformed"):
+                    run_iteration.cmd_benchmark(args)
+
+            bench.assert_not_called()
 
 
 if __name__ == "__main__":

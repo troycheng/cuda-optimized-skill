@@ -23,6 +23,21 @@ from pathlib import Path
 
 
 _BUNDLED_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py")
+_EVIDENCE_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
+_DECISION_STATUSES = {
+    "confirmed_win",
+    "confirmed_loss",
+    "inconclusive",
+    "no_confirmed_kernel_win",
+    "workload_failed",
+    "invalid",
+    "kernel_only_win",
+    "end_to_end_win",
+    "rejected_compile",
+    "rejected_correctness",
+    "rejected_constraint",
+    "pareto_frontier",
+}
 
 
 def _read(path: str) -> dict:
@@ -42,6 +57,12 @@ def _decision_summary(decision: Mapping) -> dict:
     """Extract the sole statistic used by kernel decision consumers."""
     if not isinstance(decision, Mapping):
         raise ValueError("decision.json must contain a JSON object")
+    status = decision.get("status")
+    if type(status) is not str or status not in _DECISION_STATUSES:
+        raise ValueError("decision.json status must be a recognized status")
+    candidate_file = decision.get("candidate_file")
+    if not isinstance(candidate_file, str) or not candidate_file.strip():
+        raise ValueError("decision.json candidate_file must be a non-empty path")
     statistics = decision.get("statistics")
     if not isinstance(statistics, Mapping):
         raise ValueError("decision.json statistics must be a JSON object")
@@ -59,8 +80,10 @@ def _decision_summary(decision: Mapping) -> dict:
         "statistic"
     ].strip():
         raise ValueError("decision.json statistics.statistic must be a string")
-    if not isinstance(statistics["status"], str) or not statistics["status"]:
-        raise ValueError("decision.json statistics.status must be a string")
+    if type(statistics["status"]) is not str or statistics[
+        "status"
+    ] not in _EVIDENCE_STATUSES:
+        raise ValueError("decision.json statistics.status must be a known string")
     for field in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
         value = statistics[field]
         if isinstance(value, bool) or not isinstance(value, Real):
@@ -68,6 +91,16 @@ def _decision_summary(decision: Mapping) -> dict:
         if not math.isfinite(float(value)):
             raise ValueError(f"decision.json statistics.{field} must be finite")
     return {field: statistics[field] for field in required}
+
+
+def _load_decision_summary(path: str) -> dict:
+    if not os.path.isfile(path):
+        raise ValueError(f"decision.json missing: {path}")
+    try:
+        decision = _read(path)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"decision.json is malformed: {error}") from error
+    return _decision_summary(decision)
 
 
 def _run_bench(
@@ -164,6 +197,8 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
     json_out = os.path.join(iter_dir, "bench.json")
     stderr_out = os.path.join(iter_dir, "bench.stderr.txt")
+    decision_path = os.path.join(iter_dir, "decision.json")
+    decision_summary = _load_decision_summary(decision_path)
     _run_bench(
         benchmark_py=os.path.abspath(args.benchmark),
         solution=kernel,
@@ -177,12 +212,6 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     )
     # Return the result summary on stdout for the orchestrator to consume
     res = _read(json_out)
-    decision_path = os.path.join(iter_dir, "decision.json")
-    decision_summary = (
-        _decision_summary(_read(decision_path))
-        if os.path.isfile(decision_path)
-        else None
-    )
     summary = {
         "iter": args.iter,
         "kernel": kernel,
@@ -193,7 +222,8 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         "error": res.get("error"),
         "bench_json": json_out,
         "stderr_log": stderr_out,
-        "decision": decision_summary,
+        **decision_summary,
+        "decision": dict(decision_summary),
     }
     print(json.dumps(summary, indent=2))
 
