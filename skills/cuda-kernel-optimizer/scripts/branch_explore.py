@@ -153,15 +153,20 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         )
 
         passed = bool(bench_result.get("correctness", {}).get("passed", False))
-        ms = None
-        if bench_result.get("kernel"):
-            ms = bench_result["kernel"].get("average_ms")
+        kernel_stats = bench_result.get("kernel") or {}
+        average_ms = kernel_stats.get("average_ms")
+        median_ms = kernel_stats.get("median_ms")
+        ms = median_ms if median_ms is not None else average_ms
 
         results.append({
             "branch_index": idx,
             "kernel": kernel,
             "passed": passed,
             "ms": ms,
+            "average_ms": average_ms,
+            "median_ms": median_ms,
+            "p95_ms": kernel_stats.get("p95_ms"),
+            "cv_pct": kernel_stats.get("cv_pct"),
             "error": bench_result.get("error"),
         })
 
@@ -184,6 +189,18 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         sys.exit(2)
 
     champion = min(valid_results, key=lambda r: r["ms"])
+    noise_threshold_pct = state.get("noise_threshold_pct", 2.0)
+    for result in valid_results:
+        if champion["ms"] > 0:
+            delta_pct = (result["ms"] - champion["ms"]) / champion["ms"] * 100
+        else:
+            delta_pct = 0.0 if result["ms"] == champion["ms"] else None
+        result["delta_pct_from_champion"] = (
+            round(delta_pct, 6) if delta_pct is not None else None
+        )
+        result["within_noise_of_champion"] = (
+            delta_pct is not None and delta_pct <= noise_threshold_pct
+        )
 
     # Copy champion kernel to iterv{i}/kernel.<ext>
     champ_kernel = champion["kernel"]
@@ -208,6 +225,8 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
                 "kernel": r["kernel"],
                 "ms": r["ms"],
                 "delta_from_champion": round(r["ms"] - champion["ms"], 4),
+                "delta_pct_from_champion": r["delta_pct_from_champion"],
+                "within_noise_of_champion": r["within_noise_of_champion"],
             })
 
     output = {
@@ -217,11 +236,16 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "branch_index": champion["branch_index"],
             "kernel": dest,
             "ms": champion["ms"],
+            "average_ms": champion["average_ms"],
+            "median_ms": champion["median_ms"],
+            "p95_ms": champion["p95_ms"],
+            "cv_pct": champion["cv_pct"],
         },
         "branches": results,
         "frontier": frontier_entries,
         "total_branches": len(branch_dirs),
         "valid_branches": len(valid_results),
+        "noise_threshold_pct": noise_threshold_pct,
     }
 
     _write_json(os.path.join(iter_dir, "branch_results.json"), output)
