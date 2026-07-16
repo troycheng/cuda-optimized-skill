@@ -110,7 +110,7 @@ class BudgetClock:
             self.started_at + self.policy.max_seconds - self.policy.reserve_seconds
         )
         estimate = max(0.0, float(estimated_seconds))
-        return now < execution_deadline and now + estimate <= execution_deadline
+        return now + estimate <= execution_deadline
 
     def remaining_seconds(self, *, now: float) -> float:
         deadline = self.started_at + self.policy.max_seconds

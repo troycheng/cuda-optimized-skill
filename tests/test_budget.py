@@ -114,12 +114,19 @@ class BudgetClockTests(unittest.TestCase):
 
         self.assertFalse(clock.can_start(now=2500, estimated_seconds=10))
 
-    def test_negative_estimate_is_treated_as_zero(self) -> None:
+    def test_zero_estimate_can_start_at_execution_deadline(self) -> None:
         clock = budget.BudgetClock(
             policy=budget.resolve_budget("quick"), started_at=100
         )
 
-        self.assertTrue(clock.can_start(now=2499, estimated_seconds=-10))
+        self.assertTrue(clock.can_start(now=2500, estimated_seconds=0))
+
+    def test_negative_estimate_is_zero_at_execution_deadline(self) -> None:
+        clock = budget.BudgetClock(
+            policy=budget.resolve_budget("quick"), started_at=100
+        )
+
+        self.assertTrue(clock.can_start(now=2500, estimated_seconds=-10))
 
     def test_remaining_seconds_is_clamped_to_zero(self) -> None:
         clock = budget.BudgetClock(
