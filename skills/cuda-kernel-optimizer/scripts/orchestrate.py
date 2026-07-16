@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -45,6 +46,47 @@ def _read_branch_results(path: str) -> dict:
     if type(status) is not str or status not in _BRANCH_RESULT_STATUSES:
         sys.exit(f"branch_results artifact status is invalid: {status!r}")
     return payload
+
+
+def _selected_kernel(
+    branch_payload: dict, *, iter_dir: str, decision_path: str
+) -> str:
+    """Resolve the champion solely from the authoritative branch artifact."""
+    declared = branch_payload.get("selected_kernel")
+    if not isinstance(declared, str) or not declared.strip():
+        sys.exit("branch_results selected_kernel must be a non-empty path")
+
+    candidate = Path(declared).expanduser()
+    if candidate.is_symlink():
+        sys.exit(f"selected_kernel must not be a symlink: {candidate}")
+    try:
+        candidate_stat = candidate.lstat()
+    except OSError as error:
+        sys.exit(f"selected_kernel is missing or unreadable: {error}")
+    if not stat.S_ISREG(candidate_stat.st_mode):
+        sys.exit(f"selected_kernel must be a regular file: {candidate}")
+
+    iteration = Path(iter_dir).expanduser().resolve()
+    resolved = candidate.resolve(strict=True)
+    if resolved.parent != iteration or resolved.name not in {"kernel.cu", "kernel.py"}:
+        sys.exit(
+            "selected_kernel must be the current iteration kernel.cu or kernel.py"
+        )
+
+    try:
+        decision = _read(decision_path)
+    except (OSError, json.JSONDecodeError) as error:
+        sys.exit(f"decision candidate_file cannot be validated: {error}")
+    if not isinstance(decision, dict):
+        sys.exit("decision candidate_file cannot be validated")
+    decision_candidate = decision.get("candidate_file")
+    if not isinstance(decision_candidate, str) or not decision_candidate.strip():
+        sys.exit("decision candidate_file must be a non-empty path")
+    if os.path.abspath(os.path.expanduser(decision_candidate)) != os.path.abspath(
+        str(candidate)
+    ):
+        sys.exit("decision candidate_file does not match selected_kernel")
+    return os.path.abspath(str(candidate))
 
 
 # ---------------------------------------------------------------------------
@@ -267,15 +309,11 @@ def cmd_close_iter(args):
         }, indent=2))
         return
 
-    # Find champion kernel
-    kernel = None
-    for ext in (".cu", ".py"):
-        candidate = os.path.join(iter_dir, f"kernel{ext}")
-        if os.path.isfile(candidate):
-            kernel = candidate
-            break
-    if not kernel:
-        sys.exit(f"No champion kernel found after branch_explore")
+    # Bind every downstream step to the exact champion named by the artifact.
+    decision_path = os.path.join(iter_dir, "decision.json")
+    kernel = _selected_kernel(
+        branch_payload, iter_dir=iter_dir, decision_path=decision_path
+    )
 
     bench_json = os.path.join(iter_dir, "bench.json")
     if not os.path.isfile(bench_json):

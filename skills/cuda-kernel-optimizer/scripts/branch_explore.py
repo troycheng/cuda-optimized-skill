@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
@@ -36,6 +37,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from paired_benchmark import run_paired  # noqa: E402
 from paired_stats import classify_pairs  # noqa: E402
+from artifact_store import sha256_file  # noqa: E402
 
 
 _PAIRED_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
@@ -58,6 +60,51 @@ def _write_json(path: str, obj) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def _bounded_candidate_error(error: Exception, limit: int = 560) -> str:
+    """Return a bounded, single-line diagnostic without hiding its type."""
+    detail = " ".join(str(error).split())
+    message = f"invalid_statistics: {type(error).__name__}: {detail}"
+    if len(message) <= limit:
+        return message
+    return message[: limit - 3] + "..."
+
+
+def _promote_kernel(source: str, destination: str, iter_dir: str) -> None:
+    """Atomically publish the selected kernel and remove a stale suffix."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    iteration_path = Path(iter_dir)
+
+    if os.path.abspath(source) != os.path.abspath(destination):
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination_path.name}.",
+            suffix=".tmp",
+            dir=str(iteration_path),
+        )
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copy2(source_path, temporary)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination_path)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    for suffix in (".cu", ".py"):
+        stale = iteration_path / f"kernel{suffix}"
+        if stale == destination_path:
+            continue
+        if stale.is_symlink() or stale.is_file():
+            stale.unlink()
+        elif stale.exists():
+            raise ValueError(f"stale champion path is not a file: {stale}")
 
 
 def _dims_argv(dims: dict) -> list[str]:
@@ -324,8 +371,8 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
                         max_clock_delta_pct=max_clock_delta_pct,
                     )
                 )
-            except (TypeError, ValueError) as error:
-                result["error"] = f"invalid_statistics: {error}"
+            except Exception as error:
+                result["error"] = _bounded_candidate_error(error)
             else:
                 result["statistics"] = statistics
                 result["status"] = statistics["status"]
@@ -344,6 +391,10 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
     completed_comparisons = sum(
         result["status"] in _COMPLETED_STATUSES for result in results
     )
+    measurement_failures = sum(
+        result["passed"] and result["status"] == "invalid"
+        for result in results
+    )
 
     if not shortlist:
         output = {
@@ -356,6 +407,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "total_branches": len(branch_dirs),
             "valid_branches": sum(result["passed"] for result in results),
             "completed_comparisons": completed_comparisons,
+            "measurement_failures": measurement_failures,
         }
         _write_json(os.path.join(iter_dir, "branch_results.json"), output)
         _write_json(
@@ -375,8 +427,8 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
     champ_kernel = champion["kernel"]
     ext = os.path.splitext(champ_kernel)[1]
     dest = os.path.join(iter_dir, f"kernel{ext}")
-    if os.path.abspath(champ_kernel) != os.path.abspath(dest):
-        shutil.copy2(champ_kernel, dest)
+    _promote_kernel(champ_kernel, dest, iter_dir)
+    candidate_sha256 = sha256_file(dest)
 
     # Also copy champion bench.json to iter_dir
     champ_bench = os.path.join(os.path.dirname(champ_kernel), "bench.json")
@@ -397,6 +449,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         "total_branches": len(branch_dirs),
         "valid_branches": sum(result["passed"] for result in results),
         "completed_comparisons": completed_comparisons,
+        "measurement_failures": measurement_failures,
     }
 
     _write_json(os.path.join(iter_dir, "branch_results.json"), output)
@@ -405,6 +458,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         {
             "status": champion["statistics"]["status"],
             "candidate_file": os.path.abspath(dest),
+            "candidate_sha256": candidate_sha256,
             "source_candidate_file": os.path.abspath(champ_kernel),
             "statistics": copy.deepcopy(champion["statistics"]),
         },
@@ -424,7 +478,7 @@ def main():
     output = run(args.state, args.iter, args.benchmark, args.warmup, args.repeat)
     if (
         output.get("status") == "no_confirmed_kernel_win"
-        and output.get("completed_comparisons", 0) == 0
+        and output.get("valid_branches", 0) == 0
     ):
         sys.exit(2)
 

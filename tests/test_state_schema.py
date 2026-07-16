@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -226,11 +228,18 @@ class StateDecisionPromotionTests(unittest.TestCase):
         }
         has_workload_statistics = decision_status == "end_to_end_win"
         if write_decision:
+            candidate_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
             decision.write_text(
                 json.dumps(
                     {
                         "status": decision_status,
                         "candidate_file": candidate_override or str(candidate),
+                        "candidate_sha256": (
+                            candidate_sha256
+                            if decision_status
+                            in {"confirmed_win", "kernel_only_win", "end_to_end_win"}
+                            else None
+                        ),
                         "statistics": statistics if has_kernel_statistics else None,
                         "workload_statistics": (
                             {
@@ -405,6 +414,110 @@ class StateDecisionPromotionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "candidate_file"):
                 self.state._load_decision(str(decision_path), candidate_file=None)
 
+    def test_win_candidate_missing_tampered_or_bad_hash_never_writes_state(self) -> None:
+        for case in ("missing", "missing_hash", "tampered", "bad_hash"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                args, state_path, candidate, _before = self._fixture(
+                    Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+                )
+                original_state = state_path.read_bytes()
+                decision_path = Path(tmp) / "run" / "iterv1" / "decision.json"
+                if case == "missing":
+                    candidate.unlink()
+                elif case == "missing_hash":
+                    decision = json.loads(decision_path.read_text("utf-8"))
+                    decision.pop("candidate_sha256")
+                    decision_path.write_text(json.dumps(decision), encoding="utf-8")
+                elif case == "tampered":
+                    candidate.write_text("# changed\n", encoding="utf-8")
+                else:
+                    decision = json.loads(decision_path.read_text("utf-8"))
+                    decision["candidate_sha256"] = "not-a-sha"
+                    decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "candidate|sha256|hash"):
+                    self._run_update(args)
+                self.assertEqual(state_path.read_bytes(), original_state)
+
+    def test_candidate_must_be_regular_non_symlink_in_current_iteration(self) -> None:
+        for case in ("outside", "symlink", "directory"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, state_path, candidate, _before = self._fixture(
+                    root, mode="kernel-only", decision_status="confirmed_win"
+                )
+                original_state = state_path.read_bytes()
+                decision_path = root / "run" / "iterv1" / "decision.json"
+                if case == "outside":
+                    candidate = root / "outside.py"
+                    candidate.write_text("# outside\n", encoding="utf-8")
+                elif case == "symlink":
+                    real = root / "real.py"
+                    real.write_text("# real\n", encoding="utf-8")
+                    candidate.unlink()
+                    candidate.symlink_to(real)
+                else:
+                    candidate.unlink()
+                    candidate.mkdir()
+                args.kernel = str(candidate)
+                decision = json.loads(decision_path.read_text("utf-8"))
+                decision["candidate_file"] = str(candidate)
+                if candidate.is_file():
+                    decision["candidate_sha256"] = hashlib.sha256(
+                        candidate.read_bytes()
+                    ).hexdigest()
+                decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    ValueError, "iteration|candidate|symlink|regular"
+                ):
+                    self._run_update(args)
+                self.assertEqual(state_path.read_bytes(), original_state)
+
+    def test_decision_must_be_current_iteration_regular_file(self) -> None:
+        for case in ("other_iteration", "symlink"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, state_path, _candidate, _before = self._fixture(
+                    root, mode="kernel-only", decision_status="confirmed_win"
+                )
+                original_state = state_path.read_bytes()
+                decision_path = root / "run" / "iterv1" / "decision.json"
+                if case == "other_iteration":
+                    other = root / "run" / "iterv2" / "decision.json"
+                    other.parent.mkdir()
+                    other.write_bytes(decision_path.read_bytes())
+                    args.decision = str(other)
+                else:
+                    external = root / "external-decision.json"
+                    external.write_bytes(decision_path.read_bytes())
+                    decision_path.unlink()
+                    decision_path.symlink_to(external)
+
+                with self.assertRaisesRegex(ValueError, "decision.*iteration|symlink"):
+                    self._run_update(args)
+                self.assertEqual(state_path.read_bytes(), original_state)
+
+    def test_candidate_swap_before_state_write_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, candidate, _before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            original_state = state_path.read_bytes()
+            original_verify = self.state._verify_candidate_binding
+
+            def swap_then_verify(binding):
+                candidate.write_text("# swapped before write\n", encoding="utf-8")
+                return original_verify(binding)
+
+            with mock.patch.object(
+                self.state, "_verify_candidate_binding", side_effect=swap_then_verify
+            ):
+                with self.assertRaisesRegex(ValueError, "changed|sha256|hash"):
+                    self._run_update(args)
+
+            self.assertEqual(state_path.read_bytes(), original_state)
+
     def test_confirmed_win_with_conflicting_statistics_status_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args, state_path, _candidate, before = self._fixture(
@@ -420,6 +533,25 @@ class StateDecisionPromotionTests(unittest.TestCase):
             unchanged = json.loads(state_path.read_text("utf-8"))
 
         self.assertEqual(unchanged["best_file"], before["best_file"])
+
+    def test_decision_candidate_symlink_alias_does_not_match_regular_kernel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, state_path, candidate, _before = self._fixture(
+                root, mode="kernel-only", decision_status="confirmed_win"
+            )
+            original_state = state_path.read_bytes()
+            alias = candidate.with_name("alias.py")
+            alias.symlink_to(candidate)
+            decision_path = root / "run" / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            decision["candidate_file"] = str(alias)
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "candidate_file|symlink"):
+                self._run_update(args)
+
+            self.assertEqual(state_path.read_bytes(), original_state)
 
     def test_terminal_wins_require_confirmed_kernel_and_workload_evidence(self) -> None:
         cases = (

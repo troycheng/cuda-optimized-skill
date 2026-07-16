@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -120,6 +121,50 @@ class BranchExploreTests(unittest.TestCase):
             self.assertEqual(decision["status"], "confirmed_win")
             self.assertEqual(Path(decision["candidate_file"]), promoted)
             self.assertEqual(decision["statistics"], output["champion"]["statistics"])
+            self.assertEqual(
+                decision["candidate_sha256"],
+                hashlib.sha256(promoted.read_bytes()).hexdigest(),
+            )
+
+    def test_candidate_exception_is_isolated_and_later_winner_survives(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path, _payload = self._state(root)
+            with mock.patch.object(
+                branch_explore, "_bench_kernel", side_effect=[_bench(), _bench()]
+            ), mock.patch.object(
+                branch_explore,
+                "_paired_candidate",
+                side_effect=[
+                    RuntimeError("CUDA prepare failed " + "x" * 4000),
+                    _statistics("confirmed_win", 3.0),
+                ],
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output = branch_explore.run(str(state_path), iteration=1)
+
+            by_branch = {item["branch_index"]: item for item in output["branches"]}
+            self.assertEqual(by_branch[1]["status"], "invalid")
+            self.assertIn("RuntimeError", by_branch[1]["error"])
+            self.assertIn("CUDA prepare failed", by_branch[1]["error"])
+            self.assertLessEqual(len(by_branch[1]["error"]), 600)
+            self.assertEqual(output["champion"]["branch_index"], 2)
+            self.assertTrue((root / "run" / "iterv1" / "branch_results.json").is_file())
+            self.assertTrue((root / "run" / "iterv1" / "decision.json").is_file())
+
+    def test_control_flow_exceptions_are_never_swallowed(self) -> None:
+        branch_explore = _load_branch_explore()
+        for error in (KeyboardInterrupt(), SystemExit(7)):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:
+                state_path, _payload = self._state(Path(tmp))
+                with mock.patch.object(
+                    branch_explore, "_bench_kernel", side_effect=[_bench(), _bench()]
+                ), mock.patch.object(
+                    branch_explore, "_paired_candidate", side_effect=error
+                ), self.assertRaises(type(error)):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        branch_explore.run(str(state_path), iteration=1)
 
     def test_no_confirmed_win_keeps_existing_best_and_does_not_copy_candidate(self) -> None:
         branch_explore = _load_branch_explore()
@@ -256,6 +301,52 @@ class BranchExploreTests(unittest.TestCase):
             },
         ):
             branch_explore.main()
+
+    def test_cli_treats_passed_but_failed_measurements_as_no_confirmed(self) -> None:
+        branch_explore = _load_branch_explore()
+        argv = ["branch_explore.py", "--state", "state.json", "--iter", "1"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            branch_explore,
+            "run",
+            return_value={
+                "status": "no_confirmed_kernel_win",
+                "valid_branches": 2,
+                "completed_comparisons": 0,
+                "measurement_failures": 2,
+            },
+        ):
+            branch_explore.main()
+
+    def test_promoting_python_removes_stale_cuda_with_atomic_replace(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path, _payload = self._state(root)
+            iter_dir = root / "run" / "iterv1"
+            stale = iter_dir / "kernel.cu"
+            stale.write_text("// stale\n", encoding="utf-8")
+            with mock.patch.object(
+                branch_explore, "_bench_kernel", side_effect=[_bench(), _bench()]
+            ), mock.patch.object(
+                branch_explore,
+                "_paired_candidate",
+                side_effect=[
+                    _statistics("confirmed_win", 3.0),
+                    _statistics("inconclusive", 0.0),
+                ],
+            ), mock.patch.object(
+                branch_explore.os, "replace", wraps=branch_explore.os.replace
+            ) as replace:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output = branch_explore.run(str(state_path), iteration=1)
+
+            selected = Path(output["selected_kernel"])
+            self.assertEqual(selected.name, "kernel.py")
+            self.assertEqual(selected.read_text("utf-8"), "# branch 1\n")
+            self.assertFalse(stale.exists())
+            temporary, target = map(Path, replace.call_args.args)
+            self.assertEqual(temporary.parent, iter_dir)
+            self.assertEqual(target, selected)
 
     def test_cli_keeps_nonzero_exit_when_all_branches_fail(self) -> None:
         branch_explore = _load_branch_explore()

@@ -89,17 +89,30 @@ class CloseIterationDecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             args, _state_path, iter_dir = self._fixture(root)
+            selected = iter_dir / "kernel.py"
+            stale = iter_dir / "kernel.cu"
+            selected.write_text("# champion\n", encoding="utf-8")
+            stale.write_text("// stale\n", encoding="utf-8")
             (iter_dir / "branch_results.json").write_text(
                 json.dumps(
                     {
                         "iter": 1,
                         "status": "shortlist_ready",
                         "champion": {"branch_index": 1},
+                        "selected_kernel": str(selected),
                     }
                 ),
                 encoding="utf-8",
             )
-            (iter_dir / "kernel.py").write_text("# champion\n", encoding="utf-8")
+            (iter_dir / "decision.json").write_text(
+                json.dumps(
+                    {
+                        "status": "confirmed_win",
+                        "candidate_file": str(selected),
+                    }
+                ),
+                encoding="utf-8",
+            )
             (iter_dir / "bench.json").write_text(
                 json.dumps({"correctness": {"passed": True}}), encoding="utf-8"
             )
@@ -108,18 +121,93 @@ class CloseIterationDecisionTests(unittest.TestCase):
                 stdout="CUDA setup log\n{not the authority}",
                 stderr="",
             )
+            ok = SimpleNamespace(returncode=0, stdout="", stderr="")
             runner = mock.Mock(
-                side_effect=[branch_result, RuntimeError("profile reached")]
+                side_effect=[
+                    branch_result,
+                    ok,
+                    ok,
+                    RuntimeError("state update reached"),
+                ]
             )
 
             with mock.patch.object(orchestrate, "_run", runner):
-                with self.assertRaisesRegex(RuntimeError, "profile reached"):
+                with self.assertRaisesRegex(RuntimeError, "state update reached"):
                     orchestrate.cmd_close_iter(args)
 
-        self.assertEqual(runner.call_count, 2)
-        self.assertTrue(
-            any("profile_ncu.py" in str(part) for part in runner.call_args_list[1].args[0])
-        )
+        self.assertEqual(runner.call_count, 4)
+        update_command = runner.call_args_list[3].args[0]
+        self.assertEqual(update_command[update_command.index("--kernel") + 1], str(selected))
+
+    def test_selected_kernel_identity_rejects_malformed_escape_symlink_and_directory(self) -> None:
+        orchestrate = _load_orchestrate()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            valid = root / "valid.py"
+            valid.write_text("# valid\n", encoding="utf-8")
+            cases = (
+                "missing",
+                "outside",
+                "symlink",
+                "directory",
+                "decision_mismatch",
+                "decision_symlink_alias",
+            )
+            for case in cases:
+                with self.subTest(case=case):
+                    case_root = root / case
+                    args, _state_path, iter_dir = self._fixture(case_root)
+                    selected = iter_dir / "kernel.py"
+                    selected_value = str(selected)
+                    decision_value = selected_value
+                    if case == "missing":
+                        selected_value = None
+                    elif case == "outside":
+                        selected = case_root / "outside.py"
+                        selected.write_text("# outside\n", encoding="utf-8")
+                        selected_value = str(selected)
+                        decision_value = selected_value
+                    elif case == "symlink":
+                        selected.symlink_to(valid)
+                    elif case == "directory":
+                        selected.mkdir()
+                    elif case == "decision_mismatch":
+                        selected.write_text("# selected\n", encoding="utf-8")
+                        decision_value = str(iter_dir / "other.py")
+                    elif case == "decision_symlink_alias":
+                        selected.write_text("# selected\n", encoding="utf-8")
+                        alias = iter_dir / "alias.py"
+                        alias.symlink_to(selected)
+                        decision_value = str(alias)
+
+                    (iter_dir / "branch_results.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "shortlist_ready",
+                                "selected_kernel": selected_value,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    (iter_dir / "decision.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "confirmed_win",
+                                "candidate_file": decision_value,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    branch_result = SimpleNamespace(
+                        returncode=0, stdout="noise", stderr=""
+                    )
+                    runner = mock.Mock(return_value=branch_result)
+                    with mock.patch.object(orchestrate, "_run", runner):
+                        with self.assertRaisesRegex(
+                            SystemExit, "selected_kernel|candidate_file"
+                        ):
+                            orchestrate.cmd_close_iter(args)
+                    self.assertEqual(runner.call_count, 1)
 
     def test_missing_malformed_or_unknown_branch_artifact_fails_clearly(self) -> None:
         orchestrate = _load_orchestrate()

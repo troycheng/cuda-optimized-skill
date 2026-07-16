@@ -42,7 +42,9 @@ import datetime as _dt
 import json
 import math
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -59,6 +61,7 @@ from artifact_store import (  # noqa: E402
     ArtifactStore,
     CURRENT_SCHEMA_VERSION,
     atomic_write_json,
+    sha256_file,
 )
 
 
@@ -119,6 +122,7 @@ _STATISTIC_FIELDS = (
     "ci_high_pct",
     "status",
 )
+_SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
 def _resolved_path(path: str) -> str:
@@ -127,11 +131,19 @@ def _resolved_path(path: str) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
 
+def _absolute_candidate_path(path: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("decision candidate_file and kernel must be non-empty paths")
+    return os.path.abspath(os.path.expanduser(path))
+
+
 def _validate_candidate_contract(
     *, status: str, declared_candidate, candidate_file
 ) -> None:
     if status in _WIN_STATUSES:
-        if _resolved_path(declared_candidate) != _resolved_path(candidate_file):
+        if _absolute_candidate_path(declared_candidate) != _absolute_candidate_path(
+            candidate_file
+        ):
             raise ValueError(
                 "decision.json candidate_file does not match the update kernel"
             )
@@ -143,10 +155,125 @@ def _validate_candidate_contract(
         raise ValueError(
             "decision.json candidate_file conflicts with the supplied kernel"
         )
-    if _resolved_path(declared_candidate) != _resolved_path(candidate_file):
+    if _absolute_candidate_path(declared_candidate) != _absolute_candidate_path(
+        candidate_file
+    ):
         raise ValueError(
             "decision.json candidate_file does not match the update kernel"
         )
+
+
+def _regular_candidate(path: str) -> tuple[Path, os.stat_result]:
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        raise ValueError(f"decision candidate must not be a symlink: {candidate}")
+    try:
+        candidate_stat = candidate.lstat()
+    except OSError as error:
+        raise ValueError(
+            f"decision candidate is missing or unreadable: {candidate}"
+        ) from error
+    if not stat.S_ISREG(candidate_stat.st_mode):
+        raise ValueError(f"decision candidate must be a regular file: {candidate}")
+    return candidate.resolve(strict=True), candidate_stat
+
+
+def _validate_candidate_hash(
+    decision: Mapping, *, status: str, candidate_file: str | None
+) -> str | None:
+    declared_hash = decision.get("candidate_sha256")
+    if candidate_file is None:
+        if declared_hash is not None:
+            raise ValueError(
+                "decision candidate_sha256 requires a candidate_file"
+            )
+        return None
+
+    candidate, _ = _regular_candidate(candidate_file)
+    if declared_hash is None:
+        if status in _WIN_STATUSES:
+            raise ValueError("winning decision requires candidate_sha256")
+        return sha256_file(candidate)
+    if not isinstance(declared_hash, str) or not _SHA256.fullmatch(declared_hash):
+        raise ValueError("decision candidate_sha256 must be 64 hexadecimal characters")
+
+    actual_hash = sha256_file(candidate)
+    if actual_hash != declared_hash.lower():
+        raise ValueError("decision candidate_sha256 does not match candidate content")
+    return actual_hash
+
+
+def _validate_decision_path(path: str, *, iter_dir: str) -> str:
+    expected = Path(os.path.abspath(os.path.join(iter_dir, "decision.json")))
+    actual = Path(os.path.abspath(os.path.expanduser(path)))
+    if actual != expected:
+        raise ValueError(
+            "decision.json must be the decision for the current iteration"
+        )
+    if actual.is_symlink():
+        raise ValueError("decision.json must not be a symlink")
+    try:
+        decision_stat = actual.lstat()
+    except OSError as error:
+        raise ValueError(f"decision.json missing: {actual}") from error
+    if not stat.S_ISREG(decision_stat.st_mode):
+        raise ValueError("decision.json must be a regular file")
+    return str(actual)
+
+
+def _capture_candidate_binding(
+    decision: Mapping,
+    *,
+    status: str,
+    candidate_file: str | None,
+    iter_dir: str,
+) -> dict | None:
+    if candidate_file is None:
+        return None
+
+    candidate, candidate_stat = _regular_candidate(candidate_file)
+    iteration = Path(iter_dir).expanduser().resolve()
+    if candidate.parent != iteration:
+        raise ValueError(
+            "decision candidate must be a file in the current iteration"
+        )
+    actual_hash = _validate_candidate_hash(
+        decision, status=status, candidate_file=str(candidate)
+    )
+    return {
+        "path": str(candidate),
+        "sha256": actual_hash,
+        "device": candidate_stat.st_dev,
+        "inode": candidate_stat.st_ino,
+        "size": candidate_stat.st_size,
+        "mtime_ns": candidate_stat.st_mtime_ns,
+    }
+
+
+def _verify_candidate_binding(binding: dict | None) -> None:
+    """Revalidate the exact candidate immediately before state persistence."""
+    if binding is None:
+        return
+    try:
+        candidate, candidate_stat = _regular_candidate(binding["path"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("candidate changed before state write") from error
+    identity = (
+        candidate_stat.st_dev,
+        candidate_stat.st_ino,
+        candidate_stat.st_size,
+        candidate_stat.st_mtime_ns,
+    )
+    expected_identity = (
+        binding.get("device"),
+        binding.get("inode"),
+        binding.get("size"),
+        binding.get("mtime_ns"),
+    )
+    if identity != expected_identity:
+        raise ValueError("candidate changed before state write")
+    if sha256_file(candidate) != binding.get("sha256"):
+        raise ValueError("candidate sha256 changed before state write")
 
 
 def _validate_decision_statistics(
@@ -210,6 +337,9 @@ def _load_decision(
         status=status,
         declared_candidate=declared_candidate,
         candidate_file=candidate_file,
+    )
+    _validate_candidate_hash(
+        decision, status=status, candidate_file=candidate_file
     )
     statistics = _validate_decision_statistics(
         decision.get("statistics"), required=status in _WIN_STATUSES
@@ -376,6 +506,7 @@ def cmd_update(args: argparse.Namespace) -> None:
     decision_path = getattr(args, "decision", None) or os.path.join(
         iter_dir, "decision.json"
     )
+    decision_path = _validate_decision_path(decision_path, iter_dir=iter_dir)
     (
         decision,
         decision_status,
@@ -383,6 +514,12 @@ def cmd_update(args: argparse.Namespace) -> None:
         workload_statistics,
     ) = _load_decision(
         decision_path, candidate_file=args.kernel
+    )
+    candidate_binding = _capture_candidate_binding(
+        decision,
+        status=decision_status,
+        candidate_file=args.kernel,
+        iter_dir=iter_dir,
     )
     mode = _state_mode(state)
     terminal_status, promote_best = _promotion_for(decision_status, mode)
@@ -534,6 +671,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         "retries": int(args.retries),
     })
 
+    _verify_candidate_binding(candidate_binding)
     _write(args.state, state)
     print(json.dumps({
         "iter": args.iter,
