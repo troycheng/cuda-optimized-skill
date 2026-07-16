@@ -290,6 +290,78 @@ def _note_cleanup_failure(active_error, cleanup_error, context: str) -> None:
         pass
 
 
+def _compile_command_prefix(nvcc_bin: str) -> list[str]:
+    command = [nvcc_bin]
+    if os.name != "nt":
+        command.extend(["-Xcompiler", "-fPIC"])
+    else:
+        command.extend([
+            "-allow-unsupported-compiler",
+            "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+        ])
+    return command
+
+
+def _reset_compile_attempt(
+    final_path: Path,
+    evidence_path: Path,
+    source,
+    compile_command,
+    backend: str,
+    arch: str,
+) -> dict:
+    """Remove prior output and durably replace prior evidence before compiling."""
+    reset_outputs = {
+        stage: None for stage in compiler_evidence.STAGES if stage != "source"
+    }
+    _remove_output(final_path)
+    try:
+        manifest = compiler_evidence.write_fresh_manifest(
+            evidence_path,
+            source=source,
+            discovered=reset_outputs,
+            compile_command=compile_command,
+            backend=backend,
+            arch=arch,
+        )
+    except (OSError, ValueError) as reset_error:
+        manifest_path = evidence_path / "manifest.json"
+        try:
+            _remove_output(manifest_path)
+        except BaseException as revoke_error:
+            _note_cleanup_failure(
+                reset_error, revoke_error, "stale compiler evidence revocation"
+            )
+        raise
+    return _evidence_status(evidence_path, manifest=manifest)
+
+
+def _manifest_record_matches_identity(record, identity: dict) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("status") == "available"
+        and record.get("path") == str(identity["path"])
+        and record.get("sha256") == identity["sha256"]
+        and record.get("size_bytes") == identity["size_bytes"]
+    )
+
+
+def _manifest_binds_published_compile(
+    evidence_status: dict, source_identity: dict, published_identity: dict
+) -> bool:
+    manifest = evidence_status.get("manifest")
+    return (
+        evidence_status.get("status") == "available"
+        and isinstance(manifest, dict)
+        and _manifest_record_matches_identity(
+            manifest.get("source"), source_identity
+        )
+        and _manifest_record_matches_identity(
+            manifest.get("binary"), published_identity
+        )
+    )
+
+
 def _write_private_source_snapshot(directory: Path, data: bytes, suffix: str) -> Path:
     fd, name = tempfile.mkstemp(
         prefix=".source-snapshot-",
@@ -334,27 +406,10 @@ def _compile_cu_with_owner(
     """Compile via a unique attempt file and atomically publish the final binary."""
     final_path = Path(output_so).expanduser().absolute()
     evidence_path = _evidence_dir(cu_file, evidence_dir)
-    cmd_prefix = [nvcc_bin]
-    if os.name != "nt":
-        cmd_prefix.extend(["-Xcompiler", "-fPIC"])
-    else:
-        cmd_prefix.extend([
-            "-allow-unsupported-compiler",
-            "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
-        ])
+    cmd_prefix = _compile_command_prefix(nvcc_bin)
     reset_outputs = {
         stage: None for stage in compiler_evidence.STAGES if stage != "source"
     }
-
-    _remove_output(final_path)
-    evidence_status = _fresh_evidence_safely(
-        evidence_path,
-        source=cu_file,
-        discovered=reset_outputs,
-        compile_command=cmd_prefix,
-        backend=backend,
-        arch=arch,
-    )
 
     attempt_dir = Path(attempt_owner.name)
     os.chmod(attempt_dir, 0o700)
@@ -524,18 +579,23 @@ def _compile_cu_with_owner(
             backend=backend,
             arch=arch,
         )
-        if compiler_evidence.artifact_identity(canonical_path) != source_identity:
-            _remove_output(final_path)
-            _fresh_evidence_safely(
+        if (
+            not _manifest_binds_published_compile(
+                evidence_status, source_identity, published
+            )
+            or compiler_evidence.artifact_identity(canonical_path) != source_identity
+            or compiler_evidence.artifact_identity(final_path) != published
+        ):
+            _reset_compile_attempt(
+                final_path,
                 evidence_path,
-                source=canonical_path,
-                discovered=reset_outputs,
-                compile_command=cmd,
-                backend=backend,
-                arch=arch,
+                canonical_path,
+                cmd,
+                backend,
+                arch,
             )
             print(
-                "Compilation failed:\ncanonical source changed before evidence commit",
+                "Compilation failed:\nfinal compiler evidence identity mismatch",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -558,6 +618,15 @@ def compile_cu(
 ):
     """Compile from a private source snapshot and clean its owner deterministically."""
     final_path = Path(output_so).expanduser().absolute()
+    evidence_path = _evidence_dir(cu_file, evidence_dir)
+    _reset_compile_attempt(
+        final_path,
+        evidence_path,
+        cu_file,
+        _compile_command_prefix(nvcc_bin),
+        backend,
+        arch,
+    )
     attempt_owner = tempfile.TemporaryDirectory(
         prefix=f".{final_path.name}.compile-",
         dir=str(final_path.parent),

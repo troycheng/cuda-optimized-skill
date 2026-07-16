@@ -413,6 +413,93 @@ class CompilerEvidenceTests(unittest.TestCase):
 
 
 class CompilerEvidenceIntegrationTests(unittest.TestCase):
+    def test_owner_construction_failure_invalidates_stale_output_and_evidence(self) -> None:
+        benchmark = _load("benchmark")
+        compiler_evidence = _load("compiler_evidence")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            sass = root / "old.sass"
+            ptx = root / "old.ptx"
+            source.write_text("current source", encoding="utf-8")
+            binary.write_bytes(b"stale-elf")
+            sass.write_text("stale sass", encoding="utf-8")
+            ptx.write_text("stale ptx", encoding="utf-8")
+            compiler_evidence.write_fresh_manifest(
+                root / "compiler_evidence",
+                source=source,
+                binary=binary,
+                discovered={"sass": sass, "ptx": ptx},
+                compile_command=["old-nvcc"],
+                backend="cuda",
+                arch="sm_90",
+            )
+
+            with mock.patch.object(
+                benchmark.tempfile,
+                "TemporaryDirectory",
+                side_effect=OSError("owner construction failed"),
+            ), mock.patch.object(benchmark.subprocess, "run") as run:
+                with self.assertRaisesRegex(OSError, "owner construction failed"):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "new-nvcc", backend="cutlass"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            run.assert_not_called()
+            self.assertFalse(binary.exists())
+        self.assertEqual(manifest["source"]["path"], str(source.resolve()))
+        self.assertEqual(manifest["source"]["status"], "available")
+        self.assertEqual(manifest["backend"], "cutlass")
+        self.assertEqual(manifest["arch"], "sm_120")
+        self.assertEqual(manifest["compile_command"][0], "new-nvcc")
+        self.assertNotEqual(manifest["compile_command"], ["old-nvcc"])
+        for stage in ("binary", "sass", "ptx", "ttir", "ttgir", "llvm_ir"):
+            self.assertEqual(manifest[stage]["status"], "unavailable")
+
+    def test_reset_failure_removes_stale_manifest_and_does_not_compile(self) -> None:
+        benchmark = _load("benchmark")
+        compiler_evidence = _load("compiler_evidence")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            evidence_dir = root / "compiler_evidence"
+            source.write_text("current source", encoding="utf-8")
+            binary.write_bytes(b"stale-elf")
+            compiler_evidence.write_fresh_manifest(
+                evidence_dir,
+                source=source,
+                binary=binary,
+                compile_command=["old-nvcc"],
+                backend="cuda",
+                arch="sm_90",
+            )
+            reset_error = OSError("reset failed")
+
+            with mock.patch.object(
+                benchmark.compiler_evidence,
+                "write_fresh_manifest",
+                side_effect=reset_error,
+            ), mock.patch.object(benchmark.subprocess, "run") as run:
+                with self.assertRaises(OSError) as raised:
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest_path = evidence_dir / "manifest.json"
+
+            self.assertIs(raised.exception, reset_error)
+            run.assert_not_called()
+            self.assertFalse(binary.exists())
+            self.assertFalse(manifest_path.exists())
+
     def test_private_compile_owner_cleans_all_initialization_failures(self) -> None:
         real_temporary_directory = tempfile.TemporaryDirectory
         real_mkstemp = tempfile.mkstemp
@@ -649,6 +736,150 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                 )
             )
 
+            self.assertFalse(binary.exists())
+            self.assertEqual(manifest["binary"]["status"], "unavailable")
+            self.assertEqual(manifest["sass"]["status"], "unavailable")
+
+    def test_compile_rejects_source_aba_during_final_manifest_write(self) -> None:
+        for preprocess in (False, True):
+            with self.subTest(preprocess=preprocess):
+                benchmark = _load("benchmark")
+                real_write_manifest = benchmark.compiler_evidence.write_fresh_manifest
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    source = root / "kernel.cu"
+                    binary = root / "kernel.so"
+                    displaced_old = root / "displaced-old.cu"
+                    staged_new = root / "staged-new.cu"
+                    old_text = "OLD source"
+                    if preprocess:
+                        old_text = (
+                            "#include <__clang_cuda_runtime_wrapper.h>\n" + old_text
+                        )
+                    source.write_text(old_text, encoding="utf-8")
+                    staged_new.write_text("NEW source", encoding="utf-8")
+                    recorded_sources = []
+
+                    def write_manifest_with_source_aba(*args, **kwargs):
+                        if kwargs.get("binary") is None:
+                            return real_write_manifest(*args, **kwargs)
+                        os.replace(source, displaced_old)
+                        os.replace(staged_new, source)
+                        try:
+                            manifest = real_write_manifest(*args, **kwargs)
+                            recorded_sources.append(dict(manifest["source"]))
+                        finally:
+                            source.unlink(missing_ok=True)
+                            os.replace(displaced_old, source)
+                        return manifest
+
+                    def fake_run(command, **_kwargs):
+                        snapshot = Path(command[-1])
+                        if preprocess:
+                            self.assertEqual(
+                                snapshot.read_text(encoding="utf-8").strip(), "OLD source"
+                            )
+                        else:
+                            self.assertEqual(
+                                snapshot.read_text(encoding="utf-8"), "OLD source"
+                            )
+                        Path(command[command.index("-o") + 1]).write_bytes(b"elf-for-old")
+                        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                    with mock.patch.object(
+                        benchmark.subprocess, "run", side_effect=fake_run
+                    ), mock.patch.object(
+                        benchmark.compiler_evidence,
+                        "write_fresh_manifest",
+                        side_effect=write_manifest_with_source_aba,
+                    ):
+                        with self.assertRaises(SystemExit):
+                            benchmark.compile_cu(
+                                str(source),
+                                str(binary),
+                                "sm_120",
+                                "nvcc",
+                                backend="cuda",
+                            )
+
+                    manifest = json.loads(
+                        (root / "compiler_evidence" / "manifest.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(len(recorded_sources), 1)
+                    self.assertEqual(
+                        recorded_sources[0]["sha256"],
+                        hashlib.sha256(b"NEW source").hexdigest(),
+                    )
+                    self.assertEqual(source.read_text(encoding="utf-8"), old_text)
+                    self.assertFalse(binary.exists())
+                    self.assertEqual(
+                        manifest["source"]["sha256"],
+                        hashlib.sha256(old_text.encode()).hexdigest(),
+                    )
+                    for stage in (
+                        "binary",
+                        "sass",
+                        "ptx",
+                        "ttir",
+                        "ttgir",
+                        "llvm_ir",
+                    ):
+                        self.assertEqual(manifest[stage]["status"], "unavailable")
+
+    def test_compile_rejects_binary_aba_during_final_manifest_write(self) -> None:
+        benchmark = _load("benchmark")
+        real_write_manifest = benchmark.compiler_evidence.write_fresh_manifest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            displaced_binary = root / "displaced-kernel.so"
+            staged_other = root / "staged-other.so"
+            source.write_text("source", encoding="utf-8")
+            staged_other.write_bytes(b"other-elf")
+            recorded_binaries = []
+
+            def write_manifest_with_binary_aba(*args, **kwargs):
+                if kwargs.get("binary") is None:
+                    return real_write_manifest(*args, **kwargs)
+                os.replace(binary, displaced_binary)
+                os.replace(staged_other, binary)
+                try:
+                    manifest = real_write_manifest(*args, **kwargs)
+                    recorded_binaries.append(dict(manifest["binary"]))
+                finally:
+                    binary.unlink(missing_ok=True)
+                    os.replace(displaced_binary, binary)
+                return manifest
+
+            def fake_run(command, **_kwargs):
+                Path(command[command.index("-o") + 1]).write_bytes(b"expected-elf")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                benchmark.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                benchmark.compiler_evidence,
+                "write_fresh_manifest",
+                side_effect=write_manifest_with_binary_aba,
+            ):
+                with self.assertRaises(SystemExit):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(len(recorded_binaries), 1)
+            self.assertEqual(
+                recorded_binaries[0]["sha256"],
+                hashlib.sha256(b"other-elf").hexdigest(),
+            )
             self.assertFalse(binary.exists())
             self.assertEqual(manifest["binary"]["status"], "unavailable")
             self.assertEqual(manifest["sass"]["status"], "unavailable")
