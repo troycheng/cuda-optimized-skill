@@ -323,6 +323,55 @@ class StateDecisionPromotionTests(unittest.TestCase):
             self.state.cmd_update(args)
         return json.loads(stdout.getvalue())
 
+    def _attach_sass_status(self, args: argparse.Namespace, status: str) -> None:
+        methods_path = Path(args.methods_json)
+        methods_path.write_text(
+            json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8"
+        )
+        sass_path = methods_path.parent / "sass_check.json"
+        sass_path.write_text(
+            json.dumps(
+                {
+                    "status": status,
+                    "checks": [
+                        {
+                            "method_id": "vectorize",
+                            "status": status,
+                            "verified": status == "passed",
+                            "patterns_missing": ["LDG"] if status == "failed" else [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        args.sass_check = str(sass_path)
+
+    def test_unavailable_or_not_applicable_sass_is_not_implementation_failed(self) -> None:
+        for sass_status in ("unavailable", "not_applicable"):
+            with self.subTest(status=sass_status), tempfile.TemporaryDirectory() as tmp:
+                args, state_path, _candidate, _before = self._fixture(
+                    Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+                )
+                self._attach_sass_status(args, sass_status)
+                self._run_update(args)
+                updated = json.loads(state_path.read_text("utf-8"))
+
+            self.assertEqual(updated["implementation_failed_methods"], [])
+            self.assertEqual(updated["effective_methods"][0]["id"], "vectorize")
+
+    def test_only_failed_sass_status_is_implementation_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, _before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            self._attach_sass_status(args, "failed")
+            self._run_update(args)
+            updated = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(updated["implementation_failed_methods"][0]["id"], "vectorize")
+        self.assertEqual(updated["effective_methods"], [])
+
     def test_full_mode_inner_kernel_win_does_not_promote_best(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args, state_path, _candidate, before = self._fixture(

@@ -859,13 +859,13 @@ def cmd_update(args: argparse.Namespace) -> None:
         attr_info = attribution_data.get(mid, {})
         sass_info = sass_data.get(mid, {})
 
-        sass_verified = sass_info.get("verified", True)  # Default True if no check
+        sass_status = sass_info.get("status", "unavailable")
         contributed = attr_info.get("contributed", None)
         attr_ms = attr_info.get("attribution_ms", None)
 
         m_entry = dict(m)
 
-        if not sass_verified:
+        if sass_status == "failed":
             # SASS signature missing — implementation failed
             m_entry["note"] = f"SASS patterns not found: {sass_info.get('patterns_missing', [])}"
             state["implementation_failed_methods"].append(m_entry)

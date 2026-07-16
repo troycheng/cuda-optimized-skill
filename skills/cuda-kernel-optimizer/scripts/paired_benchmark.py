@@ -16,7 +16,12 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from benchmark import measure_once, prepare_solution, warm_solution  # noqa: E402
+from benchmark import (  # noqa: E402
+    cleanup_solution,
+    measure_once,
+    prepare_solution,
+    warm_solution,
+)
 from telemetry import read_gpu_telemetry, validate_block  # noqa: E402
 
 
@@ -194,7 +199,7 @@ def run_paired(
             }
         )
 
-    return {
+    result = {
         "baseline_file": baseline_file,
         "candidate_file": candidate_file,
         "backend": backend,
@@ -203,3 +208,6 @@ def run_paired(
         "warmup": warmup_count,
         "pairs": pairs,
     }
+    cleanup_solution(baseline_state)
+    cleanup_solution(candidate_state)
+    return result

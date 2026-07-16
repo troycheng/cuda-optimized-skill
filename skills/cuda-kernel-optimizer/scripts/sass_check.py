@@ -72,35 +72,92 @@ def check_method_sass(
     result = {
         "method_id": method_id,
         "verified": False,
+        "status": "unavailable",
         "patterns_checked": [],
         "patterns_found": [],
         "patterns_missing": [],
     }
 
-    method_sigs = signatures.get("methods", {}).get(method_id, {})
+    methods = signatures.get("methods", {})
+    if not isinstance(methods, dict) or method_id not in methods:
+        result["note"] = "method_signature_unavailable"
+        return result
+    method_sigs = methods.get(method_id)
+    if not isinstance(method_sigs, dict):
+        result["note"] = "method_signature_invalid"
+        return result
     patterns = method_sigs.get("sass_patterns", [])
-    require_any = method_sigs.get("require_any", True)  # True = at least one pattern found
+    require_any = method_sigs.get("require_any", True)
 
     if not patterns:
-        # No patterns defined for this method — skip (vacuously true)
-        result["verified"] = True
+        result["status"] = "not_applicable"
         result["note"] = "no_patterns_defined"
+        return result
+    if not isinstance(patterns, list) or not all(
+        type(pattern) is str and pattern for pattern in patterns
+    ) or type(require_any) is not bool:
+        result["note"] = "method_signature_invalid"
         return result
 
     result["patterns_checked"] = patterns
 
-    for pattern in patterns:
-        if re.search(pattern, sass_text, re.IGNORECASE):
-            result["patterns_found"].append(pattern)
-        else:
-            result["patterns_missing"].append(pattern)
+    try:
+        for pattern in patterns:
+            if re.search(pattern, sass_text, re.IGNORECASE):
+                result["patterns_found"].append(pattern)
+            else:
+                result["patterns_missing"].append(pattern)
+    except re.error as error:
+        result["note"] = f"invalid_sass_pattern: {error}"
+        return result
 
     if require_any:
         result["verified"] = len(result["patterns_found"]) > 0
     else:
         # require_all
         result["verified"] = len(result["patterns_missing"]) == 0
+    result["status"] = "passed" if result["verified"] else "failed"
 
+    return result
+
+
+def _status_checks(methods_list: list, status: str, note: str) -> list:
+    return [
+        {
+            "method_id": method.get("id", "unknown"),
+            "verified": False,
+            "status": status,
+            "patterns_checked": [],
+            "patterns_found": [],
+            "patterns_missing": [],
+            "note": note,
+        }
+        for method in methods_list
+    ]
+
+
+def _checks_status(checks: list) -> str:
+    statuses = {check.get("status") for check in checks}
+    if "failed" in statuses:
+        return "failed"
+    if "passed" in statuses:
+        return "passed"
+    if statuses == {"not_applicable"}:
+        return "not_applicable"
+    return "unavailable"
+
+
+def _binary_matches_record(identity: dict, record: dict) -> bool:
+    return (
+        record.get("status") == "available"
+        and record.get("path") == str(identity["path"])
+        and record.get("sha256") == identity["sha256"]
+        and record.get("size_bytes") == identity["size_bytes"]
+    )
+
+
+def _write_and_return(iter_dir: str, result: dict) -> dict:
+    _write_result(iter_dir, result)
     return result
 
 
@@ -136,57 +193,123 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
 
     # For Triton kernels, SASS check is not directly applicable
     if kernel_path.endswith(".py"):
-        checks = []
-        for m in methods_list:
-            checks.append({
-                "method_id": m.get("id", "unknown"),
-                "verified": True,
-                "note": "triton_kernel_sass_not_applicable",
-            })
-        result = {"kernel": kernel_path, "backend": "triton", "checks": checks}
-        _write_result(iter_dir, result)
-        return result
+        checks = _status_checks(
+            methods_list, "not_applicable", "triton_kernel_sass_not_applicable"
+        )
+        return _write_and_return(iter_dir, {
+            "kernel": kernel_path,
+            "backend": "triton",
+            "status": "not_applicable",
+            "binary_sha256": None,
+            "checks": checks,
+        })
 
     # CUDA/CUTLASS: find .so and dump SASS
     so_path = _find_so_file(kernel_path)
     evidence_dir = Path(iter_dir) / "compiler_evidence"
     if not so_path:
-        compiler_evidence.update_manifest(
-            evidence_dir,
-            source=kernel_path,
-            discovered={"binary": None, "sass": None},
+        checks = _status_checks(methods_list, "unavailable", "binary_not_found")
+        return _write_and_return(iter_dir, {
+            "error": "so_not_found",
+            "kernel": kernel_path,
+            "backend": "cuda",
+            "status": "unavailable",
+            "binary_sha256": None,
+            "checks": checks,
+        })
+
+    try:
+        manifest = compiler_evidence.load_manifest(evidence_dir)
+    except (OSError, ValueError) as error:
+        checks = _status_checks(
+            methods_list, "unavailable", f"compiler_evidence_unavailable: {error}"
         )
-        return {"error": "so_not_found", "kernel": kernel_path, "checks": []}
+        return _write_and_return(iter_dir, {
+            "kernel": kernel_path,
+            "so": so_path,
+            "backend": "cuda",
+            "status": "unavailable",
+            "binary_sha256": None,
+            "checks": checks,
+        })
+
+    before_dump = compiler_evidence.artifact_identity(so_path)
+    if before_dump is None or not _binary_matches_record(
+        before_dump, manifest["binary"]
+    ):
+        checks = _status_checks(
+            methods_list, "unavailable", "binary_evidence_mismatch"
+        )
+        return _write_and_return(iter_dir, {
+            "kernel": kernel_path,
+            "so": so_path,
+            "backend": "cuda",
+            "status": "unavailable",
+            "binary_sha256": None,
+            "checks": checks,
+        })
 
     sass_text = _dump_sass(so_path)
 
     if sass_text.startswith("ERROR:"):
         compiler_evidence.update_manifest(
             evidence_dir,
-            source=kernel_path,
-            binary=so_path,
             discovered={"sass": None},
         )
-        checks = []
-        for m in methods_list:
-            checks.append({
-                "method_id": m.get("id", "unknown"),
-                "verified": False,
-                "status": "unavailable",
-                "note": f"cuobjdump_unavailable: {sass_text}",
-            })
-        result = {"kernel": kernel_path, "backend": "cuda", "sass_error": sass_text, "checks": checks}
-        _write_result(iter_dir, result)
-        return result
+        checks = _status_checks(
+            methods_list, "unavailable", f"cuobjdump_unavailable: {sass_text}"
+        )
+        return _write_and_return(iter_dir, {
+            "kernel": kernel_path,
+            "so": so_path,
+            "backend": "cuda",
+            "status": "unavailable",
+            "binary_sha256": before_dump["sha256"],
+            "sass_error": sass_text,
+            "checks": checks,
+        })
+
+    after_dump = compiler_evidence.artifact_identity(so_path)
+    if after_dump != before_dump:
+        try:
+            compiler_evidence.update_manifest(
+                evidence_dir, discovered={"binary": None, "sass": None}
+            )
+        except (OSError, ValueError):
+            pass
+        checks = _status_checks(
+            methods_list, "unavailable", "binary_changed_during_sass_dump"
+        )
+        return _write_and_return(iter_dir, {
+            "kernel": kernel_path,
+            "so": so_path,
+            "backend": "cuda",
+            "status": "unavailable",
+            "binary_sha256": None,
+            "checks": checks,
+        })
 
     sass_path = evidence_dir / "sass.txt"
-    compiler_evidence.atomic_write_text(sass_path, sass_text)
-    compiler_evidence.update_manifest(
-        evidence_dir,
-        source=kernel_path,
-        binary=so_path,
-        discovered={"sass": sass_path},
-    )
+    try:
+        compiler_evidence.atomic_write_text(sass_path, sass_text)
+        manifest = compiler_evidence.update_manifest(
+            evidence_dir,
+            binary=so_path,
+            discovered={"sass": sass_path},
+            binary_sha256=before_dump["sha256"],
+        )
+    except (OSError, ValueError) as error:
+        checks = _status_checks(
+            methods_list, "unavailable", f"sass_evidence_write_failed: {error}"
+        )
+        return _write_and_return(iter_dir, {
+            "kernel": kernel_path,
+            "so": so_path,
+            "backend": "cuda",
+            "status": "unavailable",
+            "binary_sha256": None,
+            "checks": checks,
+        })
 
     # Check each method
     checks = []
@@ -199,6 +322,8 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
         "kernel": kernel_path,
         "so": so_path,
         "backend": "cuda",
+        "status": _checks_status(checks),
+        "binary_sha256": manifest["binary_sha256"],
         "sass_lines": len(sass_text.splitlines()),
         "checks": checks,
     }

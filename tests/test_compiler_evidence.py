@@ -153,7 +153,118 @@ class CompilerEvidenceTests(unittest.TestCase):
             )
 
         self.assertEqual(updated["binary"]["status"], "unavailable")
-        self.assertEqual(updated["sass"]["status"], "available")
+        self.assertEqual(updated["sass"]["status"], "unavailable")
+
+    def test_merge_marks_content_tampered_non_overridden_stage_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            sass = root / "sass.txt"
+            source.write_text("original", encoding="utf-8")
+            sass.write_text("sass", encoding="utf-8")
+            evidence_dir = root / "compiler_evidence"
+            original = self.compiler_evidence.update_manifest(
+                evidence_dir, source=source, backend="cuda", arch="sm_120"
+            )
+            source.write_text("tampered", encoding="utf-8")
+
+            updated = self.compiler_evidence.update_manifest(
+                evidence_dir, discovered={"sass": sass}
+            )
+
+        self.assertNotEqual(
+            original["source"]["sha256"],
+            self.compiler_evidence.collect(source=source)["source"]["sha256"],
+        )
+        self.assertEqual(updated["source"]["status"], "unavailable")
+
+    def test_manifest_schema_rejects_extra_fields_and_incoherent_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            source.write_text("source", encoding="utf-8")
+            evidence_dir = root / "compiler_evidence"
+            self.compiler_evidence.update_manifest(
+                evidence_dir, source=source, backend="cuda", arch="sm_120"
+            )
+            manifest_path = evidence_dir / "manifest.json"
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["unexpected"] = True
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "top-level"):
+                self.compiler_evidence.update_manifest(evidence_dir)
+
+            payload.pop("unexpected")
+            payload["source"]["extra"] = "forged"
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "source"):
+                self.compiler_evidence.update_manifest(evidence_dir)
+
+    def test_collect_rejects_forged_compile_metadata(self) -> None:
+        for kwargs in (
+            {"compile_command": ["nvcc", ""]},
+            {"backend": "forged"},
+            {"arch": []},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.compiler_evidence.collect(**kwargs)
+
+    def test_fresh_manifest_overwrites_corrupt_previous_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            source.write_text("source", encoding="utf-8")
+            evidence_dir = root / "compiler_evidence"
+            evidence_dir.mkdir()
+            (evidence_dir / "manifest.json").write_text(
+                "{not-json", encoding="utf-8"
+            )
+
+            result = self.compiler_evidence.write_fresh_manifest(
+                evidence_dir,
+                source=source,
+                compile_command=["nvcc"],
+                backend="cuda",
+                arch="sm_120",
+            )
+
+        self.assertEqual(result["source"]["status"], "available")
+
+    def test_parent_symlink_switch_during_hashing_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_dir = root / "first"
+            second_dir = root / "second"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            (first_dir / "kernel.ptx").write_text("first", encoding="utf-8")
+            (second_dir / "kernel.ptx").write_text("second", encoding="utf-8")
+            linked_dir = root / "active"
+            try:
+                linked_dir.symlink_to(first_dir, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+            candidate = linked_dir / "kernel.ptx"
+            real_open = os.open
+            switched = False
+
+            def switching_open(path, flags, *args, **kwargs):
+                nonlocal switched
+                if not switched:
+                    switched = True
+                    linked_dir.unlink()
+                    linked_dir.symlink_to(second_dir, target_is_directory=True)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                self.compiler_evidence.os, "open", side_effect=switching_open
+            ):
+                result = self.compiler_evidence.collect(
+                    discovered={"ptx": candidate}, backend="triton"
+                )
+
+        self.assertEqual(result["ptx"]["status"], "unavailable")
 
     def test_failed_atomic_replace_leaves_previous_manifest_readable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,6 +350,37 @@ class CompilerEvidenceTests(unittest.TestCase):
             {},
         )
 
+    def test_triton_cache_never_combines_stages_from_different_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            ttir = cache / "unit-a" / "kernel.ttir"
+            ptx = cache / "unit-b" / "kernel.ptx"
+            ttir.parent.mkdir()
+            ptx.parent.mkdir()
+            ttir.write_text("ttir", encoding="utf-8")
+            ptx.write_text("ptx", encoding="utf-8")
+
+            discovered = self.compiler_evidence.discover_triton_cache(cache, {})
+
+        self.assertEqual(len(discovered), 1)
+        self.assertNotEqual(set(discovered), {"ttir", "ptx"})
+
+    def test_triton_snapshot_detects_same_size_same_mtime_content_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            ptx = cache / "unit" / "kernel.ptx"
+            ptx.parent.mkdir()
+            ptx.write_text("first", encoding="utf-8")
+            timestamp_ns = 1_700_000_000_000_000_000
+            os.utime(ptx, ns=(timestamp_ns, timestamp_ns))
+            before = self.compiler_evidence.snapshot_cache(cache)
+            ptx.write_text("other", encoding="utf-8")
+            os.utime(ptx, ns=(timestamp_ns, timestamp_ns))
+
+            discovered = self.compiler_evidence.discover_triton_cache(cache, before)
+
+        self.assertEqual(discovered["ptx"], ptx.resolve())
+
     def test_rejects_unknown_stage_names(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown compiler stage"):
             self.compiler_evidence.collect(discovered={"made_up": "x"})
@@ -255,8 +397,14 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                 'extern "C" void solve(float *out) {}', encoding="utf-8"
             )
 
+            commands = []
+
             def fake_run(command, **_kwargs):
-                Path(command[command.index("-o") + 1]).write_bytes(b"elf")
+                commands.append(list(command))
+                attempt = Path(command[command.index("-o") + 1])
+                self.assertEqual(attempt.parent, binary.parent)
+                self.assertNotEqual(attempt, binary)
+                attempt.write_bytes(b"elf")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with mock.patch.object(benchmark.subprocess, "run", side_effect=fake_run):
@@ -269,12 +417,16 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            binary_bytes = binary.read_bytes()
+            attempts = list(root.glob(".*.attempt-*"))
 
         self.assertEqual(manifest["backend"], "cuda")
         self.assertEqual(manifest["arch"], "sm_120")
         self.assertEqual(manifest["binary"]["status"], "available")
         self.assertEqual(manifest["compile_command"][0], "nvcc")
         self.assertNotIn("-lineinfo", manifest["compile_command"])
+        self.assertEqual(binary_bytes, b"elf")
+        self.assertEqual(attempts, [])
 
     def test_compile_failure_invalidates_stale_binary_evidence(self) -> None:
         benchmark = _load("benchmark")
@@ -310,6 +462,7 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(manifest["binary"]["status"], "unavailable")
+        self.assertFalse(binary.exists())
         self.assertEqual(manifest["source"]["status"], "available")
         self.assertEqual(manifest["arch"], "sm_120")
         self.assertEqual(manifest["compile_command"][0], "nvcc")
@@ -367,6 +520,7 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
             source.write_text(
                 'extern "C" void solve(float *out) {}', encoding="utf-8"
             )
+            binary.write_bytes(b"stale-elf")
             succeeded_without_output = SimpleNamespace(
                 returncode=0, stdout="", stderr=""
             )
@@ -385,6 +539,112 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                 )
             )
 
+        self.assertEqual(manifest["binary"]["status"], "unavailable")
+        self.assertFalse(binary.exists())
+
+    def test_cutlass_header_early_exit_invalidates_old_output_and_evidence(self) -> None:
+        benchmark = _load("benchmark")
+        compiler_evidence = _load("compiler_evidence")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            sass = root / "old.sass"
+            source.write_text(
+                'extern "C" void solve(float *out) {}', encoding="utf-8"
+            )
+            binary.write_bytes(b"stale")
+            sass.write_text("stale", encoding="utf-8")
+            compiler_evidence.update_manifest(
+                root / "compiler_evidence",
+                source=source,
+                binary=binary,
+                discovered={"sass": sass},
+                compile_command=["old-nvcc"],
+                backend="cuda",
+                arch="sm_90",
+            )
+
+            with mock.patch.object(benchmark, "find_cutlass_include_dir", return_value=""):
+                with self.assertRaises(SystemExit):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cutlass"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertFalse(binary.exists())
+        self.assertEqual(manifest["backend"], "cutlass")
+        self.assertEqual(manifest["arch"], "sm_120")
+        self.assertEqual(manifest["binary"]["status"], "unavailable")
+        self.assertEqual(manifest["sass"]["status"], "unavailable")
+
+    def test_preprocess_failure_invalidates_old_output_and_records_attempt(self) -> None:
+        benchmark = _load("benchmark")
+        compiler_evidence = _load("compiler_evidence")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "missing.cu"
+            binary = root / "kernel.so"
+            old_source = root / "old.cu"
+            old_source.write_text("old", encoding="utf-8")
+            binary.write_bytes(b"stale")
+            compiler_evidence.update_manifest(
+                root / "compiler_evidence",
+                source=old_source,
+                binary=binary,
+                compile_command=["old-nvcc"],
+                backend="cuda",
+                arch="sm_90",
+            )
+
+            with self.assertRaises(OSError):
+                benchmark.compile_cu(
+                    str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertFalse(binary.exists())
+        self.assertEqual(manifest["backend"], "cuda")
+        self.assertEqual(manifest["arch"], "sm_120")
+        self.assertEqual(manifest["source"]["status"], "unavailable")
+        self.assertEqual(manifest["binary"]["status"], "unavailable")
+
+    def test_spawn_failure_invalidates_old_output(self) -> None:
+        benchmark = _load("benchmark")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            source.write_text(
+                'extern "C" void solve(float *out) {}', encoding="utf-8"
+            )
+            binary.write_bytes(b"stale")
+
+            with mock.patch.object(
+                benchmark.subprocess, "run", side_effect=OSError("spawn failed")
+            ):
+                with self.assertRaises(SystemExit):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertFalse(binary.exists())
         self.assertEqual(manifest["binary"]["status"], "unavailable")
 
     def test_preprocessed_compile_records_canonical_source_not_temporary_copy(self) -> None:
@@ -459,12 +719,111 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            benchmark.cleanup_solution(state)
 
         self.assertEqual(manifest["backend"], "triton")
         self.assertEqual(manifest["ttir"]["status"], "available")
         self.assertEqual(manifest["ptx"]["status"], "available")
         self.assertTrue(manifest["ptx"]["path"].endswith("hash/kernel.ptx"))
         self.assertEqual(manifest["binary"]["status"], "unavailable")
+
+    def test_triton_uses_isolated_cache_for_import_setup_and_launch(self) -> None:
+        benchmark = _load("benchmark")
+
+        class FakeTensor:
+            pass
+
+        benchmark.torch = SimpleNamespace(Tensor=FakeTensor)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ambient = root / "ambient-cache"
+            ambient.mkdir()
+            (ambient / "unrelated.ptx").write_text("ambient", encoding="utf-8")
+            evidence_dir = root / "evidence"
+            source = root / "kernel.py"
+            source.write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "IMPORT_CACHE = os.environ.get('TRITON_CACHE_DIR')\n"
+                "def setup(**kwargs):\n"
+                "    global SETUP_CACHE\n"
+                "    SETUP_CACHE = os.environ.get('TRITON_CACHE_DIR')\n"
+                "    return {'inputs': {'n': kwargs['n']}, 'outputs': []}\n"
+                "def run_kernel(**kwargs):\n"
+                "    cache = os.environ.get('TRITON_CACHE_DIR')\n"
+                "    if cache != IMPORT_CACHE or cache != SETUP_CACHE:\n"
+                "        raise RuntimeError('cache changed across lifecycle')\n"
+                "    unit = Path(cache) / 'compile-key'\n"
+                "    unit.mkdir(parents=True, exist_ok=True)\n"
+                "    (unit / 'kernel.ttir').write_text('ttir')\n"
+                "    (unit / 'kernel.ptx').write_text('ptx')\n"
+                "    return cache\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ, {"TRITON_CACHE_DIR": str(ambient)}, clear=False
+            ):
+                state = benchmark._setup_triton(
+                    str(source),
+                    {"n": 1},
+                    seed=1,
+                    arch="sm_120",
+                    evidence_dir=evidence_dir,
+                )
+                isolated = Path(
+                    state["_compiler_evidence_runtime"]["cache_dir"]
+                ).resolve()
+                self.assertNotEqual(isolated, ambient.resolve())
+                self.assertTrue(isolated.exists())
+                self.assertEqual(os.environ["TRITON_CACHE_DIR"], str(ambient))
+                self.assertEqual(Path(state["callable"]()).resolve(), isolated)
+                self.assertEqual(os.environ["TRITON_CACHE_DIR"], str(ambient))
+                benchmark._record_triton_compiler_evidence(state)
+
+            manifest = json.loads(
+                (evidence_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(Path(manifest["ptx"]["path"]).is_relative_to(isolated))
+            self.assertNotEqual(
+                Path(manifest["ptx"]["path"]), ambient / "unrelated.ptx"
+            )
+            self.assertTrue(isolated.exists())
+            benchmark.cleanup_solution(state)
+            self.assertFalse(isolated.exists())
+
+    def test_readonly_triton_source_does_not_block_benchmark_evidence(self) -> None:
+        benchmark = _load("benchmark")
+
+        class FakeTensor:
+            pass
+
+        benchmark.torch = SimpleNamespace(Tensor=FakeTensor)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "readonly"
+            source_dir.mkdir()
+            source = source_dir / "kernel.py"
+            source.write_text(
+                "def setup(**kwargs):\n"
+                "    return {'inputs': {'n': kwargs['n']}, 'outputs': []}\n"
+                "def run_kernel(**kwargs):\n"
+                "    return None\n",
+                encoding="utf-8",
+            )
+            source_dir.chmod(0o555)
+            try:
+                state = benchmark._setup_triton(
+                    str(source), {"n": 1}, seed=1, arch="sm_120"
+                )
+                state["callable"]()
+                benchmark._record_triton_compiler_evidence(state)
+            finally:
+                source_dir.chmod(0o755)
+
+        self.assertEqual(state["compiler_evidence"]["status"], "unavailable")
+        self.assertTrue(state["compiler_evidence"]["error"])
+        benchmark.cleanup_solution(state)
 
     def test_zero_warmup_does_not_finalize_triton_cache_before_first_launch(self) -> None:
         benchmark = _load("benchmark")
@@ -479,6 +838,7 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
 
     def test_sass_dump_is_persisted_and_merged_into_compiler_manifest(self) -> None:
         sass_check = _load("sass_check")
+        compiler_evidence = _load("compiler_evidence")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             iter_dir = root / "iterv1"
@@ -487,6 +847,14 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
             binary = iter_dir / "kernel.so"
             source.write_text("source", encoding="utf-8")
             binary.write_bytes(b"elf")
+            compiler_evidence.write_fresh_manifest(
+                iter_dir / "compiler_evidence",
+                source=source,
+                binary=binary,
+                compile_command=["nvcc", "kernel.cu"],
+                backend="cuda",
+                arch="sm_120",
+            )
             (iter_dir / "methods.json").write_text(
                 json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8"
             )
@@ -523,6 +891,140 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
         self.assertEqual(manifest["source"]["status"], "available")
         self.assertEqual(manifest["binary"]["status"], "available")
         self.assertEqual(manifest["sass"]["status"], "available")
+        self.assertEqual(result["binary_sha256"], manifest["binary"]["sha256"])
+        self.assertEqual(manifest["binary_sha256"], manifest["binary"]["sha256"])
+        self.assertEqual(result["checks"][0]["status"], "passed")
+
+    def test_sass_method_status_is_tri_state_and_never_vacuously_verified(self) -> None:
+        sass_check = _load("sass_check")
+        signatures = {
+            "methods": {
+                "empty": {"sass_patterns": [], "require_any": True},
+                "required": {"sass_patterns": ["LDG"], "require_any": True},
+            }
+        }
+
+        unknown = sass_check.check_method_sass("unknown", "LDG", signatures)
+        not_applicable = sass_check.check_method_sass("empty", "LDG", signatures)
+        failed = sass_check.check_method_sass("required", "NOP", signatures)
+        passed = sass_check.check_method_sass("required", "LDG", signatures)
+
+        self.assertEqual((unknown["status"], unknown["verified"]), ("unavailable", False))
+        self.assertEqual(
+            (not_applicable["status"], not_applicable["verified"]),
+            ("not_applicable", False),
+        )
+        self.assertEqual((failed["status"], failed["verified"]), ("failed", False))
+        self.assertEqual((passed["status"], passed["verified"]), ("passed", True))
+
+    def test_sass_requires_current_bound_binary_manifest(self) -> None:
+        sass_check = _load("sass_check")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            (iter_dir / "kernel.cu").write_text("source", encoding="utf-8")
+            (iter_dir / "kernel.so").write_bytes(b"elf")
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8"
+            )
+            state = root / "state.json"
+            state.write_text(json.dumps({"run_dir": str(root)}), encoding="utf-8")
+
+            with mock.patch.object(sass_check, "_dump_sass") as dump:
+                result = sass_check.run(str(state), 1)
+
+        dump.assert_not_called()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertFalse(result["checks"][0]["verified"])
+
+    def test_sass_rejects_symlink_binary_without_dumping(self) -> None:
+        sass_check = _load("sass_check")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            source = iter_dir / "kernel.cu"
+            source.write_text("source", encoding="utf-8")
+            real_binary = root / "real.so"
+            real_binary.write_bytes(b"elf")
+            linked_binary = iter_dir / "kernel.so"
+            try:
+                linked_binary.symlink_to(real_binary)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8"
+            )
+            state = root / "state.json"
+            state.write_text(json.dumps({"run_dir": str(root)}), encoding="utf-8")
+
+            with mock.patch.object(sass_check, "_dump_sass") as dump:
+                result = sass_check.run(str(state), 1)
+
+        dump.assert_not_called()
+        self.assertEqual(result["status"], "unavailable")
+
+    def test_sass_fails_closed_when_binary_is_replaced_during_dump(self) -> None:
+        sass_check = _load("sass_check")
+        compiler_evidence = _load("compiler_evidence")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            source = iter_dir / "kernel.cu"
+            binary = iter_dir / "kernel.so"
+            source.write_text("source", encoding="utf-8")
+            binary.write_bytes(b"original-elf")
+            compiler_evidence.write_fresh_manifest(
+                iter_dir / "compiler_evidence",
+                source=source,
+                binary=binary,
+                compile_command=["nvcc"],
+                backend="cuda",
+                arch="sm_120",
+            )
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8"
+            )
+            state = root / "state.json"
+            state.write_text(json.dumps({"run_dir": str(root)}), encoding="utf-8")
+
+            def replace_during_dump(_path):
+                replacement = iter_dir / "replacement.so"
+                replacement.write_bytes(b"replacement-elf")
+                os.replace(replacement, binary)
+                return "LDG.E"
+
+            with mock.patch.object(
+                sass_check, "_dump_sass", side_effect=replace_during_dump
+            ):
+                result = sass_check.run(str(state), 1)
+
+            manifest = compiler_evidence.load_manifest(iter_dir / "compiler_evidence")
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertFalse(result["checks"][0]["verified"])
+        self.assertEqual(manifest["sass"]["status"], "unavailable")
+
+    def test_triton_sass_is_not_applicable_and_not_verified(self) -> None:
+        sass_check = _load("sass_check")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            (iter_dir / "kernel.py").write_text("# triton", encoding="utf-8")
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": [{"id": "triton_method"}]}), encoding="utf-8"
+            )
+            state = root / "state.json"
+            state.write_text(json.dumps({"run_dir": str(root)}), encoding="utf-8")
+
+            result = sass_check.run(str(state), 1)
+
+        self.assertEqual(result["status"], "not_applicable")
+        self.assertEqual(result["checks"][0]["status"], "not_applicable")
+        self.assertFalse(result["checks"][0]["verified"])
 
     def test_unavailable_cuobjdump_is_not_reported_as_verified(self) -> None:
         sass_check = _load("sass_check")

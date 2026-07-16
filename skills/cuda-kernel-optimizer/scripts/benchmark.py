@@ -26,11 +26,14 @@ import json
 import math
 import copy
 import glob
+import stat
+import tempfile
 import subprocess
 import ctypes
 import argparse
 import statistics
 import importlib.util
+from contextlib import contextmanager
 from numbers import Real
 from pathlib import Path
 
@@ -160,9 +163,15 @@ def _preprocess_cu(cu_file: str) -> str:
     cleaned = _STRIP_INCLUDES.sub("", src)
     if cleaned == src:
         return cu_file
-    tmp = cu_file + ".nvcc_clean.cu"
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{Path(cu_file).name}.",
+        suffix=".nvcc_clean.cu",
+        dir=str(Path(cu_file).parent),
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(cleaned)
+        f.flush()
+        os.fsync(f.fileno())
     return tmp
 
 
@@ -200,94 +209,217 @@ def find_cutlass_include_dir() -> str:
 
 
 
-def compile_cu(cu_file: str, output_so: str, arch: str, nvcc_bin: str, backend: str = "cuda"):
-    """Compile .cu to a shared library."""
-    clean_file = _preprocess_cu(cu_file)
+_EVIDENCE_DIR_ENV = "CUDA_KERNEL_OPTIMIZER_EVIDENCE_DIR"
+
+
+def _evidence_dir(source_file, explicit=None) -> Path:
+    configured = explicit or os.environ.get(_EVIDENCE_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(source_file).expanduser().absolute().parent / "compiler_evidence"
+
+
+def _evidence_status(evidence_dir: Path, manifest=None, error=None) -> dict:
+    return {
+        "status": "available" if error is None else "unavailable",
+        "manifest_path": str(evidence_dir / "manifest.json"),
+        "error": None if error is None else str(error),
+        "manifest": manifest,
+    }
+
+
+def _fresh_evidence_safely(evidence_dir: Path, **kwargs) -> dict:
     try:
-        source = Path(cu_file).read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        source = ""
-    cmd = [nvcc_bin]
+        manifest = compiler_evidence.write_fresh_manifest(evidence_dir, **kwargs)
+    except (OSError, ValueError) as error:
+        return _evidence_status(evidence_dir, error=error)
+    return _evidence_status(evidence_dir, manifest=manifest)
+
+
+def _update_evidence_safely(evidence_dir: Path, **kwargs) -> dict:
+    try:
+        manifest = compiler_evidence.update_manifest(evidence_dir, **kwargs)
+    except (OSError, ValueError) as error:
+        return _evidence_status(evidence_dir, error=error)
+    return _evidence_status(evidence_dir, manifest=manifest)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _remove_output(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+        raise OSError(f"compile output is a directory: {path}")
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _fsync_regular_file(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        details = os.fstat(fd)
+        if not stat.S_ISREG(details.st_mode):
+            raise OSError(f"compile attempt is not a regular file: {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def compile_cu(
+    cu_file: str,
+    output_so: str,
+    arch: str,
+    nvcc_bin: str,
+    backend: str = "cuda",
+    evidence_dir=None,
+):
+    """Compile via a unique attempt file and atomically publish the final binary."""
+    final_path = Path(output_so).expanduser().absolute()
+    evidence_path = _evidence_dir(cu_file, evidence_dir)
+    cmd_prefix = [nvcc_bin]
     if os.name != "nt":
-        cmd.extend(["-Xcompiler", "-fPIC"])
+        cmd_prefix.extend(["-Xcompiler", "-fPIC"])
     else:
-        cmd.extend([
+        cmd_prefix.extend([
             "-allow-unsupported-compiler",
             "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
         ])
-
-    if backend == "cutlass":
-        cutlass_include_dir = find_cutlass_include_dir()
-        if not cutlass_include_dir:
-            if clean_file != cu_file and os.path.exists(clean_file):
-                os.remove(clean_file)
-            print(
-                "Compilation failed:\n"
-                "Cannot locate CUTLASS headers. Set CUTLASS_PATH or CUTLASS_INCLUDE_DIR, "
-                "or install CUTLASS under a standard path such as /usr/local/cutlass*/include.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        cmd.extend(["-I", cutlass_include_dir])
-
-    if "#include <cublas_v2.h>" in source or "#include <cublasLt.h>" in source:
-        cmd.extend(["-lcublas", "-lcublasLt"])
-
-    cmd.extend(["-shared", "-std=c++17", f"-arch={arch}", "-O3", "-o", output_so, clean_file])
     reset_outputs = {
         stage: None for stage in compiler_evidence.STAGES if stage != "source"
     }
-    print(f"[compile] {' '.join(cmd)}")
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-        )
-    except OSError as exc:
-        if clean_file != cu_file and os.path.exists(clean_file):
-            os.remove(clean_file)
-        compiler_evidence.update_manifest(
-            Path(output_so).parent / "compiler_evidence",
-            source=cu_file,
-            discovered=reset_outputs,
-            compile_command=cmd,
-            backend=backend,
-            arch=arch,
-        )
-        print(f"Compilation failed:\n{exc}", file=sys.stderr)
-        sys.exit(1)
-    if clean_file != cu_file and os.path.exists(clean_file):
-        os.remove(clean_file)
-    if result.returncode != 0:
-        compiler_evidence.update_manifest(
-            Path(output_so).parent / "compiler_evidence",
-            source=cu_file,
-            discovered=reset_outputs,
-            compile_command=cmd,
-            backend=backend,
-            arch=arch,
-        )
-        print(f"Compilation failed:\n{result.stderr}", file=sys.stderr)
-        sys.exit(1)
-    evidence = compiler_evidence.update_manifest(
-        Path(output_so).parent / "compiler_evidence",
+
+    _remove_output(final_path)
+    evidence_status = _fresh_evidence_safely(
+        evidence_path,
         source=cu_file,
-        binary=output_so,
         discovered=reset_outputs,
-        compile_command=cmd,
+        compile_command=cmd_prefix,
         backend=backend,
         arch=arch,
     )
-    if evidence["binary"]["status"] != "available":
-        print(
-            f"Compilation failed:\nnvcc did not produce a real output binary: {output_so}",
-            file=sys.stderr,
+
+    fd, attempt_name = tempfile.mkstemp(
+        prefix=f".{final_path.name}.attempt-",
+        suffix=final_path.suffix,
+        dir=str(final_path.parent),
+    )
+    os.close(fd)
+    attempt_path = Path(attempt_name)
+    attempt_path.unlink()
+    clean_file = cu_file
+    cmd = list(cmd_prefix)
+    try:
+        source = Path(cu_file).read_text(encoding="utf-8", errors="ignore")
+        cleaned = _STRIP_INCLUDES.sub("", source)
+        if cleaned != source:
+            clean_fd, clean_name = tempfile.mkstemp(
+                prefix=f".{Path(cu_file).name}.",
+                suffix=".nvcc_clean.cu",
+                dir=str(final_path.parent),
+            )
+            clean_file = clean_name
+            with os.fdopen(clean_fd, "w", encoding="utf-8") as stream:
+                stream.write(cleaned)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        if backend == "cutlass":
+            cutlass_include_dir = find_cutlass_include_dir()
+            if not cutlass_include_dir:
+                print(
+                    "Compilation failed:\n"
+                    "Cannot locate CUTLASS headers. Set CUTLASS_PATH or CUTLASS_INCLUDE_DIR, "
+                    "or install CUTLASS under a standard path such as /usr/local/cutlass*/include.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            cmd.extend(["-I", cutlass_include_dir])
+
+        if "#include <cublas_v2.h>" in source or "#include <cublasLt.h>" in source:
+            cmd.extend(["-lcublas", "-lcublasLt"])
+
+        cmd.extend([
+            "-shared", "-std=c++17", f"-arch={arch}", "-O3",
+            "-o", str(attempt_path), clean_file,
+        ])
+        evidence_status = _fresh_evidence_safely(
+            evidence_path,
+            source=cu_file,
+            discovered=reset_outputs,
+            compile_command=cmd,
+            backend=backend,
+            arch=arch,
         )
-        sys.exit(1)
-    print(f"[compile] -> {output_so}")
+        print(f"[compile] {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except OSError as exc:
+            print(f"Compilation failed:\n{exc}", file=sys.stderr)
+            sys.exit(1)
+        if result.returncode != 0:
+            print(f"Compilation failed:\n{result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+        before_publish = compiler_evidence.artifact_identity(attempt_path)
+        if before_publish is None or before_publish["size_bytes"] <= 0:
+            print(
+                f"Compilation failed:\nnvcc did not produce a real output binary: {output_so}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _fsync_regular_file(attempt_path)
+        after_fsync = compiler_evidence.artifact_identity(attempt_path)
+        if after_fsync != before_publish:
+            print("Compilation failed:\ncompile attempt changed before publish", file=sys.stderr)
+            sys.exit(1)
+
+        os.replace(str(attempt_path), str(final_path))
+        _fsync_directory(final_path.parent)
+        published = compiler_evidence.artifact_identity(final_path)
+        if published is None or any(
+            published[field] != before_publish[field]
+            for field in ("dev", "ino", "size_bytes", "sha256")
+        ):
+            _remove_output(final_path)
+            print("Compilation failed:\npublished binary identity mismatch", file=sys.stderr)
+            sys.exit(1)
+
+        evidence_status = _fresh_evidence_safely(
+            evidence_path,
+            source=cu_file,
+            binary=final_path,
+            discovered=reset_outputs,
+            compile_command=cmd,
+            backend=backend,
+            arch=arch,
+        )
+        print(f"[compile] -> {output_so}")
+        return evidence_status
+    finally:
+        if clean_file != cu_file:
+            try:
+                Path(clean_file).unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            attempt_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 
@@ -582,7 +714,9 @@ def _setup_cuda(solution_file, dim_values, ptr_size_override, arch, nvcc_bin, se
 
     lib_ext = ".dll" if os.name == "nt" else ".so"
     so_file = os.path.splitext(solution_file)[0] + lib_ext
-    compile_cu(solution_file, so_file, arch, nvcc_bin, backend=backend_name)
+    compiler_status = compile_cu(
+        solution_file, so_file, arch, nvcc_bin, backend=backend_name
+    )
     lib = ctypes.CDLL(so_file)
 
     for ptype, pname, _ in params:
@@ -668,34 +802,61 @@ def _setup_cuda(solution_file, dim_values, ptr_size_override, arch, nvcc_bin, se
             }
             for ptype, pname, is_const in params if ptype in DTYPE_MAP
         ],
+        "compiler_evidence": compiler_status,
     }
 
 
 
-def _triton_cache_dir() -> Path:
-    configured = os.environ.get("TRITON_CACHE_DIR", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".triton" / "cache"
+@contextmanager
+def _temporary_environment(name: str, value: str):
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 def _record_triton_compiler_evidence(state) -> None:
-    evidence = state.get("compiler_evidence")
-    if not isinstance(evidence, dict) or evidence.get("recorded"):
+    runtime = state.get("_compiler_evidence_runtime")
+    if not isinstance(runtime, dict) or runtime.get("recorded"):
         return
     discovered = compiler_evidence.discover_triton_cache(
-        evidence["cache_dir"], evidence["cache_before"]
+        runtime["cache_dir"], runtime["cache_before"]
     )
-    compiler_evidence.update_manifest(
-        evidence["evidence_dir"], discovered=discovered
+    status = _update_evidence_safely(
+        runtime["evidence_dir"], discovered=discovered
     )
-    evidence["recorded"] = True
+    state["compiler_evidence"].clear()
+    state["compiler_evidence"].update(status)
+    runtime["recorded"] = True
 
 
-def _setup_triton(solution_file, dim_values, seed=None, arch=None):
-    cache_dir = _triton_cache_dir()
+def cleanup_solution(state) -> None:
+    runtime = state.get("_compiler_evidence_runtime")
+    if not isinstance(runtime, dict) or runtime.get("cleaned"):
+        return
+    owner = runtime.get("cache_owner")
+    if owner is not None:
+        owner.cleanup()
+    runtime["cleaned"] = True
+
+
+def _sync_result_compiler_evidence(result: dict, state: dict) -> None:
+    status = state.get("compiler_evidence")
+    if isinstance(status, dict):
+        result["compiler_evidence"] = copy.deepcopy(status)
+
+
+def _setup_triton(solution_file, dim_values, seed=None, arch=None, evidence_dir=None):
+    cache_owner = tempfile.TemporaryDirectory(prefix="cuda-opt-triton-cache-")
+    cache_dir = Path(cache_owner.name)
     cache_before = compiler_evidence.snapshot_cache(cache_dir)
-    module = load_python_module(solution_file, "_triton_kernel_module")
+    with _temporary_environment("TRITON_CACHE_DIR", str(cache_dir)):
+        module = load_python_module(solution_file, "_triton_kernel_module")
     if not hasattr(module, "setup"):
         raise AttributeError(f"'{solution_file}' must define a `setup(**kwargs)` function for Triton benchmarking.")
     if not hasattr(module, "run_kernel"):
@@ -703,7 +864,8 @@ def _setup_triton(solution_file, dim_values, seed=None, arch=None):
 
     setup_kwargs = dict(dim_values)
     setup_kwargs["seed"] = seed
-    prepared = module.setup(**setup_kwargs)
+    with _temporary_environment("TRITON_CACHE_DIR", str(cache_dir)):
+        prepared = module.setup(**setup_kwargs)
     if not isinstance(prepared, dict):
         raise TypeError("Triton setup() must return a dict")
 
@@ -790,18 +952,22 @@ def _setup_triton(solution_file, dim_values, seed=None, arch=None):
         dtype_name = str(setup_inputs[name].dtype).replace("torch.", "")
         output_specs.append((name, dtype_name))
 
-    evidence_dir = Path(solution_file).expanduser().resolve().parent / "compiler_evidence"
-    compiler_evidence.update_manifest(
-        evidence_dir,
+    evidence_path = _evidence_dir(solution_file, evidence_dir)
+    evidence_status = _fresh_evidence_safely(
+        evidence_path,
         source=solution_file,
         backend="triton",
         arch=arch,
     )
 
+    def invoke_triton():
+        with _temporary_environment("TRITON_CACHE_DIR", str(cache_dir)):
+            return module.run_kernel(**kernel_kwargs)
+
     return {
         "backend": "triton",
         "signature": signature,
-        "callable": lambda: module.run_kernel(**kernel_kwargs),
+        "callable": invoke_triton,
         "tensor_inputs": tensor_inputs,
         "reference_inputs": reference_inputs,
         "pristine_tensors": pristine_tensors,
@@ -809,11 +975,14 @@ def _setup_triton(solution_file, dim_values, seed=None, arch=None):
         "ptr_elems": ptr_elems,
         "total_ptr_bytes": total_ptr_bytes,
         "preview_tensors": preview_tensors,
-        "compiler_evidence": {
+        "compiler_evidence": evidence_status,
+        "_compiler_evidence_runtime": {
+            "cache_owner": cache_owner,
             "cache_dir": cache_dir,
             "cache_before": cache_before,
-            "evidence_dir": evidence_dir,
+            "evidence_dir": evidence_path,
             "recorded": False,
+            "cleaned": False,
         },
     }
 
@@ -937,6 +1106,12 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
         "kernel": None,
         "reference": None,
         "speedup_vs_reference": None,
+        "compiler_evidence": {
+            "status": "unavailable",
+            "manifest_path": None,
+            "error": "solution setup did not produce compiler evidence",
+            "manifest": None,
+        },
         "error": None,
     }
 
@@ -976,6 +1151,7 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
     result["ptr_elems"] = state["ptr_elems"]
     result["total_ptr_bytes"] = state["total_ptr_bytes"]
     result["correctness"]["output_tensor_count"] = len(state["output_specs"])
+    _sync_result_compiler_evidence(result, state)
 
     if profile_only:
         for _ in range(warmup):
@@ -988,10 +1164,12 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
             cuda=torch.cuda,
         )
         _record_triton_compiler_evidence(state)
+        _sync_result_compiler_evidence(result, state)
         result["profile_only"] = True
         result["profiled_launches"] = 1
         _write_json_out(json_out, result)
         print(json.dumps({"profile_only": True, "profiled_launches": 1}, indent=2))
+        cleanup_solution(state)
         return
 
     if not state["output_specs"] and has_ref:
@@ -1082,7 +1260,9 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
         result["correctness"]["passed"] = validation_passed
         result["correctness"]["seeds"] = per_seed_results
         if not validation_passed:
+            _sync_result_compiler_evidence(result, state)
             _write_json_out(json_out, result)
+            cleanup_solution(state)
             sys.exit(1)
 
     times_ref = None
@@ -1177,7 +1357,9 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
             arch,
         )
 
+    _sync_result_compiler_evidence(result, state)
     _write_json_out(json_out, result)
+    cleanup_solution(state)
 
 
 # ---------------------------------------------------------------------------

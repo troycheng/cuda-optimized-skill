@@ -162,6 +162,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(initialized, [True])
         self.assertEqual(state["backend"], "triton")
         self.assertEqual(state["reference_inputs"], {"n": 128})
+        benchmark.cleanup_solution(state)
 
     def test_warm_solution_resets_before_every_call_and_synchronizes(self) -> None:
         benchmark = _load_benchmark()
@@ -248,6 +249,7 @@ class BenchmarkTests(unittest.TestCase):
             "kernel",
             "reference",
             "speedup_vs_reference",
+            "compiler_evidence",
             "error",
         }
         with tempfile.TemporaryDirectory() as tmp:
