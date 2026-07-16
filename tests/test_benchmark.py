@@ -11,6 +11,7 @@ import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -340,9 +341,18 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_cleanup_failure_does_not_mask_active_run_exception(self) -> None:
         benchmark = _load_benchmark()
+        cleanup_calls = []
 
         def fail_cleanup():
+            cleanup_calls.append("cleanup")
             raise OSError("cleanup broke")
+
+        class BrokenStderr:
+            def write(self, _text):
+                raise OSError("stderr broke")
+
+            def flush(self):
+                raise OSError("stderr broke")
 
         state = {
             "_compiler_evidence_runtime": {
@@ -358,15 +368,17 @@ class BenchmarkTests(unittest.TestCase):
         )
         benchmark._setup_backend = lambda *_args, **_kwargs: state
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with warnings.catch_warnings(), mock.patch.object(
+            benchmark.sys, "stderr", BrokenStderr()
+        ):
+            warnings.simplefilter("error")
             with self.assertRaises(KeyError):
                 benchmark.run(
                     "kernel.py", "", {}, 0, 1, 0, "sm_120", 1e-4, 1e-3, 42,
                     backend="triton",
                 )
 
-        self.assertTrue(any("cleanup broke" in str(item.message) for item in caught))
+        self.assertEqual(cleanup_calls, ["cleanup"])
 
     def test_cleanup_solution_is_idempotent(self) -> None:
         benchmark = _load_benchmark()

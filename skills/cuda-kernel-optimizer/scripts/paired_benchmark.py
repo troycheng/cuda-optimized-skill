@@ -7,7 +7,6 @@ import copy
 import math
 import random
 import sys
-import warnings
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
@@ -65,6 +64,21 @@ def _nonempty_string(value, name: str) -> str:
     return value
 
 
+def _note_cleanup_failure(active_error, cleanup_error) -> None:
+    message = f"solution cleanup failed: {cleanup_error}"
+    add_note = getattr(active_error, "add_note", None)
+    if callable(add_note):
+        try:
+            add_note(message)
+            return
+        except BaseException:
+            pass
+    try:
+        print(message, file=sys.stderr)
+    except BaseException:
+        pass
+
+
 def _cleanup_created_solutions(states) -> None:
     active_error = sys.exc_info()[1]
     cleanup_errors = []
@@ -74,10 +88,7 @@ def _cleanup_created_solutions(states) -> None:
         except Exception as error:
             cleanup_errors.append(error)
             if active_error is not None:
-                warnings.warn(
-                    f"solution cleanup failed while preserving active error: {error}",
-                    RuntimeWarning,
-                )
+                _note_cleanup_failure(active_error, error)
     if cleanup_errors and active_error is None:
         raise RuntimeError(
             f"solution cleanup failed: {cleanup_errors[0]}"

@@ -368,10 +368,19 @@ class PairedBenchmarkTests(unittest.TestCase):
         paired = _load_paired_benchmark()
         states = iter(({"name": "baseline"}, {"name": "candidate"}))
 
+        class BrokenStderr:
+            def write(self, _text):
+                raise OSError("stderr broke")
+
+            def flush(self):
+                raise OSError("stderr broke")
+
         with mock.patch.object(
             paired, "cleanup_solution", side_effect=OSError("cleanup broke")
-        ), warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        ), mock.patch.object(
+            paired.sys, "stderr", BrokenStderr()
+        ), warnings.catch_warnings():
+            warnings.simplefilter("error")
             with self.assertRaisesRegex(RuntimeError, "measure broke"):
                 paired.run_paired(
                     "baseline.py", "candidate.py", backend="triton", dims={},
@@ -384,8 +393,6 @@ class PairedBenchmarkTests(unittest.TestCase):
                     ),
                     telemetry_reader=lambda: {"available": False},
                 )
-
-        self.assertTrue(any("cleanup broke" in str(item.message) for item in caught))
 
     def test_paired_keeps_durable_triton_evidence_after_cleanup(self) -> None:
         paired = _load_paired_benchmark()

@@ -33,7 +33,6 @@ import ctypes
 import argparse
 import statistics
 import importlib.util
-import warnings
 from contextlib import contextmanager
 from numbers import Real
 from pathlib import Path
@@ -275,6 +274,21 @@ def _fsync_regular_file(path: Path) -> None:
         os.close(fd)
 
 
+def _note_cleanup_failure(active_error, cleanup_error, context: str) -> None:
+    message = f"{context} cleanup failed: {cleanup_error}"
+    add_note = getattr(active_error, "add_note", None)
+    if callable(add_note):
+        try:
+            add_note(message)
+            return
+        except BaseException:
+            pass
+    try:
+        print(message, file=sys.stderr)
+    except BaseException:
+        pass
+
+
 def compile_cu(
     cu_file: str,
     output_so: str,
@@ -308,11 +322,32 @@ def compile_cu(
         arch=arch,
     )
 
-    fd, attempt_name = tempfile.mkstemp(
-        prefix=f".{final_path.name}.attempt-",
-        suffix=final_path.suffix,
+    attempt_owner = tempfile.TemporaryDirectory(
+        prefix=f".{final_path.name}.compile-",
         dir=str(final_path.parent),
     )
+    attempt_dir = Path(attempt_owner.name)
+    try:
+        os.chmod(attempt_dir, 0o700)
+        attempt_dir_stat = attempt_dir.lstat()
+        if (
+            stat.S_ISLNK(attempt_dir_stat.st_mode)
+            or not stat.S_ISDIR(attempt_dir_stat.st_mode)
+            or stat.S_IMODE(attempt_dir_stat.st_mode) != 0o700
+            or attempt_dir_stat.st_dev != final_path.parent.stat().st_dev
+        ):
+            raise OSError(f"compile attempt directory is not private: {attempt_dir}")
+        fd, attempt_name = tempfile.mkstemp(
+            prefix=f".{final_path.name}.attempt-",
+            suffix=final_path.suffix,
+            dir=str(attempt_dir),
+        )
+    except BaseException as error:
+        try:
+            attempt_owner.cleanup()
+        except BaseException as cleanup_error:
+            _note_cleanup_failure(error, cleanup_error, "compile attempt directory")
+        raise
     attempt_path = Path(attempt_name)
     try:
         os.utime(fd, ns=(0, 0))
@@ -446,6 +481,15 @@ def compile_cu(
             attempt_path.unlink()
         except FileNotFoundError:
             pass
+        active_error = sys.exc_info()[1]
+        try:
+            attempt_owner.cleanup()
+        except BaseException as cleanup_error:
+            if active_error is None:
+                raise
+            _note_cleanup_failure(
+                active_error, cleanup_error, "compile attempt directory"
+            )
 
 
 
@@ -887,10 +931,7 @@ def _cleanup_created_solutions(states) -> None:
         except Exception as error:
             cleanup_errors.append(error)
             if active_error is not None:
-                warnings.warn(
-                    f"solution cleanup failed while preserving active error: {error}",
-                    RuntimeWarning,
-                )
+                _note_cleanup_failure(active_error, error, "solution")
     if cleanup_errors and active_error is None:
         raise RuntimeError(
             f"solution cleanup failed: {cleanup_errors[0]}"
@@ -903,8 +944,10 @@ def _sync_result_compiler_evidence(result: dict, state: dict) -> None:
         result["compiler_evidence"] = copy.deepcopy(status)
 
 
-def _setup_triton(solution_file, dim_values, seed=None, arch=None, evidence_dir=None):
-    cache_owner = tempfile.TemporaryDirectory(prefix="cuda-opt-triton-cache-")
+def _setup_triton_impl(
+    solution_file, dim_values, seed=None, arch=None, evidence_dir=None,
+    *, cache_owner,
+):
     cache_dir = Path(cache_owner.name)
     cache_before = compiler_evidence.snapshot_cache(cache_dir)
     with _temporary_environment("TRITON_CACHE_DIR", str(cache_dir)):
@@ -1037,6 +1080,25 @@ def _setup_triton(solution_file, dim_values, seed=None, arch=None, evidence_dir=
             "cleaned": False,
         },
     }
+
+
+def _setup_triton(solution_file, dim_values, seed=None, arch=None, evidence_dir=None):
+    cache_owner = tempfile.TemporaryDirectory(prefix="cuda-opt-triton-cache-")
+    try:
+        return _setup_triton_impl(
+            solution_file,
+            dim_values,
+            seed=seed,
+            arch=arch,
+            evidence_dir=evidence_dir,
+            cache_owner=cache_owner,
+        )
+    except BaseException as error:
+        try:
+            cache_owner.cleanup()
+        except BaseException as cleanup_error:
+            _note_cleanup_failure(error, cleanup_error, "Triton cache")
+        raise
 
 
 

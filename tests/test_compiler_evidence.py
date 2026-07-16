@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import stat
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -422,16 +424,22 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
 
             commands = []
             attempt_identity = []
+            private_dirs = []
 
             def fake_run(command, **_kwargs):
                 commands.append(list(command))
                 attempt = Path(command[command.index("-o") + 1])
-                self.assertEqual(attempt.parent, binary.parent)
+                private_dirs.append(attempt.parent)
+                self.assertEqual(attempt.parent.parent, binary.parent)
+                self.assertEqual(stat.S_IMODE(attempt.parent.stat().st_mode), 0o700)
+                self.assertEqual(attempt.parent.stat().st_dev, binary.parent.stat().st_dev)
                 self.assertNotEqual(attempt, binary)
                 self.assertTrue(attempt.is_file())
                 self.assertEqual(attempt.stat().st_size, 0)
                 attempt_identity.append((attempt.stat().st_dev, attempt.stat().st_ino))
-                attempt.write_bytes(b"elf")
+                with attempt.open("r+b") as stream:
+                    stream.write(b"elf")
+                    stream.truncate()
                 self.assertEqual(
                     (attempt.stat().st_dev, attempt.stat().st_ino),
                     attempt_identity[-1],
@@ -449,7 +457,7 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                 )
             )
             binary_bytes = binary.read_bytes()
-            attempts = list(root.glob(".*.attempt-*"))
+            private_dirs_removed = [not path.exists() for path in private_dirs]
 
         self.assertEqual(manifest["backend"], "cuda")
         self.assertEqual(manifest["arch"], "sm_120")
@@ -457,7 +465,50 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
         self.assertEqual(manifest["compile_command"][0], "nvcc")
         self.assertNotIn("-lineinfo", manifest["compile_command"])
         self.assertEqual(binary_bytes, b"elf")
-        self.assertEqual(attempts, [])
+        self.assertEqual(private_dirs_removed, [True])
+
+    def test_private_compile_directory_blocks_shared_parent_symlink_attack(self) -> None:
+        benchmark = _load("benchmark")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            victim = root / "victim.so"
+            source.write_text('extern "C" void solve(float *out) {}', encoding="utf-8")
+            victim.write_bytes(b"SAFE")
+            private_dirs = []
+            decoys = []
+
+            def fake_compiler_open(command, **_kwargs):
+                attempt = Path(command[command.index("-o") + 1])
+                self.assertNotEqual(attempt.parent, binary.parent)
+                self.assertEqual(stat.S_IMODE(attempt.parent.stat().st_mode), 0o700)
+                private_dirs.append(attempt.parent)
+                decoy = binary.parent / attempt.name
+                decoys.append(decoy)
+                try:
+                    decoy.symlink_to(victim)
+                except OSError:
+                    self.skipTest("symlinks are unavailable")
+                with attempt.open("r+b") as stream:
+                    stream.write(b"elf")
+                    stream.truncate()
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            try:
+                with mock.patch.object(
+                    benchmark.subprocess, "run", side_effect=fake_compiler_open
+                ):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+                self.assertEqual(victim.read_bytes(), b"SAFE")
+                self.assertEqual(binary.read_bytes(), b"elf")
+                self.assertTrue(all(not path.exists() for path in private_dirs))
+            finally:
+                for decoy in decoys:
+                    decoy.unlink(missing_ok=True)
 
     def test_compile_rejects_attempt_path_replacement_without_following_symlink(self) -> None:
         benchmark = _load("benchmark")
@@ -843,6 +894,94 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
         self.assertEqual(durable_contents["ttir"], "ttir")
         self.assertEqual(durable_contents["ptx"], "ptx")
         self.assertEqual(manifest["binary"]["status"], "unavailable")
+
+    def test_triton_missing_interface_cleans_cache_without_masking_error(self) -> None:
+        benchmark = _load("benchmark")
+        real_temporary_directory = tempfile.TemporaryDirectory
+        owners = []
+
+        class CleanupFailingOwner:
+            def __init__(self, *args, **kwargs):
+                self.inner = real_temporary_directory(*args, **kwargs)
+                self.name = self.inner.name
+                self.cleanup_calls = 0
+
+            def cleanup(self):
+                self.cleanup_calls += 1
+                self.inner.cleanup()
+                raise OSError("cleanup broke")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "kernel.py"
+            source.write_text(
+                "def run_kernel(**kwargs):\n"
+                "    return None\n",
+                encoding="utf-8",
+            )
+
+            def tracked_owner(*args, **kwargs):
+                owner = CleanupFailingOwner(*args, **kwargs)
+                owners.append(owner)
+                return owner
+
+            try:
+                with mock.patch.object(
+                    benchmark.tempfile, "TemporaryDirectory", side_effect=tracked_owner
+                ):
+                    try:
+                        benchmark._setup_triton(str(source), {}, seed=1, arch="sm_120")
+                    except AttributeError as error:
+                        captured = error
+                        frames = traceback.extract_tb(error.__traceback__)
+                    else:
+                        self.fail("missing setup() must raise AttributeError")
+
+                self.assertIn("must define a `setup", str(captured))
+                self.assertIn("_setup_triton", [frame.name for frame in frames])
+                self.assertEqual(frames[-1].name, "_setup_triton_impl")
+                self.assertEqual(owners[0].cleanup_calls, 1)
+                self.assertFalse(Path(owners[0].name).exists())
+            finally:
+                for owner in owners:
+                    owner.inner.cleanup()
+
+    def test_triton_setup_exception_cleans_cache_and_preserves_traceback(self) -> None:
+        benchmark = _load("benchmark")
+        real_temporary_directory = tempfile.TemporaryDirectory
+        owners = []
+
+        def tracked_owner(*args, **kwargs):
+            owner = real_temporary_directory(*args, **kwargs)
+            owners.append(owner)
+            return owner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "kernel.py"
+            source.write_text(
+                "def setup(**kwargs):\n"
+                "    raise RuntimeError('setup exploded')\n"
+                "def run_kernel(**kwargs):\n"
+                "    return None\n",
+                encoding="utf-8",
+            )
+            try:
+                with mock.patch.object(
+                    benchmark.tempfile, "TemporaryDirectory", side_effect=tracked_owner
+                ):
+                    try:
+                        benchmark._setup_triton(str(source), {}, seed=1, arch="sm_120")
+                    except RuntimeError as error:
+                        captured = error
+                        frames = traceback.extract_tb(error.__traceback__)
+                    else:
+                        self.fail("setup exception must be preserved")
+
+                self.assertEqual(str(captured), "setup exploded")
+                self.assertEqual(frames[-1].name, "setup")
+                self.assertFalse(Path(owners[0].name).exists())
+            finally:
+                for owner in owners:
+                    owner.cleanup()
 
     def test_triton_uses_isolated_cache_for_import_setup_and_launch(self) -> None:
         benchmark = _load("benchmark")
