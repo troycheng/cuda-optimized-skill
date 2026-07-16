@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-import copy
+import json
+import math
 from collections.abc import Mapping
 
 
@@ -37,6 +38,13 @@ _PRIMARY_STATUSES = {
 }
 _CONSTRAINT_STATUSES = {"passed", "failed", "inconclusive"}
 _PARETO_SCHEMA = "cuda-kernel-optimizer/pareto-v1"
+_STATISTIC_FIELDS = {
+    "statistic",
+    "estimate_pct",
+    "ci_low_pct",
+    "ci_high_pct",
+    "status",
+}
 
 
 def _literal_status(value, allowed: set[str], field: str) -> str:
@@ -49,6 +57,71 @@ def _mapping(value, field: str) -> Mapping:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field} must be a mapping")
     return value
+
+
+def _json_copy(value, field: str, active: set[int] | None = None):
+    """Validate strict JSON evidence and return a detached normalized copy."""
+    if active is None:
+        active = set()
+    if value is None or type(value) in {bool, str, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{field} numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{field} must not contain a cycle")
+        active.add(identity)
+        try:
+            result = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValueError(f"{field} mappings must use string keys")
+                result[key] = _json_copy(item, f"{field}.{key}", active)
+            return result
+        finally:
+            active.remove(identity)
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{field} must not contain a cycle")
+        active.add(identity)
+        try:
+            return [
+                _json_copy(item, f"{field}[{index}]", active)
+                for index, item in enumerate(value)
+            ]
+        finally:
+            active.remove(identity)
+    raise ValueError(f"{field} must contain only strict JSON values")
+
+
+def _validate_win_statistics(value, field: str) -> dict:
+    statistics = _mapping(value, field)
+    missing = sorted(_STATISTIC_FIELDS - set(statistics))
+    if missing:
+        raise ValueError(f"{field} missing required field: {missing[0]}")
+    statistic = statistics["statistic"]
+    if not isinstance(statistic, str) or not statistic.strip():
+        raise ValueError(f"{field}.statistic must be a non-empty string")
+    _literal_status(statistics["status"], {"confirmed_win"}, f"{field}.status")
+    for name in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
+        number = statistics[name]
+        try:
+            finite = math.isfinite(float(number))
+        except (OverflowError, TypeError, ValueError):
+            finite = False
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not finite
+        ):
+            raise ValueError(f"{field}.{name} must be a finite real number")
+    normalized = dict(statistics)
+    normalized["statistic"] = statistic.strip()
+    return normalized
 
 
 def _normalize_mode(mode) -> str:
@@ -67,17 +140,70 @@ def _validate_workload(workload) -> Mapping | None:
     primary = workload.get("primary")
     if primary is not None:
         primary = _mapping(primary, "workload.primary")
-        _literal_status(
+        primary_status = _literal_status(
             primary.get("status"), _PRIMARY_STATUSES, "workload.primary.status"
         )
+        if primary_status == "confirmed_win":
+            _validate_win_statistics(primary, "workload.primary")
+            _validate_winning_workload_schema(workload)
     if status == "evaluated" and "constraints" in workload:
         _validate_constraints(workload["constraints"])
     return workload
 
 
+def _validate_winning_workload_schema(workload: Mapping) -> None:
+    objective = workload.get("objective")
+    if not isinstance(objective, Mapping):
+        raise ValueError("incomplete workload evidence: objective is required")
+    if "primary_metric" not in objective or "constraints" not in objective:
+        raise ValueError(
+            "incomplete workload evidence: objective primary_metric and constraints "
+            "are required"
+        )
+    primary_metric = objective["primary_metric"]
+    if not isinstance(primary_metric, Mapping):
+        raise ValueError("incomplete workload evidence: primary_metric must be a mapping")
+    primary_name = primary_metric.get("name")
+    if not isinstance(primary_name, str) or not primary_name.strip():
+        raise ValueError("incomplete workload evidence: primary_metric.name is required")
+    if primary_metric.get("direction") not in {"lower", "higher"}:
+        raise ValueError(
+            "incomplete workload evidence: primary_metric.direction is invalid"
+        )
+    declared = objective["constraints"]
+    if not isinstance(declared, list):
+        raise ValueError(
+            "incomplete workload evidence: objective.constraints must be a sequence"
+        )
+    declared_names = []
+    declared_seen = set()
+    for index, constraint in enumerate(declared):
+        constraint = _mapping(
+            constraint, f"workload.objective.constraints[{index}]"
+        )
+        name = constraint.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"workload.objective.constraints[{index}].name must be non-empty"
+            )
+        name = name.strip()
+        if name in declared_seen:
+            raise ValueError(f"workload objective contains duplicate constraint: {name}")
+        declared_seen.add(name)
+        declared_names.append(name)
+    if "constraints" not in workload or workload["constraints"] is None:
+        raise ValueError("incomplete workload evidence: constraints are required")
+    results = _validate_constraints(workload["constraints"])
+    result_names = [constraint["name"] for constraint in results]
+    if set(result_names) != set(declared_names):
+        raise ValueError(
+            "incomplete workload evidence: objective and result constraints must match"
+        )
+
+
 def _validate_constraints(constraints) -> list[dict]:
     if constraints is None:
-        return []
+        raise ValueError("constraints must be a sequence of mappings")
     if isinstance(constraints, (str, bytes, bytearray, Mapping)):
         raise ValueError("constraints must be a sequence of mappings")
     try:
@@ -100,7 +226,7 @@ def _validate_constraints(constraints) -> list[dict]:
             _CONSTRAINT_STATUSES,
             f"constraints[{index}].status",
         )
-        item = copy.deepcopy(dict(constraint))
+        item = dict(constraint)
         item["name"] = name
         normalized.append(item)
     return normalized
@@ -162,33 +288,39 @@ def _validate_pareto(pareto) -> dict | None:
 
 
 def _kernel_statistics(kernel: Mapping) -> dict:
-    statistics = kernel.get("statistics")
-    if statistics is not None:
-        statistics = _mapping(statistics, "kernel.statistics")
-        _literal_status(
-            statistics.get("status"), {"confirmed_win"}, "kernel.statistics.status"
-        )
-        return copy.deepcopy(dict(statistics))
-    if kernel["status"] == "confirmed_win":
-        return copy.deepcopy(dict(kernel))
-    return {"status": "confirmed_win", "source_status": "kernel_only_win"}
+    if "statistics" not in kernel:
+        raise ValueError("kernel.statistics is required for an inner win")
+    return _validate_win_statistics(kernel["statistics"], "kernel.statistics")
 
 
 def _result(status: str, reason: str, mode: str, evidence: dict, **fields) -> dict:
     if status not in TERMINAL_STATUSES:
         raise AssertionError("decision engine produced a non-terminal status")
-    return {
+    result = {
         "status": status,
         "reason": reason,
         "mode": mode,
         "evidence": evidence,
         **fields,
     }
+    normalized = _json_copy(result, "decision")
+    try:
+        json.dumps(normalized, allow_nan=False)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"decision result must be strict JSON: {error}") from error
+    return normalized
 
 
 def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dict:
     """Return one terminal decision without mutating or weighting evidence."""
     normalized_mode = _normalize_mode(mode)
+    kernel = _json_copy(kernel, "kernel")
+    if workload is not None:
+        workload = _json_copy(workload, "workload")
+    if constraints is not None:
+        constraints = _json_copy(constraints, "constraints")
+    if pareto is not None:
+        pareto = _json_copy(pareto, "pareto")
     kernel = _mapping(kernel, "kernel")
     kernel_status = _literal_status(
         kernel.get("status"), _KERNEL_STATUSES, "kernel.status"
@@ -217,10 +349,10 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
         normalized_constraints = []
     normalized_pareto = _validate_pareto(pareto)
     evidence = {
-        "kernel": copy.deepcopy(dict(kernel)),
-        "workload": None if workload is None else copy.deepcopy(dict(workload)),
-        "constraints": copy.deepcopy(normalized_constraints),
-        "pareto": copy.deepcopy(normalized_pareto),
+        "kernel": dict(kernel),
+        "workload": None if workload is None else dict(workload),
+        "constraints": normalized_constraints,
+        "pareto": normalized_pareto,
     }
 
     if kernel_status in {"rejected_compile", "rejected_correctness"}:
@@ -262,7 +394,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
-            constraints=copy.deepcopy(normalized_constraints),
+            constraints=normalized_constraints,
         )
     if any(item["status"] != "passed" for item in normalized_constraints):
         return _result(
@@ -271,7 +403,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
-            constraints=copy.deepcopy(normalized_constraints),
+            constraints=normalized_constraints,
         )
     if workload is None:
         return _result(
@@ -298,7 +430,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             evidence,
             statistics=kernel_statistics,
         )
-    workload_statistics = copy.deepcopy(dict(primary))
+    workload_statistics = _validate_win_statistics(primary, "workload.primary")
     if normalized_pareto is not None:
         return _result(
             "pareto_frontier",
@@ -307,7 +439,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             evidence,
             statistics=kernel_statistics,
             workload_statistics=workload_statistics,
-            pareto=copy.deepcopy(normalized_pareto),
+            pareto=normalized_pareto,
         )
     return _result(
         "end_to_end_win",
@@ -316,7 +448,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
         evidence,
         statistics=kernel_statistics,
         workload_statistics=workload_statistics,
-        constraints=copy.deepcopy(normalized_constraints),
+        constraints=normalized_constraints,
     )
 
 
