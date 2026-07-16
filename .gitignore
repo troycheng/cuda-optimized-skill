@@ -4,3 +4,4 @@ example
 .codex
 env.json
 tree.py
+.worktrees/
