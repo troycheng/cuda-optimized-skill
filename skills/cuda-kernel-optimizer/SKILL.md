@@ -38,7 +38,8 @@ Accept exactly one workload form:
 - `--workload-cmd 'COMMAND ...' --objective objective.json`: command parsed
   without a shell and an external objective;
 - `--workload-manifest manifest.json`: strict manifest describing a Python or
-  command workload, objective, and cases.
+  command workload, objective, and cases. It requires `kind`, `source`, and
+  `cases`; use an embedded objective or external `--objective`, never both.
 
 Start a Python adapter from `templates/workload.py`. Validate objectives against
 `templates/objective.schema.json`. Treat adapter source, declared local
@@ -60,7 +61,7 @@ Use `--budget custom` only with all required explicit limits. A budget deadline
 stops admission of new work and preserves a resumable checkpoint; it does not
 turn partial evidence into a win.
 
-## Setup and resume
+## Setup, open, and resume
 
 Run setup once:
 
@@ -78,8 +79,19 @@ Omit the workload option for kernel-only mode. Substitute either
 the user's chosen input form.
 
 Setup checks the environment and input contracts, freezes a manifest, seeds the
-baseline, and writes `checkpoint.json`. Do not edit frozen inputs inside a run.
-After interruption, validate and inspect the next unfinished stage with:
+baseline, and writes `checkpoint.json`. Setup does not profile or create branch directories.
+Do not edit frozen inputs inside a run.
+
+Before generating round N candidates, explicitly open the iteration:
+
+```bash
+python3 <skill>/scripts/orchestrate.py open-iter \
+  --run-dir ./run_YYYYMMDD_HHMMSS --iter N
+```
+
+`open-iter` attempts current-best profiling, writes Roofline evidence, and
+creates the budgeted branch directories. After interruption, validate and
+inspect the next unfinished stage with:
 
 ```bash
 python3 <skill>/scripts/orchestrate.py resume --run-dir ./run_YYYYMMDD_HHMMSS
@@ -92,11 +104,12 @@ Resume never replays a completed stage. Follow the reported `next_stage` and
 
 For each admitted round:
 
-1. Read `state.json`, `checkpoint.json`, the current best source, and available
-   profiler/sanitizer/compiler evidence.
-2. When counters are readable, profile the current best and use evidenced
-   compute, memory, and latency gaps. Read `references/optimization_catalog.md`
-   and `references/ncu_metrics_guide.md` before selecting methods.
+1. Run `open-iter --run-dir ... --iter N`. It profiles the current best when
+   counters are readable, computes the Roofline evidence, and prepares branch
+   directories.
+2. Read `state.json`, `checkpoint.json`, the current best source, and available
+   profiler evidence. Read `references/optimization_catalog.md` and
+   `references/ncu_metrics_guide.md` before selecting methods.
 3. Record selected methods and rejected higher-priority alternatives in
    `methods.json` and `analysis.md`; do not persist hidden reasoning.
 4. Generate the budgeted branch variants under `itervN/branches/`. Keep the
@@ -109,12 +122,16 @@ For each admitted round:
      --run-dir ./run_YYYYMMDD_HHMMSS --iter N
    ```
 
-6. Inner loop gates candidates through reference correctness, sanitizer policy,
-   compiler/SASS provenance, and telemetry-gated randomized paired AB/BA timing.
-7. Only `confirmed_win` kernel evidence may enter the outer shortlist. Preserve
-   `confirmed_loss`, `inconclusive`, invalid, and failed candidates without
-   promoting them.
-8. In full mode, evaluate shortlisted candidates with paired baseline/candidate
+6. `close-iter` follows the real lifecycle: reference correctness first, then
+   telemetry-gated randomized paired AB/BA timing. The sanitizer policy is
+   applied to the statistically confirmed shortlist, and SASS is checked only
+   for the final eligible candidate. In short: correctness → paired → sanitizer → SASS.
+   Candidate profiling occurs before sanitizer and may be repeated if
+   sanitizer selection changes the finalist.
+7. Compiler provenance and SASS results are evidence and method-classification
+   inputs, not hard promotion gates. Source/artifact identity drift still fails
+   closed because the evidence would no longer describe the tested candidate.
+8. In full mode, evaluate eligible candidates with paired baseline/candidate
    observations on the frozen user workload. Enforce the primary metric's
    `min_effect_pct` and every constraint's `max_regression_pct`.
 9. Apply the terminal decision atomically. Continue to the next round only when
@@ -141,10 +158,14 @@ remain recorded but do not count as valid pairs.
 
 Terminal outcomes:
 
-- `kernel_only_win`: a confirmed kernel win in kernel-only mode. It says nothing
-  about application throughput or latency.
+- `kernel_only_win`: confirms only a kernel win. It is the expected successful
+  terminal label in kernel-only mode, but can also be terminal in full mode when
+  workload failure/loss/inconclusive evidence prevents an end-to-end claim. It
+  says nothing about application throughput or latency, and it never promotes
+  the global best in full mode.
 - `end_to_end_win`: full mode only; both kernel evidence and the user workload's
-  primary KPI are confirmed wins and all constraints pass.
+  primary KPI are confirmed wins and all constraints pass. This is the only
+  full-mode outcome that promotes the global best.
 - failure, loss, timeout, or inconclusive outcomes keep the current best.
 
 Do not update `best_file` from an average, one sample, a profiler estimate, or an
@@ -164,8 +185,9 @@ inner-loop win in full mode. `decision.json` is the promotion authority.
   If a selected tool cannot provide full coverage but the policy permits
   continuation, record `degraded` prominently. Never label degraded coverage as
   passed. Read `references/sanitizer_policy.json` for the exact routing policy.
-- A failed correctness, sanitizer, compiler-provenance, or SASS gate cannot be
-  rescued by good timing.
+- Failed correctness and sanitizer gates cannot be rescued by good timing.
+  Compiler/SASS evidence must be reported honestly, but an unavailable or
+  negative classification is not by itself a hard promotion veto.
 - Bound retries and retain the failure artifacts. Do not loop indefinitely.
 - Reject non-finite metrics, malformed workload output, changed frozen inputs,
   unsafe symlinks, and candidate/source hash drift.
@@ -193,7 +215,7 @@ run_YYYYMMDD_HHMMSS/
 │   ├── sass_check.json
 │   ├── compiler_evidence/manifest.json
 │   ├── branches/<candidate>/paired_samples.jsonl
-│   ├── workload/<candidate-id>/paired_samples.jsonl
+│   ├── workload/<candidate-hash-prefix>/paired_samples.jsonl
 │   ├── decision.json             # authoritative promotion decision
 │   └── *.ncu.log                 # success or exact degraded failure
 └── summary.md                    # separate kernel and workload conclusions

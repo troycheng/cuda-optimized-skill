@@ -51,6 +51,31 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("kernel_only_win", text)
         self.assertIn("end_to_end_win", text)
 
+    def test_skill_documents_real_stage_order_and_open_iter(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("orchestrate.py open-iter", text)
+        self.assertIn("correctness → paired → sanitizer → SASS", text)
+        self.assertIn("not hard promotion gates", text)
+        self.assertIn(
+            "setup does not profile or create branch directories", text.lower()
+        )
+
+    def test_skill_kernel_only_win_is_not_restricted_to_kernel_only_mode(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("confirms only a kernel win", text)
+        self.assertIn("can also be terminal in full mode", text)
+        self.assertIn("workload failure/loss/inconclusive", text)
+        self.assertIn("global best", text)
+        self.assertNotIn(
+            "kernel_only_win is limited to kernel-only mode", text
+        )
+
+    def test_skill_uses_real_workload_pair_prefix_path(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn(
+            "workload/<candidate-hash-prefix>/paired_samples.jsonl", text
+        )
+
     def test_skill_documents_budget_default_and_delegates_details(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         self.assertLessEqual(len(text.splitlines()), 500)

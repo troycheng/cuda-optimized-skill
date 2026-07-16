@@ -4,6 +4,12 @@ This example optimizes `gemm.cu` against `ref.py` and then validates the
 shortlisted kernel on a user-provided inference workload. Values are illustrative;
 the verdict rules and artifact names match V2.2.
 
+Commands run from the installed skill root:
+
+```bash
+cd "${CODEX_HOME:-$HOME/.codex}/skills/cuda-kernel-optimizer"
+```
+
 ## 1. User-owned inputs
 
 ```text
@@ -49,7 +55,7 @@ Choose only one form.
 ## 2. Freeze a balanced run
 
 ```bash
-python3 cuda-kernel-optimizer/scripts/orchestrate.py setup \
+python3 scripts/orchestrate.py setup \
   --baseline ~/work/gemm.cu \
   --ref ~/work/ref.py \
   --dims '{"M":4096,"N":4096,"K":4096}' \
@@ -65,13 +71,22 @@ and targeted sanitizer coverage. Setup emits paths to `manifest.json`,
 
 At this point the baseline and reference have stable hashes, the baseline passed
 correctness, and the workload snapshot is frozen. Changing those inputs requires
-a new run.
+a new run. Setup has not profiled the current best or created branch directories.
 
 ## 3. Inner kernel loop
 
-The agent reads the current best, available environment/profiler evidence, the
-optimization catalog, and the iteration report template. Suppose it records two
-methods and writes eight implementation variants:
+Open the round first:
+
+```bash
+python3 scripts/orchestrate.py open-iter \
+  --run-dir ~/work/run_20260717_101500 --iter 1
+```
+
+`open-iter` attempts current-best profiling, writes the Roofline evidence, and
+creates eight branch directories. The agent then reads the current best,
+available profiler evidence, optimization catalog, and iteration report
+template. Suppose it records two methods and writes eight implementation
+variants:
 
 ```text
 iterv1/
@@ -86,14 +101,17 @@ iterv1/
 Then it runs:
 
 ```bash
-python3 cuda-kernel-optimizer/scripts/orchestrate.py close-iter \
+python3 scripts/orchestrate.py close-iter \
   --run-dir ~/work/run_20260717_101500 --iter 1
 ```
 
-For every viable branch, the deterministic loop checks the Python reference,
-runs the sanitizer policy, captures compiler/SASS provenance, and measures
-randomized AB/BA baseline/candidate pairs. Telemetry-invalid blocks are retained
-but excluded from the valid pair count.
+The deterministic order is reference correctness, randomized AB/BA
+baseline/candidate pairs, sanitizer processing of the statistically confirmed
+shortlist, and SASS on the final eligible candidate. Candidate profiling occurs
+before sanitizer and is repeated if sanitizer selection changes the finalist.
+Compiler/SASS findings are evidence and method classification, not hard
+promotion gates. Telemetry-invalid blocks are retained but excluded from the
+valid pair count.
 
 Illustrative inner results:
 
@@ -117,7 +135,7 @@ The orchestrator evaluates frozen baseline/candidate roles across the user cases
 and writes raw observations under:
 
 ```text
-iterv1/workload/<candidate-hash>/paired_samples.jsonl
+iterv1/workload/<candidate-hash-prefix>/paired_samples.jsonl
 ```
 
 Illustrative workload result:
@@ -136,13 +154,16 @@ the current best would remain unchanged.
 If setup omitted every workload option, the same confirmed b2 kernel evidence
 could produce `kernel_only_win`. The summary would explicitly say that no
 user-provided workload was supplied and would not claim an end-to-end result.
+The same terminal label can appear in full mode if workload collection fails,
+the primary KPI is a loss/inconclusive, or constraint evidence is inconclusive.
+In full mode `kernel_only_win` never updates the global best.
 
 ## 6. Resume without replay
 
 After interruption:
 
 ```bash
-python3 cuda-kernel-optimizer/scripts/orchestrate.py resume --run-dir \
+python3 scripts/orchestrate.py resume --run-dir \
   ~/work/run_20260717_101500
 ```
 
@@ -153,7 +174,7 @@ not replayed. A drifted input or unsafe symlink fails closed.
 ## 7. Finalize and inspect evidence
 
 ```bash
-python3 cuda-kernel-optimizer/scripts/orchestrate.py finalize --run-dir \
+python3 scripts/orchestrate.py finalize --run-dir \
   ~/work/run_20260717_101500
 ```
 

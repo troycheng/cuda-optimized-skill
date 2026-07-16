@@ -26,8 +26,12 @@ The installer does not overwrite an existing skill. Back up or move the old
 directory first, install again, then restart the Codex session.
 
 ```bash
-cd skills/cuda-kernel-optimizer
+cd "${CODEX_HOME:-$HOME/.codex}/skills/cuda-kernel-optimizer"
 ```
+
+All commands below run from this installed skill root, so script paths start at
+`scripts/`. Contributors using a repository checkout can instead run
+`cd skills/cuda-kernel-optimizer` once and use the same commands.
 
 ## What V2.2 changes
 
@@ -77,24 +81,45 @@ Optionally provide exactly one real workload form:
 - `--workload-manifest ./workload.json`: strict manifest containing the source,
   objective, and cases.
 
+A minimal Python manifest is:
+
+```json
+{
+  "kind": "python",
+  "source": "./workload.py",
+  "objective": {
+    "primary_metric": {"name": "p50_latency_ms", "direction": "lower"},
+    "min_effect_pct": 1.0,
+    "constraints": []
+  },
+  "cases": [{}]
+}
+```
+
+`kind` must be `python` or `command`. A manifest requires `kind`, `source`, and
+`cases`. Use one objective source: embedded objective or --objective, never both. For a Python
+manifest, the embedded/external objective must match the adapter's `metrics()`.
+
 The objective schema is
 [`templates/objective.schema.json`](skills/cuda-kernel-optimizer/templates/objective.schema.json).
 It declares one primary metric, its direction and minimum effect, plus allowed
 regression for every constraint.
 
-Without a workload the run is kernel-only. A confirmed kernel improvement may
-produce `kernel_only_win`, which does not claim application throughput or
-latency. With a workload, `end_to_end_win` requires both a confirmed kernel win
-and a confirmed primary-KPI win with every constraint passing.
+`kernel_only_win` confirms only the kernel result. It is the normal successful
+outcome without a workload, but may also be the terminal outcome in full mode
+after workload failure/loss/inconclusive evidence. It never advances the global
+best in full mode. `end_to_end_win` requires both a confirmed kernel win and a
+confirmed primary-KPI win with every constraint passing; it is the only
+full-mode outcome that advances the global best.
 
 ## Quick start
 
 Kernel-only:
 
 ```bash
-python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py setup \
-  --baseline ./gemm.cu \
-  --ref ./ref.py \
+python3 scripts/orchestrate.py setup \
+  --baseline /path/to/gemm.cu \
+  --ref /path/to/ref.py \
   --dims '{"M":4096,"N":4096,"K":4096}' \
   --budget balanced
 ```
@@ -102,48 +127,62 @@ python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py setup \
 Full mode with a Python workload:
 
 ```bash
-python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py setup \
-  --baseline ./gemm.cu \
-  --ref ./ref.py \
+python3 scripts/orchestrate.py setup \
+  --baseline /path/to/gemm.cu \
+  --ref /path/to/ref.py \
   --dims '{"M":4096,"N":4096,"K":4096}' \
   --budget balanced \
-  --workload ./workload.py
+  --workload /path/to/workload.py
 ```
 
-The agent then creates the requested branch candidates and closes each round:
+Setup freezes inputs, validates and seeds the baseline, and writes the initial
+checkpoint. It does not profile the current best or create branch directories.
+Open each iteration before the agent reads profiler evidence or writes branches:
 
 ```bash
-python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py close-iter \
-  --run-dir ./run_YYYYMMDD_HHMMSS --iter 1
+python3 scripts/orchestrate.py open-iter \
+  --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
+```
+
+`open-iter` attempts current-best profiling, computes Roofline evidence, and
+creates the budgeted branch directories. The agent then writes candidates and
+closes the round:
+
+```bash
+python3 scripts/orchestrate.py close-iter \
+  --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
 ```
 
 After an interruption, validate frozen inputs and inspect the next unfinished
 stage without replaying completed work:
 
 ```bash
-python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py resume --run-dir \
-  ./run_YYYYMMDD_HHMMSS
+python3 scripts/orchestrate.py resume --run-dir \
+  /path/to/run_YYYYMMDD_HHMMSS
 ```
 
 Finalize after the decision stage completes:
 
 ```bash
-python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py finalize \
-  --run-dir ./run_YYYYMMDD_HHMMSS
+python3 scripts/orchestrate.py finalize \
+  --run-dir /path/to/run_YYYYMMDD_HHMMSS
 ```
 
 ## How promotion works
 
-The inner loop gates candidates through reference correctness, configured
-sanitizers, compiler/SASS evidence, and randomized paired baseline/candidate
-measurements. A candidate is shortlisted only after a `confirmed_win` whose
-finite confidence interval clears the configured minimum effect.
+The real candidate order is correctness, randomized paired baseline/candidate
+measurement, sanitizer processing of the confirmed shortlist, and SASS on the
+final eligible candidate. Compiler provenance and SASS are evidence and method
+classification, not hard promotion gates. Correctness and sanitizer remain
+hard gates; changed source/artifact identity fails closed.
 
 The outer loop runs only for a user-provided workload. It collects paired
 baseline/candidate observations across the frozen cases, evaluates the primary
-metric and constraints, and emits the terminal decision. Loss, timeout,
-malformed evidence, failed constraints, and `inconclusive` all retain the
-current best.
+metric and constraints, and emits the terminal decision. A confirmed failed
+hard constraint becomes `rejected_constraint`. Workload collection failure,
+primary loss/inconclusive, or inconclusive constraint evidence after a confirmed
+kernel win can terminate as `kernel_only_win`. All of these retain the global
+best in full mode.
 
 ## Artifact tree
 
@@ -172,7 +211,7 @@ run_YYYYMMDD_HHMMSS/
 │   ├── sanitizer.json
 │   ├── sanitizer/*.json
 │   ├── sass_check.json
-│   ├── workload/<candidate-hash>/paired_samples.jsonl
+│   ├── workload/<candidate-hash-prefix>/paired_samples.jsonl
 │   ├── decision.json               # authoritative promotion decision
 │   └── *.ncu.log                   # successful or degraded profiler log
 ├── iterv2/ ...
@@ -185,8 +224,11 @@ states whether profiler, sanitizer, compiler, or workload coverage degraded.
 
 ## RTX 5090 validation and NCU permissions
 
-On 2026-07-16 the opt-in SM120 matrix passed correctness and timing artifact
-checks on a physical RTX 5090 for Triton, native CUDA, and CUTLASS.
+The table below is V2.1 carried-forward backend fixture evidence collected on a
+physical RTX 5090 on 2026-07-16. It covers Triton, native CUDA, and CUTLASS
+correctness plus timing artifacts; it does not yet validate the V2.2 dual-loop,
+paired/no-op decision, or real-workload acceptance paths.
+V2.2 dual-loop acceptance is pending Task 14.
 
 | Lane | CUDA compiler | Triton | CUTLASS | Nsight Compute | Result |
 |---|---:|---:|---:|---:|---|

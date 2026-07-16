@@ -20,6 +20,9 @@
 
 Missing or degraded evidence stays missing or degraded. In particular,
 `ERR_NVGPUCTRPERM` is not a reason to add privileges automatically.
+Compiler and SASS findings are evidence and method-classification inputs, not
+hard promotion gates. Record source or artifact identity drift as an integrity
+failure rather than treating it as ordinary missing coverage.
 
 ## Bottleneck evidence
 
@@ -70,6 +73,9 @@ hyperparameters or implementation details.
 ## Inner kernel evidence
 
 Fill this section from durable artifacts after `close-iter`.
+Record the actual lifecycle: correctness → paired → sanitizer → SASS. The
+sanitizer processes the statistically confirmed shortlist; SASS describes the
+final eligible candidate.
 
 | Candidate | Correctness | Sanitizer | Estimate | Confidence interval | Valid/invalid pairs | Verdict |
 |---|---|---|---:|---|---:|---|
@@ -103,5 +109,8 @@ available.”
 - **Reason**: {{decision_reason}}
 - **Next checkpoint stage**: {{next_stage}}
 
-`kernel_only_win` is limited to kernel-only mode. `end_to_end_win` requires
-confirmed kernel and workload wins plus passing constraints.
+`kernel_only_win` confirms only the kernel result. It is normal in kernel-only
+mode and can also be terminal in full mode after workload
+failure/loss/inconclusive evidence; in full mode it must retain the global best.
+`end_to_end_win` requires confirmed kernel and workload wins plus passing
+constraints and is the only full-mode result that may promote the global best.
