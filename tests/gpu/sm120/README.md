@@ -1,26 +1,116 @@
-# RTX 5090 opt-in acceptance
+# RTX 5090 / SM120 opt-in acceptance
 
-These tests exercise the bundled benchmark against Triton, native CUDA, and
-CUTLASS on an SM120 GPU. They are skipped during the default CPU suite.
+This suite runs real CUDA work and is skipped unless `CUDA_SM120_E2E=1` is
+set. It covers:
 
-Run in a disposable container with exactly one idle GPU:
+- reference correctness and timing distributions for Triton, native CUDA, and
+  CUTLASS;
+- an identical Triton baseline/candidate measured by real randomized paired
+  timing, persisted to JSONL, recomputed, and required to remain
+  `inconclusive`;
+- a small user-owned Python workload adapter that executes the candidate on the
+  GPU through the production outer evaluator, persists its automatic
+  `workload_paired_samples` evidence, and verifies that an inconclusive outer
+  result cannot be promoted globally;
+- a target-bounded Nsight Compute attempt. It must either collect real metrics
+  with readable counters or record exactly `ERR_NVGPUCTRPERM`; no other
+  degraded result is accepted. The test never adds capabilities or changes
+  driver policy.
+
+The no-op check uses the production `run_paired`, `classify_pairs`, and
+`write_paired_samples` APIs. The workload check enters through the production
+`evaluate_outer_candidate` seam and recomputes the persisted pairs with
+`classify_recorded_pairs`; it does not manufacture outer-loop evidence.
+
+## Local and current-lane execution
+
+Without opt-in, seven CPU helper regressions pass and all four GPU tests are
+reported as skipped:
 
 ```bash
-docker run --rm --gpus device=1 \
-  -e CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
-  -e CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/artifacts/compatibility \
-  -v /data:/data \
-  -w /data/tcheng/cuda-skill-e2e/repo \
-  lmsysorg/sglang:latest-cu130-runtime \
-  bash tests/gpu/sm120/remote/run_lane.sh
+python3 -m unittest tests.gpu.sm120.test_sm120_acceptance -v
 ```
 
-Re-check GPU utilization immediately before the command. Do not point the
-working directory at `/data/vllm-opt` or install into a running service
-container.
+On the isolated checkout, a current host environment can run the same suite
+directly:
 
-The acceptance runner requires each backend to pass reference correctness and
-to emit `samples_ms`, `median_ms`, `p95_ms`, `stddev_ms`, and `cv_pct`. Set a
-different `CUDA_E2E_ARTIFACTS` directory for every toolchain lane so results are
-never overwritten. Nsight Compute counter access is validated separately with
-a real target-bounded profile; `ncu --query-metrics` alone is insufficient.
+```bash
+cd /data/tcheng/cuda-skill-e2e/v2.2/repo
+CUDA_VISIBLE_DEVICES=1 \
+CUDA_SM120_E2E=1 \
+CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v2.2/artifacts/current-host \
+CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
+python3 -m unittest tests.gpu.sm120.test_sm120_acceptance -v
+```
+
+## Disposable current and compatibility containers
+
+`remote/run_lane.sh` accepts `current` or `compat` (default). It requires the
+exact repository path `/data/tcheng/cuda-skill-e2e/v2.2/repo`, an artifact lane
+below `/data/tcheng/cuda-skill-e2e/v2.2/artifacts`, and the physical CUTLASS
+checkout `/data/tcheng/cuda-skill-e2e/deps/cutlass` with both
+`include/cutlass/cutlass.h` and `include/cutlass/version.h`. CUTLASS must not
+overlap the repository or `/data/vllm-opt`, and the version header must report
+the validated `4.6.1` release. The artifact lane must be fresh; only a regular
+`run.log` created by an outer `tee` is allowed to pre-exist.
+
+The runner checks the selected GPU for compute processes before image
+inspection and again immediately before `docker run`; query failures stop the
+run. It drops all Linux capabilities, disables networking, and mounts both the
+repository and CUTLASS read-only. Each test copies the complete clean fixture
+tree to its artifact-only `workspace/` first, so relative Python dependencies
+remain available while compiler binaries and evidence stay out of the
+repository.
+
+```bash
+cd /data/tcheng/cuda-skill-e2e/v2.2/repo
+CUDA_E2E_GPU=1 \
+CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v2.2/artifacts/current \
+CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
+tests/gpu/sm120/remote/run_lane.sh current
+
+CUDA_E2E_GPU=1 \
+CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v2.2/artifacts/compatibility \
+CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
+tests/gpu/sm120/remote/run_lane.sh compat
+```
+
+The defaults are the locally built
+`cuda-skill-current:cuda13.3-triton3.7.1-ncu2026.2.1` image and the cached
+`lmsysorg/sglang:latest-cu130-runtime` compatibility image. The runner resolves
+the requested reference once to an immutable `sha256:` image ID, inspects and
+runs that exact ID with `--pull never`, and saves both `requested_ref` and
+`resolved_id` in `container-image.json`. Override the defaults with
+`CUDA_CURRENT_IMAGE` or `CUDA_COMPAT_IMAGE` when a digest-pinned image is
+available.
+
+Use a distinct `CUDA_E2E_ARTIFACTS` directory for every lane. Expected durable
+outputs include:
+
+```text
+artifacts/<lane>/
+├── container-image.json
+├── env.json
+├── triton_vector/bench.json
+├── triton_vector/workspace/...
+├── cuda_reduction/bench.json
+├── cuda_reduction/workspace/...
+├── cutlass_gemm/bench.json
+├── cutlass_gemm/workspace/...
+├── paired_noop/
+│   ├── paired_samples.jsonl
+│   ├── statistics.json
+│   └── workspace/...
+├── workload_smoke/
+│   └── iterv1/
+│       ├── workspace/...
+│       └── workload/<candidate-sha-prefix>/paired_samples.jsonl
+└── ncu_target/
+    ├── workspace/...
+    └── iterv1/
+        ├── best_input.ncu.log
+        └── ncu_top.json
+```
+
+Large profiler reports remain in the isolated artifact tree. `ncu
+--query-metrics` is not treated as proof that hardware counters are readable.

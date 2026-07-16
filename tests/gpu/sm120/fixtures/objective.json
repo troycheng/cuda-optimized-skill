@@ -1,0 +1,13 @@
+{
+  "primary_metric": {
+    "name": "latency_ms",
+    "direction": "lower"
+  },
+  "min_effect_pct": 1.0,
+  "constraints": [
+    {
+      "name": "output_checksum",
+      "max_regression_pct": 0.001
+    }
+  ]
+}
