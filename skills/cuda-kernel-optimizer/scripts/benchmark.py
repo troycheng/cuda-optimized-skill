@@ -31,6 +31,7 @@ import ctypes
 import argparse
 import statistics
 import importlib.util
+from numbers import Real
 from pathlib import Path
 
 torch = None
@@ -756,6 +757,56 @@ def _setup_backend(solution_file, backend, dim_values, ptr_size_override, arch, 
             backend_name=backend,
         )
     raise ValueError(f"Unsupported backend: {backend}")
+
+
+def prepare_solution(
+    solution_file,
+    *,
+    backend,
+    dims,
+    ptr_size,
+    arch,
+    nvcc_bin,
+    seed,
+):
+    """Prepare one solution for repeated warm-up and single-shot timing."""
+    resolved_backend = infer_backend(solution_file, backend)
+    return _setup_backend(
+        solution_file,
+        resolved_backend,
+        dims,
+        ptr_size,
+        arch,
+        nvcc_bin,
+        seed=seed,
+    )
+
+
+def warm_solution(state, warmup):
+    """Warm a prepared solution, resetting its tensors before every launch."""
+    if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
+        raise ValueError("warmup must be a non-negative integer")
+    for _ in range(warmup):
+        _reset_tensor_inputs(state)
+        state["callable"]()
+    _require_torch().cuda.synchronize()
+
+
+def measure_once(state, *, cuda=None):
+    """Reset and time exactly one launch of a prepared solution."""
+    _reset_tensor_inputs(state)
+    value = _time_iterations(
+        state["callable"], warmup=0, repeat=1, cuda=cuda
+    )[0]
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("timing must be a finite non-negative real number")
+    try:
+        timing = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("timing must be a finite non-negative real number") from exc
+    if not math.isfinite(timing) or timing < 0:
+        raise ValueError("timing must be a finite non-negative real number")
+    return timing
 
 
 # ---------------------------------------------------------------------------
