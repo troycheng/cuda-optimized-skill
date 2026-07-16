@@ -5,7 +5,17 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from collections.abc import Mapping
+from pathlib import Path
+
+
+# Keep sibling imports reliable for direct CLI and importlib file loading.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from workload_adapter import validate_objective  # noqa: E402
 
 
 TERMINAL_STATUSES = {
@@ -39,11 +49,28 @@ _PRIMARY_STATUSES = {
 _CONSTRAINT_STATUSES = {"passed", "failed", "inconclusive"}
 _PARETO_SCHEMA = "cuda-kernel-optimizer/pareto-v1"
 _STATISTIC_FIELDS = {
+    "status",
     "statistic",
+    "direction",
+    "min_effect_pct",
+    "confidence",
+    "estimate_pct",
+    "ci_low_pct",
+    "ci_high_pct",
+    "valid_pairs",
+    "invalid_pairs",
+    "improvements_pct",
+}
+_PAIRED_STATISTIC = "median_paired_improvement_pct"
+_CONSTRAINT_RESULT_FIELDS = {
+    "name",
+    "max_regression_pct",
+    "cap_pct",
     "estimate_pct",
     "ci_low_pct",
     "ci_high_pct",
     "status",
+    "values_pct",
 }
 
 
@@ -98,30 +125,121 @@ def _json_copy(value, field: str, active: set[int] | None = None):
     raise ValueError(f"{field} must contain only strict JSON values")
 
 
-def _validate_win_statistics(value, field: str) -> dict:
+def _finite_real(value, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite real number")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a finite real number") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite real number")
+    return number
+
+
+def _literal_integer(value, field: str, *, positive: bool) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{field} must be a {qualifier} integer")
+    if (positive and value <= 0) or (not positive and value < 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{field} must be a {qualifier} integer")
+    return value
+
+
+def _paired_status(ci_low: float, ci_high: float, min_effect: float) -> str:
+    if (min_effect == 0.0 and ci_low > 0.0) or (
+        min_effect > 0.0 and ci_low >= min_effect
+    ):
+        return "confirmed_win"
+    if (min_effect == 0.0 and ci_high < 0.0) or (
+        min_effect > 0.0 and ci_high <= -min_effect
+    ):
+        return "confirmed_loss"
+    return "inconclusive"
+
+
+def _validate_paired_statistics(
+    value,
+    field: str,
+    *,
+    expected_direction: str | None = None,
+    expected_min_effect: float | None = None,
+    required_status: str | None = None,
+) -> dict:
     statistics = _mapping(value, field)
     missing = sorted(_STATISTIC_FIELDS - set(statistics))
     if missing:
         raise ValueError(f"{field} missing required field: {missing[0]}")
-    statistic = statistics["statistic"]
-    if not isinstance(statistic, str) or not statistic.strip():
-        raise ValueError(f"{field}.statistic must be a non-empty string")
-    _literal_status(statistics["status"], {"confirmed_win"}, f"{field}.status")
-    for name in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
-        number = statistics[name]
-        try:
-            finite = math.isfinite(float(number))
-        except (OverflowError, TypeError, ValueError):
-            finite = False
-        if (
-            isinstance(number, bool)
-            or not isinstance(number, (int, float))
-            or not finite
-        ):
-            raise ValueError(f"{field}.{name} must be a finite real number")
-    normalized = dict(statistics)
-    normalized["statistic"] = statistic.strip()
-    return normalized
+    unknown = sorted(set(statistics) - _STATISTIC_FIELDS)
+    if unknown:
+        raise ValueError(f"{field} contains unknown field: {unknown[0]}")
+    if statistics["statistic"] != _PAIRED_STATISTIC:
+        raise ValueError(f"{field}.statistic must be {_PAIRED_STATISTIC}")
+
+    direction = statistics["direction"]
+    if type(direction) is not str or direction not in {"lower", "higher"}:
+        raise ValueError(f"{field}.direction must be 'lower' or 'higher'")
+    if expected_direction is not None and direction != expected_direction:
+        raise ValueError(f"{field}.direction must match objective primary direction")
+
+    min_effect = _finite_real(statistics["min_effect_pct"], f"{field}.min_effect_pct")
+    if min_effect < 0.0:
+        raise ValueError(f"{field}.min_effect_pct must be non-negative")
+    if expected_min_effect is not None and min_effect != expected_min_effect:
+        raise ValueError(f"{field}.min_effect_pct must match objective")
+
+    confidence = _finite_real(statistics["confidence"], f"{field}.confidence")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"{field}.confidence must be between zero and one")
+    estimate = _finite_real(statistics["estimate_pct"], f"{field}.estimate_pct")
+    ci_low = _finite_real(statistics["ci_low_pct"], f"{field}.ci_low_pct")
+    ci_high = _finite_real(statistics["ci_high_pct"], f"{field}.ci_high_pct")
+    if ci_low > ci_high:
+        raise ValueError(f"{field} confidence interval must be ordered")
+
+    valid_pairs = _literal_integer(
+        statistics["valid_pairs"], f"{field}.valid_pairs", positive=True
+    )
+    invalid_pairs = _literal_integer(
+        statistics["invalid_pairs"], f"{field}.invalid_pairs", positive=False
+    )
+    improvements = statistics["improvements_pct"]
+    if not isinstance(improvements, list):
+        raise ValueError(f"{field}.improvements_pct must be a finite list")
+    normalized_improvements = [
+        _finite_real(item, f"{field}.improvements_pct[{index}]")
+        for index, item in enumerate(improvements)
+    ]
+    if len(normalized_improvements) < valid_pairs:
+        raise ValueError(
+            f"{field}.improvements_pct must contain at least valid_pairs values"
+        )
+
+    status = _literal_status(
+        statistics["status"],
+        {"confirmed_win", "confirmed_loss", "inconclusive"},
+        f"{field}.status",
+    )
+    derived_status = _paired_status(ci_low, ci_high, min_effect)
+    if status != derived_status:
+        raise ValueError(f"{field}.status contradicts its confidence interval")
+    if required_status is not None and status != required_status:
+        raise ValueError(f"{field}.status must be {required_status}")
+
+    return {
+        "status": status,
+        "statistic": _PAIRED_STATISTIC,
+        "direction": direction,
+        "min_effect_pct": min_effect,
+        "confidence": confidence,
+        "estimate_pct": estimate,
+        "ci_low_pct": ci_low,
+        "ci_high_pct": ci_high,
+        "valid_pairs": valid_pairs,
+        "invalid_pairs": invalid_pairs,
+        "improvements_pct": normalized_improvements,
+    }
 
 
 def _normalize_mode(mode) -> str:
@@ -137,68 +255,39 @@ def _validate_workload(workload) -> Mapping | None:
     status = _literal_status(
         workload.get("status"), _WORKLOAD_STATUSES, "workload.status"
     )
-    primary = workload.get("primary")
-    if primary is not None:
-        primary = _mapping(primary, "workload.primary")
-        primary_status = _literal_status(
-            primary.get("status"), _PRIMARY_STATUSES, "workload.primary.status"
-        )
-        if primary_status == "confirmed_win":
-            _validate_win_statistics(primary, "workload.primary")
-            _validate_winning_workload_schema(workload)
-    if status == "evaluated" and "constraints" in workload:
-        _validate_constraints(workload["constraints"])
-    return workload
-
-
-def _validate_winning_workload_schema(workload: Mapping) -> None:
-    objective = workload.get("objective")
-    if not isinstance(objective, Mapping):
-        raise ValueError("incomplete workload evidence: objective is required")
-    if "primary_metric" not in objective or "constraints" not in objective:
-        raise ValueError(
-            "incomplete workload evidence: objective primary_metric and constraints "
-            "are required"
-        )
-    primary_metric = objective["primary_metric"]
-    if not isinstance(primary_metric, Mapping):
-        raise ValueError("incomplete workload evidence: primary_metric must be a mapping")
-    primary_name = primary_metric.get("name")
-    if not isinstance(primary_name, str) or not primary_name.strip():
-        raise ValueError("incomplete workload evidence: primary_metric.name is required")
-    if primary_metric.get("direction") not in {"lower", "higher"}:
-        raise ValueError(
-            "incomplete workload evidence: primary_metric.direction is invalid"
-        )
-    declared = objective["constraints"]
-    if not isinstance(declared, list):
-        raise ValueError(
-            "incomplete workload evidence: objective.constraints must be a sequence"
-        )
-    declared_names = []
-    declared_seen = set()
-    for index, constraint in enumerate(declared):
-        constraint = _mapping(
-            constraint, f"workload.objective.constraints[{index}]"
-        )
-        name = constraint.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(
-                f"workload.objective.constraints[{index}].name must be non-empty"
+    normalized = dict(workload)
+    if status != "evaluated":
+        primary = workload.get("primary")
+        if primary is not None:
+            primary = _mapping(primary, "workload.primary")
+            _literal_status(
+                primary.get("status"), _PRIMARY_STATUSES, "workload.primary.status"
             )
-        name = name.strip()
-        if name in declared_seen:
-            raise ValueError(f"workload objective contains duplicate constraint: {name}")
-        declared_seen.add(name)
-        declared_names.append(name)
+        return normalized
+
+    if "objective" not in workload:
+        raise ValueError("incomplete workload evidence: objective is required")
+    try:
+        objective = validate_objective(workload["objective"])
+    except ValueError as error:
+        raise ValueError(f"incomplete workload evidence: {error}") from error
+    if "primary" not in workload:
+        raise ValueError("incomplete workload evidence: primary is required")
+    primary = _validate_paired_statistics(
+        workload["primary"],
+        "workload.primary",
+        expected_direction=objective["primary_metric"]["direction"],
+        expected_min_effect=objective["min_effect_pct"],
+    )
     if "constraints" not in workload or workload["constraints"] is None:
         raise ValueError("incomplete workload evidence: constraints are required")
-    results = _validate_constraints(workload["constraints"])
-    result_names = [constraint["name"] for constraint in results]
-    if set(result_names) != set(declared_names):
-        raise ValueError(
-            "incomplete workload evidence: objective and result constraints must match"
-        )
+    constraints = _validate_workload_constraints(
+        workload["constraints"], objective["constraints"]
+    )
+    normalized["objective"] = objective
+    normalized["primary"] = primary
+    normalized["constraints"] = constraints
+    return normalized
 
 
 def _validate_constraints(constraints) -> list[dict]:
@@ -228,6 +317,64 @@ def _validate_constraints(constraints) -> list[dict]:
         )
         item = dict(constraint)
         item["name"] = name
+        normalized.append(item)
+    return normalized
+
+
+def _validate_workload_constraints(constraints, declared_constraints) -> list[dict]:
+    results = _validate_constraints(constraints)
+    declared = {constraint["name"]: constraint for constraint in declared_constraints}
+    result_names = {result["name"] for result in results}
+    if result_names != set(declared):
+        raise ValueError(
+            "incomplete workload evidence: objective and result constraints must match"
+        )
+
+    normalized = []
+    for index, result in enumerate(results):
+        field = f"workload.constraints[{index}]"
+        missing = sorted(_CONSTRAINT_RESULT_FIELDS - set(result))
+        if missing:
+            raise ValueError(f"{field} missing required field: {missing[0]}")
+        cap = declared[result["name"]]["max_regression_pct"]
+        declared_cap = _finite_real(
+            result["max_regression_pct"], f"{field}.max_regression_pct"
+        )
+        result_cap = _finite_real(result["cap_pct"], f"{field}.cap_pct")
+        if declared_cap != cap or result_cap != cap:
+            raise ValueError(f"{field} cap must match its objective constraint")
+        estimate = _finite_real(result["estimate_pct"], f"{field}.estimate_pct")
+        ci_low = _finite_real(result["ci_low_pct"], f"{field}.ci_low_pct")
+        ci_high = _finite_real(result["ci_high_pct"], f"{field}.ci_high_pct")
+        if ci_low > ci_high:
+            raise ValueError(f"{field} confidence interval must be ordered")
+        values = result["values_pct"]
+        if not isinstance(values, list):
+            raise ValueError(f"{field}.values_pct must be a finite list")
+        normalized_values = [
+            _finite_real(item, f"{field}.values_pct[{value_index}]")
+            for value_index, item in enumerate(values)
+        ]
+        if ci_high <= cap:
+            derived_status = "passed"
+        elif ci_low > cap:
+            derived_status = "failed"
+        else:
+            derived_status = "inconclusive"
+        if result["status"] != derived_status:
+            raise ValueError(f"{field}.status contradicts its confidence interval")
+
+        item = dict(result)
+        item.update(
+            {
+                "max_regression_pct": cap,
+                "cap_pct": cap,
+                "estimate_pct": estimate,
+                "ci_low_pct": ci_low,
+                "ci_high_pct": ci_high,
+                "values_pct": normalized_values,
+            }
+        )
         normalized.append(item)
     return normalized
 
@@ -290,7 +437,11 @@ def _validate_pareto(pareto) -> dict | None:
 def _kernel_statistics(kernel: Mapping) -> dict:
     if "statistics" not in kernel:
         raise ValueError("kernel.statistics is required for an inner win")
-    return _validate_win_statistics(kernel["statistics"], "kernel.statistics")
+    return _validate_paired_statistics(
+        kernel["statistics"],
+        "kernel.statistics",
+        required_status="confirmed_win",
+    )
 
 
 def _result(status: str, reason: str, mode: str, evidence: dict, **fields) -> dict:
@@ -430,7 +581,13 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             evidence,
             statistics=kernel_statistics,
         )
-    workload_statistics = _validate_win_statistics(primary, "workload.primary")
+    workload_statistics = _validate_paired_statistics(
+        primary,
+        "workload.primary",
+        expected_direction=workload["objective"]["primary_metric"]["direction"],
+        expected_min_effect=workload["objective"]["min_effect_pct"],
+        required_status="confirmed_win",
+    )
     if normalized_pareto is not None:
         return _result(
             "pareto_frontier",

@@ -48,17 +48,48 @@ def _load_workload_evaluate():
 
 
 def _statistics(status: str = "confirmed_win") -> dict:
+    intervals = {
+        "confirmed_win": (5.0, 3.0, 7.0),
+        "confirmed_loss": (-5.0, -7.0, -3.0),
+        "inconclusive": (0.0, -1.0, 1.0),
+    }
+    estimate, ci_low, ci_high = intervals[status]
     return {
         "status": status,
         "statistic": "median_paired_improvement_pct",
-        "estimate_pct": 5.0,
-        "ci_low_pct": 3.0,
-        "ci_high_pct": 7.0,
+        "direction": "lower",
+        "min_effect_pct": 1.0,
+        "confidence": 0.95,
+        "estimate_pct": estimate,
+        "ci_low_pct": ci_low,
+        "ci_high_pct": ci_high,
+        "valid_pairs": 3,
+        "invalid_pairs": 0,
+        "improvements_pct": [estimate, estimate, estimate],
     }
 
 
 def _kernel(status: str = "confirmed_win") -> dict:
     return {"status": status, "statistics": _statistics(status)}
+
+
+def _constraint(name: str, status: str = "passed", cap: float = 5.0) -> dict:
+    intervals = {
+        "passed": (3.0, 2.0, 4.0),
+        "failed": (7.0, 6.0, 8.0),
+        "inconclusive": (5.0, 4.0, 6.0),
+    }
+    estimate, ci_low, ci_high = intervals[status]
+    return {
+        "name": name,
+        "max_regression_pct": cap,
+        "cap_pct": cap,
+        "estimate_pct": estimate,
+        "ci_low_pct": ci_low,
+        "ci_high_pct": ci_high,
+        "status": status,
+        "values_pct": [estimate, estimate, estimate],
+    }
 
 
 def _workload(primary_status: str = "confirmed_win", *, constraints=None) -> dict:
@@ -70,7 +101,10 @@ def _workload(primary_status: str = "confirmed_win", *, constraints=None) -> dic
             "primary_metric": {"name": "latency_ms", "direction": "lower"},
             "min_effect_pct": 1.0,
             "constraints": [
-                {"name": constraint["name"].strip(), "max_regression_pct": 5.0}
+                {
+                    "name": constraint["name"].strip(),
+                    "max_regression_pct": constraint["max_regression_pct"],
+                }
                 for constraint in constraint_results
             ],
         },
@@ -144,8 +178,8 @@ class DecisionTests(unittest.TestCase):
     def test_full_mode_requires_primary_win_and_passed_constraints(self) -> None:
         module = _load_decision()
         constraints = [
-            {"name": "memory_mb", "status": "passed"},
-            {"name": "p99_ms", "status": "passed"},
+            _constraint("memory_mb"),
+            _constraint("p99_ms"),
         ]
         kernel = _kernel()
         workload = _workload(constraints=constraints)
@@ -165,7 +199,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_constraint_failure_rejects_before_pareto(self) -> None:
         module = _load_decision()
-        constraints = [{"name": "memory", "status": "failed"}]
+        constraints = [_constraint("memory", "failed")]
         result = module.decide(
             mode="full",
             kernel=_kernel(),
@@ -177,21 +211,21 @@ class DecisionTests(unittest.TestCase):
     def test_explicit_constraints_cannot_override_workload_constraints(self) -> None:
         module = _load_decision()
         workload = _workload(
-            constraints=[{"name": "memory", "status": "failed"}]
+            constraints=[_constraint("memory", "failed")]
         )
         with self.assertRaisesRegex(ValueError, "conflicting constraints"):
             module.decide(
                 mode="full",
                 kernel=_kernel(),
                 workload=workload,
-                constraints=[{"name": "memory", "status": "passed"}],
+                constraints=[_constraint("memory")],
             )
 
     def test_matching_explicit_and_workload_constraints_are_accepted(self) -> None:
         module = _load_decision()
-        constraints = [{"name": " memory ", "status": "passed"}]
+        constraints = [_constraint(" memory ")]
         workload = _workload(
-            constraints=[{"name": "memory", "status": "passed"}]
+            constraints=[_constraint("memory")]
         )
         result = module.decide(
             mode="full",
@@ -209,7 +243,7 @@ class DecisionTests(unittest.TestCase):
                 mode="full",
                 kernel=_kernel(),
                 workload=workload,
-                constraints=[{"name": "memory", "status": "passed"}],
+                constraints=[_constraint("memory")],
             )
 
     def test_winning_workload_constraint_names_match_objective_exactly(self) -> None:
@@ -222,6 +256,7 @@ class DecisionTests(unittest.TestCase):
                 "primary": primary,
                 "objective": {
                     "primary_metric": primary_metric,
+                    "min_effect_pct": 1.0,
                     "constraints": [
                         {"name": "memory", "max_regression_pct": 5.0}
                     ],
@@ -231,26 +266,32 @@ class DecisionTests(unittest.TestCase):
             {
                 "status": "evaluated",
                 "primary": primary,
-                "objective": {"primary_metric": primary_metric, "constraints": []},
-                "constraints": [{"name": "memory", "status": "passed"}],
+                "objective": {
+                    "primary_metric": primary_metric,
+                    "min_effect_pct": 1.0,
+                    "constraints": [],
+                },
+                "constraints": [_constraint("memory")],
             },
             {
                 "status": "evaluated",
                 "primary": primary,
                 "objective": {
                     "primary_metric": primary_metric,
+                    "min_effect_pct": 1.0,
                     "constraints": [
                         {"name": "memory", "max_regression_pct": 5.0},
                         {"name": "memory", "max_regression_pct": 5.0},
                     ],
                 },
-                "constraints": [{"name": "memory", "status": "passed"}],
+                "constraints": [_constraint("memory")],
             },
             {
                 "status": "evaluated",
                 "primary": primary,
                 "objective": {
                     "primary_metric": primary_metric,
+                    "min_effect_pct": 1.0,
                     "constraints": None,
                 },
                 "constraints": [],
@@ -258,7 +299,11 @@ class DecisionTests(unittest.TestCase):
             {
                 "status": "evaluated",
                 "primary": primary,
-                "objective": {"primary_metric": primary_metric, "constraints": []},
+                "objective": {
+                    "primary_metric": primary_metric,
+                    "min_effect_pct": 1.0,
+                    "constraints": [],
+                },
                 "constraints": None,
             },
         )
@@ -274,7 +319,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_inconclusive_constraint_keeps_only_kernel_win(self) -> None:
         module = _load_decision()
-        constraints = [{"name": "memory", "status": "inconclusive"}]
+        constraints = [_constraint("memory", "inconclusive")]
         result = module.decide(
             mode="full",
             kernel=_kernel(),
@@ -290,7 +335,6 @@ class DecisionTests(unittest.TestCase):
             {"status": "workload_failed"},
             _workload("inconclusive"),
             _workload("confirmed_loss"),
-            {"status": "evaluated", "constraints": []},
         )
         for workload in workloads:
             with self.subTest(workload=workload):
@@ -306,7 +350,6 @@ class DecisionTests(unittest.TestCase):
             {"status": "workload_failed"},
             _workload("inconclusive"),
             _workload("confirmed_loss"),
-            {"status": "evaluated", "constraints": []},
         )
         for workload in workloads:
             with self.subTest(workload=workload):
@@ -317,6 +360,21 @@ class DecisionTests(unittest.TestCase):
                     pareto=_pareto(),
                 )
                 self.assertEqual(result["status"], "kernel_only_win")
+
+    def test_every_evaluated_workload_requires_complete_objective_and_primary(self) -> None:
+        module = _load_decision()
+        malformed = (
+            {"status": "evaluated", "constraints": []},
+            {"status": "evaluated", "objective": _workload()["objective"]},
+            {
+                "status": "evaluated",
+                "primary": _statistics(),
+                "objective": _workload()["objective"],
+            },
+        )
+        for workload in malformed:
+            with self.subTest(workload=workload), self.assertRaises(ValueError):
+                module.decide(mode="full", kernel=_kernel(), workload=workload)
 
     def test_empty_constraints_are_all_passed(self) -> None:
         module = _load_decision()
@@ -352,6 +410,130 @@ class DecisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "workload.primary"):
             module.decide(mode="full", kernel=_kernel(), workload=workload)
 
+    def test_decision_reuses_workload_objective_validator(self) -> None:
+        module = _load_decision()
+        original = module.validate_objective
+        seen = []
+
+        def recording_validator(value):
+            seen.append(value)
+            return original(value)
+
+        module.validate_objective = recording_validator
+        workload = _workload()
+        result = module.decide(mode="full", kernel=_kernel(), workload=workload)
+
+        self.assertEqual(result["status"], "end_to_end_win")
+        self.assertEqual(seen, [workload["objective"]])
+
+    def test_evaluated_workload_rejects_incomplete_objective_thresholds(self) -> None:
+        module = _load_decision()
+        missing_min_effect = _workload()
+        del missing_min_effect["objective"]["min_effect_pct"]
+        missing_constraint_cap = _workload(
+            constraints=[_constraint("memory")]
+        )
+        del missing_constraint_cap["objective"]["constraints"][0][
+            "max_regression_pct"
+        ]
+
+        for workload in (missing_min_effect, missing_constraint_cap):
+            with self.subTest(workload=workload), self.assertRaises(ValueError):
+                module.decide(mode="full", kernel=_kernel(), workload=workload)
+
+    def test_primary_statistics_must_match_objective_and_ci_semantics(self) -> None:
+        module = _load_decision()
+        malformed = []
+
+        for field, value in (
+            ("statistic", "mean_unpaired_improvement_pct"),
+            ("direction", "higher"),
+            ("min_effect_pct", 2.0),
+            ("confidence", 1.0),
+            ("valid_pairs", True),
+            ("invalid_pairs", -1),
+            ("improvements_pct", [5.0, math.inf, 5.0]),
+            ("improvements_pct", [5.0, 5.0]),
+        ):
+            workload = _workload()
+            workload["primary"][field] = value
+            malformed.append(workload)
+
+        negative_ci_win = _workload()
+        negative_ci_win["primary"].update(
+            {"estimate_pct": -5.0, "ci_low_pct": -7.0, "ci_high_pct": -3.0}
+        )
+        malformed.append(negative_ci_win)
+
+        reversed_ci = _workload()
+        reversed_ci["primary"].update({"ci_low_pct": 8.0, "ci_high_pct": 2.0})
+        malformed.append(reversed_ci)
+
+        for workload in malformed:
+            with self.subTest(primary=workload["primary"]), self.assertRaises(
+                ValueError
+            ):
+                module.decide(mode="full", kernel=_kernel(), workload=workload)
+
+    def test_constraint_statistics_must_match_objective_cap_and_ci_semantics(
+        self,
+    ) -> None:
+        module = _load_decision()
+        malformed_constraints = []
+
+        passed_above_cap = _constraint("memory")
+        passed_above_cap.update(
+            {"estimate_pct": 8.0, "ci_low_pct": 7.0, "ci_high_pct": 9.0}
+        )
+        malformed_constraints.append(passed_above_cap)
+
+        for field, value in (
+            ("max_regression_pct", 4.0),
+            ("cap_pct", 4.0),
+            ("ci_low_pct", 9.0),
+            ("values_pct", [3.0, math.inf, 3.0]),
+        ):
+            constraint = _constraint("memory")
+            constraint[field] = value
+            malformed_constraints.append(constraint)
+
+        missing_cap = _constraint("memory")
+        del missing_cap["cap_pct"]
+        malformed_constraints.append(missing_cap)
+
+        for constraint in malformed_constraints:
+            workload = _workload(constraints=[constraint])
+            if constraint["max_regression_pct"] != 5.0:
+                workload["objective"]["constraints"][0][
+                    "max_regression_pct"
+                ] = 5.0
+            with self.subTest(constraint=constraint), self.assertRaises(ValueError):
+                module.decide(mode="full", kernel=_kernel(), workload=workload)
+
+    def test_kernel_statistics_require_complete_semantic_paired_schema(self) -> None:
+        module = _load_decision()
+        malformed = []
+
+        negative_ci_win = _kernel()
+        negative_ci_win["statistics"].update(
+            {"estimate_pct": -5.0, "ci_low_pct": -7.0, "ci_high_pct": -3.0}
+        )
+        malformed.append(negative_ci_win)
+
+        for field, value in (
+            ("direction", "sideways"),
+            ("min_effect_pct", -1.0),
+        ):
+            kernel = _kernel()
+            kernel["statistics"][field] = value
+            malformed.append(kernel)
+
+        for kernel in malformed:
+            with self.subTest(statistics=kernel["statistics"]), self.assertRaises(
+                ValueError
+            ):
+                module.decide(mode="full", kernel=kernel, workload=_workload())
+
     def test_win_statistics_require_complete_finite_nonboolean_fields(self) -> None:
         module = _load_decision()
         bad_values = (math.nan, math.inf, -math.inf, True, 10**400)
@@ -373,9 +555,15 @@ class DecisionTests(unittest.TestCase):
                         )
         for missing in (
             "statistic",
+            "direction",
+            "min_effect_pct",
+            "confidence",
             "estimate_pct",
             "ci_low_pct",
             "ci_high_pct",
+            "valid_pairs",
+            "invalid_pairs",
+            "improvements_pct",
         ):
             with self.subTest(source="kernel", missing=missing):
                 kernel = _kernel()
@@ -461,9 +649,15 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(result["status"], "end_to_end_win")
         required = {
             "statistic",
+            "direction",
+            "min_effect_pct",
+            "confidence",
             "estimate_pct",
             "ci_low_pct",
             "ci_high_pct",
+            "valid_pairs",
+            "invalid_pairs",
+            "improvements_pct",
             "status",
         }
         self.assertTrue(required.issubset(result["statistics"]))
