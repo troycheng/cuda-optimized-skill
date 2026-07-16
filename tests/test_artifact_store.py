@@ -109,6 +109,26 @@ class ArtifactStoreTests(unittest.TestCase):
                 [{"index": 1}, {"index": 2}],
             )
 
+    def test_write_methods_return_normalized_paths_inside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.artifacts.ArtifactStore(Path(tmp) / "parent" / ".." / "run")
+            results = (
+                (
+                    store.write_json("nested/../result.json", {"ok": True}),
+                    store.root / "result.json",
+                ),
+                (
+                    store.append_jsonl("events/../history.jsonl", {"index": 1}),
+                    store.root / "history.jsonl",
+                ),
+            )
+
+            for result, expected in results:
+                with self.subTest(expected=expected.name):
+                    self.assertIsInstance(result, Path)
+                    self.assertEqual(result, expected.resolve())
+                    self.assertEqual(result.relative_to(store.root), Path(expected.name))
+
     def test_read_jsonl_missing_is_empty_and_bad_line_reports_number(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self.artifacts.ArtifactStore(Path(tmp) / "run")

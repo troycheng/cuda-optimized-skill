@@ -143,10 +143,12 @@ class ArtifactStore:
             raise ValueError(f"artifact path must name a file below {self.root}: {text}")
         return target
 
-    def write_json(self, relative_path: _PathLike, payload: Any) -> None:
-        atomic_write_json(self._resolve_relative(relative_path), payload)
+    def write_json(self, relative_path: _PathLike, payload: Any) -> Path:
+        target = self._resolve_relative(relative_path)
+        atomic_write_json(target, payload)
+        return target
 
-    def append_jsonl(self, relative_path: _PathLike, payload: Any) -> None:
+    def append_jsonl(self, relative_path: _PathLike, payload: Any) -> Path:
         target = self._resolve_relative(relative_path)
         line = (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -157,6 +159,7 @@ class ArtifactStore:
             stream.write(line)
             stream.flush()
             os.fsync(stream.fileno())
+        return target
 
     def read_jsonl(self, relative_path: _PathLike) -> list:
         target = self._resolve_relative(relative_path)
