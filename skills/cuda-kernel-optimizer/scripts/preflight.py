@@ -27,6 +27,8 @@ import re
 import sys
 from pathlib import Path
 
+from workload_adapter import WorkloadSpec, normalize_workload
+
 
 # ---------------------------------------------------------------------------
 # CUDA .cu inspection (mirrors benchmark.py's parse_solve_signature)
@@ -156,8 +158,33 @@ def _check_dims_cuda(sig: list[tuple[str, str, bool]], dims: dict) -> list[str]:
 # Driver
 # ---------------------------------------------------------------------------
 
-def run(baseline: str, ref: str, dims: dict, strict_ref_params: bool = False) -> dict:
-    report = {"ok": True, "baseline": {}, "ref": {}, "warnings": [], "errors": []}
+def _workload_summary(spec: WorkloadSpec | None) -> dict | None:
+    if spec is None:
+        return None
+    return {
+        "kind": spec.kind,
+        "source_hash": spec.source_hash,
+        "objective": spec.objective,
+        "cases_count": len(spec.cases),
+    }
+
+
+def run(
+    baseline: str,
+    ref: str,
+    dims: dict,
+    strict_ref_params: bool = False,
+    workload_spec: WorkloadSpec | None = None,
+) -> dict:
+    report = {
+        "ok": True,
+        "baseline": {},
+        "ref": {},
+        "warnings": [],
+        "errors": [],
+        "mode": "full" if workload_spec is not None else "kernel-only",
+        "workload": _workload_summary(workload_spec),
+    }
 
     # ref first: it's cheaper and always .py
     try:
@@ -229,6 +256,30 @@ def main() -> None:
                    help="Also warn when ref.reference() parameters don't overlap solve()'s")
     p.add_argument("--out", type=str, default="",
                    help="Optional path to write the report as JSON")
+    p.add_argument(
+        "--workload",
+        type=str,
+        default=None,
+        help="User-owned Python workload adapter",
+    )
+    p.add_argument(
+        "--workload-cmd",
+        type=str,
+        default=None,
+        help="User-owned command workload (parsed without a shell)",
+    )
+    p.add_argument(
+        "--workload-manifest",
+        type=str,
+        default=None,
+        help="User-owned workload manifest JSON",
+    )
+    p.add_argument(
+        "--objective",
+        type=str,
+        default=None,
+        help="External objective JSON (required for command workloads)",
+    )
     args = p.parse_args()
 
     try:
@@ -236,7 +287,31 @@ def main() -> None:
     except json.JSONDecodeError as e:
         sys.exit(f"--dims must be valid JSON: {e}")
 
-    rep = run(os.path.abspath(args.baseline), os.path.abspath(args.ref), dims, args.strict)
+    try:
+        workload_spec = normalize_workload(
+            workload=args.workload,
+            workload_cmd=args.workload_cmd,
+            workload_manifest=args.workload_manifest,
+            objective=args.objective,
+        )
+    except (ValueError, OSError) as e:
+        rep = {
+            "ok": False,
+            "baseline": {},
+            "ref": {},
+            "warnings": [],
+            "errors": [f"workload: {e}"],
+            "mode": "kernel-only",
+            "workload": None,
+        }
+    else:
+        rep = run(
+            os.path.abspath(args.baseline),
+            os.path.abspath(args.ref),
+            dims,
+            args.strict,
+            workload_spec,
+        )
     payload = json.dumps(rep, indent=2, ensure_ascii=False)
     print(payload)
     if args.out:
