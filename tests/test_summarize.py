@@ -302,6 +302,8 @@ class SummarizeTests(unittest.TestCase):
                         "mode": "full",
                         "workload": workload,
                         "min_effect_pct": 1.0,
+                        "bootstrap_samples": 20,
+                        "seed": 0,
                         "best_file": str(baseline),
                         "best_metric_ms": 2.0,
                         "best_kernel_statistics": None,

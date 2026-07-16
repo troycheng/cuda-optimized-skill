@@ -344,6 +344,9 @@ class DecisionTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "kernel_only_win")
         self.assertEqual(result["statistics"]["status"], "confirmed_win")
+        self.assertEqual(result["workload_status"], "evaluated")
+        self.assertEqual(result["workload_statistics"], _workload(constraints=constraints)["primary"])
+        self.assertEqual(result["constraints"], constraints)
 
     def test_missing_failed_or_nonwinning_workload_keeps_only_kernel_win(self) -> None:
         module = _load_decision()
@@ -359,6 +362,43 @@ class DecisionTests(unittest.TestCase):
                     mode="full", kernel=_kernel(), workload=workload
                 )
                 self.assertEqual(result["status"], "kernel_only_win")
+                if workload is not None:
+                    self.assertEqual(result["workload_status"], workload["status"])
+                    if workload["status"] == "evaluated":
+                        self.assertEqual(
+                            result["workload_statistics"], workload["primary"]
+                        )
+
+    def test_workload_failure_preserves_recomputable_failure_evidence(self) -> None:
+        module = _load_decision()
+        workload = {
+            "status": "workload_failed",
+            "reason": "one or more workload roles exhausted retries",
+            "primary": {
+                "status": "invalid",
+                "statistic": "median_paired_improvement_pct",
+                "estimate_pct": None,
+                "ci_low_pct": None,
+                "ci_high_pct": None,
+            },
+            "constraints": [],
+            "failure": {"error_type": "RuntimeError", "reason": "failed"},
+        }
+
+        result = module.decide(mode="full", kernel=_kernel(), workload=workload)
+
+        self.assertEqual(result["status"], "kernel_only_win")
+        self.assertEqual(result["workload_status"], "workload_failed")
+        self.assertEqual(
+            result["workload_failure"],
+            {
+                "status": "workload_failed",
+                "reason": workload["reason"],
+                "primary": workload["primary"],
+                "constraints": [],
+                "failure": workload["failure"],
+            },
+        )
 
     def test_pareto_cannot_bypass_missing_or_nonwinning_workload(self) -> None:
         module = _load_decision()

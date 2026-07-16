@@ -488,6 +488,22 @@ def _result(status: str, reason: str, mode: str, evidence: dict, **fields) -> di
     return normalized
 
 
+def _terminal_workload_fields(workload, constraints: list[dict]) -> dict:
+    fields = {"constraints": constraints}
+    if workload is None:
+        return fields
+    fields["workload_status"] = workload["status"]
+    if workload["status"] == "evaluated":
+        fields["workload_statistics"] = workload["primary"]
+        return fields
+    fields["workload_failure"] = {
+        key: workload[key]
+        for key in ("status", "reason", "primary", "constraints", "failure")
+        if key in workload
+    }
+    return fields
+
+
 def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dict:
     """Return one terminal decision without mutating or weighting evidence."""
     normalized_mode = _normalize_mode(mode)
@@ -531,6 +547,9 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
         "constraints": normalized_constraints,
         "pareto": normalized_pareto,
     }
+    workload_fields = _terminal_workload_fields(
+        workload, normalized_constraints
+    )
 
     if kernel_status in {"rejected_compile", "rejected_correctness"}:
         return _result(
@@ -538,6 +557,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             f"kernel evaluation ended with {kernel_status}",
             normalized_mode,
             evidence,
+            **workload_fields,
         )
     if kernel_status == "confirmed_loss":
         return _result(
@@ -545,6 +565,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             "paired kernel evidence confirms a loss",
             normalized_mode,
             evidence,
+            **workload_fields,
         )
     if kernel_status in {"inconclusive", "invalid", "no_confirmed_kernel_win"}:
         return _result(
@@ -552,6 +573,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             "kernel evidence does not contain a confirmed inner-loop win",
             normalized_mode,
             evidence,
+            **workload_fields,
         )
 
     kernel_statistics = _kernel_statistics(kernel)
@@ -571,7 +593,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
-            constraints=normalized_constraints,
+            **workload_fields,
         )
     if any(item["status"] != "passed" for item in normalized_constraints):
         return _result(
@@ -580,7 +602,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
-            constraints=normalized_constraints,
+            **workload_fields,
         )
     if workload is None:
         return _result(
@@ -589,6 +611,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
+            **workload_fields,
         )
     if workload["status"] == "workload_failed":
         return _result(
@@ -597,6 +620,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
+            **workload_fields,
         )
     primary = workload.get("primary")
     if primary is None or primary["status"] != "confirmed_win":
@@ -606,6 +630,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             normalized_mode,
             evidence,
             statistics=kernel_statistics,
+            **workload_fields,
         )
     workload_statistics = _validate_paired_statistics(
         primary,
@@ -623,6 +648,8 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             statistics=kernel_statistics,
             workload_statistics=workload_statistics,
             pareto=normalized_pareto,
+            constraints=normalized_constraints,
+            workload_status="evaluated",
         )
     return _result(
         "end_to_end_win",
@@ -632,6 +659,7 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
         statistics=kernel_statistics,
         workload_statistics=workload_statistics,
         constraints=normalized_constraints,
+        workload_status="evaluated",
     )
 
 

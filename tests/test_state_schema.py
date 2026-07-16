@@ -216,6 +216,10 @@ class StateSchemaTests(unittest.TestCase):
                 "budget": {},
                 "candidates": {},
                 "mode": "kernel-only",
+                "confidence": 0.95,
+                "min_effect_pct": 1.0,
+                "bootstrap_samples": 20,
+                "seed": 0,
                 "history": [],
             }
             state_path.write_text(json.dumps(initial_state), encoding="utf-8")
@@ -340,6 +344,10 @@ class StateDecisionPromotionTests(unittest.TestCase):
             "budget": {},
             "candidates": {},
             "mode": mode,
+            "confidence": 0.95,
+            "min_effect_pct": 1.0,
+            "bootstrap_samples": 20,
+            "seed": 0,
             "workload": (
                 {
                     "kind": "command",
@@ -701,6 +709,37 @@ class StateDecisionPromotionTests(unittest.TestCase):
                 self.skipTest("symlinks are unavailable")
 
             with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+        self.assertNotIn("terminal_decision", unchanged)
+
+    def test_low_confidence_reclassification_cannot_forge_a_terminal_win(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            decision_path = state_path.parent / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            statistics = decision["statistics"]
+            statistics["confidence"] = 0.5
+            evidence = decision["kernel_paired_samples"]
+            evidence["classifier"]["confidence"] = 0.5
+            artifact = Path(evidence["path"])
+            records = [
+                json.loads(line) for line in artifact.read_text("utf-8").splitlines()
+            ]
+            for record in records:
+                record["classifier"]["confidence"] = 0.5
+            artifact.write_text(
+                "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            evidence["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "confidence.*frozen|frozen.*confidence"):
                 self._run_update(args)
             unchanged = json.loads(state_path.read_text("utf-8"))
 

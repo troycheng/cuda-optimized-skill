@@ -336,6 +336,29 @@ def _strict_json_copy(value, field: str):
         raise ValueError(f"{field} must be strict JSON") from error
 
 
+def _workload_failure_snapshot(value, field: str) -> dict:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be a mapping")
+    snapshot = {
+        key: value[key]
+        for key in ("status", "reason", "primary", "constraints", "failure")
+        if key in value
+    }
+    clean = _strict_json_copy(snapshot, field)
+    if clean.get("status") != "workload_failed":
+        raise ValueError(f"{field}.status must be workload_failed")
+    if type(clean.get("reason")) is not str or not clean["reason"].strip():
+        raise ValueError(f"{field}.reason must be non-empty")
+    if not isinstance(clean.get("primary"), Mapping):
+        raise ValueError(f"{field}.primary must be a mapping")
+    constraints = clean.get("constraints")
+    if not isinstance(constraints, list) or not all(
+        isinstance(item, Mapping) for item in constraints
+    ):
+        raise ValueError(f"{field}.constraints must be a sequence of mappings")
+    return clean
+
+
 def _validate_paired_artifact(
     payload,
     *,
@@ -348,6 +371,12 @@ def _validate_paired_artifact(
     expected_statistics: Mapping | None,
     expected_constraints,
     expected_objective,
+    expected_workload_status: str | None,
+    expected_workload_failure,
+    expected_confidence: float,
+    expected_kernel_min_effect: float,
+    expected_bootstrap_samples: int,
+    expected_seed: int,
     verify_file: bool,
 ) -> dict:
     field = f"{kind}_paired_samples"
@@ -450,6 +479,16 @@ def _validate_paired_artifact(
         }
         if set(classifier) != required_classifier:
             raise ValueError(f"{field}.classifier fields are invalid")
+        if classifier["direction"] != "lower":
+            raise ValueError(f"{field}.classifier direction does not match frozen state")
+        if classifier["min_effect_pct"] != expected_kernel_min_effect:
+            raise ValueError(f"{field}.classifier min_effect does not match frozen state")
+        if classifier["confidence"] != expected_confidence:
+            raise ValueError(f"{field}.classifier confidence does not match frozen state")
+        if classifier["bootstrap_samples"] != expected_bootstrap_samples:
+            raise ValueError(f"{field}.classifier bootstrap policy does not match frozen state")
+        if classifier["seed"] != expected_seed:
+            raise ValueError(f"{field}.classifier seed does not match frozen state")
         recomputed = paired_stats.classify_pairs(
             raw_pairs,
             direction=classifier["direction"],
@@ -470,6 +509,12 @@ def _validate_paired_artifact(
         }
         if set(classifier) != required_classifier:
             raise ValueError(f"{field}.classifier fields are invalid")
+        if classifier["confidence"] != expected_confidence:
+            raise ValueError(f"{field}.classifier confidence does not match frozen state")
+        if classifier["bootstrap_samples"] != expected_bootstrap_samples:
+            raise ValueError(f"{field}.classifier bootstrap policy does not match frozen state")
+        if classifier["seed"] != expected_seed:
+            raise ValueError(f"{field}.classifier seed does not match frozen state")
         objective = classifier["objective"]
         encoded = json.dumps(
             objective,
@@ -489,12 +534,21 @@ def _validate_paired_artifact(
             bootstrap_samples=classifier["bootstrap_samples"],
             seed=classifier["seed"],
         )
-        if recomputed.get("status") != "evaluated":
-            raise ValueError(f"{field} raw pairs do not form evaluated workload evidence")
-        if recomputed.get("primary") != expected_statistics:
-            raise ValueError(f"{field} raw pairs do not recompute declared statistics")
-        if recomputed.get("constraints") != expected_constraints:
-            raise ValueError(f"{field} raw pairs do not recompute declared constraints")
+        if recomputed.get("status") != expected_workload_status:
+            raise ValueError(f"{field} raw pairs do not recompute workload status")
+        if expected_workload_status == "evaluated":
+            if recomputed.get("primary") != expected_statistics:
+                raise ValueError(f"{field} raw pairs do not recompute declared statistics")
+            if recomputed.get("constraints") != expected_constraints:
+                raise ValueError(f"{field} raw pairs do not recompute declared constraints")
+        elif expected_workload_status == "workload_failed":
+            recomputed_failure = _workload_failure_snapshot(
+                recomputed, f"{field} recomputed failure"
+            )
+            if recomputed_failure != expected_workload_failure:
+                raise ValueError(f"{field} raw pairs do not recompute workload failure")
+        else:
+            raise ValueError(f"{field} terminal workload status is missing")
     return clean
 
 
@@ -554,6 +608,41 @@ def _validate_terminal_snapshot(
         raise ValueError("terminal_decision win requires confirmed kernel evidence")
     if status == "end_to_end_win" and workload_statistics["status"] != "confirmed_win":
         raise ValueError("terminal_decision end_to_end_win requires workload evidence")
+    workload_status = clean.get("workload_status")
+    if workload_status is None and workload_statistics is not None:
+        workload_status = "evaluated"
+    if workload_status not in {None, "evaluated", "workload_failed"}:
+        raise ValueError("terminal_decision.workload_status is invalid")
+    workload_failure = clean.get("workload_failure")
+    if workload_status == "evaluated":
+        if workload_statistics is None:
+            raise ValueError("evaluated workload requires workload_statistics")
+        if workload_failure is not None:
+            raise ValueError("evaluated workload must not contain workload_failure")
+    elif workload_status == "workload_failed":
+        if workload_statistics is not None:
+            raise ValueError("workload_failed must not contain workload_statistics")
+        workload_failure = _workload_failure_snapshot(
+            workload_failure, "terminal_decision.workload_failure"
+        )
+    elif workload_failure is not None:
+        raise ValueError("workload_failure requires workload_status")
+    if status == "end_to_end_win" and workload_status != "evaluated":
+        raise ValueError("end_to_end_win requires evaluated workload status")
+    expected_confidence = state.get("confidence", 0.95)
+    for field_name, stats in (
+        ("statistics", statistics),
+        ("workload_statistics", workload_statistics),
+    ):
+        if stats is not None and stats.get("confidence") != expected_confidence:
+            raise ValueError(
+                f"terminal_decision.{field_name}.confidence does not match frozen state"
+            )
+    expected_bootstrap_samples = state.get(
+        "bootstrap_samples", workload_evaluate.DEFAULT_BOOTSTRAP_SAMPLES
+    )
+    expected_seed = state.get("seed", 0)
+    expected_kernel_min_effect = state.get("min_effect_pct", 0.5)
     candidate_sha256 = clean.get("candidate_sha256")
     if candidate_sha256 is not None and (
         not isinstance(candidate_sha256, str) or not _SHA256.fullmatch(candidate_sha256)
@@ -627,7 +716,7 @@ def _validate_terminal_snapshot(
         evidence = clean.get(field)
         required_evidence = (
             kind == "kernel" and status in _WIN_STATUSES
-        ) or (kind == "workload" and status == "end_to_end_win")
+        ) or (kind == "workload" and workload_status is not None)
         if evidence is None and required_evidence:
             raise ValueError(f"terminal_decision win requires {field}")
         if evidence is not None:
@@ -648,10 +737,22 @@ def _validate_terminal_snapshot(
                     if isinstance(state.get("workload"), Mapping)
                     else None
                 ),
+                expected_workload_status=(
+                    workload_status if kind == "workload" else None
+                ),
+                expected_workload_failure=(
+                    workload_failure if kind == "workload" else None
+                ),
+                expected_confidence=expected_confidence,
+                expected_kernel_min_effect=expected_kernel_min_effect,
+                expected_bootstrap_samples=expected_bootstrap_samples,
+                expected_seed=expected_seed,
                 verify_file=verify_artifacts,
             )
     clean["statistics"] = statistics
     clean["workload_statistics"] = workload_statistics
+    clean["workload_status"] = workload_status
+    clean["workload_failure"] = workload_failure
     return clean
 
 
@@ -1000,6 +1101,8 @@ def initialize_state(
         "started_at": float(started_at),
         "confidence": float(confidence),
         "min_effect_pct": float(min_effect_pct),
+        "bootstrap_samples": workload_evaluate.DEFAULT_BOOTSTRAP_SAMPLES,
+        "seed": 0,
         "backend": backend,
         "baseline_file": str(baseline_copy),
         "baseline_file_original": str(baseline_path),
@@ -1423,6 +1526,8 @@ def cmd_update(args: argparse.Namespace) -> None:
         "decision_sha256": _sha256_nofollow(decision_path),
         "statistics": decision_statistics,
         "workload_statistics": workload_statistics,
+        "workload_status": decision.get("workload_status"),
+        "workload_failure": decision.get("workload_failure"),
         "constraints": _strict_json_copy(constraints, "decision constraints"),
         "correctness": {
             "status": "passed" if validation_passed else "failed",
@@ -1568,6 +1673,8 @@ def cmd_record_decision(args: argparse.Namespace) -> None:
         "decision_sha256": decision_digest,
         "statistics": statistics,
         "workload_statistics": workload_statistics,
+        "workload_status": decision.get("workload_status"),
+        "workload_failure": decision.get("workload_failure"),
         "constraints": _strict_json_copy(constraints, "decision constraints"),
         "correctness": {"status": "not_recorded"},
         "compiler_evidence": {"status": "not_recorded"},

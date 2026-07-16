@@ -2343,6 +2343,363 @@ class OuterLoopTests(unittest.TestCase):
         self.assertEqual(evidence["pairs"], 1)
         self.assertEqual(records[0]["pair"], raw_pairs[0])
 
+    def test_full_outer_non_win_matrix_preserves_workload_terminal_evidence(self) -> None:
+        objective = {
+            "primary_metric": {"name": "latency", "direction": "lower"},
+            "min_effect_pct": 1.0,
+            "constraints": [{"name": "memory", "max_regression_pct": 2.0}],
+        }
+
+        def primary(status: str, estimate: float, low: float, high: float) -> dict:
+            return {
+                "status": status,
+                "statistic": "median_paired_improvement_pct",
+                "direction": "lower",
+                "min_effect_pct": 1.0,
+                "confidence": 0.95,
+                "estimate_pct": estimate,
+                "ci_low_pct": low,
+                "ci_high_pct": high,
+                "valid_pairs": 1,
+                "invalid_pairs": 0,
+                "improvements_pct": [estimate],
+            }
+
+        def constraint(status: str, estimate: float, low: float, high: float) -> dict:
+            return {
+                "name": "memory",
+                "max_regression_pct": 2.0,
+                "cap_pct": 2.0,
+                "estimate_pct": estimate,
+                "ci_low_pct": low,
+                "ci_high_pct": high,
+                "status": status,
+                "values_pct": [estimate],
+            }
+
+        cases = {
+            "primary_loss": {
+                "status": "evaluated",
+                "objective": objective,
+                "primary": primary("confirmed_loss", -2.0, -2.0, -2.0),
+                "constraints": [constraint("passed", 0.0, 0.0, 0.0)],
+            },
+            "primary_inconclusive": {
+                "status": "evaluated",
+                "objective": objective,
+                "primary": primary("inconclusive", 0.0, 0.0, 0.0),
+                "constraints": [constraint("passed", 0.0, 0.0, 0.0)],
+            },
+            "constraint_failed": {
+                "status": "evaluated",
+                "objective": objective,
+                "primary": primary("confirmed_win", 3.0, 3.0, 3.0),
+                "constraints": [constraint("failed", 5.0, 5.0, 5.0)],
+            },
+            "constraint_inconclusive": {
+                "status": "evaluated",
+                "objective": objective,
+                "primary": primary("confirmed_win", 3.0, 3.0, 3.0),
+                "constraints": [constraint("inconclusive", 2.0, 2.0, 3.0)],
+            },
+            "workload_failed": {
+                "status": "workload_failed",
+                "objective": objective,
+                "reason": "one or more workload roles exhausted retries",
+                "primary": {
+                    "status": "invalid",
+                    "statistic": "median_paired_improvement_pct",
+                    "estimate_pct": None,
+                    "ci_low_pct": None,
+                    "ci_high_pct": None,
+                },
+                "constraints": [],
+            },
+        }
+        for name, workload_result in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                iter_dir = Path(tmp).resolve() / "iterv1"
+                iter_dir.mkdir()
+                candidate_file = iter_dir / "candidate.py"
+                candidate_file.write_text("# candidate\n", encoding="utf-8")
+                candidate = {
+                    "id": "b1",
+                    "status": "confirmed_win",
+                    "candidate_file": str(candidate_file),
+                    "statistics": self.orchestrate_test_statistics(),
+                }
+                raw_pair = {
+                    "block": 0,
+                    "order": "AB",
+                    "case": None,
+                    "baseline_metrics": {"latency": 100.0, "memory": 100.0},
+                    "candidate_metrics": {"latency": 100.0, "memory": 100.0},
+                    "valid": name != "workload_failed",
+                    "attempts": {"baseline": 1, "candidate": 1},
+                    "attempt_records": {"baseline": [], "candidate": []},
+                }
+                result_payload = copy.deepcopy(workload_result)
+                result_payload.update(
+                    confidence=0.95,
+                    bootstrap_samples=10000,
+                    seed=0,
+                    pairs=[raw_pair],
+                )
+                result = self.orchestrate.evaluate_outer_candidate(
+                    candidate,
+                    mode="full",
+                    workload_spec=self.orchestrate.WorkloadSpec(
+                        kind="command",
+                        source=["/bin/echo"],
+                        objective=objective,
+                        cases=(),
+                        source_hash="c" * 64,
+                    ),
+                    baseline="best.py",
+                    policy=self.orchestrate.resolve_budget("quick"),
+                    confidence=0.95,
+                    evaluator=mock.Mock(return_value=result_payload),
+                    candidate_root=iter_dir,
+                    input_hash="a" * 64,
+                    iteration=1,
+                )
+
+                self.assertEqual(result["workload_status"], workload_result["status"])
+                self.assertIn("workload_paired_samples", result)
+                if workload_result["status"] == "evaluated":
+                    self.assertEqual(
+                        result["workload_statistics"], workload_result["primary"]
+                    )
+                    self.assertEqual(result["constraints"], workload_result["constraints"])
+                else:
+                    self.assertEqual(
+                        result["workload_failure"]["reason"],
+                        workload_result["reason"],
+                    )
+
+    def test_actual_outer_non_win_matrix_survives_state_update_and_finalize(self) -> None:
+        cases = {
+            "primary_loss": {"latency": 102.0, "memory": [100.0], "fail": False},
+            "primary_inconclusive": {"latency": 100.0, "memory": [100.0], "fail": False},
+            "constraint_failed": {"latency": 97.0, "memory": [105.0], "fail": False},
+            "constraint_inconclusive": {
+                "latency": 97.0,
+                "memory": [100.0, 104.0, 100.0],
+                "fail": False,
+            },
+            "workload_failed": {"latency": 97.0, "memory": [100.0], "fail": True},
+        }
+        expected_terminal = {
+            "primary_loss": "kernel_only_win",
+            "primary_inconclusive": "kernel_only_win",
+            "constraint_failed": "rejected_constraint",
+            "constraint_inconclusive": "kernel_only_win",
+            "workload_failed": "kernel_only_win",
+        }
+        for name, outcome in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                run_dir = root / "run"
+                iter_dir = run_dir / "iterv1"
+                iter_dir.mkdir(parents=True)
+                baseline = run_dir / "baseline.py"
+                candidate_file = iter_dir / "kernel.py"
+                baseline.write_text("# baseline\n", encoding="utf-8")
+                candidate_file.write_text("# candidate\n", encoding="utf-8")
+                input_hash = "a" * 64
+                objective = {
+                    "primary_metric": {"name": "latency", "direction": "lower"},
+                    "min_effect_pct": 1.0,
+                    "constraints": [
+                        {"name": "memory", "max_regression_pct": 2.0}
+                    ],
+                }
+                memory_values = outcome["memory"]
+                workload_cases = tuple(
+                    {"index": index, "memory": value}
+                    for index, value in enumerate(memory_values)
+                )
+                workload_spec = self.orchestrate.WorkloadSpec(
+                    kind="command",
+                    source=["/bin/echo"],
+                    objective=objective,
+                    cases=workload_cases,
+                    source_hash="b" * 64,
+                )
+                state_path = run_dir / "state.json"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "run_dir": str(run_dir),
+                            "input_hash": input_hash,
+                            "budget": {
+                                "name": "custom",
+                                "max_seconds": 60,
+                                "max_rounds": 1,
+                                "branches": 1,
+                            },
+                            "candidates": {},
+                            "mode": "full",
+                            "workload": {
+                                "kind": "command",
+                                "source": ["/bin/echo"],
+                                "source_hash": "b" * 64,
+                                "cases": list(workload_cases),
+                                "objective": objective,
+                            },
+                            "confidence": 0.95,
+                            "min_effect_pct": 1.0,
+                            "bootstrap_samples": 10000,
+                            "seed": 0,
+                            "best_file": str(baseline),
+                            "best_metric_ms": 2.0,
+                            "best_kernel_statistics": None,
+                            "best_workload_statistics": None,
+                            "selected_methods": [],
+                            "effective_methods": [],
+                            "ineffective_methods": [],
+                            "implementation_failed_methods": [],
+                            "history": [],
+                            "roofline_history": [],
+                            "frontier": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                kernel_pairs = [
+                    {"baseline": 100.0, "candidate": 97.0, "valid": True}
+                    for _ in range(3)
+                ]
+                kernel_statistics = self.orchestrate.workload_evaluate.paired_stats.classify_pairs(
+                    kernel_pairs,
+                    direction="lower",
+                    min_effect_pct=1.0,
+                    confidence=0.95,
+                    bootstrap_samples=10000,
+                    seed=0,
+                )
+                kernel_evidence = self.orchestrate.write_paired_samples(
+                    iter_dir / "kernel-pairs.jsonl",
+                    kernel_pairs,
+                    kind="kernel",
+                    input_hash=input_hash,
+                    iteration=1,
+                    candidate_id="b1",
+                    candidate_file=candidate_file,
+                    classifier_config={
+                        "direction": "lower",
+                        "min_effect_pct": 1.0,
+                        "confidence": 0.95,
+                        "bootstrap_samples": 10000,
+                        "seed": 0,
+                    },
+                )
+                candidate = {
+                    "id": "b1",
+                    "status": "confirmed_win",
+                    "candidate_file": str(candidate_file),
+                    "statistics": kernel_statistics,
+                    "paired_samples": kernel_evidence,
+                }
+
+                def workload_runner(_spec, *, role, case=None, **_kwargs):
+                    if outcome["fail"] and role == "candidate":
+                        raise RuntimeError("workload failed")
+                    memory = 100.0 if role == "baseline" else case["memory"]
+                    latency = 100.0 if role == "baseline" else outcome["latency"]
+                    return {
+                        "role": role,
+                        "case": case,
+                        "validation": True,
+                        "benchmark": {"latency": latency, "memory": memory},
+                        "objective": objective,
+                    }
+
+                policy = self.orchestrate.resolve_budget(
+                    "custom",
+                    max_seconds=60,
+                    max_rounds=1,
+                    branches=1,
+                    min_pairs=3,
+                    max_pairs=3,
+                    outer_candidates=1,
+                    reserve_seconds=5,
+                )
+                terminal = self.orchestrate.evaluate_outer_candidate(
+                    candidate,
+                    mode="full",
+                    workload_spec=workload_spec,
+                    baseline=str(baseline),
+                    policy=policy,
+                    confidence=0.95,
+                    candidate_root=iter_dir,
+                    input_hash=input_hash,
+                    iteration=1,
+                    retries=0,
+                    seed=0,
+                    workload_runner=workload_runner,
+                )
+                self.assertEqual(terminal["status"], expected_terminal[name])
+                self.assertIn("workload_paired_samples", terminal)
+
+                bench = iter_dir / "bench.json"
+                bench.write_text(
+                    json.dumps(
+                        {
+                            "correctness": {"passed": True},
+                            "kernel": {"average_ms": 1.0},
+                            "reference": {"average_ms": 2.0},
+                            "compiler_evidence": {"status": "not_recorded"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                methods = iter_dir / "methods.json"
+                methods.write_text('{"methods":[]}', encoding="utf-8")
+                sass = iter_dir / "sass_check.json"
+                sass.write_text('{"status":"passed","checks":[]}', encoding="utf-8")
+                applied = self.orchestrate.apply_decision(
+                    terminal,
+                    run_dir=run_dir,
+                    iteration=1,
+                    state_path=state_path,
+                    kernel=candidate_file,
+                    bench=bench,
+                    methods_json=methods,
+                    sass_check=sass,
+                    skip_validation=True,
+                    runner=lambda command, **_kwargs: subprocess.run(
+                        command, capture_output=True, text=True
+                    ),
+                )
+                self.assertEqual(applied["returncode"], 0, applied["stderr"])
+                updated = json.loads(state_path.read_text("utf-8"))
+                self.assertEqual(
+                    updated["terminal_decision"]["workload_status"],
+                    "workload_failed" if name == "workload_failed" else "evaluated",
+                )
+
+                self.orchestrate.ArtifactStore(run_dir).write_checkpoint(
+                    {
+                        "schema_version": 2,
+                        "input_hash": input_hash,
+                        "run_dir": str(run_dir),
+                        "iteration": 1,
+                        "stage": "decision",
+                        "stage_index": self.orchestrate.STAGES.index("decision"),
+                        "status": "stage_complete",
+                        "candidate_id": "b1",
+                        "candidate_status": terminal["status"],
+                        "budget": {"elapsed_seconds": 1.0, "remaining_seconds": 59.0},
+                        "updated_at": 1.0,
+                        "stage_evidence": {"decision": {"status": terminal["status"]}},
+                    }
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.orchestrate.cmd_finalize(SimpleNamespace(run_dir=str(run_dir)))
+                self.assertTrue((run_dir / "summary.md").is_file())
+
     def test_outer_deadline_marks_candidate_inconclusive_without_workload_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidate_file = Path(tmp) / "kernel.py"
