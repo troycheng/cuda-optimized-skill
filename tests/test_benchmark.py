@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import statistics
 import subprocess
 import sys
 import unittest
@@ -74,6 +75,18 @@ class BenchmarkTests(unittest.TestCase):
         benchmark = _load_benchmark()
         _average, median, _minimum, _maximum = benchmark._stats([1.0, 2.0, 100.0, 200.0])
         self.assertEqual(median, 51.0)
+
+    def test_stats_dict_preserves_samples_and_distribution(self) -> None:
+        benchmark = _load_benchmark()
+        samples = [1.0, 2.0, 3.0, 4.0]
+        result = benchmark._stats_dict(samples)
+        self.assertEqual(result["samples_ms"], samples)
+        self.assertEqual(result["median_ms"], 2.5)
+        self.assertAlmostEqual(result["p95_ms"], 4.0)
+        self.assertAlmostEqual(result["stddev_ms"], statistics.pstdev(samples))
+        self.assertAlmostEqual(
+            result["cv_pct"], statistics.pstdev(samples) / 2.5 * 100
+        )
 
 
 if __name__ == "__main__":

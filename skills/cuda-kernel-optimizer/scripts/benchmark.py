@@ -23,6 +23,7 @@ import re
 import os
 import sys
 import json
+import math
 import copy
 import glob
 import subprocess
@@ -421,11 +422,18 @@ def _stats(times_ms: list):
 
 def _stats_dict(times_ms: list):
     avg, med, mn, mx = _stats(times_ms)
+    ordered = sorted(times_ms)
+    p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+    stddev = statistics.pstdev(times_ms)
     return {
         "average_ms": avg,
         "median_ms": med,
         "min_ms": mn,
         "max_ms": mx,
+        "samples_ms": list(times_ms),
+        "p95_ms": p95,
+        "stddev_ms": stddev,
+        "cv_pct": stddev / med * 100 if med else None,
     }
 
 
