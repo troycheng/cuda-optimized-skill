@@ -530,6 +530,61 @@ def _validation_failed(result) -> bool:
     return False
 
 
+def _json_value_copy(value, field: str):
+    """Return a detached JSON value, rejecting ambiguous Python-only data."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field} numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{field} object must use string keys")
+            normalized[key] = _json_value_copy(item, f"{field}.{key}")
+        return normalized
+    if isinstance(value, list):
+        return [
+            _json_value_copy(item, f"{field}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise ValueError(
+        f"{field} must contain only JSON-compatible values, got "
+        f"{type(value).__name__}"
+    )
+
+
+def _validate_validation_result(validation) -> bool | dict:
+    if isinstance(validation, bool):
+        return validation
+    elif isinstance(validation, Mapping):
+        normalized_validation = _json_value_copy(validation, "validation")
+        if not isinstance(normalized_validation.get("valid"), bool):
+            raise ValueError("validation object requires literal boolean valid")
+        return normalized_validation
+    raise ValueError(
+        "validation must be a literal boolean or object with literal boolean valid"
+    )
+
+
+def _validate_benchmark_result(benchmark) -> dict:
+    if not isinstance(benchmark, Mapping):
+        raise ValueError("benchmark must be a JSON object")
+    return _json_value_copy(benchmark, "benchmark")
+
+
+def _validate_observation(validation, benchmark) -> tuple[bool | dict, dict]:
+    """Normalize the lifecycle evidence shared by Python and command paths."""
+    return (
+        _validate_validation_result(validation),
+        _validate_benchmark_result(benchmark),
+    )
+
+
 def _record_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
     note = f"workload cleanup failed: {type(cleanup).__name__}: {cleanup}"
     add_note = getattr(primary, "add_note", None)
@@ -554,10 +609,12 @@ def run_once(adapter, *, candidate, role: str, case: dict) -> dict:
     primary = None
     try:
         adapter.prepare(lifecycle_candidate)
-        validation = adapter.validate(lifecycle_candidate)
+        raw_validation = adapter.validate(lifecycle_candidate)
+        validation = _validate_validation_result(raw_validation)
         if _validation_failed(validation):
             raise ValueError("workload validation failed")
-        benchmark = adapter.benchmark(lifecycle_candidate)
+        raw_benchmark = adapter.benchmark(lifecycle_candidate)
+        benchmark = _validate_benchmark_result(raw_benchmark)
         objective = validate_objective(adapter.metrics())
         return {
             "role": role,
@@ -649,20 +706,14 @@ def _read_command_output(path: Path) -> dict:
         raise RuntimeError(
             f"workload command output contains unknown fields: {shown}{suffix}"
         )
-    validation = value["validation"]
-    if isinstance(validation, bool):
-        pass
-    elif isinstance(validation, dict):
-        if not isinstance(validation.get("valid"), bool):
-            raise RuntimeError(
-                "workload command validation object requires boolean valid"
-            )
-    else:
-        raise RuntimeError(
-            "workload command validation must be a boolean or object with boolean valid"
+    try:
+        validation, benchmark = _validate_observation(
+            value["validation"], value["benchmark"]
         )
-    if not isinstance(value["benchmark"], dict):
-        raise RuntimeError("workload command benchmark must be a JSON object")
+    except ValueError as error:
+        raise RuntimeError(f"workload command {error}") from error
+    value["validation"] = validation
+    value["benchmark"] = benchmark
     if "diagnostics" in value and not isinstance(value["diagnostics"], dict):
         raise RuntimeError("workload command diagnostics must be a JSON object")
     return value

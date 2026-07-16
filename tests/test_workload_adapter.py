@@ -435,6 +435,126 @@ class PythonLifecycleTests(unittest.TestCase):
             any("cleanup failed" in note for note in getattr(raised.exception, "__notes__", []))
         )
 
+    def test_validation_result_schema_errors_still_cleanup_exactly_once(self) -> None:
+        for invalid in (None, "passed", {}, {"valid": "yes"}):
+            cleanup_count = 0
+
+            def validate(candidate, invalid=invalid):
+                return invalid
+
+            def cleanup():
+                nonlocal cleanup_count
+                cleanup_count += 1
+
+            adapter, _ = self._adapter(validate=validate, cleanup=cleanup)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "validation"
+            ):
+                self.workloads.run_once(
+                    adapter,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case={},
+                )
+            self.assertEqual(cleanup_count, 1)
+
+    def test_benchmark_must_be_json_object_and_schema_errors_cleanup(self) -> None:
+        invalid_results = (None, True, 1, 1.5, "fast", [], [1, 2])
+        for invalid in invalid_results:
+            cleanup_count = 0
+
+            def benchmark(candidate, invalid=invalid):
+                return invalid
+
+            def cleanup():
+                nonlocal cleanup_count
+                cleanup_count += 1
+
+            adapter, _ = self._adapter(benchmark=benchmark, cleanup=cleanup)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "benchmark"
+            ):
+                self.workloads.run_once(
+                    adapter,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case={},
+                )
+            self.assertEqual(cleanup_count, 1)
+
+    def test_observation_objects_are_json_safe_deep_copies(self) -> None:
+        for benchmark, message in (
+            ({1: "non-string key"}, "string keys"),
+            ({"value": object()}, "JSON"),
+            ({"value": math.nan}, "finite"),
+        ):
+            cleanup_count = 0
+
+            def return_benchmark(candidate, benchmark=benchmark):
+                return benchmark
+
+            def cleanup():
+                nonlocal cleanup_count
+                cleanup_count += 1
+
+            adapter, _ = self._adapter(
+                benchmark=return_benchmark,
+                cleanup=cleanup,
+            )
+            with self.subTest(benchmark=benchmark), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                self.workloads.run_once(
+                    adapter,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case={},
+                )
+            self.assertEqual(cleanup_count, 1)
+
+        validation = {"valid": True, "checks": ["shape"]}
+        benchmark = {"latency": {"samples": [1.0, 1.1]}}
+        adapter, _ = self._adapter(
+            validate=lambda candidate: validation,
+            benchmark=lambda candidate: benchmark,
+        )
+        result = self.workloads.run_once(
+            adapter,
+            candidate="candidate.py",
+            role="candidate",
+            case={},
+        )
+        self.assertEqual(result["validation"], validation)
+        self.assertEqual(result["benchmark"], benchmark)
+        self.assertIsNot(result["validation"], validation)
+        self.assertIsNot(result["benchmark"], benchmark)
+        validation["checks"].append("changed")
+        benchmark["latency"]["samples"].append(99)
+        self.assertEqual(result["validation"]["checks"], ["shape"])
+        self.assertEqual(result["benchmark"]["latency"]["samples"], [1.0, 1.1])
+
+    def test_schema_error_is_primary_when_cleanup_also_fails(self) -> None:
+        def cleanup_error():
+            raise RuntimeError("cleanup failed")
+
+        adapter, _ = self._adapter(
+            validate=lambda candidate: None,
+            cleanup=cleanup_error,
+        )
+        with self.assertRaisesRegex(ValueError, "validation") as raised:
+            self.workloads.run_once(
+                adapter,
+                candidate="candidate.py",
+                role="candidate",
+                case={},
+            )
+        self.assertTrue(
+            any(
+                "cleanup failed" in note
+                for note in getattr(raised.exception, "__notes__", [])
+            )
+        )
+
 
 class CommandWorkloadTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -553,6 +673,10 @@ class CommandWorkloadTests(unittest.TestCase):
                 ('{"validation": true}', "benchmark"),
                 (
                     '{"validation": "passed", "benchmark": {}}',
+                    "validation",
+                ),
+                (
+                    '{"validation": {}, "benchmark": {}}',
                     "validation",
                 ),
                 (
