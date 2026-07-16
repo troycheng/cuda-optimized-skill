@@ -662,6 +662,59 @@ class LifecycleIntegrationTests(unittest.TestCase):
         output = json.loads(stdout.getvalue())
         return Path(output["run_dir"]), Path(output["state"])
 
+    def _close_args(self, run_dir: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_dir=str(run_dir), iter=1, benchmark="benchmark.py",
+            warmup=1, repeat=1, retries=0,
+        )
+
+    def _write_winner_artifacts(self, run_dir: Path) -> Path:
+        iter_dir = run_dir / "iterv1"
+        selected = iter_dir / "kernel.py"
+        selected.write_text("# candidate\n", encoding="utf-8")
+        (iter_dir / "methods.json").write_text(
+            json.dumps({"methods": []}), encoding="utf-8"
+        )
+        (iter_dir / "bench.json").write_text(
+            json.dumps(
+                {
+                    "correctness": {"passed": True},
+                    "kernel": {"average_ms": 1.0},
+                    "reference": {"average_ms": 2.0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        statistics = self._statistics()
+        branch_payload = {
+            "status": "shortlist_ready",
+            "selected_kernel": str(selected),
+            "champion": {
+                "status": "confirmed_win",
+                "kernel": str(selected),
+                "branch_index": 1,
+                "statistics": statistics,
+            },
+            "shortlist": [],
+            "valid_branches": 1,
+            "completed_comparisons": 1,
+        }
+        (iter_dir / "branch_results.json").write_text(
+            json.dumps(branch_payload), encoding="utf-8"
+        )
+        (iter_dir / "decision.json").write_text(
+            json.dumps(
+                {
+                    "status": "confirmed_win",
+                    "candidate_file": str(selected),
+                    "candidate_sha256": self.orchestrate.sha256_file(selected),
+                    "statistics": statistics,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return selected
+
     def test_real_setup_no_win_close_resume_and_finalize_records_all_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -840,6 +893,184 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 "candidate_correctness",
             )
 
+    def test_correctness_checkpoint_resumes_at_paired_without_rerunning_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+            iter_dir = run_dir / "iterv1"
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": []}), encoding="utf-8"
+            )
+            (iter_dir / "branch_results.json").write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "champion": None,
+                        "shortlist": [],
+                        "completed_comparisons": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (iter_dir / "decision.json").write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "candidate_file": None,
+                        "statistics": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            checkpoint = self.orchestrate.transition_checkpoint(
+                checkpoint, "candidate_correctness", status="ready"
+            )
+            checkpoint = self.orchestrate.transition_checkpoint(
+                checkpoint,
+                "candidate_correctness",
+                status="stage_complete",
+                evidence={"status": "passed"},
+            )
+            self.orchestrate.ArtifactStore(run_dir).write_checkpoint(checkpoint)
+            self.assertEqual(
+                self.orchestrate.resume(
+                    checkpoint,
+                    input_hash=json.loads(state_path.read_text("utf-8"))["input_hash"],
+                )["next_stage"],
+                "candidate_paired",
+            )
+            runner = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+            with mock.patch.object(self.orchestrate, "_run", runner), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            scripts = [Path(call.args[0][1]).name for call in runner.call_args_list]
+            self.assertNotIn("branch_explore.py", scripts)
+            completed = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(completed["stage"], "decision")
+
+    def test_profile_checkpoint_resumes_at_sanitizer_without_branch_or_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+
+            def stop_after_profile(command, **_kwargs):
+                script = Path(command[1]).name
+                if script == "sass_check.py":
+                    raise RuntimeError("stop after profile")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=stop_after_profile
+            ), self.assertRaisesRegex(RuntimeError, "stop after profile"):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            interrupted = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(interrupted["stage"], "candidate_sanitizer")
+            self.assertEqual(
+                interrupted["stage_evidence"]["candidate_profile"]["status"],
+                "passed",
+            )
+            self.assertTrue((run_dir / "iterv1" / "selected_candidate.json").is_file())
+
+            calls = []
+
+            def resumed_runner(command, **_kwargs):
+                calls.append(Path(command[1]).name)
+                if Path(command[1]).name == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=resumed_runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            self.assertNotIn("branch_explore.py", calls)
+            self.assertNotIn("profile_ncu.py", calls)
+
+    def test_workload_checkpoint_resumes_at_decision_without_workload_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+            with mock.patch.object(
+                self.orchestrate,
+                "_run",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ), mock.patch.object(
+                self.orchestrate,
+                "apply_decision",
+                side_effect=RuntimeError("stop before decision"),
+            ), self.assertRaisesRegex(RuntimeError, "stop before decision"):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            interrupted = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(interrupted["stage"], "workload_paired")
+            self.assertEqual(interrupted["status"], "stage_complete")
+            self.assertTrue((run_dir / "iterv1" / "workload_result.json").is_file())
+
+            workload = mock.Mock(side_effect=AssertionError("workload reran"))
+            applied = mock.Mock(
+                return_value={"returncode": 0, "stdout": "", "stderr": ""}
+            )
+            with mock.patch.object(
+                self.orchestrate, "evaluate_outer_candidate", workload
+            ), mock.patch.object(
+                self.orchestrate, "apply_decision", applied
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            workload.assert_not_called()
+            applied.assert_called_once()
+
+    def test_decision_checkpoint_makes_close_idempotent_without_state_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+
+            def first_runner(command, **_kwargs):
+                if Path(command[1]).name == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=first_runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(checkpoint["stage"], "decision")
+            self.assertEqual(checkpoint["status"], "stage_complete")
+            # A completed decision no longer needs intermediate update inputs.
+            (run_dir / "iterv1" / "methods.json").unlink()
+
+            runner = mock.Mock()
+            applied = mock.Mock()
+            with mock.patch.object(self.orchestrate, "_run", runner), \
+                    mock.patch.object(self.orchestrate, "apply_decision", applied), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            runner.assert_not_called()
+            applied.assert_not_called()
+
+    def test_resume_from_profile_checkpoint_rejects_missing_selection_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+
+            def stop_after_profile(command, **_kwargs):
+                if Path(command[1]).name == "sass_check.py":
+                    raise RuntimeError("stop after profile")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=stop_after_profile
+            ), self.assertRaisesRegex(RuntimeError, "stop after profile"):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            selection = run_dir / "iterv1" / "selected_candidate.json"
+            self.assertTrue(selection.is_file())
+            selection.unlink()
+
+            with self.assertRaisesRegex(ValueError, "selected_candidate.*missing"):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
 
 class CheckpointAndResumeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -900,6 +1131,18 @@ class CheckpointAndResumeTests(unittest.TestCase):
         )
         self.assertFalse(result["checkpoint_written"])
         self.assertIn("checkpoint_error", result)
+
+    def test_schedule_next_rejects_completed_current_stage(self) -> None:
+        checkpoint = self.orchestrate.transition_checkpoint(
+            self._checkpoint(Path("/tmp/run")),
+            "baseline",
+            status="stage_complete",
+        )
+        clock = self.orchestrate.BudgetClock(self.budget, started_at=100.0)
+        with self.assertRaisesRegex(ValueError, "completed stage"):
+            self.orchestrate.schedule_next(
+                checkpoint, clock, 1.0, now=101.0, candidate_id=None
+            )
 
     def test_transition_is_ordered_and_resume_skips_completed_stage(self) -> None:
         checkpoint = self._checkpoint(Path("/tmp/run"))

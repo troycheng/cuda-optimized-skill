@@ -406,6 +406,10 @@ def schedule_next(
         checkpoint = _validate_checkpoint(checkpoint)
     else:
         checkpoint = _validate_checkpoint(state)
+    if checkpoint["status"] in {"stage_complete", "complete"}:
+        raise ValueError(
+            "schedule_next requires the next unfinished stage, not a completed stage"
+        )
     checkpoint["budget"] = {
         "elapsed_seconds": elapsed,
         "remaining_seconds": remaining,
@@ -1406,414 +1410,200 @@ def _candidate_checkpoint_id(candidate: Mapping | None) -> str | None:
     return None
 
 
-def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
-    policy = _policy_from_state(state)
-    started_at = _finite_real(
-        state.get("started_at", time.time()), "state started_at"
-    )
-    clock = BudgetClock(policy, started_at=started_at)
-    store = ArtifactStore(args.run_dir)
-    checkpoint = _validate_checkpoint(
-        store.load_checkpoint(expected_input_hash=state["input_hash"]),
-        input_hash=state["input_hash"],
-    )
+def _safe_iteration_file(iter_dir: Path, name: str) -> Path:
+    path = iter_dir / name
+    if path.is_symlink():
+        raise ValueError(f"{name} must not be a symlink")
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise ValueError(f"{name} is missing from the current iteration") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{name} must be a regular file")
+    if path.resolve(strict=True).parent != iter_dir:
+        raise ValueError(f"{name} escapes the current iteration")
+    return path
 
-    admitted, checkpoint = _admit_checkpoint_stage(
-        checkpoint,
-        "candidate_correctness",
-        store=store,
-        clock=clock,
-        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_correctness"],
-        candidate_id=None,
-    )
-    if not admitted:
-        _budget_stop_output(args, checkpoint)
-        return
 
-    branch_result = _run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "branch_explore.py"),
-            "--state",
-            state_path,
-            "--iter",
-            str(args.iter),
-            "--benchmark",
-            os.path.abspath(args.benchmark),
-            "--warmup",
-            str(args.warmup),
-            "--repeat",
-            str(args.repeat),
-        ],
-        capture_output=True,
-    )
-    sys.stderr.write(branch_result.stderr or "")
-    if branch_result.returncode == 2:
-        print(
-            json.dumps(
-                {
-                    "iter": args.iter,
-                    "status": "all_branches_failed",
-                    "guidance": "The agent should fix the kernels and retry close-iter.",
-                },
-                indent=2,
-            )
-        )
-        raise SystemExit(2)
-    if branch_result.returncode != 0:
-        raise SystemExit(f"branch_explore failed rc={branch_result.returncode}")
+def _load_iteration_json(iter_dir: Path, name: str) -> dict:
+    path = _safe_iteration_file(iter_dir, name)
+    try:
+        payload = _read(str(path))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"{name} is malformed: {error}") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} must contain a JSON object")
+    return _strict_json_copy(payload, name)
 
-    branch_results_path = os.path.join(iter_dir, "branch_results.json")
-    branch_payload = _read_branch_results(branch_results_path)
+
+def _load_lifecycle_branch_results(iter_dir: Path) -> dict:
+    payload = _load_iteration_json(iter_dir, "branch_results.json")
+    status = payload.get("status")
+    if status not in _BRANCH_RESULT_STATUSES:
+        raise ValueError(f"branch_results.json status is invalid: {status!r}")
+    return payload
+
+
+def _select_lifecycle_candidate(
+    branch_payload: Mapping, *, mode: str, policy: BudgetPolicy
+) -> tuple[dict, list[dict]]:
     champion = branch_payload.get("champion")
-    candidate_id = _candidate_checkpoint_id(champion)
-    checkpoint = _complete_checkpoint_stage(
-        checkpoint,
-        "candidate_correctness",
-        {"status": "passed"},
-        store=store,
-        clock=clock,
-        candidate_id=candidate_id,
-    )
-    paired_status = (
-        "completed"
-        if branch_payload.get("status") == "no_confirmed_kernel_win"
-        else "passed"
-    )
-    checkpoint = _complete_checkpoint_stage(
-        checkpoint,
-        "candidate_paired",
-        {
-            "status": paired_status,
-            "completed_comparisons": branch_payload.get(
-                "completed_comparisons", 0
-            ),
-        },
-        store=store,
-        clock=clock,
-        candidate_id=candidate_id,
-    )
-
-    decision_path = os.path.join(iter_dir, "decision.json")
-    if branch_payload.get("status") == "no_confirmed_kernel_win":
-        checkpoint = _complete_checkpoint_stage(
-            checkpoint,
-            "candidate_profile",
-            {"status": "not_applicable"},
-            store=store,
-            clock=clock,
-        )
-        checkpoint = _complete_checkpoint_stage(
-            checkpoint,
-            "candidate_sanitizer",
-            {
-                "status": "deferred",
-                "reason": "sanitizer stage is not implemented yet",
-            },
-            store=store,
-            clock=clock,
-        )
-        checkpoint = _complete_checkpoint_stage(
-            checkpoint,
-            "workload_paired",
-            {"status": "not_applicable"},
-            store=store,
-            clock=clock,
-        )
-        _complete_checkpoint_stage(
-            checkpoint,
-            "decision",
-            {"status": "no_confirmed_kernel_win"},
-            store=store,
-            clock=clock,
-            candidate_status="no_confirmed_kernel_win",
-        )
-        print(
-            json.dumps(
-                {
-                    "iter": args.iter,
-                    "status": "no_confirmed_kernel_win",
-                    "decision": decision_path,
-                    "state": state_path,
-                    "next_step": (
-                        "No candidate was promoted. Continue with another iteration "
-                        "or finalize the run with the current best."
-                    ),
-                },
-                indent=2,
-            )
-        )
-        return
-
-    mode = state.get("mode", "kernel-only")
     if mode == "full":
         candidates = select_outer_candidates(
             branch_payload.get("shortlist", []), policy.outer_candidates
         )
         if not candidates:
             raise ValueError("full mode shortlist contains no confirmed kernel win")
-        selected_candidate = candidates[0]
-    elif mode == "kernel-only":
+        return candidates[0], candidates
+    if mode == "kernel-only":
         if not isinstance(champion, Mapping):
             raise ValueError("branch_results champion must be a mapping")
-        selected_candidate = dict(champion)
-        selected_candidate["candidate_file"] = branch_payload.get(
-            "selected_kernel"
-        )
-        candidates = [selected_candidate]
-    else:
-        raise ValueError("state mode must be full or kernel-only")
+        selected = dict(champion)
+        selected["candidate_file"] = branch_payload.get("selected_kernel")
+        return selected, [selected]
+    raise ValueError("state mode must be full or kernel-only")
 
-    candidate_id = _candidate_checkpoint_id(selected_candidate)
-    kernel = _publish_outer_candidate(
-        selected_candidate, iter_dir=Path(iter_dir).resolve()
-    )
-    bench_json = os.path.join(iter_dir, "bench.json")
-    if not os.path.isfile(bench_json):
-        raise SystemExit("bench.json missing for champion")
-    bench = _read(bench_json)
-    if not bool(bench.get("correctness", {}).get("passed", False)):
-        print(
-            json.dumps(
-                {
-                    "iter": args.iter,
-                    "status": "validation_failed",
-                    "bench_json": bench_json,
-                    "guidance": "The agent should fix the kernel and re-run close-iter.",
-                },
-                indent=2,
-            )
-        )
-        raise SystemExit(2)
 
-    admitted, checkpoint = _admit_checkpoint_stage(
-        checkpoint,
-        "candidate_profile",
-        store=store,
-        clock=clock,
-        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_profile"],
-        candidate_id=candidate_id,
-    )
-    if not admitted:
-        _budget_stop_output(args, checkpoint)
-        return
-    profile_rc = _run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "profile_ncu.py"),
-            "--state",
-            state_path,
-            "--iter",
-            str(args.iter),
-            "--which",
-            "kernel",
-            "--benchmark",
-            os.path.abspath(args.benchmark),
-            "--promote-if-best",
-        ]
-    ).returncode
-    checkpoint = _complete_checkpoint_stage(
-        checkpoint,
-        "candidate_profile",
-        {"status": "passed" if profile_rc == 0 else "deferred", "returncode": profile_rc},
-        store=store,
-        clock=clock,
-        candidate_id=candidate_id,
-    )
+def _write_selection_artifact(
+    iter_dir: Path,
+    *,
+    state: Mapping,
+    candidate: Mapping,
+    kernel: str,
+    candidate_id: str | None,
+) -> dict:
+    normalized = _strict_json_copy(candidate, "selected candidate")
+    normalized["candidate_file"] = kernel
+    payload = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "input_hash": state["input_hash"],
+        "mode": state.get("mode", "kernel-only"),
+        "candidate_id": candidate_id,
+        "candidate_file": kernel,
+        "candidate_sha256": sha256_file(kernel),
+        "candidate": normalized,
+    }
+    atomic_write_json(iter_dir / "selected_candidate.json", payload)
+    return payload
 
-    admitted, checkpoint = _admit_checkpoint_stage(
-        checkpoint,
-        "candidate_sanitizer",
-        store=store,
-        clock=clock,
-        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_sanitizer"],
-        candidate_id=candidate_id,
-    )
-    if not admitted:
-        _budget_stop_output(args, checkpoint)
-        return
-    attribution_path = os.path.join(iter_dir, "attribution.json")
-    ablation_dir = os.path.join(iter_dir, "ablations")
-    if os.path.isdir(ablation_dir):
-        if not clock.can_start(
-            now=time.time(),
-            estimated_seconds=_STAGE_ESTIMATES_SECONDS["ablation"],
-        ):
-            denied = schedule_next(
-                checkpoint,
-                clock,
-                _STAGE_ESTIMATES_SECONDS["ablation"],
-                now=time.time(),
-                store=store,
-                candidate_id=candidate_id,
-            )
-            _budget_stop_output(args, denied)
-            return
-        _run(
-            [
-                sys.executable,
-                str(SCRIPT_DIR / "ablate.py"),
-                "--state",
-                state_path,
-                "--iter",
-                str(args.iter),
-                "--benchmark",
-                os.path.abspath(args.benchmark),
-            ]
-        )
 
-    if not clock.can_start(
-        now=time.time(),
-        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_sanitizer"],
+def _load_selection_artifact(iter_dir: Path, *, state: Mapping) -> dict:
+    payload = _load_iteration_json(iter_dir, "selected_candidate.json")
+    if payload.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise ValueError("selected_candidate.json schema_version is invalid")
+    if payload.get("input_hash") != state.get("input_hash"):
+        raise ValueError("selected_candidate.json input_hash drifted")
+    if payload.get("mode") != state.get("mode", "kernel-only"):
+        raise ValueError("selected_candidate.json mode drifted")
+    candidate_id = payload.get("candidate_id")
+    if candidate_id is not None and (
+        type(candidate_id) is not str or not candidate_id.strip()
     ):
-        denied = schedule_next(
-            checkpoint,
-            clock,
-            _STAGE_ESTIMATES_SECONDS["candidate_sanitizer"],
-            now=time.time(),
-            store=store,
-            candidate_id=candidate_id,
-        )
-        _budget_stop_output(args, denied)
-        return
-    sass_check_path = os.path.join(iter_dir, "sass_check.json")
-    sass_rc = _run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "sass_check.py"),
-            "--state",
-            state_path,
-            "--iter",
-            str(args.iter),
-        ]
-    ).returncode
-    checkpoint = _complete_checkpoint_stage(
-        checkpoint,
-        "candidate_sanitizer",
-        {
-            "status": "deferred",
-            "reason": "sanitizer stage is not implemented yet",
-            "sass_status": "passed" if sass_rc == 0 else "failed",
-        },
-        store=store,
-        clock=clock,
-        candidate_id=candidate_id,
+        raise ValueError("selected_candidate.json candidate_id is invalid")
+    candidate = payload.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise ValueError("selected_candidate.json candidate is malformed")
+    candidate_file = payload.get("candidate_file")
+    digest = payload.get("candidate_sha256")
+    if not isinstance(candidate_file, str) or not isinstance(digest, str):
+        raise ValueError("selected_candidate.json candidate binding is malformed")
+    kernel = Path(candidate_file).expanduser()
+    if kernel.is_symlink() or not kernel.is_file():
+        raise ValueError("selected_candidate.json candidate file drifted")
+    resolved = kernel.resolve(strict=True)
+    if resolved.parent != iter_dir or resolved.name not in {"kernel.py", "kernel.cu"}:
+        raise ValueError("selected_candidate.json candidate escapes the iteration")
+    if sha256_file(resolved) != digest.lower():
+        raise ValueError("selected_candidate.json candidate sha256 drifted")
+    if candidate.get("candidate_file") != str(resolved):
+        raise ValueError("selected_candidate.json candidate path conflicts")
+    payload["candidate_file"] = str(resolved)
+    return payload
+
+
+def _write_workload_result_artifact(
+    iter_dir: Path,
+    *,
+    state: Mapping,
+    terminal_decision: Mapping,
+    candidate_id: str | None,
+) -> dict:
+    decision = _strict_json_copy(terminal_decision, "terminal decision")
+    payload = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "input_hash": state["input_hash"],
+        "mode": state.get("mode", "kernel-only"),
+        "candidate_id": candidate_id,
+        "candidate_file": decision.get("candidate_file"),
+        "candidate_sha256": decision.get("candidate_sha256"),
+        "decision": decision,
+    }
+    atomic_write_json(iter_dir / "workload_result.json", payload)
+    return payload
+
+
+def _load_workload_result_artifact(iter_dir: Path, *, state: Mapping) -> dict:
+    payload = _load_iteration_json(iter_dir, "workload_result.json")
+    if payload.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise ValueError("workload_result.json schema_version is invalid")
+    if payload.get("input_hash") != state.get("input_hash"):
+        raise ValueError("workload_result.json input_hash drifted")
+    if payload.get("mode") != state.get("mode", "kernel-only"):
+        raise ValueError("workload_result.json mode drifted")
+    decision = payload.get("decision")
+    if not isinstance(decision, Mapping):
+        raise ValueError("workload_result.json decision is malformed")
+    candidate_file = payload.get("candidate_file")
+    digest = payload.get("candidate_sha256")
+    if (
+        decision.get("candidate_file") != candidate_file
+        or decision.get("candidate_sha256") != digest
+    ):
+        raise ValueError("workload_result.json candidate binding conflicts")
+    if not isinstance(candidate_file, str) or not isinstance(digest, str):
+        raise ValueError("workload_result.json candidate binding is malformed")
+    kernel = Path(candidate_file).expanduser()
+    if kernel.is_symlink() or not kernel.is_file():
+        raise ValueError("workload_result.json candidate file drifted")
+    resolved = kernel.resolve(strict=True)
+    if resolved.parent != iter_dir or resolved.name not in {"kernel.py", "kernel.cu"}:
+        raise ValueError("workload_result.json candidate escapes the iteration")
+    if sha256_file(resolved) != digest.lower():
+        raise ValueError("workload_result.json candidate sha256 drifted")
+    payload["candidate_file"] = str(resolved)
+    payload["decision"] = _strict_json_copy(decision, "terminal decision")
+    return payload
+
+
+def _decision_already_applied(state: Mapping, iteration: int, payload: Mapping) -> bool:
+    binding = state.get("candidates", {}).get(f"iter-{iteration}")
+    if not isinstance(binding, Mapping):
+        return False
+    if (
+        binding.get("candidate_file") != payload.get("candidate_file")
+        or binding.get("candidate_sha256") != payload.get("candidate_sha256")
+        or binding.get("status") != payload.get("status")
+    ):
+        return False
+    expected_decision = str(
+        (Path(state["run_dir"]) / f"iterv{iteration}" / "decision.json").resolve()
+    )
+    return any(
+        isinstance(item, Mapping)
+        and item.get("iter") == iteration
+        and item.get("decision_json") == expected_decision
+        and item.get("status") == payload.get("status")
+        for item in state.get("history", [])
     )
 
-    if mode == "kernel-only":
-        terminal_decision = evaluate_outer_candidate(
-            selected_candidate,
-            mode="kernel-only",
-            workload_spec=None,
-            baseline=state.get("best_file"),
-            policy=policy,
-            confidence=state.get("confidence", 0.95),
-            candidate_root=iter_dir,
-        )
-        checkpoint = _complete_checkpoint_stage(
-            checkpoint,
-            "workload_paired",
-            {"status": "not_applicable"},
-            store=store,
-            clock=clock,
-            candidate_id=candidate_id,
-        )
-    else:
-        pair_estimate = _finite_real(
-            state.get("estimated_workload_pair_seconds", 0.0),
-            "estimated_workload_pair_seconds",
-            minimum=0.0,
-        )
-        workload_estimate = max(
-            _STAGE_ESTIMATES_SECONDS["workload_paired"],
-            policy.min_pairs * pair_estimate,
-        )
-        admitted, checkpoint = _admit_checkpoint_stage(
-            checkpoint,
-            "workload_paired",
-            store=store,
-            clock=clock,
-            estimated_seconds=workload_estimate,
-            candidate_id=candidate_id,
-        )
-        if not admitted:
-            _budget_stop_output(args, checkpoint)
-            return
-        workload_spec = _workload_from_snapshot(state.get("workload"))
-        evaluated = []
-        for candidate in candidates:
-            evaluated.append(
-                (
-                    candidate,
-                    evaluate_outer_candidate(
-                        candidate,
-                        mode="full",
-                        workload_spec=workload_spec,
-                        baseline=state.get("best_file"),
-                        policy=policy,
-                        confidence=state.get("confidence", 0.95),
-                        estimated_seconds_per_pair=pair_estimate,
-                        budget_clock=clock,
-                        now=time.time(),
-                        candidate_root=iter_dir,
-                        retries=args.retries,
-                        seed=state.get("seed", 0),
-                    ),
-                )
-            )
-        selected_candidate, terminal_decision = _select_terminal_outer_result(
-            evaluated
-        )
-        candidate_id = _candidate_checkpoint_id(selected_candidate)
-        kernel = _publish_outer_candidate(
-            selected_candidate, iter_dir=Path(iter_dir).resolve()
-        )
-        checkpoint = _complete_checkpoint_stage(
-            checkpoint,
-            "workload_paired",
-            {"status": "evaluated"},
-            store=store,
-            clock=clock,
-            candidate_id=candidate_id,
-        )
 
-    terminal_decision["candidate_file"] = kernel
-    terminal_decision["candidate_sha256"] = sha256_file(kernel)
-    terminal_decision = _strict_json_copy(terminal_decision, "decision")
-    applied = apply_decision(
-        terminal_decision,
-        run_dir=args.run_dir,
-        iteration=args.iter,
-        state_path=state_path,
-        kernel=kernel,
-        bench=bench_json,
-        methods_json=methods_json,
-        retries=args.retries,
-        attribution=attribution_path,
-        sass_check=sass_check_path,
-        skip_validation=True,
-    )
-    if applied["returncode"] != 0:
-        diagnostic = (applied.get("stderr") or applied.get("stdout") or "").strip()
-        raise SystemExit(
-            "state update failed" + (f": {diagnostic}" if diagnostic else "")
-        )
-    checkpoint = _complete_checkpoint_stage(
-        checkpoint,
-        "decision",
-        {"status": terminal_decision["status"]},
-        store=store,
-        clock=clock,
-        candidate_id=candidate_id,
-        candidate_status=terminal_decision["status"],
-    )
-    updated_state = _read(state_path)
+def _closed_lifecycle_output(args, state_path: str, state: Mapping) -> None:
     print(
         json.dumps(
             {
                 "iter": args.iter,
                 "status": "closed",
-                "best_ms": updated_state.get("best_metric_ms"),
+                "best_ms": state.get("best_metric_ms"),
                 "next_iter": None,
                 "early_stop": False,
                 "state": state_path,
@@ -1821,6 +1611,450 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
             indent=2,
         )
     )
+
+
+def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
+    run_dir = Path(args.run_dir).expanduser().resolve(strict=True)
+    iteration_dir = Path(iter_dir).expanduser().resolve(strict=True)
+    if iteration_dir.parent != run_dir:
+        raise ValueError("iteration directory escapes the run root")
+    manifest, manifest_hash = _load_and_verify_manifest(run_dir)
+    if state.get("input_hash") != manifest_hash:
+        raise ValueError("manifest/state frozen input_hash mismatch")
+    if manifest.get("mode") != state.get("mode", "kernel-only"):
+        raise ValueError("manifest/state mode mismatch")
+    _verify_state_candidates(state)
+
+    policy = _policy_from_state(state)
+    clock = BudgetClock(
+        policy,
+        started_at=_finite_real(
+            state.get("started_at", time.time()), "state started_at"
+        ),
+    )
+    store = ArtifactStore(run_dir)
+    checkpoint = _validate_checkpoint(
+        store.load_checkpoint(expected_input_hash=state["input_hash"]),
+        input_hash=state["input_hash"],
+    )
+    mode = state.get("mode", "kernel-only")
+    attribution_path = str(iteration_dir / "attribution.json")
+    sass_check_path = str(iteration_dir / "sass_check.json")
+
+    while True:
+        restored = resume(checkpoint, input_hash=state["input_hash"])
+        next_stage = restored["next_stage"]
+        if next_stage == "complete":
+            _closed_lifecycle_output(args, state_path, _read(state_path))
+            return
+        if next_stage == "baseline":
+            raise ValueError("baseline stage must complete before close-iter")
+
+        if next_stage == "candidate_correctness":
+            admitted, checkpoint = _admit_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                store=store,
+                clock=clock,
+                estimated_seconds=_STAGE_ESTIMATES_SECONDS[next_stage],
+                candidate_id=None,
+            )
+            if not admitted:
+                _budget_stop_output(args, checkpoint)
+                return
+            branch_result = _run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "branch_explore.py"),
+                    "--state",
+                    state_path,
+                    "--iter",
+                    str(args.iter),
+                    "--benchmark",
+                    os.path.abspath(args.benchmark),
+                    "--warmup",
+                    str(args.warmup),
+                    "--repeat",
+                    str(args.repeat),
+                ],
+                capture_output=True,
+            )
+            sys.stderr.write(branch_result.stderr or "")
+            if branch_result.returncode == 2:
+                print(
+                    json.dumps(
+                        {
+                            "iter": args.iter,
+                            "status": "all_branches_failed",
+                            "guidance": "The agent should fix the kernels and retry close-iter.",
+                        },
+                        indent=2,
+                    )
+                )
+                raise SystemExit(2)
+            if branch_result.returncode != 0:
+                raise SystemExit(
+                    f"branch_explore failed rc={branch_result.returncode}"
+                )
+            branch_payload = _load_lifecycle_branch_results(iteration_dir)
+            checkpoint = _complete_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                {"status": "passed"},
+                store=store,
+                clock=clock,
+                candidate_id=_candidate_checkpoint_id(
+                    branch_payload.get("champion")
+                ),
+            )
+            continue
+
+        if next_stage == "candidate_paired":
+            branch_payload = _load_lifecycle_branch_results(iteration_dir)
+            checkpoint = _complete_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                {
+                    "status": (
+                        "completed"
+                        if branch_payload["status"] == "no_confirmed_kernel_win"
+                        else "passed"
+                    ),
+                    "completed_comparisons": branch_payload.get(
+                        "completed_comparisons", 0
+                    ),
+                },
+                store=store,
+                clock=clock,
+                candidate_id=_candidate_checkpoint_id(
+                    branch_payload.get("champion")
+                ),
+            )
+            continue
+
+        if next_stage == "candidate_profile":
+            branch_payload = _load_lifecycle_branch_results(iteration_dir)
+            if branch_payload["status"] == "no_confirmed_kernel_win":
+                checkpoint = _complete_checkpoint_stage(
+                    checkpoint,
+                    next_stage,
+                    {"status": "not_applicable"},
+                    store=store,
+                    clock=clock,
+                )
+                continue
+            selected, _candidates = _select_lifecycle_candidate(
+                branch_payload, mode=mode, policy=policy
+            )
+            candidate_id = _candidate_checkpoint_id(selected)
+            kernel = _publish_outer_candidate(selected, iter_dir=iteration_dir)
+            bench = _load_iteration_json(iteration_dir, "bench.json")
+            if not bool(bench.get("correctness", {}).get("passed", False)):
+                raise SystemExit("champion failed correctness validation")
+            _write_selection_artifact(
+                iteration_dir,
+                state=state,
+                candidate=selected,
+                kernel=kernel,
+                candidate_id=candidate_id,
+            )
+            admitted, checkpoint = _admit_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                store=store,
+                clock=clock,
+                estimated_seconds=_STAGE_ESTIMATES_SECONDS[next_stage],
+                candidate_id=candidate_id,
+            )
+            if not admitted:
+                _budget_stop_output(args, checkpoint)
+                return
+            profile_rc = _run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "profile_ncu.py"),
+                    "--state",
+                    state_path,
+                    "--iter",
+                    str(args.iter),
+                    "--which",
+                    "kernel",
+                    "--benchmark",
+                    os.path.abspath(args.benchmark),
+                    "--promote-if-best",
+                ]
+            ).returncode
+            checkpoint = _complete_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                {
+                    "status": "passed" if profile_rc == 0 else "deferred",
+                    "returncode": profile_rc,
+                },
+                store=store,
+                clock=clock,
+                candidate_id=candidate_id,
+            )
+            continue
+
+        if next_stage == "candidate_sanitizer":
+            branch_payload = _load_lifecycle_branch_results(iteration_dir)
+            if branch_payload["status"] == "no_confirmed_kernel_win":
+                checkpoint = _complete_checkpoint_stage(
+                    checkpoint,
+                    next_stage,
+                    {
+                        "status": "deferred",
+                        "reason": "sanitizer stage is not implemented yet",
+                    },
+                    store=store,
+                    clock=clock,
+                )
+                continue
+            selection = _load_selection_artifact(iteration_dir, state=state)
+            candidate_id = selection.get("candidate_id")
+            admitted, checkpoint = _admit_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                store=store,
+                clock=clock,
+                estimated_seconds=_STAGE_ESTIMATES_SECONDS[next_stage],
+                candidate_id=candidate_id,
+            )
+            if not admitted:
+                _budget_stop_output(args, checkpoint)
+                return
+            ablation_dir = iteration_dir / "ablations"
+            if ablation_dir.is_dir():
+                if not clock.can_start(
+                    now=time.time(),
+                    estimated_seconds=_STAGE_ESTIMATES_SECONDS["ablation"],
+                ):
+                    denied = schedule_next(
+                        checkpoint,
+                        clock,
+                        _STAGE_ESTIMATES_SECONDS["ablation"],
+                        now=time.time(),
+                        store=store,
+                        candidate_id=candidate_id,
+                    )
+                    _budget_stop_output(args, denied)
+                    return
+                _run(
+                    [
+                        sys.executable,
+                        str(SCRIPT_DIR / "ablate.py"),
+                        "--state",
+                        state_path,
+                        "--iter",
+                        str(args.iter),
+                        "--benchmark",
+                        os.path.abspath(args.benchmark),
+                    ]
+                )
+            if not clock.can_start(
+                now=time.time(),
+                estimated_seconds=_STAGE_ESTIMATES_SECONDS[next_stage],
+            ):
+                denied = schedule_next(
+                    checkpoint,
+                    clock,
+                    _STAGE_ESTIMATES_SECONDS[next_stage],
+                    now=time.time(),
+                    store=store,
+                    candidate_id=candidate_id,
+                )
+                _budget_stop_output(args, denied)
+                return
+            sass_rc = _run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "sass_check.py"),
+                    "--state",
+                    state_path,
+                    "--iter",
+                    str(args.iter),
+                ]
+            ).returncode
+            checkpoint = _complete_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                {
+                    "status": "deferred",
+                    "reason": "sanitizer stage is not implemented yet",
+                    "sass_status": "passed" if sass_rc == 0 else "failed",
+                },
+                store=store,
+                clock=clock,
+                candidate_id=candidate_id,
+            )
+            continue
+
+        if next_stage == "workload_paired":
+            branch_payload = _load_lifecycle_branch_results(iteration_dir)
+            if branch_payload["status"] == "no_confirmed_kernel_win":
+                checkpoint = _complete_checkpoint_stage(
+                    checkpoint,
+                    next_stage,
+                    {"status": "not_applicable"},
+                    store=store,
+                    clock=clock,
+                )
+                continue
+            selection = _load_selection_artifact(iteration_dir, state=state)
+            candidate_id = selection.get("candidate_id")
+            selected_candidate = selection["candidate"]
+            kernel = selection["candidate_file"]
+            if mode == "full":
+                pair_estimate = _finite_real(
+                    state.get("estimated_workload_pair_seconds", 0.0),
+                    "estimated_workload_pair_seconds",
+                    minimum=0.0,
+                )
+                workload_estimate = max(
+                    _STAGE_ESTIMATES_SECONDS[next_stage],
+                    policy.min_pairs * pair_estimate,
+                )
+            else:
+                pair_estimate = 0.0
+                workload_estimate = 0.0
+            admitted, checkpoint = _admit_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                store=store,
+                clock=clock,
+                estimated_seconds=workload_estimate,
+                candidate_id=candidate_id,
+            )
+            if not admitted:
+                _budget_stop_output(args, checkpoint)
+                return
+            if mode == "kernel-only":
+                terminal_decision = evaluate_outer_candidate(
+                    selected_candidate,
+                    mode=mode,
+                    workload_spec=None,
+                    baseline=state.get("best_file"),
+                    policy=policy,
+                    confidence=state.get("confidence", 0.95),
+                    candidate_root=iteration_dir,
+                )
+                workload_evidence = {"status": "not_applicable"}
+            else:
+                _preliminary, candidates = _select_lifecycle_candidate(
+                    branch_payload, mode=mode, policy=policy
+                )
+                workload_spec = _workload_from_snapshot(state.get("workload"))
+                evaluated = [
+                    (
+                        candidate,
+                        evaluate_outer_candidate(
+                            candidate,
+                            mode=mode,
+                            workload_spec=workload_spec,
+                            baseline=state.get("best_file"),
+                            policy=policy,
+                            confidence=state.get("confidence", 0.95),
+                            estimated_seconds_per_pair=pair_estimate,
+                            budget_clock=clock,
+                            now=time.time(),
+                            candidate_root=iteration_dir,
+                            retries=args.retries,
+                            seed=state.get("seed", 0),
+                        ),
+                    )
+                    for candidate in candidates
+                ]
+                selected_candidate, terminal_decision = (
+                    _select_terminal_outer_result(evaluated)
+                )
+                candidate_id = _candidate_checkpoint_id(selected_candidate)
+                kernel = _publish_outer_candidate(
+                    selected_candidate, iter_dir=iteration_dir
+                )
+                workload_evidence = {"status": "evaluated"}
+            terminal_decision["candidate_file"] = kernel
+            terminal_decision["candidate_sha256"] = sha256_file(kernel)
+            terminal_decision = _strict_json_copy(
+                terminal_decision, "terminal decision"
+            )
+            _write_workload_result_artifact(
+                iteration_dir,
+                state=state,
+                terminal_decision=terminal_decision,
+                candidate_id=candidate_id,
+            )
+            checkpoint = _complete_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                workload_evidence,
+                store=store,
+                clock=clock,
+                candidate_id=candidate_id,
+            )
+            continue
+
+        if next_stage == "decision":
+            branch_payload = _load_lifecycle_branch_results(iteration_dir)
+            if branch_payload["status"] == "no_confirmed_kernel_win":
+                decision = _load_iteration_json(iteration_dir, "decision.json")
+                if decision.get("status") != "no_confirmed_kernel_win":
+                    raise ValueError(
+                        "decision.json conflicts with no-win branch results"
+                    )
+                checkpoint = _complete_checkpoint_stage(
+                    checkpoint,
+                    next_stage,
+                    {"status": "no_confirmed_kernel_win"},
+                    store=store,
+                    clock=clock,
+                    candidate_status="no_confirmed_kernel_win",
+                )
+                continue
+            workload_result = _load_workload_result_artifact(
+                iteration_dir, state=state
+            )
+            terminal_decision = workload_result["decision"]
+            kernel = workload_result["candidate_file"]
+            current_state = _read(state_path)
+            if not _decision_already_applied(
+                current_state, args.iter, terminal_decision
+            ):
+                applied = apply_decision(
+                    terminal_decision,
+                    run_dir=run_dir,
+                    iteration=args.iter,
+                    state_path=state_path,
+                    kernel=kernel,
+                    bench=_safe_iteration_file(iteration_dir, "bench.json"),
+                    methods_json=_safe_iteration_file(
+                        iteration_dir, Path(methods_json).name
+                    ),
+                    retries=args.retries,
+                    attribution=attribution_path,
+                    sass_check=sass_check_path,
+                    skip_validation=True,
+                )
+                if applied["returncode"] != 0:
+                    diagnostic = (
+                        applied.get("stderr") or applied.get("stdout") or ""
+                    ).strip()
+                    raise SystemExit(
+                        "state update failed"
+                        + (f": {diagnostic}" if diagnostic else "")
+                    )
+            checkpoint = _complete_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                {"status": terminal_decision["status"]},
+                store=store,
+                clock=clock,
+                candidate_id=workload_result.get("candidate_id"),
+                candidate_status=terminal_decision["status"],
+            )
+            continue
+
+        raise ValueError(f"unsupported lifecycle stage: {next_stage}")
 
 def cmd_close_iter(args):
     state_path = os.path.join(args.run_dir, "state.json")
@@ -1830,8 +2064,6 @@ def cmd_close_iter(args):
     state = _read(state_path)
     iter_dir = os.path.join(args.run_dir, f"iterv{args.iter}")
     methods_json = os.path.join(iter_dir, "methods.json")
-    if not os.path.isfile(methods_json):
-        sys.exit(f"methods.json missing at {methods_json}")
 
     checkpoint_path = Path(args.run_dir) / "checkpoint.json"
     if (
@@ -1844,6 +2076,8 @@ def cmd_close_iter(args):
         return _cmd_close_iter_lifecycle(
             args, state, state_path, iter_dir, methods_json
         )
+    if not os.path.isfile(methods_json):
+        sys.exit(f"methods.json missing at {methods_json}")
 
     # Step 3e: Branch explore — compile + benchmark all branches
     branch_result = _run([
