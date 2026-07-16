@@ -120,7 +120,7 @@ class ArtifactStore:
             raise ValueError(
                 "candidate_id must match [A-Za-z0-9._-]+ and cannot be '.' or '..'"
             )
-        path = self.root / "candidates" / candidate_id
+        path = self._resolve_relative(Path("candidates") / candidate_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -186,12 +186,12 @@ class ArtifactStore:
             raise ValueError("checkpoint payload must be a dict")
         checkpoint = copy.deepcopy(payload)
         checkpoint["schema_version"] = CURRENT_SCHEMA_VERSION
-        path = self.root / "checkpoint.json"
+        path = self._resolve_relative("checkpoint.json")
         atomic_write_json(path, checkpoint)
         return path
 
     def load_checkpoint(self, *, expected_input_hash: str) -> dict:
-        path = self.root / "checkpoint.json"
+        path = self._resolve_relative("checkpoint.json")
         if not path.is_file():
             raise ValueError(f"checkpoint not found: {path}")
         with path.open("r", encoding="utf-8") as stream:

@@ -171,6 +171,40 @@ class ArtifactStoreTests(unittest.TestCase):
             self.assertEqual(valid, store.root / "candidates" / "candidate_1.2-ok")
             self.assertTrue(valid.is_dir())
 
+    def test_candidate_dir_rejects_existing_symlink_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = self.artifacts.ArtifactStore(base / "run")
+            candidates = store.root / "candidates"
+            candidates.mkdir(parents=True)
+            outside = base / "outside-candidate"
+            outside.mkdir()
+            marker = outside / "marker.txt"
+            marker.write_text("unchanged", encoding="utf-8")
+            (candidates / "linked").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, r"escapes run root"):
+                store.candidate_dir("linked")
+
+            self.assertEqual(marker.read_text("utf-8"), "unchanged")
+            self.assertEqual([path.name for path in outside.iterdir()], ["marker.txt"])
+
+    def test_candidate_dir_rejects_candidates_parent_symlink_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = self.artifacts.ArtifactStore(base / "run")
+            store.root.mkdir(parents=True)
+            outside = base / "outside-candidates"
+            outside.mkdir()
+            (store.root / "candidates").symlink_to(
+                outside, target_is_directory=True
+            )
+
+            with self.assertRaisesRegex(ValueError, r"escapes run root"):
+                store.candidate_dir("new-candidate")
+
+            self.assertFalse((outside / "new-candidate").exists())
+
     def test_checkpoint_requires_matching_v2_schema_and_frozen_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self.artifacts.ArtifactStore(Path(tmp) / "run")
@@ -193,6 +227,45 @@ class ArtifactStoreTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, r"schema.*2"):
                 store.load_checkpoint(expected_input_hash="abc")
+
+    def test_load_checkpoint_rejects_symlink_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = self.artifacts.ArtifactStore(base / "run")
+            store.root.mkdir(parents=True)
+            outside = base / "outside-checkpoint.json"
+            outside.write_text(
+                json.dumps({"schema_version": 2, "input_hash": "abc"}),
+                encoding="utf-8",
+            )
+            (store.root / "checkpoint.json").symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, r"escapes run root"):
+                store.load_checkpoint(expected_input_hash="abc")
+
+            self.assertEqual(
+                json.loads(outside.read_text("utf-8")),
+                {"schema_version": 2, "input_hash": "abc"},
+            )
+
+    def test_write_checkpoint_rejects_symlink_outside_root_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = self.artifacts.ArtifactStore(base / "run")
+            store.root.mkdir(parents=True)
+            outside = base / "outside-checkpoint.json"
+            outside.write_text('{"sentinel": "unchanged"}', encoding="utf-8")
+            checkpoint_link = store.root / "checkpoint.json"
+            checkpoint_link.symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, r"escapes run root"):
+                store.write_checkpoint({"input_hash": "abc"})
+
+            self.assertTrue(checkpoint_link.is_symlink())
+            self.assertEqual(
+                json.loads(outside.read_text("utf-8")),
+                {"sentinel": "unchanged"},
+            )
 
     def test_atomic_json_replaces_and_serialization_failure_preserves_old_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
