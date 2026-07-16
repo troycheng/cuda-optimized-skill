@@ -1119,6 +1119,49 @@ class UnifiedExecutionTests(unittest.TestCase):
                     role="candidate",
                 )
 
+    def test_run_spec_metrics_dynamic_import_uses_frozen_dependency_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            module_name = "cuda_optimizer_dynamic_metrics_helper"
+            helper = root / f"{module_name}.py"
+            helper.write_text(f"OBJECTIVE = {_objective()!r}\n", "utf-8")
+            adapter = root / "workload.py"
+            adapter.write_text(
+                textwrap.dedent(
+                    f"""
+                    WORKLOAD_DEPENDENCIES = ["{module_name}.py"]
+                    def prepare(candidate): return None
+                    def validate(candidate): return True
+                    def benchmark(candidate): return {{"latency_ms": 1.0}}
+                    def metrics():
+                        if "CUDA_OPTIMIZER_CONTEXT" in globals():
+                            raise AssertionError("metrics received observation context")
+                        import {module_name} as helper
+                        return helper.OBJECTIVE
+                    def cleanup(): return None
+                    """
+                ),
+                "utf-8",
+            )
+            previous = sys.modules.pop(module_name, None)
+            try:
+                spec = self.workloads.normalize_workload(workload=adapter)
+
+                try:
+                    result = self.workloads.run_spec_once(
+                        spec,
+                        candidate="candidate.py",
+                        role="candidate",
+                        case={"batch": 4},
+                    )
+                except ModuleNotFoundError as error:
+                    self.fail(f"frozen metrics dependency was not installed: {error}")
+            finally:
+                if previous is not None:
+                    sys.modules[module_name] = previous
+
+            self.assertEqual(result["objective"], _objective())
+
     def test_command_validation_failure_is_not_treated_as_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

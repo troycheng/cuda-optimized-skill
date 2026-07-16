@@ -955,7 +955,8 @@ def run_once(adapter, *, candidate, role: str, case: dict) -> dict:
                 if primary is None:
                     raise
                 _record_cleanup_failure(primary, cleanup_error)
-    objective = validate_objective(adapter.metrics())
+    with _adapter_runtime_scope(adapter):
+        objective = validate_objective(adapter.metrics())
     return {
         "role": normalized_role,
         "case": copy.deepcopy(normalized_case),
