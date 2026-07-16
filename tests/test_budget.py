@@ -27,18 +27,57 @@ def _load_budget():
 
 budget = _load_budget()
 
+INVALID_TIME_VALUES = (True, False, "100", float("nan"), float("inf"), float("-inf"))
+
 
 class BudgetPolicyTests(unittest.TestCase):
-    def test_balanced_preset_has_expected_limits(self) -> None:
-        policy = budget.resolve_budget("balanced")
-
-        self.assertEqual(policy.max_seconds, 3 * 60 * 60)
-        self.assertEqual(policy.branches, 8)
-        self.assertEqual(policy.max_rounds, 4)
-        self.assertEqual(policy.min_pairs, 20)
-        self.assertEqual(policy.max_pairs, 100)
-        self.assertEqual(policy.outer_candidates, 2)
-        self.assertEqual(policy.reserve_seconds, 300)
+    def test_presets_have_expected_fields(self) -> None:
+        expected = {
+            "quick": {
+                "name": "quick",
+                "max_seconds": 2700,
+                "branches": 4,
+                "max_rounds": 2,
+                "min_pairs": 20,
+                "max_pairs": 50,
+                "outer_candidates": 1,
+                "max_cases": 3,
+                "sanitizer_mode": "targeted",
+                "reserve_seconds": 300,
+            },
+            "balanced": {
+                "name": "balanced",
+                "max_seconds": 3 * 60 * 60,
+                "branches": 8,
+                "max_rounds": 4,
+                "min_pairs": 20,
+                "max_pairs": 100,
+                "outer_candidates": 2,
+                "max_cases": 10,
+                "sanitizer_mode": "targeted",
+                "reserve_seconds": 300,
+            },
+            "thorough": {
+                "name": "thorough",
+                "max_seconds": 10 * 60 * 60,
+                "branches": 16,
+                "max_rounds": 8,
+                "min_pairs": 30,
+                "max_pairs": 200,
+                "outer_candidates": 3,
+                "max_cases": None,
+                "sanitizer_mode": "full",
+                "reserve_seconds": 300,
+            },
+        }
+        for name, expected_fields in expected.items():
+            with self.subTest(name=name):
+                policy = budget.resolve_budget(name)
+                actual = {
+                    field: getattr(policy, field)
+                    for field in policy.__dataclass_fields__
+                }
+                self.assertEqual(actual, expected_fields)
 
     def test_overrides_do_not_mutate_presets(self) -> None:
         original = dict(budget.PRESETS)
@@ -107,6 +146,65 @@ class BudgetPolicyTests(unittest.TestCase):
 
 
 class BudgetClockTests(unittest.TestCase):
+    def _assert_invalid_time(self, parameter: str, action) -> None:
+        try:
+            action()
+        except ValueError as error:
+            self.assertIn(parameter, str(error))
+        except Exception as error:
+            self.fail(
+                f"{parameter} raised {type(error).__name__}, expected ValueError"
+            )
+        else:
+            self.fail(f"{parameter} did not raise ValueError")
+
+    def test_constructor_rejects_invalid_started_at(self) -> None:
+        policy = budget.resolve_budget("quick")
+        for value in INVALID_TIME_VALUES:
+            with self.subTest(value=repr(value)):
+                self._assert_invalid_time(
+                    "started_at",
+                    lambda value=value: budget.BudgetClock(
+                        policy=policy, started_at=value
+                    ),
+                )
+
+    def test_can_start_rejects_invalid_now(self) -> None:
+        clock = budget.BudgetClock(
+            policy=budget.resolve_budget("quick"), started_at=100
+        )
+        for value in INVALID_TIME_VALUES:
+            with self.subTest(value=repr(value)):
+                self._assert_invalid_time(
+                    "now",
+                    lambda value=value: clock.can_start(
+                        now=value, estimated_seconds=10
+                    ),
+                )
+
+    def test_remaining_seconds_rejects_invalid_now(self) -> None:
+        clock = budget.BudgetClock(
+            policy=budget.resolve_budget("quick"), started_at=100
+        )
+        for value in INVALID_TIME_VALUES:
+            with self.subTest(value=repr(value)):
+                self._assert_invalid_time(
+                    "now", lambda value=value: clock.remaining_seconds(now=value)
+                )
+
+    def test_can_start_rejects_invalid_estimated_seconds(self) -> None:
+        clock = budget.BudgetClock(
+            policy=budget.resolve_budget("quick"), started_at=100
+        )
+        for value in INVALID_TIME_VALUES:
+            with self.subTest(value=repr(value)):
+                self._assert_invalid_time(
+                    "estimated_seconds",
+                    lambda value=value: clock.can_start(
+                        now=200, estimated_seconds=value
+                    ),
+                )
+
     def test_quick_policy_cannot_start_after_execution_deadline(self) -> None:
         clock = budget.BudgetClock(
             policy=budget.resolve_budget("quick"), started_at=100

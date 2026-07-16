@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 
@@ -40,6 +41,18 @@ _VALID_SANITIZER_MODES = {"targeted", "full"}
 
 def _is_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _validate_time(value: object, parameter: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{parameter} must be a finite number")
+    try:
+        numeric = float(value)
+    except OverflowError:
+        raise ValueError(f"{parameter} must be a finite number") from None
+    if not math.isfinite(numeric):
+        raise ValueError(f"{parameter} must be a finite number")
+    return numeric
 
 
 def _validate_policy(policy: BudgetPolicy) -> None:
@@ -105,13 +118,20 @@ class BudgetClock:
     policy: BudgetPolicy
     started_at: float
 
+    def __post_init__(self) -> None:
+        _validate_time(self.started_at, "started_at")
+
     def can_start(self, *, now: float, estimated_seconds: float) -> bool:
+        current = _validate_time(now, "now")
         execution_deadline = (
             self.started_at + self.policy.max_seconds - self.policy.reserve_seconds
         )
-        estimate = max(0.0, float(estimated_seconds))
-        return now + estimate <= execution_deadline
+        estimate = max(
+            0.0, _validate_time(estimated_seconds, "estimated_seconds")
+        )
+        return current + estimate <= execution_deadline
 
     def remaining_seconds(self, *, now: float) -> float:
+        current = _validate_time(now, "now")
         deadline = self.started_at + self.policy.max_seconds
-        return max(0.0, deadline - now)
+        return max(0.0, deadline - current)
