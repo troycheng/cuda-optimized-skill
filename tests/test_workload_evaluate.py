@@ -568,6 +568,64 @@ class EvaluatePairsTests(unittest.TestCase):
         serialized = json.dumps(result, allow_nan=False)
         self.assertNotIn("confirmed_win", serialized)
 
+    def test_primary_median_overflow_becomes_json_safe_workload_failure(self) -> None:
+        module = _load_workload_evaluate()
+        objective = _objective(
+            primary="throughput",
+            direction="higher",
+            constraints=[],
+        )
+
+        def runner(spec, *, candidate, role, case, timeout):
+            metrics = {
+                "throughput": 1e-306 if role == "baseline" else 1.0,
+            }
+            return _observation(spec, role=role, case=case, metrics=metrics)
+
+        result = module.evaluate_pairs(
+            _workload(module, objective=objective),
+            "baseline.py",
+            "candidate.py",
+            blocks=2,
+            retries=0,
+            bootstrap_samples=20,
+            runner=runner,
+        )
+
+        self.assertEqual(result["status"], "workload_failed")
+        self.assertTrue(all(not pair["valid"] for pair in result["pairs"]))
+        self.assertTrue(all("invalid_reason" in pair for pair in result["pairs"]))
+        serialized = json.dumps(result, allow_nan=False)
+        self.assertNotIn("confirmed_win", serialized)
+
+    def test_constraint_median_overflow_becomes_json_safe_workload_failure(
+        self,
+    ) -> None:
+        module = _load_workload_evaluate()
+
+        def runner(spec, *, candidate, role, case, timeout):
+            metrics = {
+                "latency_ms": 100.0 if role == "baseline" else 90.0,
+                "memory_mb": 1e-306 if role == "baseline" else 1.0,
+            }
+            return _observation(spec, role=role, case=case, metrics=metrics)
+
+        result = module.evaluate_pairs(
+            _workload(module),
+            "baseline.py",
+            "candidate.py",
+            blocks=2,
+            retries=0,
+            bootstrap_samples=20,
+            runner=runner,
+        )
+
+        self.assertEqual(result["status"], "workload_failed")
+        self.assertTrue(all(not pair["valid"] for pair in result["pairs"]))
+        self.assertTrue(all("invalid_reason" in pair for pair in result["pairs"]))
+        serialized = json.dumps(result, allow_nan=False)
+        self.assertNotIn("confirmed_win", serialized)
+
     def test_blocks_are_positive_literal_integers(self) -> None:
         module = _load_workload_evaluate()
         for blocks in (True, 0, -1, 1.0, "1"):

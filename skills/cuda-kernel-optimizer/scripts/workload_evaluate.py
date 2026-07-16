@@ -221,6 +221,37 @@ def _error_diagnostic(error: Exception) -> dict:
     }
 
 
+def _validate_statistical_evidence(value, field: str) -> None:
+    if value is None or isinstance(value, str):
+        return
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must not contain boolean numeric evidence")
+    if isinstance(value, Real):
+        _finite_real(value, field)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_statistical_evidence(item, f"{field}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_statistical_evidence(item, f"{field}[{index}]")
+        return
+    raise ValueError(f"{field} must contain JSON statistical evidence")
+
+
+def _failed_statistics(base: dict, pairs: list[dict], error: Exception) -> dict:
+    diagnostic = _error_diagnostic(error)
+    for pair in pairs:
+        pair["valid"] = False
+        pair["invalid_reason"] = copy.deepcopy(diagnostic)
+    result = _failed_evaluation(
+        base, pairs, "statistical aggregation produced invalid evidence"
+    )
+    result["failure"] = diagnostic
+    return result
+
+
 def evaluate_pairs(
     workload,
     baseline,
@@ -390,45 +421,49 @@ def evaluate_pairs(
             base, pairs, "objective metric derivation is invalid"
         )
 
-    primary_statistics = paired_stats.classify_pairs(
-        primary_pairs,
-        direction=primary["direction"],
-        min_effect_pct=objective["min_effect_pct"],
-        confidence=confidence_value,
-        bootstrap_samples=bootstrap_count,
-        seed=seed,
-    )
-
-    constraint_statistics = []
-    for index, constraint in enumerate(objective["constraints"]):
-        name = constraint["name"]
-        cap = constraint["max_regression_pct"]
-        regressions = constraint_regressions[name]
-        estimate = statistics.median(regressions)
-        ci_low, ci_high = paired_stats.bootstrap_median_ci(
-            regressions,
+    try:
+        primary_statistics = paired_stats.classify_pairs(
+            primary_pairs,
+            direction=primary["direction"],
+            min_effect_pct=objective["min_effect_pct"],
             confidence=confidence_value,
-            samples=bootstrap_count,
-            seed=seed + index + 1,
+            bootstrap_samples=bootstrap_count,
+            seed=seed,
         )
-        if ci_high <= cap:
-            status = "passed"
-        elif ci_low > cap:
-            status = "failed"
-        else:
-            status = "inconclusive"
-        constraint_statistics.append(
-            {
-                "name": name,
-                "max_regression_pct": cap,
-                "cap_pct": cap,
-                "estimate_pct": estimate,
-                "ci_low_pct": ci_low,
-                "ci_high_pct": ci_high,
-                "status": status,
-                "values_pct": regressions,
-            }
-        )
+        constraint_statistics = []
+        for index, constraint in enumerate(objective["constraints"]):
+            name = constraint["name"]
+            cap = constraint["max_regression_pct"]
+            regressions = constraint_regressions[name]
+            estimate = statistics.median(regressions)
+            ci_low, ci_high = paired_stats.bootstrap_median_ci(
+                regressions,
+                confidence=confidence_value,
+                samples=bootstrap_count,
+                seed=seed + index + 1,
+            )
+            if ci_high <= cap:
+                status = "passed"
+            elif ci_low > cap:
+                status = "failed"
+            else:
+                status = "inconclusive"
+            constraint_statistics.append(
+                {
+                    "name": name,
+                    "max_regression_pct": cap,
+                    "cap_pct": cap,
+                    "estimate_pct": estimate,
+                    "ci_low_pct": ci_low,
+                    "ci_high_pct": ci_high,
+                    "status": status,
+                    "values_pct": regressions,
+                }
+            )
+        _validate_statistical_evidence(primary_statistics, "primary")
+        _validate_statistical_evidence(constraint_statistics, "constraints")
+    except (ArithmeticError, ValueError) as error:
+        return _failed_statistics(base, pairs, error)
 
     return {
         **base,
