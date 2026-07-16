@@ -33,6 +33,7 @@ import ctypes
 import argparse
 import statistics
 import importlib.util
+import warnings
 from contextlib import contextmanager
 from numbers import Real
 from pathlib import Path
@@ -312,9 +313,12 @@ def compile_cu(
         suffix=final_path.suffix,
         dir=str(final_path.parent),
     )
-    os.close(fd)
     attempt_path = Path(attempt_name)
-    attempt_path.unlink()
+    try:
+        os.utime(fd, ns=(0, 0))
+        initial_attempt = os.fstat(fd)
+    finally:
+        os.close(fd)
     clean_file = cu_file
     cmd = list(cmd_prefix)
     try:
@@ -376,9 +380,15 @@ def compile_cu(
             sys.exit(1)
 
         before_publish = compiler_evidence.artifact_identity(attempt_path)
-        if before_publish is None or before_publish["size_bytes"] <= 0:
+        if (
+            before_publish is None
+            or before_publish["dev"] != initial_attempt.st_dev
+            or before_publish["ino"] != initial_attempt.st_ino
+            or before_publish["size_bytes"] <= 0
+            or before_publish["mtime_ns"] == initial_attempt.st_mtime_ns
+        ):
             print(
-                f"Compilation failed:\nnvcc did not produce a real output binary: {output_so}",
+                f"Compilation failed:\nnvcc did not update the secured output file: {output_so}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -388,16 +398,32 @@ def compile_cu(
             print("Compilation failed:\ncompile attempt changed before publish", file=sys.stderr)
             sys.exit(1)
 
-        os.replace(str(attempt_path), str(final_path))
-        _fsync_directory(final_path.parent)
-        published = compiler_evidence.artifact_identity(final_path)
-        if published is None or any(
-            published[field] != before_publish[field]
-            for field in ("dev", "ino", "size_bytes", "sha256")
-        ):
-            _remove_output(final_path)
-            print("Compilation failed:\npublished binary identity mismatch", file=sys.stderr)
-            sys.exit(1)
+        try:
+            os.replace(str(attempt_path), str(final_path))
+            _fsync_directory(final_path.parent)
+            published = compiler_evidence.artifact_identity(final_path)
+            if published is None or any(
+                published[field] != before_publish[field]
+                for field in ("dev", "ino", "size_bytes", "sha256")
+            ):
+                print(
+                    "Compilation failed:\npublished binary identity mismatch",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except BaseException:
+            try:
+                _remove_output(final_path)
+            except BaseException as cleanup_error:
+                try:
+                    final_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise RuntimeError(
+                        f"failed to revoke incomplete compile output: {final_path}"
+                    ) from cleanup_error
+            raise
 
         evidence_status = _fresh_evidence_safely(
             evidence_path,
@@ -827,9 +853,16 @@ def _record_triton_compiler_evidence(state) -> None:
     discovered = compiler_evidence.discover_triton_cache(
         runtime["cache_dir"], runtime["cache_before"]
     )
-    status = _update_evidence_safely(
-        runtime["evidence_dir"], discovered=discovered
-    )
+    try:
+        durable = compiler_evidence.publish_triton_stages(
+            runtime["evidence_dir"], discovered
+        )
+    except (OSError, ValueError) as error:
+        status = _evidence_status(runtime["evidence_dir"], error=error)
+    else:
+        status = _update_evidence_safely(
+            runtime["evidence_dir"], discovered=durable
+        )
     state["compiler_evidence"].clear()
     state["compiler_evidence"].update(status)
     runtime["recorded"] = True
@@ -843,6 +876,25 @@ def cleanup_solution(state) -> None:
     if owner is not None:
         owner.cleanup()
     runtime["cleaned"] = True
+
+
+def _cleanup_created_solutions(states) -> None:
+    active_error = sys.exc_info()[1]
+    cleanup_errors = []
+    for state in reversed(states):
+        try:
+            cleanup_solution(state)
+        except Exception as error:
+            cleanup_errors.append(error)
+            if active_error is not None:
+                warnings.warn(
+                    f"solution cleanup failed while preserving active error: {error}",
+                    RuntimeWarning,
+                )
+    if cleanup_errors and active_error is None:
+        raise RuntimeError(
+            f"solution cleanup failed: {cleanup_errors[0]}"
+        ) from cleanup_errors[0]
 
 
 def _sync_result_compiler_evidence(result: dict, state: dict) -> None:
@@ -1063,7 +1115,7 @@ def measure_once(state, *, cuda=None):
 # ---------------------------------------------------------------------------
 
 
-def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc", backend="auto", validation_seeds=None, profile_only=False):
+def _run_impl(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc", backend="auto", validation_seeds=None, profile_only=False, _created_states=None):
     """Main benchmark pipeline."""
     _require_torch()
     resolved_backend = infer_backend(solution_file, backend)
@@ -1147,6 +1199,8 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
         }
         _write_json_out(json_out, result)
         raise
+    if _created_states is not None:
+        _created_states.append(state)
     result["signature"] = state["signature"]
     result["ptr_elems"] = state["ptr_elems"]
     result["total_ptr_bytes"] = state["total_ptr_bytes"]
@@ -1169,7 +1223,6 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
         result["profiled_launches"] = 1
         _write_json_out(json_out, result)
         print(json.dumps({"profile_only": True, "profiled_launches": 1}, indent=2))
-        cleanup_solution(state)
         return
 
     if not state["output_specs"] and has_ref:
@@ -1262,7 +1315,6 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
         if not validation_passed:
             _sync_result_compiler_evidence(result, state)
             _write_json_out(json_out, result)
-            cleanup_solution(state)
             sys.exit(1)
 
     times_ref = None
@@ -1359,7 +1411,32 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
 
     _sync_result_compiler_evidence(result, state)
     _write_json_out(json_out, result)
-    cleanup_solution(state)
+
+
+def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, arch, atol, rtol, seed, json_out="", nvcc_bin="nvcc", backend="auto", validation_seeds=None, profile_only=False):
+    """Run one benchmark and deterministically clean every created solution."""
+    created_states = []
+    try:
+        return _run_impl(
+            solution_file,
+            ref_file,
+            dim_values,
+            warmup,
+            repeat,
+            ptr_size_override,
+            arch,
+            atol,
+            rtol,
+            seed,
+            json_out=json_out,
+            nvcc_bin=nvcc_bin,
+            backend=backend,
+            validation_seeds=validation_seeds,
+            profile_only=profile_only,
+            _created_states=created_states,
+        )
+    finally:
+        _cleanup_created_solutions(created_states)
 
 
 # ---------------------------------------------------------------------------

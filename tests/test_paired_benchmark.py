@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import math
 import random
 import sys
+import tempfile
 import unittest
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -297,6 +302,156 @@ class PairedBenchmarkTests(unittest.TestCase):
             kwargs[name] = value
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
                 paired.run_paired("baseline.py", "candidate.py", **kwargs)
+
+    def test_candidate_prepare_failure_cleans_baseline_state(self) -> None:
+        paired = _load_paired_benchmark()
+        baseline = {"name": "baseline"}
+        prepared = iter((baseline, RuntimeError("candidate prepare broke")))
+
+        def prepare(*_args, **_kwargs):
+            value = next(prepared)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with mock.patch.object(paired, "cleanup_solution") as cleanup:
+            with self.assertRaisesRegex(RuntimeError, "candidate prepare broke"):
+                paired.run_paired(
+                    "baseline.py", "candidate.py", backend="triton", dims={},
+                    ptr_size=0, arch="sm_120", nvcc_bin="nvcc", seed=1,
+                    blocks=1, warmup=0, prepare_fn=prepare,
+                )
+
+        cleanup.assert_called_once_with(baseline)
+
+    def test_paired_cleans_both_states_for_warm_measure_and_validator_errors(self) -> None:
+        paired = _load_paired_benchmark()
+        for failure_stage in ("warm", "measure", "validator"):
+            states = [{"name": "baseline"}, {"name": "candidate"}]
+            prepared = iter(states)
+
+            def prepare(*_args, **_kwargs):
+                return next(prepared)
+
+            def warm(_state, _warmup):
+                if failure_stage == "warm":
+                    raise RuntimeError("warm broke")
+
+            def measure(_state):
+                if failure_stage == "measure":
+                    raise RuntimeError("measure broke")
+                return 1.0
+
+            def validate(*_args, **_kwargs):
+                if failure_stage == "validator":
+                    raise RuntimeError("validator broke")
+                return {"valid": True, "invalid_reasons": []}
+
+            with self.subTest(stage=failure_stage), mock.patch.object(
+                paired, "cleanup_solution"
+            ) as cleanup, self.assertRaisesRegex(RuntimeError, "broke"):
+                paired.run_paired(
+                    "baseline.py", "candidate.py", backend="triton", dims={},
+                    ptr_size=0, arch="sm_120", nvcc_bin="nvcc", seed=1,
+                    blocks=1, warmup=0, prepare_fn=prepare, warm_fn=warm,
+                    measure_fn=measure,
+                    telemetry_reader=lambda: {"available": False},
+                    block_validator=validate,
+                )
+
+            self.assertEqual(
+                cleanup.call_args_list,
+                [mock.call(states[1]), mock.call(states[0])],
+            )
+
+    def test_paired_cleanup_failure_does_not_mask_measure_error(self) -> None:
+        paired = _load_paired_benchmark()
+        states = iter(({"name": "baseline"}, {"name": "candidate"}))
+
+        with mock.patch.object(
+            paired, "cleanup_solution", side_effect=OSError("cleanup broke")
+        ), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaisesRegex(RuntimeError, "measure broke"):
+                paired.run_paired(
+                    "baseline.py", "candidate.py", backend="triton", dims={},
+                    ptr_size=0, arch="sm_120", nvcc_bin="nvcc", seed=1,
+                    blocks=1, warmup=0,
+                    prepare_fn=lambda *_args, **_kwargs: next(states),
+                    warm_fn=lambda *_args: None,
+                    measure_fn=lambda *_args: (_ for _ in ()).throw(
+                        RuntimeError("measure broke")
+                    ),
+                    telemetry_reader=lambda: {"available": False},
+                )
+
+        self.assertTrue(any("cleanup broke" in str(item.message) for item in caught))
+
+    def test_paired_keeps_durable_triton_evidence_after_cleanup(self) -> None:
+        paired = _load_paired_benchmark()
+        benchmark = sys.modules[paired.prepare_solution.__module__]
+
+        class FakeTensor:
+            pass
+
+        benchmark.torch = SimpleNamespace(Tensor=FakeTensor)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            states = []
+            for name in ("baseline", "candidate"):
+                source_dir = root / name
+                source_dir.mkdir()
+                (source_dir / "kernel.py").write_text(
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "def setup(**kwargs):\n"
+                    "    return {'inputs': {'n': kwargs['n']}, 'outputs': []}\n"
+                    "def run_kernel(**kwargs):\n"
+                    "    unit = Path(os.environ['TRITON_CACHE_DIR']) / 'unit'\n"
+                    "    unit.mkdir(parents=True, exist_ok=True)\n"
+                    f"    (unit / 'kernel.ptx').write_text('{name} ptx')\n",
+                    encoding="utf-8",
+                )
+
+            def prepare(solution_file, **kwargs):
+                source = Path(solution_file)
+                state = benchmark._setup_triton(
+                    str(source), kwargs["dims"], seed=kwargs["seed"],
+                    arch=kwargs["arch"], evidence_dir=source.parent / "evidence",
+                )
+                states.append(state)
+                return state
+
+            def measure(state):
+                state["callable"]()
+                benchmark._record_triton_compiler_evidence(state)
+                return 1.0
+
+            paired.run_paired(
+                str(root / "baseline" / "kernel.py"),
+                str(root / "candidate" / "kernel.py"),
+                backend="triton", dims={"n": 1}, ptr_size=0,
+                arch="sm_120", nvcc_bin="nvcc", seed=1, blocks=1,
+                warmup=0, prepare_fn=prepare, warm_fn=lambda *_args: None,
+                measure_fn=measure,
+                telemetry_reader=lambda: {"available": False},
+            )
+
+            self.assertEqual(len(states), 2)
+            for state in states:
+                runtime = state["_compiler_evidence_runtime"]
+                self.assertFalse(Path(runtime["cache_dir"]).exists())
+                manifest = json.loads(
+                    (Path(runtime["evidence_dir"]) / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                durable_ptx = Path(manifest["ptx"]["path"])
+                self.assertTrue(durable_ptx.is_file())
+                self.assertEqual(
+                    benchmark.compiler_evidence.artifact_identity(durable_ptx)["sha256"],
+                    manifest["ptx"]["sha256"],
+                )
 
 
 if __name__ == "__main__":

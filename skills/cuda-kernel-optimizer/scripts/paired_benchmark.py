@@ -7,6 +7,7 @@ import copy
 import math
 import random
 import sys
+import warnings
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
@@ -64,7 +65,26 @@ def _nonempty_string(value, name: str) -> str:
     return value
 
 
-def run_paired(
+def _cleanup_created_solutions(states) -> None:
+    active_error = sys.exc_info()[1]
+    cleanup_errors = []
+    for state in reversed(states):
+        try:
+            cleanup_solution(state)
+        except Exception as error:
+            cleanup_errors.append(error)
+            if active_error is not None:
+                warnings.warn(
+                    f"solution cleanup failed while preserving active error: {error}",
+                    RuntimeWarning,
+                )
+    if cleanup_errors and active_error is None:
+        raise RuntimeError(
+            f"solution cleanup failed: {cleanup_errors[0]}"
+        ) from cleanup_errors[0]
+
+
+def _run_paired_impl(
     baseline_file,
     candidate_file,
     *,
@@ -83,6 +103,7 @@ def run_paired(
     measure_fn=None,
     telemetry_reader=None,
     block_validator=None,
+    _created_states=None,
 ) -> dict:
     """Prepare two solutions once and collect randomized paired observations."""
     _nonempty_string(baseline_file, "baseline_file")
@@ -122,11 +143,15 @@ def run_paired(
         dims=copy.deepcopy(dict(dims)),
         **common,
     )
+    if _created_states is not None:
+        _created_states.append(baseline_state)
     candidate_state = prepare(
         candidate_file,
         dims=copy.deepcopy(dict(dims)),
         **common,
     )
+    if _created_states is not None:
+        _created_states.append(candidate_state)
     if baseline_state is candidate_state:
         raise ValueError(
             "prepare_fn must return independent baseline and candidate states"
@@ -208,6 +233,51 @@ def run_paired(
         "warmup": warmup_count,
         "pairs": pairs,
     }
-    cleanup_solution(baseline_state)
-    cleanup_solution(candidate_state)
     return result
+
+
+def run_paired(
+    baseline_file,
+    candidate_file,
+    *,
+    backend,
+    dims,
+    ptr_size,
+    arch,
+    nvcc_bin,
+    seed,
+    blocks,
+    warmup,
+    max_temperature_delta_c=5,
+    max_clock_delta_pct=5,
+    prepare_fn=None,
+    warm_fn=None,
+    measure_fn=None,
+    telemetry_reader=None,
+    block_validator=None,
+) -> dict:
+    """Collect paired observations and clean every successfully prepared state."""
+    created_states = []
+    try:
+        return _run_paired_impl(
+            baseline_file,
+            candidate_file,
+            backend=backend,
+            dims=dims,
+            ptr_size=ptr_size,
+            arch=arch,
+            nvcc_bin=nvcc_bin,
+            seed=seed,
+            blocks=blocks,
+            warmup=warmup,
+            max_temperature_delta_c=max_temperature_delta_c,
+            max_clock_delta_pct=max_clock_delta_pct,
+            prepare_fn=prepare_fn,
+            warm_fn=warm_fn,
+            measure_fn=measure_fn,
+            telemetry_reader=telemetry_reader,
+            block_validator=block_validator,
+            _created_states=created_states,
+        )
+    finally:
+        _cleanup_created_solutions(created_states)

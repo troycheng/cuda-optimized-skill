@@ -137,12 +137,13 @@ def _status_checks(methods_list: list, status: str, note: str) -> list:
 
 
 def _checks_status(checks: list) -> str:
-    statuses = {check.get("status") for check in checks}
+    statuses = [check.get("status") for check in checks]
     if "failed" in statuses:
         return "failed"
-    if "passed" in statuses:
+    required = [status for status in statuses if status != "not_applicable"]
+    if required and all(status == "passed" for status in required):
         return "passed"
-    if statuses == {"not_applicable"}:
+    if statuses and not required:
         return "not_applicable"
     return "unavailable"
 
@@ -334,10 +335,9 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
 
 
 def _write_result(iter_dir: str, result: dict):
-    out_path = os.path.join(iter_dir, "sass_check.json")
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+    out_path = Path(iter_dir) / "sass_check.json"
+    payload = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
+    compiler_evidence.atomic_write_text(out_path, payload)
 
 
 def main():

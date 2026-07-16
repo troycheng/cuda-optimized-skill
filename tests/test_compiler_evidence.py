@@ -381,6 +381,29 @@ class CompilerEvidenceTests(unittest.TestCase):
 
         self.assertEqual(discovered["ptx"], ptx.resolve())
 
+    def test_durable_triton_stage_names_are_content_addressed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence_dir = root / "evidence"
+            first = root / "first" / "kernel.ptx"
+            second = root / "second" / "kernel.ptx"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_text("first ptx", encoding="utf-8")
+            second.write_text("second ptx", encoding="utf-8")
+
+            first_published = self.compiler_evidence.publish_triton_stages(
+                evidence_dir, {"ptx": first}
+            )["ptx"]
+            second_published = self.compiler_evidence.publish_triton_stages(
+                evidence_dir, {"ptx": second}
+            )["ptx"]
+
+            self.assertNotEqual(first_published, second_published)
+            self.assertEqual(first_published.read_text(encoding="utf-8"), "first ptx")
+            self.assertEqual(second_published.read_text(encoding="utf-8"), "second ptx")
+            self.assertRegex(first_published.name, r"^ptx-[0-9a-f]{64}\.ptx$")
+
     def test_rejects_unknown_stage_names(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown compiler stage"):
             self.compiler_evidence.collect(discovered={"made_up": "x"})
@@ -398,13 +421,21 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
             )
 
             commands = []
+            attempt_identity = []
 
             def fake_run(command, **_kwargs):
                 commands.append(list(command))
                 attempt = Path(command[command.index("-o") + 1])
                 self.assertEqual(attempt.parent, binary.parent)
                 self.assertNotEqual(attempt, binary)
+                self.assertTrue(attempt.is_file())
+                self.assertEqual(attempt.stat().st_size, 0)
+                attempt_identity.append((attempt.stat().st_dev, attempt.stat().st_ino))
                 attempt.write_bytes(b"elf")
+                self.assertEqual(
+                    (attempt.stat().st_dev, attempt.stat().st_ino),
+                    attempt_identity[-1],
+                )
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with mock.patch.object(benchmark.subprocess, "run", side_effect=fake_run):
@@ -427,6 +458,77 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
         self.assertNotIn("-lineinfo", manifest["compile_command"])
         self.assertEqual(binary_bytes, b"elf")
         self.assertEqual(attempts, [])
+
+    def test_compile_rejects_attempt_path_replacement_without_following_symlink(self) -> None:
+        benchmark = _load("benchmark")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            victim = root / "victim.so"
+            source.write_text('extern "C" void solve(float *out) {}', encoding="utf-8")
+            victim.write_bytes(b"do-not-touch")
+
+            def replace_attempt_with_symlink(command, **_kwargs):
+                attempt = Path(command[command.index("-o") + 1])
+                self.assertTrue(attempt.is_file())
+                attempt.unlink()
+                try:
+                    attempt.symlink_to(victim)
+                except OSError:
+                    self.skipTest("symlinks are unavailable")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                benchmark.subprocess,
+                "run",
+                side_effect=replace_attempt_with_symlink,
+            ):
+                with self.assertRaises(SystemExit):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(victim.read_bytes(), b"do-not-touch")
+            self.assertFalse(binary.exists())
+            self.assertEqual(manifest["binary"]["status"], "unavailable")
+
+    def test_publish_directory_fsync_failure_removes_visible_binary(self) -> None:
+        benchmark = _load("benchmark")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            source.write_text('extern "C" void solve(float *out) {}', encoding="utf-8")
+
+            def fake_run(command, **_kwargs):
+                Path(command[command.index("-o") + 1]).write_bytes(b"elf")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                benchmark.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(
+                benchmark,
+                "_fsync_directory",
+                side_effect=[OSError("publish fsync failed"), None],
+            ):
+                with self.assertRaisesRegex(OSError, "publish fsync failed"):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(binary.exists())
+            self.assertEqual(manifest["binary"]["status"], "unavailable")
 
     def test_compile_failure_invalidates_stale_binary_evidence(self) -> None:
         benchmark = _load("benchmark")
@@ -719,12 +821,27 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            durable_paths = {
+                stage: Path(manifest[stage]["path"])
+                for stage in ("ttir", "ptx")
+            }
             benchmark.cleanup_solution(state)
+
+            for path in durable_paths.values():
+                self.assertTrue(path.is_file())
+                self.assertTrue(
+                    path.is_relative_to((root / "compiler_evidence" / "stages").resolve())
+                )
+            durable_contents = {
+                stage: path.read_text(encoding="utf-8")
+                for stage, path in durable_paths.items()
+            }
 
         self.assertEqual(manifest["backend"], "triton")
         self.assertEqual(manifest["ttir"]["status"], "available")
         self.assertEqual(manifest["ptx"]["status"], "available")
-        self.assertTrue(manifest["ptx"]["path"].endswith("hash/kernel.ptx"))
+        self.assertEqual(durable_contents["ttir"], "ttir")
+        self.assertEqual(durable_contents["ptx"], "ptx")
         self.assertEqual(manifest["binary"]["status"], "unavailable")
 
     def test_triton_uses_isolated_cache_for_import_setup_and_launch(self) -> None:
@@ -781,16 +898,89 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                 self.assertEqual(os.environ["TRITON_CACHE_DIR"], str(ambient))
                 benchmark._record_triton_compiler_evidence(state)
 
+            try:
+                manifest = json.loads(
+                    (evidence_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                durable_ptx = Path(manifest["ptx"]["path"])
+                self.assertTrue(
+                    durable_ptx.is_relative_to((evidence_dir / "stages").resolve())
+                )
+                self.assertFalse(durable_ptx.is_relative_to(isolated))
+                self.assertNotEqual(
+                    durable_ptx, ambient / "unrelated.ptx"
+                )
+                self.assertTrue(isolated.exists())
+            finally:
+                benchmark.cleanup_solution(state)
+            self.assertFalse(isolated.exists())
+            self.assertEqual(durable_ptx.read_text(encoding="utf-8"), "ptx")
+            reloaded = benchmark.compiler_evidence.load_manifest(evidence_dir)
+            self.assertEqual(reloaded["ptx"], manifest["ptx"])
+            durable_identity = benchmark.compiler_evidence.artifact_identity(
+                durable_ptx
+            )
+            self.assertIsNotNone(durable_identity)
+            self.assertEqual(
+                durable_identity["sha256"], manifest["ptx"]["sha256"]
+            )
+
+    def test_benchmark_run_keeps_triton_evidence_after_finally_cleanup(self) -> None:
+        benchmark = _load("benchmark")
+
+        class FakeTensor:
+            pass
+
+        fake_cuda = SimpleNamespace(
+            current_device=lambda: 0,
+            get_device_name=lambda _index: "fake-gpu",
+            synchronize=lambda: None,
+        )
+        benchmark.torch = SimpleNamespace(Tensor=FakeTensor, cuda=fake_cuda)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence_dir = root / "evidence"
+            result_path = root / "result.json"
+            source = root / "kernel.py"
+            source.write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "def setup(**kwargs):\n"
+                "    return {'inputs': {'n': kwargs['n']}, 'outputs': []}\n"
+                "def run_kernel(**kwargs):\n"
+                "    unit = Path(os.environ['TRITON_CACHE_DIR']) / 'unit'\n"
+                "    unit.mkdir(parents=True, exist_ok=True)\n"
+                "    (unit / 'kernel.ptx').write_text('durable ptx')\n",
+                encoding="utf-8",
+            )
+            state = benchmark._setup_triton(
+                str(source), {"n": 1}, seed=None, arch="sm_120",
+                evidence_dir=evidence_dir,
+            )
+            isolated = Path(state["_compiler_evidence_runtime"]["cache_dir"])
+
+            with mock.patch.object(
+                benchmark, "_setup_backend", return_value=state
+            ), mock.patch.object(
+                benchmark, "_time_iterations", return_value=[1.0]
+            ):
+                benchmark.run(
+                    str(source), "", {"n": 1}, 0, 1, 0, "sm_120",
+                    1e-4, 1e-3, 42, json_out=str(result_path), backend="triton",
+                )
+
+            result = json.loads(result_path.read_text(encoding="utf-8"))
             manifest = json.loads(
                 (evidence_dir / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertTrue(Path(manifest["ptx"]["path"]).is_relative_to(isolated))
-            self.assertNotEqual(
-                Path(manifest["ptx"]["path"]), ambient / "unrelated.ptx"
-            )
-            self.assertTrue(isolated.exists())
-            benchmark.cleanup_solution(state)
+            durable_ptx = Path(manifest["ptx"]["path"])
+
             self.assertFalse(isolated.exists())
+            self.assertTrue(durable_ptx.is_file())
+            self.assertEqual(durable_ptx.read_text(encoding="utf-8"), "durable ptx")
+            self.assertEqual(
+                result["compiler_evidence"]["manifest"]["ptx"], manifest["ptx"]
+            )
 
     def test_readonly_triton_source_does_not_block_benchmark_evidence(self) -> None:
         benchmark = _load("benchmark")
@@ -916,6 +1106,50 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
         )
         self.assertEqual((failed["status"], failed["verified"]), ("failed", False))
         self.assertEqual((passed["status"], passed["verified"]), ("passed", True))
+
+    def test_sass_aggregate_does_not_hide_unknown_method_as_passed(self) -> None:
+        sass_check = _load("sass_check")
+        passed = {
+            "method_id": "known",
+            "status": "passed",
+            "verified": True,
+        }
+        unknown = {
+            "method_id": "unknown",
+            "status": "unavailable",
+            "verified": False,
+        }
+        skipped = {
+            "method_id": "skipped",
+            "status": "not_applicable",
+            "verified": False,
+        }
+
+        self.assertEqual(sass_check._checks_status([passed, unknown]), "unavailable")
+        self.assertEqual(sass_check._checks_status([passed, skipped]), "passed")
+        self.assertEqual(
+            sass_check._checks_status([passed, unknown, {"status": "failed"}]),
+            "failed",
+        )
+
+    def test_sass_result_json_refuses_symlink_output(self) -> None:
+        sass_check = _load("sass_check")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            victim = root / "victim.json"
+            victim.write_text("sentinel", encoding="utf-8")
+            output = iter_dir / "sass_check.json"
+            try:
+                output.symlink_to(victim)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                sass_check._write_result(str(iter_dir), {"status": "passed"})
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "sentinel")
 
     def test_sass_requires_current_bound_binary_manifest(self) -> None:
         sass_check = _load("sass_check")

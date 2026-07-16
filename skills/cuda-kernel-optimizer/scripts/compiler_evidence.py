@@ -90,6 +90,75 @@ def atomic_write_text(path, text: str) -> Path:
     return target
 
 
+def _read_stable_artifact(path) -> tuple[bytes, dict]:
+    """Read a real file only while its path stays bound to one stable inode."""
+    before = artifact_identity(path)
+    if before is None:
+        raise ValueError(f"compiler artifact is not a stable regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(before["path"]), flags)
+    except OSError as error:
+        raise ValueError(f"compiler artifact could not be opened safely: {path}") from error
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before["dev"]
+            or opened.st_ino != before["ino"]
+        ):
+            raise ValueError(f"compiler artifact changed before copy: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        closed = os.fstat(fd)
+        if (
+            closed.st_dev != opened.st_dev
+            or closed.st_ino != opened.st_ino
+            or closed.st_size != opened.st_size
+            or closed.st_mtime_ns != opened.st_mtime_ns
+        ):
+            raise ValueError(f"compiler artifact changed during copy: {path}")
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    after = artifact_identity(path)
+    if after != before or hashlib.sha256(data).hexdigest() != before["sha256"]:
+        raise ValueError(f"compiler artifact changed during copy: {path}")
+    return data, before
+
+
+def publish_triton_stages(evidence_dir, discovered) -> dict[str, Path]:
+    """Publish selected Triton cache stages into durable evidence storage."""
+    if not isinstance(discovered, Mapping):
+        raise ValueError("discovered compiler artifacts must be a mapping")
+    unknown = sorted(set(discovered) - set(STAGES))
+    if unknown:
+        raise ValueError(f"unknown compiler stage: {unknown[0]}")
+    stage_dir = _artifact_directory(Path(evidence_dir) / "stages")
+    published = {}
+    for stage in STAGES:
+        source = discovered.get(stage)
+        if source is None:
+            continue
+        data, source_identity = _read_stable_artifact(source)
+        suffix = source_identity["path"].suffix.lower()
+        target = stage_dir / f"{stage}-{source_identity['sha256']}{suffix}"
+        _atomic_write(target, data)
+        target_identity = artifact_identity(target)
+        if (
+            target_identity is None
+            or target_identity["size_bytes"] != source_identity["size_bytes"]
+            or target_identity["sha256"] != source_identity["sha256"]
+        ):
+            raise ValueError(f"published compiler stage could not be verified: {stage}")
+        published[stage] = target_identity["path"]
+    return published
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     data = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
     _atomic_write(path, data)

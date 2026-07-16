@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -273,6 +274,132 @@ class BenchmarkTests(unittest.TestCase):
 
         self.assertEqual(set(payload), expected_keys)
         self.assertEqual(payload["error"]["code"], "setup_value_error")
+
+    def test_run_cleans_created_state_when_post_setup_code_raises(self) -> None:
+        benchmark = _load_benchmark()
+        cleanup_calls = []
+        owner = SimpleNamespace(cleanup=lambda: cleanup_calls.append("cleanup"))
+        state = {
+            "_compiler_evidence_runtime": {
+                "cache_owner": owner,
+                "cleaned": False,
+            }
+        }
+        benchmark.torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_device=lambda: 0,
+                get_device_name=lambda _index: "fake-gpu",
+            )
+        )
+        benchmark._setup_backend = lambda *_args, **_kwargs: state
+
+        with self.assertRaises(KeyError):
+            benchmark.run(
+                "kernel.py", "", {}, 0, 1, 0, "sm_120", 1e-4, 1e-3, 42,
+                backend="triton",
+            )
+
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
+    def test_run_cleans_created_state_when_kernel_raises_system_exit(self) -> None:
+        benchmark = _load_benchmark()
+        cleanup_calls = []
+        owner = SimpleNamespace(cleanup=lambda: cleanup_calls.append("cleanup"))
+
+        def exit_kernel():
+            raise SystemExit(9)
+
+        state = {
+            "signature": [],
+            "ptr_elems": 0,
+            "total_ptr_bytes": 0,
+            "output_specs": [],
+            "preview_tensors": [],
+            "callable": exit_kernel,
+            "compiler_evidence": {"status": "unavailable"},
+            "_compiler_evidence_runtime": {
+                "cache_owner": owner,
+                "cleaned": False,
+            },
+        }
+        benchmark.torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_device=lambda: 0,
+                get_device_name=lambda _index: "fake-gpu",
+            )
+        )
+        benchmark._setup_backend = lambda *_args, **_kwargs: state
+
+        with self.assertRaisesRegex(SystemExit, "9"):
+            benchmark.run(
+                "kernel.py", "", {}, 0, 1, 0, "sm_120", 1e-4, 1e-3, 42,
+                backend="triton",
+            )
+
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
+    def test_cleanup_failure_does_not_mask_active_run_exception(self) -> None:
+        benchmark = _load_benchmark()
+
+        def fail_cleanup():
+            raise OSError("cleanup broke")
+
+        state = {
+            "_compiler_evidence_runtime": {
+                "cache_owner": SimpleNamespace(cleanup=fail_cleanup),
+                "cleaned": False,
+            }
+        }
+        benchmark.torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_device=lambda: 0,
+                get_device_name=lambda _index: "fake-gpu",
+            )
+        )
+        benchmark._setup_backend = lambda *_args, **_kwargs: state
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(KeyError):
+                benchmark.run(
+                    "kernel.py", "", {}, 0, 1, 0, "sm_120", 1e-4, 1e-3, 42,
+                    backend="triton",
+                )
+
+        self.assertTrue(any("cleanup broke" in str(item.message) for item in caught))
+
+    def test_cleanup_solution_is_idempotent(self) -> None:
+        benchmark = _load_benchmark()
+        cleanup_calls = []
+        state = {
+            "_compiler_evidence_runtime": {
+                "cache_owner": SimpleNamespace(
+                    cleanup=lambda: cleanup_calls.append("cleanup")
+                ),
+                "cleaned": False,
+            }
+        }
+
+        benchmark.cleanup_solution(state)
+        benchmark.cleanup_solution(state)
+
+        self.assertEqual(cleanup_calls, ["cleanup"])
+
+    def test_normal_cleanup_failure_is_reported_clearly(self) -> None:
+        benchmark = _load_benchmark()
+
+        def fail_cleanup():
+            raise OSError("cleanup broke")
+
+        state = {
+            "_compiler_evidence_runtime": {
+                "cache_owner": SimpleNamespace(cleanup=fail_cleanup),
+                "cleaned": False,
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "solution cleanup failed: cleanup broke"):
+            benchmark._cleanup_created_solutions([state])
 
 
 if __name__ == "__main__":
