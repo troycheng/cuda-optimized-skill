@@ -1,6 +1,6 @@
 # CUDA Ecosystem Compatibility
 
-Validated on **2026-07-16**. These are validation targets, not hard minimums.
+Validated on **2026-07-17**. These are validation targets, not hard minimums.
 Probe the installed environment before selecting an optimization path.
 
 | Component | Validation target | Runtime rule |
@@ -12,17 +12,46 @@ Probe the installed environment before selecting an optimization path.
 
 ## Observed RTX 5090 lanes
 
-Both isolated lanes passed the same opt-in SM120 correctness and timing matrix
-for Triton, native CUDA, and CUTLASS:
+Both isolated lanes passed the same V2.2 SM120 acceptance matrix on 2026-07-17:
+seven safety/helper tests and four real-GPU tests for Triton, native CUDA,
+CUTLASS, randomized identical paired timing, the production outer-workload
+evaluator, and target-bounded NCU.
 
-| Lane | nvcc | PyTorch | Triton | CUTLASS | ncu | Counter verdict |
-|---|---:|---:|---:|---:|---:|---|
-| Compatibility | 13.0.1 | 2.11.0+cu130 | 3.6.0 | 4.6.1 | 2025.3.1 | `ERR_NVGPUCTRPERM` |
-| Current | 13.3.73 | 2.11.0+cu130 | 3.7.1 | 4.6.1 | 2026.2.1 | `ERR_NVGPUCTRPERM` |
+| Lane | Immutable image ID | nvcc | PyTorch | Triton | CUTLASS headers | ncu | Tests | Counter verdict |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Current | `sha256:a2d9d89b...8252a0e5` | 13.3.73 | 2.11.0+cu130 | 3.7.1 | 4.6.1 | 2026.2.1 | 11/11 | `ERR_NVGPUCTRPERM` |
+| Compatibility | `sha256:b810841f...37188a2` | 13.0.88 | 2.11.0+cu130 | 3.6.0 | 4.6.1 | 2025.3.1 | 11/11 | `ERR_NVGPUCTRPERM` |
 
 The counter verdict is a host-policy result, not a toolchain compatibility
 failure. A successful `ncu --query-metrics` is not counter-access proof. These
 runs did not add `SYS_ADMIN`, run privileged containers, or change the driver.
+The acceptance runner bound each lane to the recorded immutable image ID,
+required a dedicated read-only CUTLASS 4.6.1 checkout, failed closed when GPU
+occupancy could not be queried, and started from fresh artifact directories.
+
+## Observed real-workload lane
+
+An isolated user-provided vLLM binary workload ran in full mode with a
+`balanced` policy limited to one round, two branches, one outer candidate, and
+10,800 seconds. It completed in 2,232.43 seconds:
+
+| Surface | Valid pairs | Estimate | 95% CI | Threshold | Status |
+|---|---:|---:|---:|---:|---|
+| Kernel paired timing | 100 | +26.3287% | [22.1801%, 30.6322%] | +0.5% | `confirmed_win` |
+| `latency_us` workload | 100 | -0.0097% | [-0.0390%, 0.0365%] | +2.0% | `inconclusive` |
+
+The authoritative full-mode verdict was `kernel_only_win`, so the baseline
+remained the global best. The final checkpoint was `complete`, resume was
+idempotent, and raw kernel and workload JSONL reproduced the stored statistics.
+Host NCU 2026.1.1 had counter access and collected 140 metrics without
+degradation. The adapter compared prebuilt baseline/optimized binaries; the
+captured dispatch headers were byte-identical, so the result is binary A/B
+evidence rather than source-level promotion proof. No source tree was modified.
+
+Durable evidence is under
+`/data/tcheng/cuda-skill-e2e/v2.2/artifacts/{current,compatibility,real}`. The
+real run directory is
+`real/orchestrator/run_20260717_043610_569950525`.
 
 ## Architecture capability rules
 

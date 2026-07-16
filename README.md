@@ -224,23 +224,38 @@ states whether profiler, sanitizer, compiler, or workload coverage degraded.
 
 ## RTX 5090 validation and NCU permissions
 
-The table below is V2.1 carried-forward backend fixture evidence collected on a
-physical RTX 5090 on 2026-07-16. It covers Triton, native CUDA, and CUTLASS
-correctness plus timing artifacts; it does not yet validate the V2.2 dual-loop,
-paired/no-op decision, or real-workload acceptance paths.
-V2.2 dual-loop acceptance is pending Task 14.
+V2.2 was validated on a physical RTX 5090 on 2026-07-17. Both isolated
+containers ran the same 11-test matrix: seven safety/helper checks plus four
+real-GPU checks covering Triton, native CUDA, CUTLASS, randomized identical
+paired timing, the production outer-workload evaluator, and target-bounded NCU.
 
-| Lane | CUDA compiler | Triton | CUTLASS | Nsight Compute | Result |
-|---|---:|---:|---:|---:|---|
-| Compatibility | 13.0.1 | 3.6.0 | 4.6.1 | 2025.3.1 | 3/3 backends passed |
-| Current | 13.3.73 | 3.7.1 | 4.6.1 | 2026.2.1 | 3/3 backends passed |
+| Lane | Immutable image ID | nvcc | PyTorch | Triton | CUTLASS headers | NCU | Result |
+|---|---|---:|---:|---:|---:|---:|---|
+| Current | `sha256:a2d9d89b...8252a0e5` | 13.3.73 | 2.11.0+cu130 | 3.7.1 | 4.6.1 | 2026.2.1 | 11/11 passed |
+| Compatibility | `sha256:b810841f...37188a2` | 13.0.88 | 2.11.0+cu130 | 3.6.0 | 4.6.1 | 2025.3.1 | 11/11 passed |
 
-The host returned `ERR_NVGPUCTRPERM` for hardware counters in both lanes. The
-skill preserves the command, return code, and log, records unavailable counter
-coverage, and continues with other evidence. No privilege, container
-capability, or driver policy was changed. NCU evidence augments the decision
-when counter access is available; it is not required for correctness or
-paired timing. `ncu --query-metrics` alone does not prove counter permission.
+The capability-dropped containers returned `ERR_NVGPUCTRPERM` for hardware
+counters. The tests accepted only that exact degraded result or a successful
+profile with real metrics; no privilege, container capability, or driver policy
+was changed. The runner used immutable image IDs, a dedicated read-only CUTLASS
+4.6.1 checkout, fail-closed GPU-idle checks, and fresh artifact directories.
+
+An additional isolated, user-provided vLLM binary workload was run in full mode
+with the `balanced` budget (one round, two branches, 10,800-second cap). The
+kernel paired result was a confirmed **26.3287%** improvement with a 95% CI of
+**[22.1801%, 30.6322%]** over 100 valid pairs. The outer `latency_us` workload
+result was **-0.0097%**, 95% CI **[-0.0390%, 0.0365%]**, also over 100 valid
+pairs and below the required 2% effect. The authoritative verdict was therefore
+`kernel_only_win`; the global best remained the baseline. The run completed in
+2,232.43 seconds, resumed idempotently at `complete`, and its host NCU 2026.1.1
+profile read 140 metrics without degradation.
+
+The workload adapter compares the user's prebuilt baseline and optimized
+binaries. The captured dispatch headers were byte-identical, so this is valid
+binary A/B evidence but not source-level promotion proof. The source trees were
+not modified. Durable evidence is under
+`/data/tcheng/cuda-skill-e2e/v2.2/artifacts/{current,compatibility,real}`; the
+real run is `real/orchestrator/run_20260717_043610_569950525`.
 
 See [`tests/gpu/sm120/README.md`](tests/gpu/sm120/README.md) for the opt-in GPU
 tests and

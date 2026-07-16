@@ -208,20 +208,35 @@ run_YYYYMMDD_HHMMSS/
 
 ## RTX 5090 验证与 NCU 权限
 
-下表是 2026-07-16 在物理 RTX 5090 上采集的历史测试结果。这是 V2.1 继承的 backend fixture 证据，
-只覆盖 Triton、原生 CUDA 和 CUTLASS 的正确性及耗时产物；它尚未验证 V2.2
-双环、paired/no-op 判定和真实 workload 验收路径。
-V2.2 双环验收将在 Task 14 完成。
+V2.2 已于 2026-07-17 在物理 RTX 5090 上完成验证。两个隔离容器均运行
+同一组 11 项测试：7 项安全/helper 检查和 4 项真实 GPU 检查，覆盖 Triton、
+原生 CUDA、CUTLASS、随机化 identical paired 计时、production 外环 workload
+评估器和限定目标的 NCU profile。
 
-| Lane | CUDA 编译器 | Triton | CUTLASS | Nsight Compute | 结果 |
-|---|---:|---:|---:|---:|---|
-| 兼容环境 | 13.0.1 | 3.6.0 | 4.6.1 | 2025.3.1 | 3/3 后端通过 |
-| 当前环境 | 13.3.73 | 3.7.1 | 4.6.1 | 2026.2.1 | 3/3 后端通过 |
+| Lane | 不可变镜像 ID | nvcc | PyTorch | Triton | CUTLASS headers | NCU | 结果 |
+|---|---|---:|---:|---:|---:|---:|---|
+| 当前环境 | `sha256:a2d9d89b...8252a0e5` | 13.3.73 | 2.11.0+cu130 | 3.7.1 | 4.6.1 | 2026.2.1 | 11/11 通过 |
+| 兼容环境 | `sha256:b810841f...37188a2` | 13.0.88 | 2.11.0+cu130 | 3.6.0 | 4.6.1 | 2025.3.1 | 11/11 通过 |
 
-两个环境中宿主机都对硬件 counter 返回 `ERR_NVGPUCTRPERM`。Skill 保留命令、
-返回码和日志，记录 counter coverage 不可用，并继续使用其它证据；测试没有增加
-特权、容器 capability 或修改驱动策略。counter 可用时，NCU 证据会补充判定，
-但正确性与成对计时不依赖它。`ncu --query-metrics` 本身不能证明 counter 权限。
+两个移除 capability 的容器都对硬件 counter 返回 `ERR_NVGPUCTRPERM`。
+测试只接受这个精确降级结果，或真正采集到 metrics 的成功结果；没有增加特权、
+容器 capability 或修改驱动策略。runner 固定使用不可变镜像 ID、专用只读
+CUTLASS 4.6.1 检出目录、fail-closed GPU 空闲检查和全新 artifact 目录。
+
+此外还用用户提供的隔离 vLLM 二进制 workload 运行了 full mode：预算为
+`balanced`，1 轮、2 个分支、上限 10,800 秒。kernel paired 结果在 100 个
+有效 pair 上确认提升 **26.3287%**，95% CI 为
+**[22.1801%, 30.6322%]**；外环 `latency_us` workload 在 100 个有效 pair
+上的结果为 **-0.0097%**，95% CI 为 **[-0.0390%, 0.0365%]**，未达到 2%
+最小效果门槛。因此权威判定为 `kernel_only_win`，全局 best 仍是 baseline。
+运行耗时 2,232.43 秒，完成后 resume 幂等返回 `complete`；宿主机 NCU 2026.1.1
+成功读取 140 项 metrics，没有降级。
+
+该 workload adapter 比较用户预构建的 baseline/optimized 二进制。采集到的
+dispatch header 字节完全相同，因此这是有效的二进制 A/B 证据，但不能作为
+源码级晋级证明；测试未修改源码树。持久证据位于
+`/data/tcheng/cuda-skill-e2e/v2.2/artifacts/{current,compatibility,real}`，真实
+workload run 为 `real/orchestrator/run_20260717_043610_569950525`。
 
 可选 GPU 测试见 [`tests/gpu/sm120/README.md`](tests/gpu/sm120/README.md)，
 已验证版本和架构路由见

@@ -1359,7 +1359,7 @@ git commit -m "docs: document v2.2 dual-loop workflow"
 
 - 不修改仓库实现文件；只验证并更新本机已安装副本。
 
-- [ ] **步骤 1：运行完整 CPU 测试**
+- [x] **步骤 1：运行完整 CPU 测试**
 
 运行：
 
@@ -1369,7 +1369,7 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 
 预期：全部非 GPU opt-in 测试 PASS，SM120 测试显示 skipped。
 
-- [ ] **步骤 2：运行脚本 help、skill 和格式校验**
+- [x] **步骤 2：运行脚本 help、skill 和格式校验**
 
 运行：
 
@@ -1384,7 +1384,7 @@ git diff --check
 
 预期：所有 help 返回 0；Skill is valid；git diff --check 无输出。
 
-- [ ] **步骤 3：安全更新本机安装副本**
+- [x] **步骤 3：安全更新本机安装副本**
 
 运行：
 
@@ -1400,7 +1400,7 @@ mv "$staging" /Users/tcheng/.codex/skills/cuda-kernel-optimizer
 
 预期：staging 校验通过后才切换；旧安装保留为带时间戳 backup。
 
-- [ ] **步骤 4：验证安装内容与仓库一致**
+- [x] **步骤 4：验证安装内容与仓库一致**
 
 运行：
 
@@ -1423,7 +1423,7 @@ diff -qr skills/cuda-kernel-optimizer \
 - 远端创建：/data/tcheng/cuda-skill-e2e/v2.2/
 - 远端写入：/data/tcheng/cuda-skill-e2e/v2.2/artifacts/**
 
-- [ ] **步骤 1：先增加 opt-in GPU acceptance 测试**
+- [x] **步骤 1：先增加 opt-in GPU acceptance 测试**
 
 ~~~python
 def test_paired_noop_is_not_reported_as_win(self):
@@ -1447,7 +1447,7 @@ def test_user_workload_smoke_produces_separate_outer_evidence(self):
     self.assertTrue(result["workload_result"]["raw_pairs"])
 ~~~
 
-- [ ] **步骤 2：运行本地测试确认 opt-in skip**
+- [x] **步骤 2：运行本地测试确认 opt-in skip**
 
 运行：
 
@@ -1455,9 +1455,10 @@ def test_user_workload_smoke_produces_separate_outer_evidence(self):
 python -m unittest tests.gpu.sm120.test_sm120_acceptance -v
 ~~~
 
-预期：没有 CUDA_SM120_E2E=1 时全部 skipped。
+实际：7 项 CPU helper 回归通过，4 项真实 GPU 测试在未设置
+CUDA_SM120_E2E=1 时按预期 skipped。
 
-- [ ] **步骤 3：同步隔离 repo 到 5090**
+- [x] **步骤 3：同步隔离 repo 到 5090**
 
 运行：
 
@@ -1470,7 +1471,7 @@ rsync -a --delete --exclude .git/ \
 
 预期：只更新 /data/tcheng/cuda-skill-e2e/v2.2/repo，不触碰 /data/vllm-opt。
 
-- [ ] **步骤 4：运行 current lane 受控矩阵**
+- [x] **步骤 4：运行 current lane 受控矩阵**
 
 运行：
 
@@ -1484,7 +1485,7 @@ ssh 5090 'cd /data/tcheng/cuda-skill-e2e/v2.2/repo && \
 
 预期：CUDA、CUTLASS、Triton correctness/timing、noop inconclusive、workload smoke 全部 PASS。
 
-- [ ] **步骤 5：运行 compatibility lane**
+- [x] **步骤 5：运行 compatibility lane**
 
 使用 tests/gpu/sm120/remote/run_lane.sh 和现有 pinned compatibility image：
 
@@ -1497,7 +1498,7 @@ ssh 5090 'cd /data/tcheng/cuda-skill-e2e/v2.2/repo && \
 
 预期：三 backend 和新 paired/noop 测试 PASS；NCU 若返回 ERR_NVGPUCTRPERM，结果必须 degraded 且测试通过。
 
-- [ ] **步骤 6：运行用户提供的隔离 vLLM workload**
+- [x] **步骤 6：运行用户提供的隔离 vLLM workload**
 
 把用户已提供、已隔离的 workload adapter 放在：
 
@@ -1525,7 +1526,7 @@ setup 返回 run_dir 后，执行者按 next_step 生成每轮候选、调用 cl
 decision、checkpoint 和 summary 都存在。相同源码/二进制不得报 win；真实候选
 只能按保存的 paired CI 得出结论。
 
-- [ ] **步骤 7：验证预算、resume 和原始样本可复算**
+- [x] **步骤 7：验证预算、resume 和原始样本可复算**
 
 运行：
 
@@ -1537,12 +1538,43 @@ ssh 5090 "python3 /data/tcheng/cuda-skill-e2e/v2.2/repo/skills/cuda-kernel-optim
 
 预期：已完成 stage 不重复；input hash 匹配；summary 中统计值可由 paired_samples.jsonl 复算；实际 elapsed 不超过预算 manifest 的 max_seconds。
 
-- [ ] **步骤 8：提交 GPU 测试和证据说明**
+- [x] **步骤 8：提交 GPU 测试和证据说明**
 
 ~~~bash
 git add tests/gpu/sm120
 git commit -m "test: validate v2.2 dual-loop on RTX 5090"
 ~~~
+
+### 任务 14 执行记录（2026-07-17）
+
+- 本地完整回归：514 项通过，4 项 GPU opt-in 按预期 skipped；Task 14
+  专项 helper 为 7/7 通过。
+- current lane：不可变镜像
+  `sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`；
+  nvcc 13.3.73、PyTorch 2.11.0+cu130、Triton 3.7.1、CUTLASS headers
+  4.6.1、NCU 2026.2.1；11/11 通过。
+- compatibility lane：不可变镜像
+  `sha256:b810841fe8962f6f65bb48a693773696be778653d48c7903dc65471ca37188a2`；
+  nvcc 13.0.88、PyTorch 2.11.0+cu130、Triton 3.6.0、CUTLASS headers
+  4.6.1、NCU 2025.3.1；11/11 通过。
+- 两个 capability-dropped 容器的 NCU 均精确记录
+  `ERR_NVGPUCTRPERM`；没有增加特权、capability 或修改驱动策略。
+- 用户提供的隔离 vLLM 二进制 workload 以 full mode、balanced 预算运行，
+  max_seconds=10800、max_rounds=1、branches=2、outer_candidates=1。最终耗时
+  2232.43 秒，checkpoint 为 complete，resume 幂等。
+- kernel 100 个有效 pair：confirmed_win，提升 26.3287%，95% CI
+  [22.1801%, 30.6322%]；外环 latency_us 100 个有效 pair：inconclusive，
+  -0.0097%，95% CI [-0.0390%, 0.0365%]，未达到 2% 门槛。最终权威判定为
+  `kernel_only_win`，没有推进全局 best。
+- 宿主机真实 workload lane 的 NCU 2026.1.1 成功读取 140 项 metrics；kernel
+  和 workload 原始 JSONL 均可精确复算保存的统计结果。
+- workload adapter 比较预构建的 baseline/optimized 二进制；采集的 dispatch
+  header 字节完全相同。因此结论属于二进制 A/B 证据，不是源码级晋级证明。
+  测试前后源码树状态一致。
+- artifact 根目录：
+  `/data/tcheng/cuda-skill-e2e/v2.2/artifacts/{current,compatibility,real}`；
+  真实 run：`real/orchestrator/run_20260717_043610_569950525`。
+- Task 14 commit：`0e737ee test: validate v2.2 dual-loop on RTX 5090`。
 
 ## 任务 15：最终回归、分支集成和仅向 fork 推送
 
@@ -1552,12 +1584,14 @@ git commit -m "test: validate v2.2 dual-loop on RTX 5090"
 - 修改：README.zh-CN.md
 - 修改：skills/cuda-kernel-optimizer/references/compatibility.md
 - 修改：docs/superpowers/plans/2026-07-16-cuda-skill-v2-2-dual-loop.md
+- 修改：tests/test_compatibility.py
+- 修改：tests/test_readme_sync.py
 
-- [ ] **步骤 1：记录实际 5090 版本与结果**
+- [x] **步骤 1：记录实际 5090 版本与结果**
 
 将 current/compatibility 工具版本、测试数、真实 workload verdict、elapsed、NCU verdict 和 artifact 路径写入两份 README、compatibility.md 和本计划的执行记录。不得写入 token、cookie、私有 host 凭据或 /data/vllm-opt 的未提交内容。
 
-- [ ] **步骤 2：运行最终完整验证**
+- [x] **步骤 2：运行最终完整验证**
 
 运行：
 
@@ -1576,7 +1610,9 @@ git status --short
 ~~~bash
 git add README.md README.zh-CN.md \
   skills/cuda-kernel-optimizer/references/compatibility.md \
-  docs/superpowers/plans/2026-07-16-cuda-skill-v2-2-dual-loop.md
+  docs/superpowers/plans/2026-07-16-cuda-skill-v2-2-dual-loop.md \
+  tests/test_compatibility.py \
+  tests/test_readme_sync.py
 git commit -m "docs: record v2.2 validation evidence"
 ~~~
 

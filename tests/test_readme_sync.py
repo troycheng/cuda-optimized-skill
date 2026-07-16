@@ -86,14 +86,17 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("checkpoint.json", text)
             self.assertIn("orchestrate.py resume --run-dir", text)
 
-    def test_readmes_preserve_5090_and_ncu_permission_facts(self) -> None:
-        self.assertIn("V2.1 carried-forward backend fixture evidence", self.english)
-        self.assertIn("V2.2 dual-loop acceptance is pending Task 14", self.english)
-        self.assertIn("V2.1 继承的 backend fixture 证据", self.chinese)
-        self.assertIn("V2.2 双环验收将在 Task 14 完成", self.chinese)
+    def test_readmes_record_completed_v2_2_5090_acceptance(self) -> None:
+        self.assertIn("V2.2 was validated", self.english)
+        self.assertIn("V2.2 已于", self.chinese)
         for text in (self.english, self.chinese):
             self.assertIn("RTX 5090", text)
+            self.assertIn("11/11", text)
             self.assertIn("ERR_NVGPUCTRPERM", text)
+            self.assertIn("kernel_only_win", text)
+            self.assertIn("26.3287%", text)
+            self.assertIn("2,232.43", text)
+            self.assertIn("140", text)
 
     def test_readmes_include_reproducible_fork_installation(self) -> None:
         for text in (self.english, self.chinese):
@@ -102,8 +105,8 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("--path skills/cuda-kernel-optimizer", text)
 
     def test_readmes_match_conditional_profiler_behavior_and_references(self) -> None:
-        self.assertIn("when counter access is available", self.english)
-        self.assertIn("counter 可用时", self.chinese)
+        self.assertRegex(self.english, r"successful\s+profile with real metrics")
+        self.assertRegex(self.chinese, r"真正采集到\s+metrics")
         for text in (self.english, self.chinese):
             self.assertIn("references/compatibility.md", text)
 
