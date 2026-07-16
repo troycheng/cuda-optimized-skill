@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -11,6 +14,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+import tests.test_orchestrate as orchestrate_tests
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +52,69 @@ def _load_orchestrate():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _sanitizer_report(
+    *,
+    candidate_file,
+    input_hash: str,
+    mode: str,
+    method_ids,
+    selected_tools,
+    benchmark_command,
+    status: str = "passed",
+) -> dict:
+    candidate = Path(candidate_file).resolve()
+    results = []
+    for index, tool in enumerate(selected_tools):
+        if status == "unavailable":
+            returncode = None
+            tool_status = "unavailable"
+        elif status == "timed_out" and index == 0:
+            returncode = None
+            tool_status = "timed_out"
+        elif status == "failed" and index == 0:
+            returncode = 86
+            tool_status = "failed"
+        else:
+            returncode = 0
+            tool_status = "passed"
+        results.append(
+            {
+                "tool": tool,
+                "command": [
+                    "compute-sanitizer",
+                    "--tool",
+                    tool,
+                    "--error-exitcode",
+                    "86",
+                    *benchmark_command,
+                ],
+                "returncode": returncode,
+                "stdout": f"{tool} stdout",
+                "stderr": f"{tool} stderr",
+                "status": tool_status,
+            }
+        )
+    coverage = {
+        "passed": "complete",
+        "failed": "complete",
+        "unavailable": "degraded",
+        "timed_out": "incomplete",
+        "not_applicable": "not_applicable",
+    }[status]
+    return {
+        "status": status,
+        "passed": status in {"passed", "not_applicable"},
+        "coverage": coverage,
+        "mode": mode,
+        "method_ids": list(method_ids),
+        "selected_tools": list(selected_tools),
+        "candidate_file": str(candidate),
+        "candidate_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        "input_hash": input_hash,
+        "results": results,
+    }
 
 
 class SanitizeTests(unittest.TestCase):
@@ -114,6 +182,34 @@ class SanitizeTests(unittest.TestCase):
             ),
             ["memcheck", "racecheck", "synccheck"],
         )
+        self.assertIn(
+            "racecheck",
+            self.sanitize.select_tools(
+                ["latency.reduce_sync_count"], mode="targeted", policy=policy
+            ),
+        )
+
+    def test_policy_rejects_method_ids_that_collide_after_strip(self):
+        policy = {
+            "schema_version": 1,
+            "tools": ["memcheck", "racecheck", "initcheck", "synccheck"],
+            "methods": {
+                " latency.async_pipeline ": ["memcheck"],
+                "latency.async_pipeline": ["racecheck"],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "collision"):
+            self.sanitize.validate_policy(policy)
+
+    def test_policy_path_must_not_be_a_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            policy = root / "policy.json"
+            policy.write_text(json.dumps(self.policy), encoding="utf-8")
+            alias = root / "policy-alias.json"
+            alias.symlink_to(policy)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                self.sanitize.load_policy(alias)
 
     def test_missing_compute_sanitizer_is_explicit_not_passed(self):
         result = self.sanitize.run_tools(
@@ -202,6 +298,97 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["returncode"], 86)
         self.assertEqual(result["results"][0]["status"], "failed")
 
+    def test_each_tool_has_a_finite_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "compute-sanitizer"
+            executable.write_text(
+                f"#!{sys.executable}\nimport time\ntime.sleep(60)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            result = self.sanitize.run_tools(
+                executable=str(executable),
+                tools=["memcheck"],
+                command=[sys.executable, "bench.py"],
+                timeout_seconds=0.05,
+            )
+        self.assertEqual(result["status"], "timed_out")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["coverage"], "incomplete")
+        self.assertEqual(result["results"][0]["status"], "timed_out")
+
+    def test_cli_timeout_default_is_positive_and_zero_is_rejected(self):
+        parser = self.sanitize.build_parser()
+        args = parser.parse_args(
+            ["--mode", "targeted", "--methods-json", "m.json", "--out", "o.json"]
+        )
+        self.assertGreater(args.timeout, 0.0)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--mode", "targeted", "--methods-json", "m.json",
+                    "--out", "o.json", "--timeout", "0",
+                ]
+            )
+
+    def test_result_contract_rejects_incomplete_or_contradictory_tool_evidence(self):
+        command = [sys.executable, "bench.py"]
+        valid = {
+            "status": "passed",
+            "passed": True,
+            "coverage": "complete",
+            "executable": "compute-sanitizer",
+            "results": [
+                {
+                    "tool": "memcheck",
+                    "command": [
+                        "compute-sanitizer",
+                        "--tool",
+                        "memcheck",
+                        "--error-exitcode",
+                        "86",
+                        *command,
+                    ],
+                    "returncode": 0,
+                    "stdout": "stdout",
+                    "stderr": "stderr",
+                    "status": "passed",
+                }
+            ],
+        }
+        self.assertEqual(
+            self.sanitize.validate_result(
+                valid, selected_tools=["memcheck"], command=command
+            )["status"],
+            "passed",
+        )
+        invalid = []
+        missing_result = json.loads(json.dumps(valid))
+        missing_result["results"] = []
+        invalid.append(missing_result)
+        wrong_tool = json.loads(json.dumps(valid))
+        wrong_tool["results"][0]["tool"] = "racecheck"
+        invalid.append(wrong_tool)
+        missing_exitcode = json.loads(json.dumps(valid))
+        missing_exitcode["results"][0]["command"] = [
+            "compute-sanitizer",
+            "--tool",
+            "memcheck",
+            *command,
+        ]
+        invalid.append(missing_exitcode)
+        contradictory = json.loads(json.dumps(valid))
+        contradictory["passed"] = False
+        invalid.append(contradictory)
+        missing_stream = json.loads(json.dumps(valid))
+        del missing_stream["results"][0]["stderr"]
+        invalid.append(missing_stream)
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.sanitize.validate_result(
+                    payload, selected_tools=["memcheck"], command=command
+                )
+
     def test_no_targeted_tools_is_explicit_not_applicable(self):
         result = self.sanitize.run_tools(
             executable=None, tools=[], command=[sys.executable, "bench.py"]
@@ -245,6 +432,7 @@ class SanitizeTests(unittest.TestCase):
                 text=True,
             )
             artifact = json.loads(output.read_text(encoding="utf-8"))
+            output_mode = os.stat(output).st_mode & 0o777
 
         self.assertEqual(completed.returncode, 86)
         self.assertEqual(artifact["status"], "failed")
@@ -252,6 +440,15 @@ class SanitizeTests(unittest.TestCase):
             [item["tool"] for item in artifact["results"]],
             ["memcheck", "racecheck", "synccheck"],
         )
+        self.assertNotIn("fake sanitizer stderr", completed.stdout)
+        self.assertEqual(output_mode, 0o600)
+
+    def test_atomic_writer_fsyncs_file_and_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            self.sanitize.os, "fsync", wraps=os.fsync
+        ) as fsync:
+            self.sanitize._atomic_write_json(Path(tmp) / "out.json", {"ok": True})
+        self.assertGreaterEqual(fsync.call_count, 2)
 
     def test_candidate_binding_records_exact_regular_file_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,18 +503,14 @@ class OrchestratorSanitizerTests(unittest.TestCase):
             def runner(command, **_kwargs):
                 output = Path(command[command.index("--out") + 1])
                 candidate_file = command[command.index("--candidate-file") + 1]
-                payload = {
-                    "status": "passed",
-                    "passed": True,
-                    "coverage": "complete",
-                    "mode": "targeted",
-                    "method_ids": ["latency.async_pipeline"],
-                    "selected_tools": ["memcheck", "racecheck", "synccheck"],
-                    "candidate_file": str(Path(candidate_file).resolve()),
-                    "candidate_sha256": self.orchestrate.sha256_file(candidate_file),
-                    "input_hash": "a" * 64,
-                    "results": [],
-                }
+                payload = _sanitizer_report(
+                    candidate_file=candidate_file,
+                    input_hash="a" * 64,
+                    mode="targeted",
+                    method_ids=["latency.async_pipeline"],
+                    selected_tools=["memcheck", "racecheck", "synccheck"],
+                    benchmark_command=command[command.index("--") + 1 :],
+                )
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(json.dumps(payload), encoding="utf-8")
                 return SimpleNamespace(
@@ -334,6 +527,8 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                     benchmark="benchmark.py",
                     hard_timeout=lambda: 123.0,
                 )
+            expected_methods_hash = self.orchestrate.sha256_file(methods)
+            expected_policy_hash = self.orchestrate.sha256_file(POLICY_PATH)
 
         self.assertEqual(run.call_count, 1)
         command = run.call_args.args[0]
@@ -345,6 +540,80 @@ class OrchestratorSanitizerTests(unittest.TestCase):
         self.assertIn("--N=64", benchmark)
         self.assertEqual(artifact["status"], "passed")
         self.assertEqual(artifact["coverage"], "complete")
+        self.assertEqual(artifact["methods_sha256"], expected_methods_hash)
+        self.assertEqual(artifact["policy_sha256"], expected_policy_hash)
+        self.assertEqual(artifact["method_ids"], ["latency.async_pipeline"])
+        self.assertEqual(
+            artifact["selected_tools"], ["memcheck", "racecheck", "synccheck"]
+        )
+
+    def test_aggregate_loader_rejects_methods_drift_and_derived_status_tamper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            methods = root / "methods.json"
+            methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+            candidate = self._candidate(root, "b1", 1)
+            state = {"input_hash": "9" * 64, "dims": {}, "ptr_size": 0}
+
+            def runner(command, **_kwargs):
+                output = Path(command[command.index("--out") + 1])
+                candidate_file = command[command.index("--candidate-file") + 1]
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps(
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash=state["input_hash"],
+                            mode="full",
+                            method_ids=[],
+                            selected_tools=[
+                                "memcheck", "racecheck", "initcheck", "synccheck"
+                            ],
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            policy = self.orchestrate.resolve_budget("thorough")
+            with mock.patch.object(self.orchestrate, "_run", side_effect=runner):
+                self.orchestrate._run_sanitizer_gate(
+                    state=state,
+                    policy=policy,
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            methods.write_text(
+                json.dumps({"methods": [{"id": "latency.async_pipeline"}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "methods_sha256"):
+                self.orchestrate._load_sanitizer_aggregate(
+                    root,
+                    state=state,
+                    policy=policy,
+                    methods_json=methods,
+                    candidates=[candidate],
+                )
+            methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+            aggregate_path = root / "sanitizer.json"
+            aggregate = json.loads(aggregate_path.read_text("utf-8"))
+            aggregate["status"] = "rejected_correctness"
+            aggregate_path.write_text(json.dumps(aggregate), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "derived status"):
+                self.orchestrate._load_sanitizer_aggregate(
+                    root,
+                    state=state,
+                    policy=policy,
+                    methods_json=methods,
+                    candidates=[candidate],
+                )
 
     def test_thorough_full_runs_every_outer_finalist(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,25 +632,19 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(
                     json.dumps(
-                        {
-                            "status": "passed",
-                            "passed": True,
-                            "coverage": "complete",
-                            "mode": "full",
-                            "method_ids": [],
-                            "selected_tools": [
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash="b" * 64,
+                            mode="full",
+                            method_ids=[],
+                            selected_tools=[
                                 "memcheck",
                                 "racecheck",
                                 "initcheck",
                                 "synccheck",
                             ],
-                            "candidate_file": str(Path(candidate_file).resolve()),
-                            "candidate_sha256": self.orchestrate.sha256_file(
-                                candidate_file
-                            ),
-                            "input_hash": "b" * 64,
-                            "results": [],
-                        }
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
                     ),
                     encoding="utf-8",
                 )
@@ -410,25 +673,80 @@ class OrchestratorSanitizerTests(unittest.TestCase):
         )
         self.assertEqual(len(artifact["candidates"]), 3)
 
+    def test_full_candidates_with_identical_bytes_keep_distinct_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            methods = root / "methods.json"
+            methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+            first = self._candidate(root, "b1", 1)
+            second = self._candidate(root, "b2", 2)
+            Path(second["kernel"]).write_bytes(Path(first["kernel"]).read_bytes())
+
+            def runner(command, **_kwargs):
+                output = Path(command[command.index("--out") + 1])
+                candidate_file = command[command.index("--candidate-file") + 1]
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps(
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash="1" * 64,
+                            mode="full",
+                            method_ids=[],
+                            selected_tools=[
+                                "memcheck",
+                                "racecheck",
+                                "initcheck",
+                                "synccheck",
+                            ],
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            with mock.patch.object(self.orchestrate, "_run", side_effect=runner) as run:
+                aggregate = self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "1" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=[first, second],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            eligible, rejected = self.orchestrate._sanitizer_candidate_outcomes(
+                aggregate, [first, second], mode="full"
+            )
+
+        self.assertEqual(run.call_count, 2)
+        artifacts = [item["artifact"] for item in aggregate["candidates"]]
+        self.assertEqual(len(set(artifacts)), 2)
+        self.assertEqual(len(eligible), 2)
+        self.assertEqual(rejected, [])
+
     def test_failed_candidate_is_rejected_correctness(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             candidate = self._candidate(root, "b1", 1)
+            candidate_file = self.orchestrate._candidate_file(candidate)
             aggregate = self.orchestrate._aggregate_sanitizer_results(
                 state={"input_hash": "c" * 64},
                 mode="targeted",
                 candidates=[candidate],
                 reports=[
-                    {
-                        "status": "failed",
-                        "passed": False,
-                        "coverage": "complete",
-                        "candidate_file": self.orchestrate._candidate_file(candidate),
-                        "candidate_sha256": self.orchestrate.sha256_file(
-                            self.orchestrate._candidate_file(candidate)
-                        ),
-                        "input_hash": "c" * 64,
-                    }
+                    _sanitizer_report(
+                        candidate_file=candidate_file,
+                        input_hash="c" * 64,
+                        mode="targeted",
+                        method_ids=["latency.reduce_sync_count"],
+                        selected_tools=["racecheck"],
+                        benchmark_command=[sys.executable, "benchmark.py"],
+                        status="failed",
+                    )
                 ],
             )
             eligible, rejected = self.orchestrate._sanitizer_candidate_outcomes(
@@ -450,16 +768,15 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                 mode="targeted",
                 candidates=[candidate],
                 reports=[
-                    {
-                        "status": "unavailable",
-                        "passed": False,
-                        "coverage": "degraded",
-                        "candidate_file": candidate_file,
-                        "candidate_sha256": self.orchestrate.sha256_file(
-                            candidate_file
-                        ),
-                        "input_hash": "d" * 64,
-                    }
+                    _sanitizer_report(
+                        candidate_file=candidate_file,
+                        input_hash="d" * 64,
+                        mode="targeted",
+                        method_ids=["latency.reduce_sync_count"],
+                        selected_tools=["racecheck"],
+                        benchmark_command=[sys.executable, "benchmark.py"],
+                        status="unavailable",
+                    )
                 ],
             )
             eligible, rejected = self.orchestrate._sanitizer_candidate_outcomes(
@@ -507,20 +824,14 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(
                     json.dumps(
-                        {
-                            "status": "passed",
-                            "passed": True,
-                            "coverage": "complete",
-                            "mode": "targeted",
-                            "method_ids": ["memory.vectorized_access"],
-                            "selected_tools": ["memcheck", "initcheck"],
-                            "candidate_file": str(Path(candidate_file).resolve()),
-                            "candidate_sha256": self.orchestrate.sha256_file(
-                                candidate_file
-                            ),
-                            "input_hash": "f" * 64,
-                            "results": [],
-                        }
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash="f" * 64,
+                            mode="targeted",
+                            method_ids=["memory.vectorized_access"],
+                            selected_tools=["memcheck", "initcheck"],
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
                     ),
                     encoding="utf-8",
                 )
@@ -543,6 +854,380 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                         benchmark="benchmark.py",
                         hard_timeout=10.0,
                     )
+
+    def test_mixed_failed_and_eligible_finalists_are_partial_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._candidate(root, "b1", 1)
+            second = self._candidate(root, "b2", 2)
+            reports = [
+                _sanitizer_report(
+                    candidate_file=first["kernel"],
+                    input_hash="2" * 64,
+                    mode="full",
+                    method_ids=[],
+                    selected_tools=[
+                        "memcheck",
+                        "racecheck",
+                        "initcheck",
+                        "synccheck",
+                    ],
+                    benchmark_command=[sys.executable, "benchmark.py"],
+                    status="failed",
+                ),
+                _sanitizer_report(
+                    candidate_file=second["kernel"],
+                    input_hash="2" * 64,
+                    mode="full",
+                    method_ids=[],
+                    selected_tools=[
+                        "memcheck",
+                        "racecheck",
+                        "initcheck",
+                        "synccheck",
+                    ],
+                    benchmark_command=[sys.executable, "benchmark.py"],
+                    status="passed",
+                ),
+            ]
+            aggregate = self.orchestrate._aggregate_sanitizer_results(
+                state={"input_hash": "2" * 64},
+                mode="full",
+                candidates=[first, second],
+                reports=reports,
+            )
+            eligible, rejected = self.orchestrate._sanitizer_candidate_outcomes(
+                aggregate, [first, second], mode="full"
+            )
+
+        self.assertEqual(aggregate["status"], "partial_rejection")
+        self.assertTrue(aggregate["passed"])
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(len(rejected), 1)
+
+    def test_sanitizer_timeout_resume_reuses_completed_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            methods = root / "methods.json"
+            methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+            candidates = [
+                self._candidate(root, "b1", 1),
+                self._candidate(root, "b2", 2),
+            ]
+            calls = []
+            should_timeout = {str(Path(candidates[1]["kernel"]).resolve()): True}
+
+            def runner(command, **_kwargs):
+                candidate_file = command[command.index("--candidate-file") + 1]
+                calls.append(candidate_file)
+                if should_timeout.get(candidate_file):
+                    should_timeout[candidate_file] = False
+                    return SimpleNamespace(
+                        returncode=124, stdout="", stderr="", timed_out=True
+                    )
+                output = Path(command[command.index("--out") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps(
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash="3" * 64,
+                            mode="full",
+                            method_ids=[],
+                            selected_tools=[
+                                "memcheck",
+                                "racecheck",
+                                "initcheck",
+                                "synccheck",
+                            ],
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            with mock.patch.object(self.orchestrate, "_run", side_effect=runner):
+                interrupted = self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "3" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=candidates,
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+                completed = self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "3" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=candidates,
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+
+        first_path = str(Path(candidates[0]["kernel"]).resolve())
+        second_path = str(Path(candidates[1]["kernel"]).resolve())
+        self.assertTrue(interrupted["timed_out"])
+        self.assertEqual(completed["status"], "passed")
+        self.assertEqual(calls.count(first_path), 1)
+        self.assertEqual(calls.count(second_path), 2)
+
+
+class SanitizerLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        fixture = orchestrate_tests.LifecycleIntegrationTests()
+        fixture.setUp()
+        self.fixture = fixture
+        self.orchestrate = fixture.orchestrate
+
+    def _run_case(self, root: Path, *, sanitizer_status: str):
+        run_dir, state_path = self.fixture._setup(root)
+        self.fixture._write_winner_artifacts(run_dir)
+        iter_dir = run_dir / "iterv1"
+        (iter_dir / "methods.json").write_text(
+            json.dumps(
+                {"methods": [{"id": "latency.reduce_sync_count", "name": "sync"}]}
+            ),
+            encoding="utf-8",
+        )
+
+        def gate(*, state, policy, candidates, **_kwargs):
+            candidate = candidates[0]
+            candidate_file = self.orchestrate._candidate_file(candidate)
+            report = _sanitizer_report(
+                candidate_file=candidate_file,
+                input_hash=state["input_hash"],
+                mode=policy.sanitizer_mode,
+                method_ids=["latency.reduce_sync_count"],
+                selected_tools=["racecheck"],
+                benchmark_command=[sys.executable, "benchmark.py"],
+                status=sanitizer_status,
+            )
+            aggregate = self.orchestrate._aggregate_sanitizer_results(
+                state=state,
+                mode=policy.sanitizer_mode,
+                candidates=candidates,
+                reports=[report],
+            )
+            aggregate.update(
+                methods_sha256=self.orchestrate.sha256_file(iter_dir / "methods.json"),
+                policy_sha256=self.orchestrate.sha256_file(POLICY_PATH),
+                method_ids=["latency.reduce_sync_count"],
+                selected_tools=["racecheck"],
+            )
+            self.orchestrate.atomic_write_json(iter_dir / "sanitizer.json", aggregate)
+            return aggregate
+
+        def runner(command, **_kwargs):
+            if Path(command[1]).name == "state.py":
+                return subprocess.run(command, capture_output=True, text=True)
+            return SimpleNamespace(
+                returncode=0, stdout="", stderr="", timed_out=False
+            )
+
+        evaluator = mock.Mock(
+            side_effect=AssertionError("workload evaluator must not run")
+        )
+        with mock.patch.object(
+            self.orchestrate, "_run_sanitizer_gate", side_effect=gate
+        ), mock.patch.object(
+            self.orchestrate, "_run", side_effect=runner
+        ), mock.patch.object(
+            self.orchestrate, "evaluate_outer_candidate", evaluator
+        ), contextlib.redirect_stdout(io.StringIO()):
+            self.orchestrate.cmd_close_iter(self.fixture._close_args(run_dir))
+        return run_dir, state_path, evaluator
+
+    def test_all_sanitizer_failed_skips_workload_and_persists_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path, evaluator = self._run_case(
+                Path(tmp), sanitizer_status="failed"
+            )
+            state = json.loads(state_path.read_text("utf-8"))
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            workload_result = json.loads(
+                (run_dir / "iterv1" / "workload_result.json").read_text("utf-8")
+            )
+
+        evaluator.assert_not_called()
+        self.assertEqual(workload_result["decision"]["status"], "rejected_correctness")
+        self.assertEqual(checkpoint["candidate_status"], "rejected_correctness")
+        self.assertEqual(state["history"][-1]["status"], "rejected_correctness")
+
+    def test_unavailable_completes_with_persisted_degraded_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self.fixture._setup(Path(tmp))
+            self.fixture._write_winner_artifacts(run_dir)
+            iter_dir = run_dir / "iterv1"
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": [{"id": "latency.reduce_sync_count"}]}),
+                encoding="utf-8",
+            )
+
+            def gate(*, state, policy, candidates, **_kwargs):
+                candidate = candidates[0]
+                candidate_file = self.orchestrate._candidate_file(candidate)
+                aggregate = self.orchestrate._aggregate_sanitizer_results(
+                    state=state,
+                    mode=policy.sanitizer_mode,
+                    candidates=candidates,
+                    reports=[
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash=state["input_hash"],
+                            mode=policy.sanitizer_mode,
+                            method_ids=["latency.reduce_sync_count"],
+                            selected_tools=["racecheck"],
+                            benchmark_command=[sys.executable, "benchmark.py"],
+                            status="unavailable",
+                        )
+                    ],
+                )
+                aggregate.update(
+                    methods_sha256=self.orchestrate.sha256_file(
+                        iter_dir / "methods.json"
+                    ),
+                    policy_sha256=self.orchestrate.sha256_file(POLICY_PATH),
+                    method_ids=["latency.reduce_sync_count"],
+                    selected_tools=["racecheck"],
+                )
+                self.orchestrate.atomic_write_json(iter_dir / "sanitizer.json", aggregate)
+                return aggregate
+
+            def runner(command, **_kwargs):
+                if Path(command[1]).name == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            with mock.patch.object(
+                self.orchestrate, "_run_sanitizer_gate", side_effect=gate
+            ), mock.patch.object(
+                self.orchestrate, "_run", side_effect=runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self.fixture._close_args(run_dir))
+            state = json.loads(state_path.read_text("utf-8"))
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+
+        self.assertTrue(state["sanitizer_coverage_degraded"])
+        self.assertEqual(state["sanitizer_coverage"], "degraded")
+        self.assertEqual(
+            checkpoint["stage_evidence"]["candidate_sanitizer"]["coverage"],
+            "degraded",
+        )
+
+    def test_sanitizer_replacement_reprofiles_and_rebinds_ncu_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self.fixture._setup(Path(tmp))
+            self.fixture._write_winner_artifacts(run_dir)
+            iter_dir = run_dir / "iterv1"
+            branch_dir = iter_dir / "branches"
+            first_file = branch_dir / "b1" / "kernel.py"
+            second_file = branch_dir / "b2" / "kernel.py"
+            first_file.parent.mkdir(parents=True)
+            second_file.parent.mkdir(parents=True)
+            first_file.write_text("# sanitizer rejects first\n", encoding="utf-8")
+            second_file.write_text("# sanitizer accepts second\n", encoding="utf-8")
+            expected_profiled_hashes = [
+                self.orchestrate.sha256_file(first_file),
+                self.orchestrate.sha256_file(second_file),
+            ]
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": [{"id": "latency.reduce_sync_count"}]}),
+                encoding="utf-8",
+            )
+            statistics = self.fixture._statistics()
+            first = {
+                "status": "confirmed_win",
+                "kernel": str(first_file),
+                "branch_index": 1,
+                "statistics": statistics,
+            }
+            second = {
+                "status": "confirmed_win",
+                "kernel": str(second_file),
+                "branch_index": 2,
+                "statistics": {**statistics, "estimate_pct": 2.0},
+            }
+
+            def select(_payload, **_kwargs):
+                return first, [first, second]
+
+            def gate(*, state, policy, candidates, **_kwargs):
+                reports = []
+                for index, candidate in enumerate(candidates):
+                    reports.append(
+                        _sanitizer_report(
+                            candidate_file=self.orchestrate._candidate_file(candidate),
+                            input_hash=state["input_hash"],
+                            mode=policy.sanitizer_mode,
+                            method_ids=["latency.reduce_sync_count"],
+                            selected_tools=["racecheck"],
+                            benchmark_command=[sys.executable, "benchmark.py"],
+                            status="failed" if index == 0 else "passed",
+                        )
+                    )
+                aggregate = self.orchestrate._aggregate_sanitizer_results(
+                    state=state,
+                    mode=policy.sanitizer_mode,
+                    candidates=candidates,
+                    reports=reports,
+                )
+                self.orchestrate.atomic_write_json(
+                    iter_dir / "sanitizer.json", aggregate
+                )
+                return aggregate
+
+            profiled_hashes = []
+
+            def runner(command, **_kwargs):
+                script = Path(command[1]).name
+                if script == "profile_ncu.py":
+                    kernel = next(iter(iter_dir.glob("kernel.*")))
+                    profiled_hashes.append(self.orchestrate.sha256_file(kernel))
+                    self.orchestrate.atomic_write_json(
+                        iter_dir / "ncu_top.json",
+                        {"profiled_file": str(kernel.resolve()), "axes": {}},
+                    )
+                    return SimpleNamespace(
+                        returncode=0, stdout="", stderr="", timed_out=False
+                    )
+                if script == "sass_check.py":
+                    raise RuntimeError("stop after sanitizer reprofile")
+                if script == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            with mock.patch.object(
+                self.orchestrate, "_select_lifecycle_candidate", side_effect=select
+            ), mock.patch.object(
+                self.orchestrate, "_run_sanitizer_gate", side_effect=gate
+            ), mock.patch.object(
+                self.orchestrate, "_run", side_effect=runner
+            ), self.assertRaisesRegex(RuntimeError, "stop after sanitizer reprofile"):
+                self.orchestrate.cmd_close_iter(self.fixture._close_args(run_dir))
+
+            binding = json.loads(
+                (iter_dir / "candidate_profile_binding.json").read_text("utf-8")
+            )
+            selection = json.loads(
+                (iter_dir / "selected_candidate.json").read_text("utf-8")
+            )
+
+        self.assertEqual(
+            profiled_hashes,
+            expected_profiled_hashes,
+        )
+        self.assertEqual(selection["candidate_id"], "2")
+        self.assertEqual(binding["candidate_id"], "2")
+        self.assertEqual(binding["candidate_sha256"], profiled_hashes[-1])
 
 
 if __name__ == "__main__":

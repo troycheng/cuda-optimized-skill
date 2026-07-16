@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -70,7 +72,12 @@ def validate_policy(policy) -> dict:
             raise ValueError(
                 f"policy.methods.{method_id} contains unknown tool: {unknown[0]}"
             )
-        normalized_methods[method_id.strip()] = method_tools
+        normalized_id = method_id.strip()
+        if normalized_id in normalized_methods:
+            raise ValueError(
+                f"policy method id collision after strip: {normalized_id}"
+            )
+        normalized_methods[normalized_id] = method_tools
     return {
         "schema_version": 1,
         "tools": list(TOOLS),
@@ -80,6 +87,14 @@ def validate_policy(policy) -> dict:
 
 def load_policy(path=DEFAULT_POLICY) -> dict:
     policy_path = Path(path).expanduser()
+    if policy_path.is_symlink():
+        raise ValueError("sanitizer policy must not be a symlink")
+    try:
+        info = policy_path.lstat()
+    except OSError as error:
+        raise ValueError(f"sanitizer policy is unreadable: {error}") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("sanitizer policy must be a regular file")
     try:
         payload = json.loads(policy_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -113,7 +128,121 @@ def _tool_command(executable: str | None, tool: str, command: list[str]) -> list
     ]
 
 
-def run_tools(*, executable, tools, command) -> dict:
+def validate_result(result, *, selected_tools, command=None) -> dict:
+    if not isinstance(result, Mapping):
+        raise ValueError("sanitizer result must be a mapping")
+    tools = _string_list(selected_tools, "selected_tools", allow_empty=True)
+    if len(set(tools)) != len(tools):
+        raise ValueError("selected_tools contains duplicates")
+    benchmark_command = (
+        [] if command is None else _string_list(command, "command", allow_empty=False)
+    )
+    records = result.get("results")
+    if not isinstance(records, list) or len(records) != len(tools):
+        raise ValueError("sanitizer results must align with selected_tools")
+    statuses = []
+    required = {"tool", "command", "returncode", "stdout", "stderr", "status"}
+    for index, (tool, record) in enumerate(zip(tools, records)):
+        if not isinstance(record, Mapping) or set(record) != required:
+            raise ValueError(f"sanitizer results[{index}] fields are invalid")
+        if record.get("tool") != tool:
+            raise ValueError(f"sanitizer results[{index}].tool is out of order")
+        tool_command = record.get("command")
+        if not isinstance(tool_command, list) or len(tool_command) < 5:
+            raise ValueError(f"sanitizer results[{index}].command is invalid")
+        if tool_command[1:5] != [
+            "--tool",
+            tool,
+            "--error-exitcode",
+            str(ERROR_EXITCODE),
+        ]:
+            raise ValueError(
+                f"sanitizer results[{index}].command lacks the required gate flags"
+            )
+        if benchmark_command and tool_command[5:] != benchmark_command:
+            raise ValueError(
+                f"sanitizer results[{index}].command benchmark drifted"
+            )
+        if type(record.get("stdout")) is not str or type(record.get("stderr")) is not str:
+            raise ValueError(
+                f"sanitizer results[{index}] stdout/stderr must be strings"
+            )
+        tool_status = record.get("status")
+        returncode = record.get("returncode")
+        if tool_status == "passed":
+            if returncode != 0 or isinstance(returncode, bool):
+                raise ValueError(
+                    f"sanitizer results[{index}] passed requires returncode 0"
+                )
+        elif tool_status == "failed":
+            if (
+                isinstance(returncode, bool)
+                or not isinstance(returncode, int)
+                or returncode == 0
+            ):
+                raise ValueError(
+                    f"sanitizer results[{index}] failed requires nonzero returncode"
+                )
+        elif tool_status in {"unavailable", "timed_out"}:
+            if returncode is not None:
+                raise ValueError(
+                    f"sanitizer results[{index}] {tool_status} requires null returncode"
+                )
+        else:
+            raise ValueError(f"sanitizer results[{index}].status is invalid")
+        statuses.append(tool_status)
+
+    status_set = set(statuses)
+    if not tools:
+        expected = ("not_applicable", True, "not_applicable")
+    elif "timed_out" in status_set:
+        expected = ("timed_out", False, "incomplete")
+    elif "failed" in status_set:
+        expected = (
+            "failed",
+            False,
+            "degraded" if "unavailable" in status_set else "complete",
+        )
+    elif "unavailable" in status_set:
+        expected = ("unavailable", False, "degraded")
+    else:
+        expected = ("passed", True, "complete")
+    actual = (result.get("status"), result.get("passed"), result.get("coverage"))
+    if actual != expected:
+        raise ValueError("sanitizer top-level status/passed/coverage is contradictory")
+    return dict(result)
+
+
+def _run_tool_with_timeout(command: list[str], timeout_seconds: float):
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        return process.returncode, stdout or "", stderr or "", False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = process.communicate(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+        return None, stdout or "", stderr or "", True
+
+
+def run_tools(*, executable, tools, command, timeout_seconds: float = 300.0) -> dict:
     selected_tools = _string_list(tools, "tools", allow_empty=True)
     unknown = sorted(set(selected_tools) - set(TOOLS))
     if unknown:
@@ -121,14 +250,21 @@ def run_tools(*, executable, tools, command) -> dict:
     if len(set(selected_tools)) != len(selected_tools):
         raise ValueError("tools contains duplicates")
     benchmark_command = _string_list(command, "command", allow_empty=False)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not float(timeout_seconds) > 0.0
+    ):
+        raise ValueError("timeout_seconds must be positive")
+    timeout_seconds = float(timeout_seconds)
     if not selected_tools:
-        return {
+        return validate_result({
             "status": "not_applicable",
             "passed": True,
             "coverage": "not_applicable",
             "executable": executable,
             "results": [],
-        }
+        }, selected_tools=[], command=None)
 
     results = []
     unavailable = executable is None
@@ -147,12 +283,8 @@ def run_tools(*, executable, tools, command) -> dict:
             )
             continue
         try:
-            completed = subprocess.run(
-                tool_command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+            returncode, stdout, stderr, timed_out = _run_tool_with_timeout(
+                tool_command, timeout_seconds
             )
         except OSError as error:
             unavailable = True
@@ -171,15 +303,23 @@ def run_tools(*, executable, tools, command) -> dict:
             {
                 "tool": tool,
                 "command": tool_command,
-                "returncode": completed.returncode,
-                "stdout": completed.stdout or "",
-                "stderr": completed.stderr or "",
-                "status": "passed" if completed.returncode == 0 else "failed",
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "status": (
+                    "timed_out"
+                    if timed_out
+                    else "passed" if returncode == 0 else "failed"
+                ),
             }
         )
 
     statuses = {item["status"] for item in results}
-    if "failed" in statuses:
+    if "timed_out" in statuses:
+        status = "timed_out"
+        passed = False
+        coverage = "incomplete"
+    elif "failed" in statuses:
         status = "failed"
         passed = False
         coverage = "degraded" if "unavailable" in statuses else "complete"
@@ -191,13 +331,16 @@ def run_tools(*, executable, tools, command) -> dict:
         status = "passed"
         passed = True
         coverage = "complete"
-    return {
+    result = {
         "status": status,
         "passed": passed,
         "coverage": coverage,
         "executable": executable,
         "results": results,
     }
+    return validate_result(
+        result, selected_tools=selected_tools, command=benchmark_command
+    )
 
 
 def bind_candidate(result, *, candidate_file, input_hash: str) -> dict:
@@ -258,12 +401,28 @@ def _atomic_write_json(path, payload) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_name, destination)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        parent_descriptor = os.open(str(destination.parent), flags)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
     except BaseException:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
         raise
+
+
+def _positive_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("timeout must be a positive number") from error
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise argparse.ArgumentTypeError("timeout must be a positive finite number")
+    return timeout
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -277,6 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-file")
     parser.add_argument("--input-hash")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--timeout", type=_positive_timeout, default=300.0)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser
 
@@ -299,6 +459,7 @@ def main(argv=None) -> int:
             executable=executable,
             tools=tools,
             command=command,
+            timeout_seconds=args.timeout,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -321,8 +482,22 @@ def main(argv=None) -> int:
         except ValueError as error:
             parser.error(str(error))
     _atomic_write_json(args.out, result)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return ERROR_EXITCODE if result["status"] == "failed" else 0
+    print(
+        json.dumps(
+            {
+                "status": result["status"],
+                "passed": result["passed"],
+                "coverage": result["coverage"],
+                "selected_tools": result["selected_tools"],
+                "artifact": str(Path(args.out).expanduser().resolve()),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    if result["status"] == "failed":
+        return ERROR_EXITCODE
+    return 124 if result["status"] == "timed_out" else 0
 
 
 if __name__ == "__main__":

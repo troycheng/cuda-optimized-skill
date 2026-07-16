@@ -12,6 +12,7 @@
     "memory.ldmatrix_stmatrix": ["memcheck", "racecheck", "initcheck", "synccheck"],
     "memory.tma_im2col_implicit_conv": ["memcheck", "racecheck", "initcheck", "synccheck"],
     "latency.async_pipeline": ["memcheck", "racecheck", "synccheck"],
+    "latency.reduce_sync_count": ["racecheck"],
     "latency.asymmetric_mbarrier_sync": ["memcheck", "racecheck", "synccheck"],
     "latency.pingpong_warpgroup_schedule": ["memcheck", "racecheck", "synccheck"],
     "latency.producer_regdealloc_setmaxnreg": ["memcheck", "racecheck", "synccheck"],
