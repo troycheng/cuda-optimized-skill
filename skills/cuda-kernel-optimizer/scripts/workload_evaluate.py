@@ -214,6 +214,13 @@ def _metric(metrics: Mapping, name: str, field: str) -> float:
     return _finite_real(metrics[name], f"{field}.{name}")
 
 
+def _error_diagnostic(error: Exception) -> dict:
+    return {
+        "error_type": type(error).__name__[:128],
+        "reason": str(error)[:512],
+    }
+
+
 def evaluate_pairs(
     workload,
     baseline,
@@ -325,7 +332,7 @@ def evaluate_pairs(
                         raise ValueError(f"{key}.{metric_name} must be nonzero")
                     values[role][metric_name] = value
                 except ValueError as error:
-                    errors.append(str(error)[:512])
+                    errors.append(_error_diagnostic(error))
         if errors:
             pair["valid"] = False
             pair["metric_errors"] = errors
@@ -334,14 +341,55 @@ def evaluate_pairs(
     if metric_failed:
         return _failed_evaluation(base, pairs, "objective metrics are invalid")
 
-    primary_pairs = [
-        {
-            "baseline": values["baseline"][primary["name"]],
-            "candidate": values["candidate"][primary["name"]],
-            "valid": True,
-        }
-        for values in numeric
-    ]
+    primary_pairs = []
+    constraint_regressions = {
+        constraint["name"]: [] for constraint in objective["constraints"]
+    }
+    derived_failed = False
+    for pair, values in zip(pairs, numeric):
+        primary_baseline = values["baseline"][primary["name"]]
+        primary_candidate = values["candidate"][primary["name"]]
+        primary_pairs.append(
+            {
+                "baseline": primary_baseline,
+                "candidate": primary_candidate,
+                "valid": True,
+            }
+        )
+        errors = []
+        try:
+            paired_stats.improvement_pct(
+                primary_baseline,
+                primary_candidate,
+                primary["direction"],
+            )
+        except ValueError as error:
+            errors.append(_error_diagnostic(error))
+        for constraint in objective["constraints"]:
+            name = constraint["name"]
+            baseline_value = values["baseline"][name]
+            candidate_value = values["candidate"][name]
+            try:
+                regression = (
+                    (candidate_value - baseline_value)
+                    / abs(baseline_value)
+                    * 100.0
+                )
+                regression = _finite_real(
+                    regression, f"constraint {name} regression_pct"
+                )
+                constraint_regressions[name].append(regression)
+            except (ArithmeticError, ValueError) as error:
+                errors.append(_error_diagnostic(error))
+        if errors:
+            pair["valid"] = False
+            pair["metric_errors"] = errors
+            derived_failed = True
+    if derived_failed:
+        return _failed_evaluation(
+            base, pairs, "objective metric derivation is invalid"
+        )
+
     primary_statistics = paired_stats.classify_pairs(
         primary_pairs,
         direction=primary["direction"],
@@ -355,14 +403,7 @@ def evaluate_pairs(
     for index, constraint in enumerate(objective["constraints"]):
         name = constraint["name"]
         cap = constraint["max_regression_pct"]
-        regressions = [
-            (
-                values["candidate"][name] - values["baseline"][name]
-            )
-            / abs(values["baseline"][name])
-            * 100.0
-            for values in numeric
-        ]
+        regressions = constraint_regressions[name]
         estimate = statistics.median(regressions)
         ci_low, ci_high = paired_stats.bootstrap_median_ci(
             regressions,

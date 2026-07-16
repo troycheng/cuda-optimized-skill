@@ -52,8 +52,6 @@ def _mapping(value, field: str) -> Mapping:
 
 
 def _normalize_mode(mode) -> str:
-    if mode == "kernel_only":
-        mode = "kernel-only"
     if type(mode) is not str or mode not in {"full", "kernel-only"}:
         raise ValueError("mode must be 'full' or 'kernel-only'")
     return mode
@@ -196,10 +194,27 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
         kernel.get("status"), _KERNEL_STATUSES, "kernel.status"
     )
     workload = _validate_workload(workload)
-    constraint_source = constraints
-    if constraint_source is None and workload is not None:
-        constraint_source = workload.get("constraints", [])
-    normalized_constraints = _validate_constraints(constraint_source)
+    workload_has_constraints = workload is not None and "constraints" in workload
+    workload_constraints = (
+        _validate_constraints(workload["constraints"])
+        if workload_has_constraints
+        else None
+    )
+    explicit_constraints = (
+        _validate_constraints(constraints) if constraints is not None else None
+    )
+    if (
+        workload_constraints is not None
+        and explicit_constraints is not None
+        and workload_constraints != explicit_constraints
+    ):
+        raise ValueError("conflicting constraints between workload and caller")
+    if workload_constraints is not None:
+        normalized_constraints = workload_constraints
+    elif explicit_constraints is not None:
+        normalized_constraints = explicit_constraints
+    else:
+        normalized_constraints = []
     normalized_pareto = _validate_pareto(pareto)
     evidence = {
         "kernel": copy.deepcopy(dict(kernel)),
@@ -249,15 +264,6 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             statistics=kernel_statistics,
             constraints=copy.deepcopy(normalized_constraints),
         )
-    if normalized_pareto is not None:
-        return _result(
-            "pareto_frontier",
-            "explicit non-dominated multi-objective evidence shows a tradeoff",
-            normalized_mode,
-            evidence,
-            statistics=kernel_statistics,
-            pareto=copy.deepcopy(normalized_pareto),
-        )
     if any(item["status"] != "passed" for item in normalized_constraints):
         return _result(
             "kernel_only_win",
@@ -293,6 +299,16 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
             statistics=kernel_statistics,
         )
     workload_statistics = copy.deepcopy(dict(primary))
+    if normalized_pareto is not None:
+        return _result(
+            "pareto_frontier",
+            "explicit non-dominated multi-objective evidence shows a tradeoff",
+            normalized_mode,
+            evidence,
+            statistics=kernel_statistics,
+            workload_statistics=workload_statistics,
+            pareto=copy.deepcopy(normalized_pareto),
+        )
     return _result(
         "end_to_end_win",
         "kernel and real-workload evidence confirm the candidate",

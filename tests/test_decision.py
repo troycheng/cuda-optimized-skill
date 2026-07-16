@@ -93,20 +93,19 @@ class DecisionTests(unittest.TestCase):
 
     def test_kernel_only_mode_never_claims_end_to_end(self) -> None:
         module = _load_decision()
-        for mode in ("kernel-only", "kernel_only"):
-            kernel = _kernel()
-            before = copy.deepcopy(kernel)
-            result = module.decide(
-                mode=mode,
-                kernel=kernel,
-                workload=_workload(),
-                constraints=[],
-            )
-            self.assertEqual(result["status"], "kernel_only_win")
-            self.assertEqual(result["mode"], "kernel-only")
-            self.assertEqual(result["statistics"], kernel["statistics"])
-            self.assertNotIn("workload_statistics", result)
-            self.assertEqual(kernel, before)
+        kernel = _kernel()
+        before = copy.deepcopy(kernel)
+        result = module.decide(
+            mode="kernel-only",
+            kernel=kernel,
+            workload=_workload(),
+            constraints=[],
+        )
+        self.assertEqual(result["status"], "kernel_only_win")
+        self.assertEqual(result["mode"], "kernel-only")
+        self.assertEqual(result["statistics"], kernel["statistics"])
+        self.assertNotIn("workload_statistics", result)
+        self.assertEqual(kernel, before)
 
     def test_full_mode_requires_primary_win_and_passed_constraints(self) -> None:
         module = _load_decision()
@@ -132,22 +131,60 @@ class DecisionTests(unittest.TestCase):
 
     def test_constraint_failure_rejects_before_pareto(self) -> None:
         module = _load_decision()
+        constraints = [{"name": "memory", "status": "failed"}]
         result = module.decide(
             mode="full",
             kernel=_kernel(),
-            workload=_workload(),
-            constraints=[{"name": "memory", "status": "failed"}],
+            workload=_workload(constraints=constraints),
             pareto=_pareto(),
         )
         self.assertEqual(result["status"], "rejected_constraint")
 
-    def test_inconclusive_constraint_keeps_only_kernel_win(self) -> None:
+    def test_explicit_constraints_cannot_override_workload_constraints(self) -> None:
         module = _load_decision()
+        workload = _workload(
+            constraints=[{"name": "memory", "status": "failed"}]
+        )
+        with self.assertRaisesRegex(ValueError, "conflicting constraints"):
+            module.decide(
+                mode="full",
+                kernel=_kernel(),
+                workload=workload,
+                constraints=[{"name": "memory", "status": "passed"}],
+            )
+
+    def test_matching_explicit_and_workload_constraints_are_accepted(self) -> None:
+        module = _load_decision()
+        constraints = [{"name": " memory ", "status": "passed"}]
+        workload = _workload(
+            constraints=[{"name": "memory", "status": "passed"}]
+        )
         result = module.decide(
             mode="full",
             kernel=_kernel(),
-            workload=_workload(),
-            constraints=[{"name": "memory", "status": "inconclusive"}],
+            workload=workload,
+            constraints=constraints,
+        )
+        self.assertEqual(result["status"], "end_to_end_win")
+
+    def test_explicit_constraints_are_allowed_when_workload_omits_them(self) -> None:
+        module = _load_decision()
+        workload = {"status": "evaluated", "primary": _statistics()}
+        result = module.decide(
+            mode="full",
+            kernel=_kernel(),
+            workload=workload,
+            constraints=[{"name": "memory", "status": "passed"}],
+        )
+        self.assertEqual(result["status"], "end_to_end_win")
+
+    def test_inconclusive_constraint_keeps_only_kernel_win(self) -> None:
+        module = _load_decision()
+        constraints = [{"name": "memory", "status": "inconclusive"}]
+        result = module.decide(
+            mode="full",
+            kernel=_kernel(),
+            workload=_workload(constraints=constraints),
         )
         self.assertEqual(result["status"], "kernel_only_win")
         self.assertEqual(result["statistics"]["status"], "confirmed_win")
@@ -165,6 +202,25 @@ class DecisionTests(unittest.TestCase):
             with self.subTest(workload=workload):
                 result = module.decide(
                     mode="full", kernel=_kernel(), workload=workload
+                )
+                self.assertEqual(result["status"], "kernel_only_win")
+
+    def test_pareto_cannot_bypass_missing_or_nonwinning_workload(self) -> None:
+        module = _load_decision()
+        workloads = (
+            None,
+            {"status": "workload_failed"},
+            _workload("inconclusive"),
+            _workload("confirmed_loss"),
+            {"status": "evaluated", "constraints": []},
+        )
+        for workload in workloads:
+            with self.subTest(workload=workload):
+                result = module.decide(
+                    mode="full",
+                    kernel=_kernel(),
+                    workload=workload,
+                    pareto=_pareto(),
                 )
                 self.assertEqual(result["status"], "kernel_only_win")
 
@@ -212,6 +268,7 @@ class DecisionTests(unittest.TestCase):
         calls = (
             {"mode": "FULL", "kernel": _kernel()},
             {"mode": True, "kernel": _kernel()},
+            {"mode": "kernel_only", "kernel": _kernel()},
             {"mode": "full", "kernel": []},
             {"mode": "full", "kernel": {}},
             {"mode": "full", "kernel": {"status": True}},

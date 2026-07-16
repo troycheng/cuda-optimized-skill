@@ -539,6 +539,35 @@ class EvaluatePairsTests(unittest.TestCase):
         self.assertGreater(constraint["ci_high_pct"], 5.0)
         self.assertEqual(constraint["status"], "inconclusive")
 
+    def test_finite_metrics_with_overflowing_regression_fail_json_safely(self) -> None:
+        module = _load_workload_evaluate()
+
+        def runner(spec, *, candidate, role, case, timeout):
+            metrics = {
+                "latency_ms": 100.0 if role == "baseline" else 90.0,
+                "memory_mb": 1e-308 if role == "baseline" else 1e308,
+            }
+            return _observation(spec, role=role, case=case, metrics=metrics)
+
+        result = module.evaluate_pairs(
+            _workload(module),
+            "baseline.py",
+            "candidate.py",
+            blocks=2,
+            retries=0,
+            bootstrap_samples=20,
+            runner=runner,
+        )
+
+        self.assertEqual(result["status"], "workload_failed")
+        self.assertTrue(all(not pair["valid"] for pair in result["pairs"]))
+        for pair in result["pairs"]:
+            error = pair["metric_errors"][0]
+            self.assertEqual(error["error_type"], "ValueError")
+            self.assertLessEqual(len(error["reason"]), 512)
+        serialized = json.dumps(result, allow_nan=False)
+        self.assertNotIn("confirmed_win", serialized)
+
     def test_blocks_are_positive_literal_integers(self) -> None:
         module = _load_workload_evaluate()
         for blocks in (True, 0, -1, 1.0, "1"):
