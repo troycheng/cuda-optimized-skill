@@ -42,6 +42,7 @@ from artifact_store import (  # noqa: E402
 from budget import BudgetClock, BudgetPolicy, resolve_budget  # noqa: E402
 import decision as decision_engine  # noqa: E402
 import preflight  # noqa: E402
+import sanitize as sanitizer_engine  # noqa: E402
 import state as state_manager  # noqa: E402
 from workload_adapter import (  # noqa: E402
     WorkloadSpec,
@@ -1812,6 +1813,354 @@ def _select_lifecycle_candidate(
     raise ValueError("state mode must be full or kernel-only")
 
 
+def _validate_sanitizer_report(
+    report,
+    *,
+    candidate: Mapping,
+    state: Mapping,
+    mode: str | None = None,
+    expected_method_ids: Sequence[str] | None = None,
+    expected_tools: Sequence[str] | None = None,
+) -> dict:
+    if not isinstance(report, Mapping):
+        raise ValueError("sanitizer report must contain a JSON object")
+    clean = _strict_json_copy(report, "sanitizer report")
+    status = clean.get("status")
+    if status not in {"passed", "failed", "unavailable", "not_applicable"}:
+        raise ValueError("sanitizer report status is invalid")
+    expected_passed = status in {"passed", "not_applicable"}
+    if clean.get("passed") is not expected_passed:
+        raise ValueError("sanitizer report passed conflicts with status")
+    expected_coverage = {
+        "passed": "complete",
+        "failed": clean.get("coverage"),
+        "unavailable": "degraded",
+        "not_applicable": "not_applicable",
+    }[status]
+    if status == "failed":
+        if clean.get("coverage") not in {"complete", "degraded"}:
+            raise ValueError("failed sanitizer report coverage is invalid")
+    elif clean.get("coverage") != expected_coverage:
+        raise ValueError("sanitizer report coverage conflicts with status")
+    candidate_file = _candidate_file(candidate)
+    if clean.get("candidate_file") != candidate_file:
+        raise ValueError("sanitizer report candidate_file drifted")
+    if clean.get("candidate_sha256") != sha256_file(candidate_file):
+        raise ValueError("sanitizer report candidate_sha256 drifted")
+    if clean.get("input_hash") != state.get("input_hash"):
+        raise ValueError("sanitizer report input_hash drifted")
+    if mode is not None and clean.get("mode") != mode:
+        raise ValueError("sanitizer report mode drifted")
+    if expected_method_ids is not None and clean.get("method_ids") != list(
+        expected_method_ids
+    ):
+        raise ValueError("sanitizer report method_ids drifted")
+    if expected_tools is not None and clean.get("selected_tools") != list(
+        expected_tools
+    ):
+        raise ValueError("sanitizer report selected_tools drifted")
+    return clean
+
+
+def _aggregate_sanitizer_results(
+    *, state: Mapping, mode: str, candidates, reports
+) -> dict:
+    if mode not in {"targeted", "full"}:
+        raise ValueError("sanitizer mode must be targeted or full")
+    candidate_list = list(candidates)
+    report_list = list(reports)
+    if not candidate_list or len(candidate_list) != len(report_list):
+        raise ValueError("sanitizer candidates and reports must be non-empty and aligned")
+    records = []
+    for candidate, report in zip(candidate_list, report_list):
+        clean = _validate_sanitizer_report(
+            report, candidate=candidate, state=state
+        )
+        record = {
+            "candidate_id": _candidate_checkpoint_id(candidate),
+            "candidate_file": clean["candidate_file"],
+            "candidate_sha256": clean["candidate_sha256"],
+            "status": clean["status"],
+            "candidate_status": (
+                "rejected_correctness" if clean["status"] == "failed" else "eligible"
+            ),
+            "passed": clean["passed"],
+            "coverage": clean["coverage"],
+        }
+        if clean.get("artifact") is not None:
+            record["artifact"] = clean["artifact"]
+        records.append(record)
+
+    statuses = {record["status"] for record in records}
+    if "failed" in statuses:
+        status = "rejected_correctness"
+    elif "unavailable" in statuses:
+        status = "unavailable"
+    elif statuses == {"not_applicable"}:
+        status = "not_applicable"
+    else:
+        status = "passed"
+    if any(record["coverage"] == "degraded" for record in records):
+        coverage = "degraded"
+    elif all(record["coverage"] == "not_applicable" for record in records):
+        coverage = "not_applicable"
+    else:
+        coverage = "complete"
+    return {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "input_hash": state.get("input_hash"),
+        "mode": mode,
+        "status": status,
+        "passed": status in {"passed", "not_applicable"},
+        "coverage": coverage,
+        "candidates": records,
+    }
+
+
+def _sanitizer_candidate_outcomes(
+    aggregate: Mapping, candidates, *, mode: str
+) -> tuple[list[dict], list[dict]]:
+    if mode not in {"kernel-only", "full"}:
+        raise ValueError("state mode must be full or kernel-only")
+    records = aggregate.get("candidates")
+    if not isinstance(records, list):
+        raise ValueError("sanitizer aggregate candidates are malformed")
+    by_digest = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("sanitizer aggregate candidate is malformed")
+        digest = record.get("candidate_sha256")
+        if not isinstance(digest, str) or digest in by_digest:
+            raise ValueError("sanitizer aggregate candidate hash is invalid")
+        by_digest[digest] = record
+    eligible = []
+    rejected = []
+    for candidate in candidates:
+        candidate_digest = sha256_file(_candidate_file(candidate))
+        record = by_digest.get(candidate_digest)
+        if record is None:
+            raise ValueError("sanitizer aggregate is missing a candidate")
+        if record.get("candidate_file") != _candidate_file(candidate):
+            raise ValueError("sanitizer aggregate candidate binding drifted")
+        if record.get("status") == "failed":
+            failed_candidate = dict(candidate)
+            failed_candidate["status"] = "rejected_correctness"
+            rejected.append(
+                build_terminal_decision(mode=mode, candidate=failed_candidate)
+            )
+        elif record.get("status") in {
+            "passed",
+            "unavailable",
+            "not_applicable",
+        }:
+            eligible.append(dict(candidate))
+        else:
+            raise ValueError("sanitizer aggregate candidate status is invalid")
+    return eligible, rejected
+
+
+def _run_sanitizer_gate(
+    *,
+    state: Mapping,
+    policy: BudgetPolicy,
+    candidates,
+    iter_dir,
+    methods_json,
+    benchmark,
+    hard_timeout,
+) -> dict:
+    candidate_list = list(candidates)
+    if not candidate_list:
+        raise ValueError("sanitizer gate requires at least one candidate")
+    iteration_dir = Path(iter_dir).expanduser().resolve(strict=True)
+    methods_source = Path(methods_json).expanduser()
+    if methods_source.is_symlink():
+        raise ValueError("methods.json must be a non-symlink regular file")
+    methods_path = methods_source.resolve(strict=True)
+    if not methods_path.is_file():
+        raise ValueError("methods.json must be a non-symlink regular file")
+    methods_payload = _read(str(methods_path))
+    if not isinstance(methods_payload, Mapping) or not isinstance(
+        methods_payload.get("methods"), list
+    ):
+        raise ValueError("methods.json must contain a top-level methods list")
+    method_ids = []
+    for index, method in enumerate(methods_payload["methods"]):
+        if not isinstance(method, Mapping):
+            raise ValueError(f"methods[{index}] must be a mapping")
+        method_id = method.get("id")
+        if type(method_id) is not str or not method_id.strip():
+            raise ValueError(f"methods[{index}].id must be a non-empty string")
+        method_ids.append(method_id.strip())
+    sanitizer_policy = sanitizer_engine.load_policy()
+    selected_tools = sanitizer_engine.select_tools(
+        method_ids, mode=policy.sanitizer_mode, policy=sanitizer_policy
+    )
+    sanitizer_dir = iteration_dir / "sanitizer"
+    if sanitizer_dir.is_symlink():
+        raise ValueError("sanitizer artifact directory must not be a symlink")
+    sanitizer_dir.mkdir(mode=0o700, exist_ok=True)
+    if sanitizer_dir.resolve(strict=True).parent != iteration_dir:
+        raise ValueError("sanitizer artifact directory escapes the iteration")
+
+    dims = state.get("dims", {})
+    if not isinstance(dims, Mapping):
+        raise ValueError("state dims must be a mapping")
+    ptr_size = state.get("ptr_size", 0)
+    if isinstance(ptr_size, bool) or not isinstance(ptr_size, int) or ptr_size < 0:
+        raise ValueError("state ptr_size must be a non-negative integer")
+    timeout_provider = hard_timeout if callable(hard_timeout) else lambda: hard_timeout
+    reports = []
+    for candidate in candidate_list:
+        candidate_file = _candidate_file(candidate)
+        try:
+            Path(candidate_file).relative_to(iteration_dir)
+        except ValueError as error:
+            raise ValueError("sanitizer candidate escapes the iteration") from error
+        digest = sha256_file(candidate_file)
+        output = sanitizer_dir / f"{digest}.json"
+        if output.is_symlink():
+            raise ValueError("sanitizer candidate artifact must not be a symlink")
+        if output.is_file():
+            try:
+                report = _read(str(output))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(f"sanitizer candidate artifact is malformed: {error}") from error
+            report["artifact"] = str(output.resolve(strict=True))
+            reports.append(
+                _validate_sanitizer_report(
+                    report,
+                    candidate=candidate,
+                    state=state,
+                    mode=policy.sanitizer_mode,
+                    expected_method_ids=method_ids,
+                    expected_tools=selected_tools,
+                )
+            )
+            continue
+        if output.exists():
+            raise ValueError("sanitizer candidate artifact must be a regular file")
+
+        benchmark_command = [
+            sys.executable,
+            str(benchmark),
+            candidate_file,
+            "--profile-only",
+            "--warmup",
+            "0",
+            "--repeat",
+            "1",
+        ]
+        if ptr_size:
+            benchmark_command.extend(["--ptr-size", str(ptr_size)])
+        benchmark_command.extend(
+            f"--{key}={value}" for key, value in sorted(dims.items())
+        )
+        if not selected_tools:
+            report = sanitizer_engine.run_tools(
+                executable=None,
+                tools=[],
+                command=benchmark_command,
+            )
+            report.update(
+                {
+                    "mode": policy.sanitizer_mode,
+                    "method_ids": method_ids,
+                    "selected_tools": [],
+                }
+            )
+            report = sanitizer_engine.bind_candidate(
+                report,
+                candidate_file=candidate_file,
+                input_hash=state["input_hash"],
+            )
+            atomic_write_json(output, report)
+            report["artifact"] = str(output.resolve(strict=True))
+            reports.append(report)
+            continue
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "sanitize.py"),
+            "--mode",
+            policy.sanitizer_mode,
+            "--policy",
+            str(SCRIPT_DIR.parent / "references" / "sanitizer_policy.json"),
+            "--methods-json",
+            str(methods_path),
+            "--candidate-file",
+            candidate_file,
+            "--input-hash",
+            state["input_hash"],
+            "--out",
+            str(output),
+            "--",
+            *benchmark_command,
+        ]
+        completed = _run(
+            command,
+            capture_output=True,
+            hard_timeout=_finite_real(
+                timeout_provider(), "sanitizer hard_timeout", minimum=0.0
+            ),
+        )
+        if getattr(completed, "timed_out", False):
+            return {
+                "timed_out": True,
+                "candidate_id": _candidate_checkpoint_id(candidate),
+            }
+        if completed.returncode not in {0, sanitizer_engine.ERROR_EXITCODE}:
+            diagnostic = (completed.stderr or completed.stdout or "").strip()
+            raise SystemExit(
+                f"sanitize failed rc={completed.returncode}"
+                + (f": {diagnostic}" if diagnostic else "")
+            )
+        if not output.is_file() or output.is_symlink():
+            raise ValueError("sanitize did not write a safe candidate artifact")
+        try:
+            report = _read(str(output))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"sanitizer candidate artifact is malformed: {error}") from error
+        report["artifact"] = str(output.resolve(strict=True))
+        reports.append(
+            _validate_sanitizer_report(
+                report,
+                candidate=candidate,
+                state=state,
+                mode=policy.sanitizer_mode,
+                expected_method_ids=method_ids,
+                expected_tools=selected_tools,
+            )
+        )
+
+    aggregate = _aggregate_sanitizer_results(
+        state=state,
+        mode=policy.sanitizer_mode,
+        candidates=candidate_list,
+        reports=reports,
+    )
+    atomic_write_json(iteration_dir / "sanitizer.json", aggregate)
+    return aggregate
+
+
+def _load_sanitizer_aggregate(
+    iter_dir: Path, *, state: Mapping, policy: BudgetPolicy
+) -> dict:
+    aggregate = _load_iteration_json(iter_dir, "sanitizer.json")
+    if aggregate.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise ValueError("sanitizer.json schema_version is invalid")
+    if aggregate.get("input_hash") != state.get("input_hash"):
+        raise ValueError("sanitizer.json input_hash drifted")
+    if aggregate.get("mode") != policy.sanitizer_mode:
+        raise ValueError("sanitizer.json mode drifted")
+    if aggregate.get("coverage") not in {
+        "complete",
+        "degraded",
+        "not_applicable",
+    }:
+        raise ValueError("sanitizer.json coverage is invalid")
+    return aggregate
+
+
 def _write_selection_artifact(
     iter_dir: Path,
     *,
@@ -2255,7 +2604,7 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     next_stage,
                     {
                         "status": "deferred",
-                        "reason": "sanitizer stage is not implemented yet",
+                        "reason": "no candidate entered the sanitizer gate",
                     },
                     store=store,
                     clock=clock,
@@ -2263,6 +2612,9 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 continue
             selection = _load_selection_artifact(iteration_dir, state=state)
             candidate_id = selection.get("candidate_id")
+            _selected, sanitizer_candidates = _select_lifecycle_candidate(
+                branch_payload, mode=mode, policy=policy
+            )
             admitted, checkpoint = _admit_checkpoint_stage(
                 checkpoint,
                 next_stage,
@@ -2274,8 +2626,52 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
             if not admitted:
                 _budget_stop_output(args, checkpoint)
                 return
+            sanitizer_result = _run_sanitizer_gate(
+                state=state,
+                policy=policy,
+                candidates=sanitizer_candidates,
+                iter_dir=iteration_dir,
+                methods_json=_safe_iteration_file(iteration_dir, "methods.json"),
+                benchmark=os.path.abspath(args.benchmark),
+                hard_timeout=lambda: _hard_timeout_seconds(clock),
+            )
+            if sanitizer_result.get("timed_out"):
+                checkpoint = _persist_hard_timeout(
+                    checkpoint,
+                    next_stage,
+                    store=store,
+                    clock=clock,
+                    candidate_id=sanitizer_result.get("candidate_id"),
+                )
+                _budget_stop_output(args, checkpoint)
+                return
+            eligible_candidates, rejected_candidates = (
+                _sanitizer_candidate_outcomes(
+                    sanitizer_result, sanitizer_candidates, mode=mode
+                )
+            )
+            if sanitizer_result["coverage"] == "degraded":
+                current_state = _read(state_path)
+                current_state["sanitizer_coverage"] = "degraded"
+                current_state["sanitizer_coverage_degraded"] = True
+                atomic_write_json(state_path, current_state)
+                state = current_state
+
+            if eligible_candidates:
+                selected_candidate = eligible_candidates[0]
+                candidate_id = _candidate_checkpoint_id(selected_candidate)
+                kernel = _publish_outer_candidate(
+                    selected_candidate, iter_dir=iteration_dir
+                )
+                _write_selection_artifact(
+                    iteration_dir,
+                    state=state,
+                    candidate=selected_candidate,
+                    kernel=kernel,
+                    candidate_id=candidate_id,
+                )
             ablation_dir = iteration_dir / "ablations"
-            if ablation_dir.is_dir():
+            if eligible_candidates and ablation_dir.is_dir():
                 if not clock.can_start(
                     now=time.monotonic(),
                     estimated_seconds=_STAGE_ESTIMATES_SECONDS["ablation"],
@@ -2313,7 +2709,7 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     )
                     _budget_stop_output(args, checkpoint)
                     return
-            if not clock.can_start(
+            if eligible_candidates and not clock.can_start(
                 now=time.monotonic(),
                 estimated_seconds=_STAGE_ESTIMATES_SECONDS[next_stage],
             ):
@@ -2327,39 +2723,59 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 )
                 _budget_stop_output(args, denied)
                 return
-            sass_result = _run(
-                [
-                    sys.executable,
-                    str(SCRIPT_DIR / "sass_check.py"),
-                    "--state",
-                    state_path,
-                    "--iter",
-                    str(args.iter),
-                ],
-                hard_timeout=_hard_timeout_seconds(clock),
-            )
-            if getattr(sass_result, "timed_out", False):
-                checkpoint = _persist_hard_timeout(
-                    checkpoint,
-                    next_stage,
-                    store=store,
-                    clock=clock,
-                    candidate_id=candidate_id,
+            if eligible_candidates:
+                sass_result = _run(
+                    [
+                        sys.executable,
+                        str(SCRIPT_DIR / "sass_check.py"),
+                        "--state",
+                        state_path,
+                        "--iter",
+                        str(args.iter),
+                    ],
+                    hard_timeout=_hard_timeout_seconds(clock),
                 )
-                _budget_stop_output(args, checkpoint)
-                return
-            sass_rc = sass_result.returncode
+                if getattr(sass_result, "timed_out", False):
+                    checkpoint = _persist_hard_timeout(
+                        checkpoint,
+                        next_stage,
+                        store=store,
+                        clock=clock,
+                        candidate_id=candidate_id,
+                    )
+                    _budget_stop_output(args, checkpoint)
+                    return
+                sass_status = (
+                    "passed" if sass_result.returncode == 0 else "failed"
+                )
+            else:
+                sass_status = "not_applicable"
             checkpoint = _complete_checkpoint_stage(
                 checkpoint,
                 next_stage,
                 {
-                    "status": "deferred",
-                    "reason": "sanitizer stage is not implemented yet",
-                    "sass_status": "passed" if sass_rc == 0 else "failed",
+                    "status": (
+                        "deferred"
+                        if sanitizer_result["status"] == "not_applicable"
+                        else sanitizer_result["status"]
+                    ),
+                    "coverage": sanitizer_result["coverage"],
+                    "artifact": str(iteration_dir / "sanitizer.json"),
+                    "eligible_candidates": len(eligible_candidates),
+                    "rejected_candidates": len(rejected_candidates),
+                    "sass_status": sass_status,
+                    "reason": (
+                        "no selected method matched sanitizer policy"
+                        if sanitizer_result["status"] == "not_applicable"
+                        else None
+                    ),
                 },
                 store=store,
                 clock=clock,
                 candidate_id=candidate_id,
+                candidate_status=(
+                    "rejected_correctness" if not eligible_candidates else None
+                ),
             )
             continue
 
@@ -2374,11 +2790,26 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     clock=clock,
                 )
                 continue
-            selection = _load_selection_artifact(iteration_dir, state=state)
-            candidate_id = selection.get("candidate_id")
-            selected_candidate = selection["candidate"]
-            kernel = selection["candidate_file"]
-            if mode == "full":
+            _preliminary, outer_candidates = _select_lifecycle_candidate(
+                branch_payload, mode=mode, policy=policy
+            )
+            sanitizer_result = _load_sanitizer_aggregate(
+                iteration_dir, state=state, policy=policy
+            )
+            eligible_candidates, rejected_candidates = (
+                _sanitizer_candidate_outcomes(
+                    sanitizer_result, outer_candidates, mode=mode
+                )
+            )
+            if eligible_candidates:
+                selected_candidate = eligible_candidates[0]
+            else:
+                selected_candidate = outer_candidates[0]
+            candidate_id = _candidate_checkpoint_id(selected_candidate)
+            kernel = _publish_outer_candidate(
+                selected_candidate, iter_dir=iteration_dir
+            )
+            if mode == "full" and eligible_candidates:
                 pair_estimate = _finite_real(
                     state.get("estimated_workload_pair_seconds", 0.0),
                     "estimated_workload_pair_seconds",
@@ -2402,7 +2833,13 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
             if not admitted:
                 _budget_stop_output(args, checkpoint)
                 return
-            if mode == "kernel-only":
+            if not eligible_candidates:
+                terminal_decision = rejected_candidates[0]
+                workload_evidence = {
+                    "status": "rejected_correctness",
+                    "reason": "all finalists failed the sanitizer gate",
+                }
+            elif mode == "kernel-only":
                 terminal_decision = evaluate_outer_candidate(
                     selected_candidate,
                     mode=mode,
@@ -2414,9 +2851,6 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 )
                 workload_evidence = {"status": "not_applicable"}
             else:
-                _preliminary, candidates = _select_lifecycle_candidate(
-                    branch_payload, mode=mode, policy=policy
-                )
                 workload_spec = _workload_from_snapshot(state.get("workload"))
                 evaluated = [
                     (
@@ -2436,7 +2870,7 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                             seed=state.get("seed", 0),
                         ),
                     )
-                    for candidate in candidates
+                    for candidate in eligible_candidates
                 ]
                 selected_candidate, terminal_decision = (
                     _select_terminal_outer_result(evaluated)

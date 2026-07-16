@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "tools": ["memcheck", "racecheck", "initcheck", "synccheck"],
+  "methods": {
+    "compute.warp_specialization": ["memcheck", "racecheck", "synccheck"],
+    "memory.coalesced_access": ["memcheck"],
+    "memory.tiling_smem": ["memcheck", "racecheck", "initcheck", "synccheck"],
+    "memory.vectorized_access": ["memcheck", "initcheck"],
+    "memory.async_copy": ["memcheck", "racecheck", "initcheck", "synccheck"],
+    "memory.multi_stage_pipeline": ["memcheck", "racecheck", "initcheck", "synccheck"],
+    "memory.tma_multicast": ["memcheck", "racecheck", "initcheck", "synccheck"],
+    "memory.ldmatrix_stmatrix": ["memcheck", "racecheck", "initcheck", "synccheck"],
+    "memory.tma_im2col_implicit_conv": ["memcheck", "racecheck", "initcheck", "synccheck"],
+    "latency.async_pipeline": ["memcheck", "racecheck", "synccheck"],
+    "latency.asymmetric_mbarrier_sync": ["memcheck", "racecheck", "synccheck"],
+    "latency.pingpong_warpgroup_schedule": ["memcheck", "racecheck", "synccheck"],
+    "latency.producer_regdealloc_setmaxnreg": ["memcheck", "racecheck", "synccheck"],
+    "latency.intra_wg_gemm_softmax_pipeline": ["memcheck", "racecheck", "synccheck"],
+    "latency.cooperative_cluster": ["memcheck", "racecheck", "synccheck"],
+    "latency.cluster_launch_control_scheduler": ["memcheck", "racecheck", "synccheck"],
+    "latency.stream_event": ["memcheck", "racecheck", "synccheck"],
+    "latency.warp_aggregated_atomics": ["memcheck", "racecheck"],
+    "latency.atomic_optimize": ["memcheck", "racecheck"]
+  }
+}
