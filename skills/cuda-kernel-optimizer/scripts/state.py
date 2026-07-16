@@ -47,6 +47,18 @@ import sys
 from pathlib import Path
 
 
+# Keep sibling imports working both as a CLI script and via importlib file specs.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from artifact_store import (  # noqa: E402
+    ArtifactStore,
+    CURRENT_SCHEMA_VERSION,
+    atomic_write_json,
+)
+
+
 # ---------------------------------------------------------------------------
 # IO helpers
 # ---------------------------------------------------------------------------
@@ -56,11 +68,29 @@ def _read(path: str) -> dict:
         return json.load(f)
 
 
+def validate_state(payload: dict) -> dict:
+    """Validate a v2.2 state without mutating the caller's payload."""
+    if not isinstance(payload, dict):
+        raise ValueError("state payload must be a JSON object")
+    if type(payload.get("schema_version")) is not int or payload.get(
+        "schema_version"
+    ) != CURRENT_SCHEMA_VERSION:
+        raise ValueError(
+            f"state schema_version must be {CURRENT_SCHEMA_VERSION}; "
+            "start a new v2.2 run"
+        )
+    for key in ("run_dir", "input_hash", "budget", "candidates"):
+        if key not in payload:
+            raise ValueError(f"v2.2 state is missing required field: {key}")
+    return payload
+
+
+def _read_state(path: str) -> dict:
+    return validate_state(_read(path))
+
+
 def _write(path: str, payload: dict) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +109,6 @@ def cmd_init(args: argparse.Namespace) -> None:
     run_dir = os.path.join(os.path.dirname(baseline), f"run_{ts}")
     os.makedirs(run_dir, exist_ok=False)
 
-    baseline_copy_dir = os.path.join(run_dir, "baseline")
-    os.makedirs(baseline_copy_dir, exist_ok=True)
-    baseline_copy = os.path.join(baseline_copy_dir, os.path.basename(baseline))
-    shutil.copy2(baseline, baseline_copy)
-
     env = {}
     if args.env and os.path.isfile(args.env):
         env = _read(args.env)
@@ -93,12 +118,34 @@ def cmd_init(args: argparse.Namespace) -> None:
     except json.JSONDecodeError as e:
         sys.exit(f"--dims must be valid JSON: {e}")
 
+    budget = {
+        "iterations_total": int(args.iterations),
+        "ncu_num": int(args.ncu_num),
+        "branches": int(args.branches),
+    }
+    store = ArtifactStore(run_dir)
+    manifest = store.initialize(
+        inputs={"baseline": baseline, "ref": ref},
+        budget=budget,
+        environment=env,
+    )
+
+    baseline_copy_dir = os.path.join(run_dir, "baseline")
+    baseline_copy = os.path.join(baseline_copy_dir, os.path.basename(baseline))
+    shutil.copy2(baseline, baseline_copy)
+
     state = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "run_dir": run_dir,
+        "input_hash": manifest["input_hash"],
+        "budget": budget,
+        "workload": None,
         "baseline_file": baseline_copy,
         "baseline_file_original": baseline,
         "ref_file": ref,
         "best_file": baseline_copy,
+        "best_kernel_statistics": None,
+        "best_workload_statistics": None,
         "best_metric_ms": None,
         "best_ncu_rep": None,
         "env": env,
@@ -113,6 +160,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "effective_methods": [],
         "ineffective_methods": [],
         "implementation_failed_methods": [],
+        "candidates": {},
         "history": [],
         "roofline_history": [],
         "frontier": [],
@@ -148,7 +196,7 @@ def _merge_unique(bag: list[dict], new_items: list[dict]) -> list[dict]:
 
 
 def cmd_update(args: argparse.Namespace) -> None:
-    state = _read(args.state)
+    state = _read_state(args.state)
     bench = _read(args.bench)
     methods = _read(args.methods_json)
 
@@ -313,7 +361,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_set_best_ncu(args: argparse.Namespace) -> None:
-    state = _read(args.state)
+    state = _read_state(args.state)
     state["best_ncu_rep"] = os.path.abspath(args.ncu_rep)
     _write(args.state, state)
     print(json.dumps({"best_ncu_rep": state["best_ncu_rep"]}, indent=2))
@@ -324,7 +372,7 @@ def cmd_set_best_ncu(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_set_baseline_metric(args: argparse.Namespace) -> None:
-    state = _read(args.state)
+    state = _read_state(args.state)
     bench = _read(args.bench)
     if not bench.get("correctness", {}).get("passed", True):
         sys.exit("Baseline failed correctness validation — cannot proceed.")
@@ -337,7 +385,7 @@ def cmd_set_baseline_metric(args: argparse.Namespace) -> None:
 
 
 def cmd_show(args: argparse.Namespace) -> None:
-    state = _read(args.state)
+    state = _read_state(args.state)
     print(json.dumps(state, indent=2))
 
 
