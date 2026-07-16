@@ -61,8 +61,13 @@ class CloseIterationDecisionTests(unittest.TestCase):
                 "champion": None,
                 "completed_comparisons": 2,
             }
+            (iter_dir / "branch_results.json").write_text(
+                json.dumps(branch_payload), encoding="utf-8"
+            )
             branch_result = SimpleNamespace(
-                returncode=0, stdout=json.dumps(branch_payload), stderr=""
+                returncode=0,
+                stdout="[triton setup]\n n: int [input]\n" + json.dumps(branch_payload),
+                stderr="",
             )
             runner = mock.Mock(return_value=branch_result)
 
@@ -78,6 +83,71 @@ class CloseIterationDecisionTests(unittest.TestCase):
         self.assertEqual(output["decision"], str(iter_dir / "decision.json"))
         self.assertEqual(output["state"], str(state_path))
         self.assertIn("next_step", output)
+
+    def test_confirmed_artifact_with_noisy_stdout_continues_to_champion_path(self) -> None:
+        orchestrate = _load_orchestrate()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, _state_path, iter_dir = self._fixture(root)
+            (iter_dir / "branch_results.json").write_text(
+                json.dumps(
+                    {
+                        "iter": 1,
+                        "status": "shortlist_ready",
+                        "champion": {"branch_index": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (iter_dir / "kernel.py").write_text("# champion\n", encoding="utf-8")
+            (iter_dir / "bench.json").write_text(
+                json.dumps({"correctness": {"passed": True}}), encoding="utf-8"
+            )
+            branch_result = SimpleNamespace(
+                returncode=0,
+                stdout="CUDA setup log\n{not the authority}",
+                stderr="",
+            )
+            runner = mock.Mock(
+                side_effect=[branch_result, RuntimeError("profile reached")]
+            )
+
+            with mock.patch.object(orchestrate, "_run", runner):
+                with self.assertRaisesRegex(RuntimeError, "profile reached"):
+                    orchestrate.cmd_close_iter(args)
+
+        self.assertEqual(runner.call_count, 2)
+        self.assertTrue(
+            any("profile_ncu.py" in str(part) for part in runner.call_args_list[1].args[0])
+        )
+
+    def test_missing_malformed_or_unknown_branch_artifact_fails_clearly(self) -> None:
+        orchestrate = _load_orchestrate()
+        cases = (
+            (None, "missing"),
+            ("{", "malformed"),
+            (json.dumps({"status": "surprise"}), "status"),
+        )
+        for artifact, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, _state_path, iter_dir = self._fixture(root)
+                if artifact is not None:
+                    (iter_dir / "branch_results.json").write_text(
+                        artifact, encoding="utf-8"
+                    )
+                branch_result = SimpleNamespace(
+                    returncode=0,
+                    stdout="noisy setup output\n{}",
+                    stderr="",
+                )
+                runner = mock.Mock(return_value=branch_result)
+
+                with mock.patch.object(orchestrate, "_run", runner):
+                    with self.assertRaisesRegex(SystemExit, rf"branch_results.*{expected}"):
+                        orchestrate.cmd_close_iter(args)
+
+                self.assertEqual(runner.call_count, 1)
 
     def test_rc2_keeps_all_branches_failed_semantics(self) -> None:
         orchestrate = _load_orchestrate()

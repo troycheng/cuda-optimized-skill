@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+_BRANCH_RESULT_STATUSES = {"shortlist_ready", "no_confirmed_kernel_win"}
 
 
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -29,6 +30,21 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 def _read(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _read_branch_results(path: str) -> dict:
+    if not os.path.isfile(path):
+        sys.exit(f"branch_results artifact missing: {path}")
+    try:
+        payload = _read(path)
+    except (OSError, json.JSONDecodeError) as error:
+        sys.exit(f"branch_results artifact malformed: {error}")
+    if not isinstance(payload, dict):
+        sys.exit("branch_results artifact must be a JSON object")
+    status = payload.get("status")
+    if type(status) is not str or status not in _BRANCH_RESULT_STATUSES:
+        sys.exit(f"branch_results artifact status is invalid: {status!r}")
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +251,8 @@ def cmd_close_iter(args):
     if branch_result.returncode != 0:
         sys.exit(f"branch_explore failed rc={branch_result.returncode}")
 
-    try:
-        branch_payload = json.loads(branch_result.stdout or "")
-    except json.JSONDecodeError as error:
-        sys.exit(f"branch_explore returned malformed JSON: {error}")
-    if not isinstance(branch_payload, dict):
-        sys.exit("branch_explore output must be a JSON object")
+    branch_results_path = os.path.join(iter_dir, "branch_results.json")
+    branch_payload = _read_branch_results(branch_results_path)
     if branch_payload.get("status") == "no_confirmed_kernel_win":
         decision_path = os.path.join(iter_dir, "decision.json")
         print(json.dumps({
