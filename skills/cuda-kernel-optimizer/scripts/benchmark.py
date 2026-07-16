@@ -34,6 +34,12 @@ import importlib.util
 from numbers import Real
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import compiler_evidence  # noqa: E402
+
 torch = None
 
 
@@ -228,6 +234,9 @@ def compile_cu(cu_file: str, output_so: str, arch: str, nvcc_bin: str, backend: 
         cmd.extend(["-lcublas", "-lcublasLt"])
 
     cmd.extend(["-shared", "-std=c++17", f"-arch={arch}", "-O3", "-o", output_so, clean_file])
+    reset_outputs = {
+        stage: None for stage in compiler_evidence.STAGES if stage != "source"
+    }
     print(f"[compile] {' '.join(cmd)}")
     try:
         result = subprocess.run(
@@ -240,12 +249,43 @@ def compile_cu(cu_file: str, output_so: str, arch: str, nvcc_bin: str, backend: 
     except OSError as exc:
         if clean_file != cu_file and os.path.exists(clean_file):
             os.remove(clean_file)
+        compiler_evidence.update_manifest(
+            Path(output_so).parent / "compiler_evidence",
+            source=cu_file,
+            discovered=reset_outputs,
+            compile_command=cmd,
+            backend=backend,
+            arch=arch,
+        )
         print(f"Compilation failed:\n{exc}", file=sys.stderr)
         sys.exit(1)
     if clean_file != cu_file and os.path.exists(clean_file):
         os.remove(clean_file)
     if result.returncode != 0:
+        compiler_evidence.update_manifest(
+            Path(output_so).parent / "compiler_evidence",
+            source=cu_file,
+            discovered=reset_outputs,
+            compile_command=cmd,
+            backend=backend,
+            arch=arch,
+        )
         print(f"Compilation failed:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    evidence = compiler_evidence.update_manifest(
+        Path(output_so).parent / "compiler_evidence",
+        source=cu_file,
+        binary=output_so,
+        discovered=reset_outputs,
+        compile_command=cmd,
+        backend=backend,
+        arch=arch,
+    )
+    if evidence["binary"]["status"] != "available":
+        print(
+            f"Compilation failed:\nnvcc did not produce a real output binary: {output_so}",
+            file=sys.stderr,
+        )
         sys.exit(1)
     print(f"[compile] -> {output_so}")
 
@@ -632,7 +672,29 @@ def _setup_cuda(solution_file, dim_values, ptr_size_override, arch, nvcc_bin, se
 
 
 
-def _setup_triton(solution_file, dim_values, seed=None):
+def _triton_cache_dir() -> Path:
+    configured = os.environ.get("TRITON_CACHE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".triton" / "cache"
+
+
+def _record_triton_compiler_evidence(state) -> None:
+    evidence = state.get("compiler_evidence")
+    if not isinstance(evidence, dict) or evidence.get("recorded"):
+        return
+    discovered = compiler_evidence.discover_triton_cache(
+        evidence["cache_dir"], evidence["cache_before"]
+    )
+    compiler_evidence.update_manifest(
+        evidence["evidence_dir"], discovered=discovered
+    )
+    evidence["recorded"] = True
+
+
+def _setup_triton(solution_file, dim_values, seed=None, arch=None):
+    cache_dir = _triton_cache_dir()
+    cache_before = compiler_evidence.snapshot_cache(cache_dir)
     module = load_python_module(solution_file, "_triton_kernel_module")
     if not hasattr(module, "setup"):
         raise AttributeError(f"'{solution_file}' must define a `setup(**kwargs)` function for Triton benchmarking.")
@@ -728,6 +790,14 @@ def _setup_triton(solution_file, dim_values, seed=None):
         dtype_name = str(setup_inputs[name].dtype).replace("torch.", "")
         output_specs.append((name, dtype_name))
 
+    evidence_dir = Path(solution_file).expanduser().resolve().parent / "compiler_evidence"
+    compiler_evidence.update_manifest(
+        evidence_dir,
+        source=solution_file,
+        backend="triton",
+        arch=arch,
+    )
+
     return {
         "backend": "triton",
         "signature": signature,
@@ -739,13 +809,19 @@ def _setup_triton(solution_file, dim_values, seed=None):
         "ptr_elems": ptr_elems,
         "total_ptr_bytes": total_ptr_bytes,
         "preview_tensors": preview_tensors,
+        "compiler_evidence": {
+            "cache_dir": cache_dir,
+            "cache_before": cache_before,
+            "evidence_dir": evidence_dir,
+            "recorded": False,
+        },
     }
 
 
 
 def _setup_backend(solution_file, backend, dim_values, ptr_size_override, arch, nvcc_bin, seed=None):
     if backend == "triton":
-        return _setup_triton(solution_file, dim_values, seed=seed)
+        return _setup_triton(solution_file, dim_values, seed=seed, arch=arch)
     if backend in {"cuda", "cutlass"}:
         return _setup_cuda(
             solution_file,
@@ -791,6 +867,8 @@ def warm_solution(state, warmup):
         _reset_tensor_inputs(state)
         state["callable"]()
     _require_torch().cuda.synchronize()
+    if warmup:
+        _record_triton_compiler_evidence(state)
 
 
 def measure_once(state, *, cuda=None):
@@ -807,6 +885,7 @@ def measure_once(state, *, cuda=None):
         raise ValueError("timing must be a finite positive real number") from exc
     if not math.isfinite(timing) or timing <= 0:
         raise ValueError("timing must be a finite positive real number")
+    _record_triton_compiler_evidence(state)
     return timing
 
 
@@ -908,6 +987,7 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
             profiler=torch.cuda.cudart(),
             cuda=torch.cuda,
         )
+        _record_triton_compiler_evidence(state)
         result["profile_only"] = True
         result["profiled_launches"] = 1
         _write_json_out(json_out, result)
@@ -950,6 +1030,7 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
             print("\n[kernel]    running ... ", end="", flush=True)
             state["callable"]()
             torch.cuda.synchronize()
+            _record_triton_compiler_evidence(state)
             print("done")
 
             print("[reference] running ... ", end="", flush=True)
@@ -1024,6 +1105,7 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
 
         state["callable"]()
         torch.cuda.synchronize()
+        _record_triton_compiler_evidence(state)
 
         print(f"\n[preview] first {preview} elements after 1 kernel call:")
         for item in state["preview_tensors"]:
@@ -1039,6 +1121,7 @@ def run(solution_file, ref_file, dim_values, warmup, repeat, ptr_size_override, 
 
     print(f"\n[warmup] kernel  {warmup} iterations ...")
     times_kernel = _time_iterations(state["callable"], warmup, repeat)
+    _record_triton_compiler_evidence(state)
     print(f"[bench]  kernel  {repeat} iterations ... done")
 
     avg_k, med_k, mn_k, mx_k = _stats(times_kernel)

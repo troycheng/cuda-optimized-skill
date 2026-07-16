@@ -17,6 +17,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import compiler_evidence  # noqa: E402
+
 
 _DEFAULT_SIGNATURES = Path(__file__).resolve().parent.parent / "references" / "sass_signatures.json"
 
@@ -46,7 +52,13 @@ def _dump_sass(so_path: str) -> str:
             encoding="utf-8", errors="ignore",
             timeout=30,
         )
-        return r.stdout or ""
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or f"exit code {r.returncode}").strip()
+            return f"ERROR: cuobjdump failed: {detail}"
+        sass_text = r.stdout or ""
+        if not sass_text.strip():
+            return "ERROR: cuobjdump produced no SASS output"
+        return sass_text
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
         return f"ERROR: {e}"
 
@@ -137,22 +149,44 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
 
     # CUDA/CUTLASS: find .so and dump SASS
     so_path = _find_so_file(kernel_path)
+    evidence_dir = Path(iter_dir) / "compiler_evidence"
     if not so_path:
+        compiler_evidence.update_manifest(
+            evidence_dir,
+            source=kernel_path,
+            discovered={"binary": None, "sass": None},
+        )
         return {"error": "so_not_found", "kernel": kernel_path, "checks": []}
 
     sass_text = _dump_sass(so_path)
 
     if sass_text.startswith("ERROR:"):
+        compiler_evidence.update_manifest(
+            evidence_dir,
+            source=kernel_path,
+            binary=so_path,
+            discovered={"sass": None},
+        )
         checks = []
         for m in methods_list:
             checks.append({
                 "method_id": m.get("id", "unknown"),
-                "verified": True,
+                "verified": False,
+                "status": "unavailable",
                 "note": f"cuobjdump_unavailable: {sass_text}",
             })
         result = {"kernel": kernel_path, "backend": "cuda", "sass_error": sass_text, "checks": checks}
         _write_result(iter_dir, result)
         return result
+
+    sass_path = evidence_dir / "sass.txt"
+    compiler_evidence.atomic_write_text(sass_path, sass_text)
+    compiler_evidence.update_manifest(
+        evidence_dir,
+        source=kernel_path,
+        binary=so_path,
+        discovered={"sass": sass_path},
+    )
 
     # Check each method
     checks = []
