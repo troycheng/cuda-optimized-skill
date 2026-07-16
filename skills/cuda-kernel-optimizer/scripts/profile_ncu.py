@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from common_options import benchmark_option_argv, normalized_ncu_options
+
 
 # ---------------------------------------------------------------------------
 # Axis rubric — which metric ID patterns belong to which axis, and whether
@@ -178,6 +180,29 @@ def _record_counter_access(
     else:
         env_ncu.pop("counter_access_error", None)
     _write_json(env_path, env)
+
+
+def _sync_winner_manifest(state: dict) -> None:
+    """Keep the durable manifest aligned after direct best-input profiling."""
+    manifest_path = os.path.join(state.get("run_dir", ""), "run_manifest.json")
+    if not os.path.isfile(manifest_path):
+        return
+    try:
+        manifest = _read_state(manifest_path)
+    except (OSError, json.JSONDecodeError):
+        return
+    winners = manifest.setdefault("winner_state", {})
+    winners["benchmark_winner"] = {
+        "file": state.get("best_file"),
+        "metric_ms": state.get("best_metric_ms"),
+        "metric_name": state.get("metric_name"),
+    }
+    winners["fully_profiled_winner"] = {
+        "file": state.get("best_profiled_file"),
+        "metric_ms": state.get("best_profiled_metric_ms"),
+        "ncu_rep": state.get("best_profiled_ncu_rep"),
+    }
+    _write_json(manifest_path, manifest)
 
 
 def _detect_backend(file: str) -> str:
@@ -360,6 +385,7 @@ def _build_profile_command(
     launch_count: int,
     ptr_size: int = 0,
     python_executable: str | None = None,
+    benchmark_options: list[str] | None = None,
 ) -> list[str]:
     if launch_count != 1:
         raise ValueError("target-bounded profiling requires launch_count=1")
@@ -379,7 +405,11 @@ def _build_profile_command(
         "--profile-only",
         "--warmup", str(warmup),
         "--repeat", "1",
-    ] + _ptr_size_argv(ptr_size) + _dims_argv(dims)
+    ]
+    if benchmark_options is None:
+        cmd += _ptr_size_argv(ptr_size) + _dims_argv(dims)
+    else:
+        cmd += benchmark_options
     return cmd
 
 
@@ -393,6 +423,7 @@ def _run_ncu_profile(
     ptr_size: int,
     warmup: int,
     launch_count: int,
+    benchmark_options: list[str] | None = None,
 ) -> tuple[int, str]:
     cmd = _build_profile_command(
         ncu_bin=ncu_bin,
@@ -403,6 +434,7 @@ def _run_ncu_profile(
         ptr_size=ptr_size,
         warmup=warmup,
         launch_count=launch_count,
+        benchmark_options=benchmark_options,
     )
 
     print(f"[ncu profile] {' '.join(cmd)}", file=sys.stderr)
@@ -562,8 +594,7 @@ def main() -> None:
     p.add_argument("--no-kernel-filter", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ncu-bin", type=str, default="")
     p.add_argument("--promote-if-best", action="store_true",
-                   help="When --which=kernel, if this kernel is the current best, "
-                        "also update state.best_ncu_rep to this report.")
+                   help=argparse.SUPPRESS)
     args = p.parse_args()
 
     state = _read_state(args.state)
@@ -587,10 +618,12 @@ def main() -> None:
         rep_name = "kernel.ncu-rep"
 
     rep_path = os.path.join(iter_dir, rep_name)
+    status_path = os.path.join(iter_dir, f"{args.which}_profile_status.json")
 
     env_ncu = state.get("env", {}).get("ncu")
     env_ncu_path = env_ncu.get("path", "") if isinstance(env_ncu, dict) else ""
-    ncu_bin = args.ncu_bin or env_ncu_path or shutil.which("ncu") or "ncu"
+    ncu_opts = normalized_ncu_options(state)
+    ncu_bin = args.ncu_bin or ncu_opts.get("ncu_bin") or env_ncu_path or shutil.which("ncu") or "ncu"
 
     backend = _detect_backend(solution)
 
@@ -611,6 +644,14 @@ def main() -> None:
             "compute": [], "memory": [], "latency": [],
         }
         _write_json(os.path.join(iter_dir, "ncu_top.json"), top)
+        _write_json(status_path, {
+            "profile_status": "unavailable",
+            "analysis_status": "unavailable",
+            "which": args.which,
+            "profiled_file": solution,
+            "ncu_rep": None,
+            "reason": top["reason"],
+        })
         print(json.dumps({"degraded": True, "reason": top["reason"]}, indent=2))
         return
 
@@ -624,6 +665,9 @@ def main() -> None:
         ptr_size=state.get("ptr_size", 0),
         warmup=args.warmup,
         launch_count=args.launch_count,
+        benchmark_options=benchmark_option_argv(
+            state, include_validation=False, include_reference=False
+        ),
     )
     log_path = os.path.join(iter_dir, f"{os.path.splitext(rep_name)[0]}.ncu.log")
     with open(log_path, "w", encoding="utf-8") as f:
@@ -643,6 +687,16 @@ def main() -> None:
             "compute": [], "memory": [], "latency": [],
         }
         _write_json(os.path.join(iter_dir, "ncu_top.json"), top)
+        _write_json(status_path, {
+            "profile_status": "failed",
+            "analysis_status": "unavailable",
+            "which": args.which,
+            "profiled_file": solution,
+            "ncu_rep": rep_path if os.path.isfile(rep_path) else None,
+            "returncode": rc,
+            "log": log_path,
+            "reason": top["reason"],
+        })
         print(json.dumps({"degraded": True, "rc": rc, "log": log_path}, indent=2))
         return
 
@@ -658,6 +712,16 @@ def main() -> None:
             "compute": [], "memory": [], "latency": [],
         }
         _write_json(os.path.join(iter_dir, "ncu_top.json"), top)
+        _write_json(status_path, {
+            "profile_status": "success",
+            "analysis_status": "failed",
+            "which": args.which,
+            "profiled_file": solution,
+            "ncu_rep": rep_path,
+            "returncode": rc,
+            "import_returncode": rc2,
+            "reason": top["reason"],
+        })
         print(json.dumps({"degraded": True, "rc": rc2}, indent=2))
         return
 
@@ -683,19 +747,46 @@ def main() -> None:
     }
     _write_json(os.path.join(iter_dir, "ncu_top.json"), top)
 
-    # Optionally promote this as best_ncu_rep
+    _write_json(status_path, {
+        "profile_status": "success",
+        "analysis_status": "success",
+        "which": args.which,
+        "profiled_file": solution,
+        "ncu_rep": rep_path,
+        "returncode": rc,
+        "import_returncode": rc2,
+        "metric_count_collected": len(agg),
+    })
+
+    # A successfully profiled best-input is immediately eligible as the
+    # promotion-ready baseline. Candidate promotion happens in state.py update.
+    if args.which == "best_input" and os.path.abspath(solution) == os.path.abspath(state.get("best_file", "")):
+        metric = state.get("best_metric_ms")
+        if metric is not None:
+            current = state.get("best_profiled_metric_ms")
+            if current is None or float(metric) < float(current):
+                state["best_profiled_file"] = os.path.abspath(solution)
+                state["best_profiled_metric_ms"] = metric
+                state["best_profiled_ncu_rep"] = os.path.abspath(rep_path)
+                state["best_ncu_rep"] = os.path.abspath(rep_path)
+                _write_json(args.state, state)
+                _sync_winner_manifest(state)
+
+    # Backward-compatible alias only. Fully-profiled winner selection remains
+    # in state.py update, after the benchmark result is known.
     if args.which == "kernel" and args.promote_if_best:
         # The caller (run_iteration) is responsible for deciding if this
         # kernel is "best" — but if it already pointed state.best_file to
         # our path, we record the rep here.
         if os.path.abspath(solution) == os.path.abspath(state.get("best_file", "")):
             state["best_ncu_rep"] = rep_path
-            with open(args.state, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
+            _write_json(args.state, state)
+            _sync_winner_manifest(state)
 
     print(json.dumps({
         "ncu_rep": rep_path,
         "ncu_top": os.path.join(iter_dir, "ncu_top.json"),
+        "profile_status": status_path,
         "compute_count": len(by_axis["compute"]),
         "memory_count": len(by_axis["memory"]),
         "latency_count": len(by_axis["latency"]),

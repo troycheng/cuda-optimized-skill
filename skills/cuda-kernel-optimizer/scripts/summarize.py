@@ -26,6 +26,14 @@ def _fmt_speedup(v) -> str:
     return f"{v:.2f}×" if v is not None else "—"
 
 
+def _timing(bench: dict) -> float | None:
+    kernel = bench.get("kernel") or {}
+    value = kernel.get("median_ms")
+    if value is None:
+        value = kernel.get("average_ms")
+    return float(value) if value is not None else None
+
+
 def _method_bullets(methods: list[dict]) -> str:
     if not methods:
         return "_(none)_"
@@ -48,14 +56,16 @@ def _method_bullets(methods: list[dict]) -> str:
 
 def _timeline_table(state: dict) -> str:
     rows = [
-        "| Iter | Status | Methods | ms | Speedup vs prev best | Speedup vs ref |",
-        "|------|--------|---------|----|----------------------|----------------|",
+        "| Iter | Status | Profile | SASS | Methods | ms | Speedup vs prev best | Speedup vs ref |",
+        "|------|--------|---------|------|---------|----|----------------------|----------------|",
     ]
     for h in state.get("history", []):
         methods = ", ".join(h.get("method_names") or h.get("methods") or [])
         rows.append(
             f"| {h['iter']} "
             f"| {h['status']} "
+            f"| {h.get('profile_status', 'missing')} "
+            f"| {h.get('sass_status', 'unknown')} "
             f"| {methods} "
             f"| {_fmt_ms(h.get('ms'))} "
             f"| {_fmt_speedup(h.get('speedup_vs_best_before'))} "
@@ -92,13 +102,19 @@ def render(state_path: str, out_path: str) -> None:
     baseline_ms = None
     if os.path.isfile(baseline_bench_path):
         b = _read(baseline_bench_path)
-        baseline_ms = (b.get("kernel") or {}).get("average_ms")
+        baseline_ms = _timing(b)
 
     best_ms = state.get("best_metric_ms")
     final_speedup = (baseline_ms / best_ms) if (baseline_ms and best_ms and best_ms > 0) else None
+    profiled_ms = state.get("best_profiled_metric_ms")
+    profiled_speedup = (
+        baseline_ms / profiled_ms
+        if baseline_ms and profiled_ms and profiled_ms > 0
+        else None
+    )
 
     env = state.get("env", {})
-    gpu = (env.get("gpus") or [{}])[0]
+    gpu = env.get("selected_gpu") or (env.get("gpus") or [{}])[0]
 
     lines = []
     lines.append("# CUDA Kernel Optimization Summary (v2 — Roofline-Driven)")
@@ -127,11 +143,17 @@ def render(state_path: str, out_path: str) -> None:
     lines.append("## Headline")
     lines.append("")
     lines.append(f"- **Baseline time**: {_fmt_ms(baseline_ms)}")
-    lines.append(f"- **Best time**: {_fmt_ms(best_ms)}")
-    lines.append(f"- **Overall speedup vs baseline**: {_fmt_speedup(final_speedup)}")
-    lines.append(f"- **Best kernel**: `{state.get('best_file')}`")
-    if state.get("best_ncu_rep"):
-        lines.append(f"- **Best kernel ncu-rep**: `{state['best_ncu_rep']}`")
+    lines.append(f"- **Benchmark winner time**: {_fmt_ms(best_ms)}")
+    lines.append(f"- **Benchmark winner speedup vs baseline**: {_fmt_speedup(final_speedup)}")
+    lines.append(f"- **Benchmark winner kernel**: `{state.get('best_file')}`")
+    lines.append(f"- **Fully-profiled winner time**: {_fmt_ms(profiled_ms)}")
+    lines.append(f"- **Fully-profiled winner speedup vs baseline**: {_fmt_speedup(profiled_speedup)}")
+    lines.append(f"- **Fully-profiled winner kernel**: `{state.get('best_profiled_file')}`")
+    lines.append(f"- **Fully-profiled winner ncu-rep**: `{state.get('best_profiled_ncu_rep')}`")
+    if not state.get("best_profiled_file"):
+        lines.append("- **Promotion status**: `blocked` — no correctness-passing full NCU report exists")
+    else:
+        lines.append("- **Promotion status**: `profile-evidence-complete` (serving validation may still be required)")
     lines.append("")
 
     lines.append("## Roofline History")
@@ -157,6 +179,19 @@ def render(state_path: str, out_path: str) -> None:
     lines.append("## Implementation-Failed Methods (SASS verification failed)")
     lines.append("")
     lines.append(_method_bullets(state.get("implementation_failed_methods", [])))
+    lines.append("")
+
+    lines.append("## Unverified Methods")
+    lines.append("")
+    lines.append(_method_bullets(state.get("unverified_methods", [])))
+    lines.append("")
+
+    constraints = ((state.get("strategy_memory") or {}).get("constraints") or {})
+    lines.append("## Cross-Run Strategy Memory")
+    lines.append("")
+    lines.append(f"- Preferred method IDs: `{constraints.get('preferred_method_ids', [])}`")
+    lines.append(f"- Blocked method IDs: `{constraints.get('blocked_method_ids', [])}`")
+    lines.append(f"- Scope: `{(state.get('strategy_memory') or {}).get('scope_key')}`")
     lines.append("")
 
     lines.append("## All Methods Tried")

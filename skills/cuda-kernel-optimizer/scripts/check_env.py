@@ -48,10 +48,17 @@ def _detect_gpus() -> list[dict]:
     return gpus
 
 
-def _detect_nvcc() -> dict:
-    path = shutil.which("nvcc")
+def _resolve_tool(requested: str, fallback: str) -> str | None:
+    requested = (requested or fallback).strip()
+    if os.path.isfile(os.path.expanduser(requested)):
+        return os.path.abspath(os.path.expanduser(requested))
+    return shutil.which(requested)
+
+
+def _detect_nvcc(requested: str = "nvcc") -> dict:
+    path = _resolve_tool(requested, "nvcc")
     if not path:
-        return {"available": False, "path": None, "version": None}
+        return {"available": False, "requested": requested, "path": None, "version": None}
     rc, out, _ = _run([path, "--version"])
     version = None
     if rc == 0:
@@ -60,14 +67,15 @@ def _detect_nvcc() -> dict:
             if line.startswith("Cuda compilation tools"):
                 version = line
                 break
-    return {"available": True, "path": path, "version": version or out.strip()}
+    return {"available": True, "requested": requested, "path": path, "version": version or out.strip()}
 
 
-def _detect_ncu() -> dict:
-    path = shutil.which("ncu")
+def _detect_ncu(requested: str = "ncu") -> dict:
+    path = _resolve_tool(requested, "ncu")
     if not path:
         return {
             "available": False,
+            "requested": requested,
             "path": None,
             "version": None,
             "metrics_query_available": None,
@@ -88,6 +96,7 @@ def _detect_ncu() -> dict:
     metrics_query_available = rc2 == 0
     return {
         "available": True,
+        "requested": requested,
         "path": path,
         "version": version,
         "metrics_query_available": metrics_query_available,
@@ -166,20 +175,26 @@ def _detect_python_libs() -> dict:
     return libs
 
 
-def collect_env() -> dict:
+def collect_env(
+    *,
+    gpu: int = 0,
+    requested_arch: str = "",
+    nvcc_bin: str = "nvcc",
+    ncu_bin: str = "ncu",
+) -> dict:
     gpus = _detect_gpus()
-    primary_arch = None
-    for g in gpus:
-        if "sm_arch" in g:
-            primary_arch = g["sm_arch"]
-            break
+    selected_gpu = next((g for g in gpus if g.get("index") == gpu), None)
+    primary_arch = selected_gpu.get("sm_arch") if selected_gpu else None
     return {
         "platform": sys.platform,
         "python": sys.version.split()[0],
         "gpus": gpus,
+        "selected_gpu_index": gpu,
+        "selected_gpu": selected_gpu,
+        "requested_arch": requested_arch or None,
         "primary_sm_arch": primary_arch,
-        "nvcc": _detect_nvcc(),
-        "ncu": _detect_ncu(),
+        "nvcc": _detect_nvcc(nvcc_bin),
+        "ncu": _detect_ncu(ncu_bin),
         "driver": _detect_driver(),
         "cutlass": _detect_cutlass(),
         "libs": _detect_python_libs(),
@@ -189,16 +204,25 @@ def collect_env() -> dict:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=str, default="./env.json", help="Output JSON path")
+    p.add_argument("--gpu", type=int, default=0, help="GPU index selected for the run")
+    p.add_argument("--arch", type=str, default="", help="Requested compiler architecture")
+    p.add_argument("--nvcc-bin", type=str, default="nvcc")
+    p.add_argument("--ncu-bin", type=str, default="ncu")
     args = p.parse_args()
 
-    env = collect_env()
+    env = collect_env(
+        gpu=args.gpu,
+        requested_arch=args.arch,
+        nvcc_bin=args.nvcc_bin,
+        ncu_bin=args.ncu_bin,
+    )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(env, f, indent=2, ensure_ascii=False)
 
     # Also print a compact summary to stdout for the agent and user to inspect.
     print(json.dumps({
-        "gpu": env["gpus"][0].get("name") if env["gpus"] else None,
+        "gpu": (env.get("selected_gpu") or {}).get("name"),
         "sm_arch": env["primary_sm_arch"],
         "nvcc": env["nvcc"].get("version"),
         "ncu": env["ncu"].get("available"),

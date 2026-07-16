@@ -69,8 +69,13 @@ def validate(
     methods_list = methods_data["methods"]
 
     # Detect sm_arch
-    gpus = state.get("env", {}).get("gpus", [{}])
-    detected_arch = _normalize_sm_arch(gpus[0].get("sm_arch") if gpus else None)
+    env = state.get("env") or {}
+    gpus = env.get("gpus") or []
+    selected = env.get("selected_gpu") or {}
+    requested = (state.get("benchmark_options") or {}).get("arch")
+    detected_arch = _normalize_sm_arch(
+        requested or selected.get("sm_arch") or (gpus[0].get("sm_arch") if gpus else None)
+    )
 
     # Load roofline budget if available
     iter_num = methods_data.get("iter", 1)
@@ -159,10 +164,15 @@ def validate(
         # ineffective check
         if not allow_ineffective:
             ineff_ids = {item.get("id") for item in state.get("ineffective_methods", [])}
-            if mid in ineff_ids:
+            prior_blocked = set(
+                ((state.get("strategy_memory") or {}).get("constraints") or {}).get(
+                    "blocked_method_ids", []
+                )
+            )
+            if mid in ineff_ids or mid in prior_blocked:
                 errors.append(
-                    f"{prefix}: '{mid}' in ineffective_methods (use --allow-ineffective "
-                    "if bottleneck profile fundamentally changed)"
+                    f"{prefix}: '{mid}' is blocked by current-run or cross-run evidence "
+                    "(use --allow-ineffective if bottleneck profile fundamentally changed)"
                 )
 
         # implementation_failed check

@@ -26,6 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common_options import benchmark_option_argv
+
 
 _BUNDLED_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py")
 
@@ -41,20 +43,10 @@ def _write_json(path: str, obj) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def _dims_argv(dims: dict) -> list[str]:
-    return [f"--{k}={v}" for k, v in dims.items()]
-
-
-def _ptr_size_argv(ptr_size: int) -> list[str]:
-    return ["--ptr-size", str(ptr_size)] if ptr_size and ptr_size > 0 else []
-
-
 def _bench_kernel(
     benchmark_py: str,
     kernel_path: str,
-    ref_path: str,
-    dims: dict,
-    ptr_size: int,
+    state: dict,
     json_out: str,
     warmup: int = 10,
     repeat: int = 20,
@@ -62,11 +54,10 @@ def _bench_kernel(
     """Run benchmark.py on a kernel. Returns parsed result or error dict."""
     cmd = [
         sys.executable, benchmark_py, kernel_path,
-        "--ref", ref_path,
         "--warmup", str(warmup),
         "--repeat", str(repeat),
         "--json-out", json_out,
-    ] + _ptr_size_argv(ptr_size) + _dims_argv(dims)
+    ] + benchmark_option_argv(state)
 
     Path(json_out).parent.mkdir(parents=True, exist_ok=True)
     stderr_out = json_out.replace(".json", ".stderr.txt")
@@ -103,9 +94,6 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
     iter_dir = os.path.join(run_dir, f"iterv{iteration}")
     bench_py = benchmark_py or _BUNDLED_BENCHMARK
     branches_dir = os.path.join(iter_dir, "branches")
-    ref_file = state["ref_file"]
-    dims = state.get("dims", {})
-    ptr_size = state.get("ptr_size", 0)
     num_branches = state.get("branches", 4)
 
     # Discover branches
@@ -149,7 +137,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
               file=sys.stderr)
 
         bench_result = _bench_kernel(
-            bench_py, kernel, ref_file, dims, ptr_size, json_out, warmup, repeat,
+            bench_py, kernel, state, json_out, warmup, repeat,
         )
 
         passed = bool(bench_result.get("correctness", {}).get("passed", False))

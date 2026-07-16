@@ -5,3 +5,5 @@ example
 env.json
 tree.py
 .worktrees/
+__pycache__/
+*.pyc

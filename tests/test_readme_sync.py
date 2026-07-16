@@ -12,11 +12,20 @@ class ReadmeSyncTests(unittest.TestCase):
         self.english = README_EN.read_text(encoding="utf-8")
         self.chinese = README_ZH.read_text(encoding="utf-8")
 
-    def test_readmes_identify_the_v2_1_release_and_five_mechanisms(self) -> None:
+    def test_readmes_identify_the_v2_2_release_and_preserve_v2_1_mechanisms(self) -> None:
+        self.assertIn("V2.2", self.english)
         self.assertIn("V2.1", self.english)
         self.assertIn("five mechanisms", self.english.lower())
+        self.assertIn("V2.2", self.chinese)
         self.assertIn("V2.1", self.chinese)
         self.assertIn("五个机制", self.chinese)
+
+    def test_readmes_cover_migrated_entry_points_and_evidence_tiers(self) -> None:
+        for text in (self.english, self.chinese):
+            self.assertIn("analyze_ncu_rep.py", text)
+            self.assertIn("run_manifest.json", text)
+            self.assertIn("strategy_memory.py", text)
+            self.assertIn("unverified_methods", text)
 
     def test_readmes_include_reproducible_fork_installation(self) -> None:
         for text in (self.english, self.chinese):

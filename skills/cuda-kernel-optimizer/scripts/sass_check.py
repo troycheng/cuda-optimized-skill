@@ -59,7 +59,8 @@ def check_method_sass(
     """Check if a method's expected SASS patterns appear in the disassembly."""
     result = {
         "method_id": method_id,
-        "verified": False,
+        "verified": None,
+        "verification_status": "unknown",
         "patterns_checked": [],
         "patterns_found": [],
         "patterns_missing": [],
@@ -70,8 +71,8 @@ def check_method_sass(
     require_any = method_sigs.get("require_any", True)  # True = at least one pattern found
 
     if not patterns:
-        # No patterns defined for this method — skip (vacuously true)
-        result["verified"] = True
+        # Runtime or structural methods may not have a meaningful SASS signature.
+        result["verification_status"] = "not_applicable"
         result["note"] = "no_patterns_defined"
         return result
 
@@ -88,6 +89,8 @@ def check_method_sass(
     else:
         # require_all
         result["verified"] = len(result["patterns_missing"]) == 0
+
+    result["verification_status"] = "verified" if result["verified"] else "failed"
 
     return result
 
@@ -120,7 +123,9 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
             break
 
     if not kernel_path:
-        return {"error": "no_kernel_found", "checks": []}
+        result = {"status": "unknown", "error": "no_kernel_found", "checks": []}
+        _write_result(iter_dir, result)
+        return result
 
     # For Triton kernels, SASS check is not directly applicable
     if kernel_path.endswith(".py"):
@@ -128,17 +133,36 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
         for m in methods_list:
             checks.append({
                 "method_id": m.get("id", "unknown"),
-                "verified": True,
+                "verified": None,
+                "verification_status": "not_applicable",
                 "note": "triton_kernel_sass_not_applicable",
             })
-        result = {"kernel": kernel_path, "backend": "triton", "checks": checks}
+        result = {
+            "status": "not_applicable",
+            "kernel": kernel_path,
+            "backend": "triton",
+            "checks": checks,
+        }
         _write_result(iter_dir, result)
         return result
 
     # CUDA/CUTLASS: find .so and dump SASS
     so_path = _find_so_file(kernel_path)
     if not so_path:
-        return {"error": "so_not_found", "kernel": kernel_path, "checks": []}
+        checks = [{
+            "method_id": m.get("id", "unknown"),
+            "verified": None,
+            "verification_status": "unknown",
+            "note": "compiled_shared_object_not_found",
+        } for m in methods_list]
+        result = {
+            "status": "unknown",
+            "error": "so_not_found",
+            "kernel": kernel_path,
+            "checks": checks,
+        }
+        _write_result(iter_dir, result)
+        return result
 
     sass_text = _dump_sass(so_path)
 
@@ -147,10 +171,17 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
         for m in methods_list:
             checks.append({
                 "method_id": m.get("id", "unknown"),
-                "verified": True,
+                "verified": None,
+                "verification_status": "unknown",
                 "note": f"cuobjdump_unavailable: {sass_text}",
             })
-        result = {"kernel": kernel_path, "backend": "cuda", "sass_error": sass_text, "checks": checks}
+        result = {
+            "status": "unknown",
+            "kernel": kernel_path,
+            "backend": "cuda",
+            "sass_error": sass_text,
+            "checks": checks,
+        }
         _write_result(iter_dir, result)
         return result
 
@@ -161,7 +192,15 @@ def run(state_path: str, iteration: int, signatures_path: str = None) -> dict:
         check = check_method_sass(mid, sass_text, signatures)
         checks.append(check)
 
+    statuses = {check.get("verification_status") for check in checks}
+    overall = (
+        "failed" if "failed" in statuses
+        else "unknown" if "unknown" in statuses
+        else "verified" if "verified" in statuses
+        else "not_applicable"
+    )
     result = {
+        "status": overall,
         "kernel": kernel_path,
         "so": so_path,
         "backend": "cuda",

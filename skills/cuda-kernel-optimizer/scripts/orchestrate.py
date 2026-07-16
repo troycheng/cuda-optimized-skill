@@ -14,8 +14,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -36,11 +38,34 @@ def _read(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def cmd_setup(args):
-    env_json = os.path.abspath(args.env_out or "./env.json")
+    staging_dir = tempfile.mkdtemp(prefix="cuda-kernel-optimizer-preflight-")
+    env_json = os.path.abspath(args.env_out) if args.env_out else os.path.join(staging_dir, "env.json")
+    preflight_json = os.path.join(staging_dir, "preflight.json")
+
+    benchmark_options = {
+        "backend": args.backend,
+        "arch": args.arch,
+        "gpu": args.gpu,
+        "atol": args.atol,
+        "rtol": args.rtol,
+        "seed": args.seed,
+        "validation_seeds": args.validation_seeds,
+        "nvcc_bin": args.nvcc_bin,
+    }
+    ncu_options = {
+        "ncu_bin": args.ncu_bin,
+        "launch_count": args.launch_count,
+    }
 
     # 0. env
-    rc = _run([sys.executable, str(SCRIPT_DIR / "check_env.py"),
-               "--out", env_json]).returncode
+    rc = _run([
+        sys.executable, str(SCRIPT_DIR / "check_env.py"),
+        "--out", env_json,
+        "--gpu", str(args.gpu),
+        "--arch", args.arch,
+        "--nvcc-bin", args.nvcc_bin,
+        "--ncu-bin", args.ncu_bin,
+    ]).returncode
     if rc != 0:
         sys.exit(f"check_env failed rc={rc}")
 
@@ -50,6 +75,7 @@ def cmd_setup(args):
         "--baseline", os.path.abspath(args.baseline),
         "--ref", os.path.abspath(args.ref),
         "--dims", args.dims,
+        "--out", preflight_json,
     ]).returncode
     if rc != 0:
         sys.exit("preflight failed — fix baseline/ref/dims above, then retry")
@@ -64,6 +90,10 @@ def cmd_setup(args):
         "--branches", str(args.branches),
         "--dims", args.dims,
         "--env", env_json,
+        "--preflight", preflight_json,
+        "--benchmark-options", json.dumps(benchmark_options, sort_keys=True),
+        "--ncu-options", json.dumps(ncu_options, sort_keys=True),
+        "--strategy-memory", os.path.expanduser(args.strategy_memory),
         "--noise-threshold-pct", str(args.noise_threshold_pct),
         "--ptr-size", str(args.ptr_size),
     ], capture_output=True)
@@ -88,6 +118,8 @@ def cmd_setup(args):
     state_path = init_info.get("state")
     if not run_dir or not state_path:
         sys.exit(f"could not parse state init output:\n{init.stdout}")
+
+    shutil.rmtree(staging_dir, ignore_errors=True)
 
     # 2. seed baseline
     rc = _run([
@@ -129,7 +161,10 @@ def cmd_setup(args):
     print(json.dumps({
         "run_dir": run_dir,
         "state": state_path,
-        "env": env_json,
+        "env": os.path.join(run_dir, "env.json"),
+        "preflight": os.path.join(run_dir, "preflight.json"),
+        "preflight_markdown": os.path.join(run_dir, "preflight.md"),
+        "manifest": os.path.join(run_dir, "run_manifest.json"),
         "early_stop": early_stop,
         "next_step": (
             "The agent should now read iterv1/roofline.json (for axis budgets), "
@@ -261,14 +296,14 @@ def cmd_close_iter(args):
         }, indent=2))
         sys.exit(2)
 
-    # Step 3g: Profile champion with ncu (MANDATORY full report)
+    # Step 3g: attempt a full champion profile. A missing profile leaves the
+    # candidate benchmark-only; it cannot become the fully-profiled winner.
     rc = _run([
         sys.executable, str(SCRIPT_DIR / "profile_ncu.py"),
         "--state", state_path,
         "--iter", str(args.iter),
         "--which", "kernel",
         "--benchmark", os.path.abspath(args.benchmark),
-        "--promote-if-best",
     ]).returncode
     if rc != 0:
         print("[warn] ncu profiling of champion failed", file=sys.stderr)
@@ -306,6 +341,9 @@ def cmd_close_iter(args):
         update_cmd.extend(["--attribution", attribution_path])
     if os.path.isfile(sass_check_path):
         update_cmd.extend(["--sass-check", sass_check_path])
+    ncu_status_path = os.path.join(iter_dir, "kernel_profile_status.json")
+    if os.path.isfile(ncu_status_path):
+        update_cmd.extend(["--ncu-status", ncu_status_path])
 
     rc = _run(update_cmd).returncode
     if rc != 0:
@@ -379,6 +417,20 @@ def main():
     ps.add_argument("--baseline", required=True)
     ps.add_argument("--ref", required=True)
     ps.add_argument("--benchmark", default=_default_bench)
+    ps.add_argument("--backend", choices=["auto", "cuda", "cutlass", "triton"], default="auto")
+    ps.add_argument("--arch", default="")
+    ps.add_argument("--gpu", type=int, default=0)
+    ps.add_argument("--atol", type=float, default=1e-4)
+    ps.add_argument("--rtol", type=float, default=1e-3)
+    ps.add_argument("--seed", type=int, default=42)
+    ps.add_argument("--validation-seeds", default="")
+    ps.add_argument("--nvcc-bin", default="nvcc")
+    ps.add_argument("--ncu-bin", default="ncu")
+    ps.add_argument("--launch-count", type=int, choices=[1], default=1)
+    ps.add_argument(
+        "--strategy-memory",
+        default=os.path.expanduser("~/.codex/state/cuda-kernel-optimizer/global_strategy_memory.json"),
+    )
     ps.add_argument("--iterations", type=int, default=3)
     ps.add_argument("--ncu-num", type=int, default=5)
     ps.add_argument("--branches", type=int, default=4)

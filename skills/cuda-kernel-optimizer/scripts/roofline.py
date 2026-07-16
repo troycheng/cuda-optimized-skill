@@ -25,7 +25,7 @@ from pathlib import Path
 def _get_gpu_spec(env: dict) -> dict:
     """Read caller-provided peak FLOPS and bandwidth without guessing."""
     gpus = env.get("gpus") or [{}]
-    gpu = gpus[0]
+    gpu = env.get("selected_gpu") or gpus[0]
     return {
         "peak_flops_tflops": _positive_float(gpu.get("peak_flops_tflops")),
         "peak_bw_gbs": _positive_float(gpu.get("peak_bw_gbs")),

@@ -1,8 +1,8 @@
-# cuda-kernel-optimizer v2.1
+# cuda-kernel-optimizer v2.2
 
 [English](README.md) | **简体中文**
 
-一个兼容 Codex 的 skill，用于围绕 Python reference 对 CUDA / CUTLASS / Triton kernel 进行迭代优化。它组合正确性检查、稳健的耗时分布、可选的 `nsight-compute`（`ncu`）profiling、分支选择、消融与 SASS 验证。
+一个兼容 Codex 的 skill，用于压测、分析和迭代优化 CUDA / CUTLASS / Triton kernel。它组合正确性检查、耗时分布、可选的 `nsight-compute`（`ncu`）profiling、现有 `.ncu-rep` 直接分析、分支选择、消融、生成代码验证和按工作负载隔离的策略记忆。
 
 这是一个 **skill package**，不是独立工具。Agent 会读取 `SKILL.md` 并驱动整个循环。`scripts/` 下的脚本负责确定性的部分（环境检测、profiling、benchmarking、state 管理）。
 
@@ -31,10 +31,18 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/insta
 安装器不会覆盖已有 skill。升级时应先备份或移走旧的
 `cuda-kernel-optimizer`，安装后重新启动 Codex 会话以加载新版。
 
-## V2.1 新增内容
+## V2.2 新增内容
 
-V2.1 把循环从“试错–记录”升级为“试错–归因–验证–学习”。在 V1
-基础上新增了五个机制，下文所有描述均反映 V2.1 行为：
+V2.2 保留 V2.1 的五个机制，并补齐旧 benchmark、NCU 分析和优化循环
+三个 skill 中仍有价值的能力：
+
+- **独立入口**：`benchmark.py` 可带或不带 reference 运行；`analyze_ncu_rep.py` 可直接分析现有 `.ncu-rep`，无需创建循环状态。
+- **可复现编排**：backend、架构、GPU、容差、seed 与工具路径贯穿 benchmark、分支、消融和 profiler。每次运行固化 `preflight.json`、`preflight.md`、环境快照、文件哈希和 `run_manifest.json`。
+- **分层赢家**：最快且正确的 benchmark 版本与拥有当前完整 NCU 报告的最快版本分别记录。部署晋级仍需干净的端到端配对测试。
+- **跨轮学习**：按工作负载隔离的策略记忆优先复用已验证方法，并阻止无效或被拒绝的方法，除非新瓶颈证据支持重试。
+- **三态证据**：缺失的 SASS 或消融证据记为 `unknown` 或 `not_applicable`，不会被隐式当作成功或失败。
+
+V2.1 引入了以下五个机制：
 
 - **Roofline 驱动的轴预算分配** — 取代 V1 固定的“每个 axis 选 1 个方法”，V2.1 每轮先计算 compute / memory / latency 三个间隙（Δc、Δm、Δl），然后按比例把总预算 3 个方法名额切给三个 axis（单轴上限 2）。只有三个 Δ 都有证据且全部小于 0.15 时，才输出 `near_peak: true` 并提前终止。
 - **Branch-and-Select 分支探索** — 每次迭代基于同一组方法生成 K 个分支候选（默认 K=4），它们共享方法但在 tile size / pipeline stages / warp 数 / 实现变体上各不相同。最快且正确的分支被选为 champion，其余归入 `frontier` 归档。
@@ -42,7 +50,7 @@ V2.1 把循环从“试错–记录”升级为“试错–归因–验证–学
 - **SASS 指令级验证** — 对 champion 调用 `cuobjdump --dump-sass`，并按签名表（`sass_signatures.json`）去 grep，确认每个声称的优化方法是否真的出现在编译后的机器码中。
 - **噪声感知测量** — benchmark JSON 保留独立样本、median、nearest-rank p95、总体标准差和按 median 归一化的 CV。分支按 median 排名，并明确标注差异是否落在配置的噪声带内。
 
-这四项共同把方法分类从“effective / ineffective”两个桶升级为三个桶：`effective_methods`（SASS ✓ 且归因超过噪声阈值）、`ineffective_methods`（SASS ✓ 但归因未超过阈值）、`implementation_failed_methods`（SASS ✗）。
+V2.2 最终使用四类方法状态：`effective_methods`、`ineffective_methods`、`implementation_failed_methods` 和 `unverified_methods`。
 
 ## RTX 5090 验证
 
@@ -103,9 +111,11 @@ capability，也没有修改驱动策略。可选运行命令见
 ```text
 run_YYYYMMDD_HHMMSS/
 ├── state.json                   # 全局状态，可跨会话重新读取
-│                                #   V2.1 新增：branches、implementation_failed_methods、
-│                                #           roofline_history、frontier
+│                                # benchmark 赢家与完整 profile 赢家分开记录
 ├── env.json                     # GPU / nvcc / ncu / CUTLASS 环境快照
+├── preflight.json               # 机器可读的契约检查
+├── preflight.md                 # 便于审阅的检查摘要
+├── run_manifest.json            # 哈希、参数和分层赢家
 ├── baseline/
 │   ├── <baseline>               # 原样复制的 baseline
 │   └── bench.json               # 初始时延与正确性结果
@@ -168,6 +178,13 @@ python scripts/orchestrate.py finalize --run-dir run_20260418_143022
 
 每个脚本都可以单独调用（对任意脚本执行 `--help` 即可）；`orchestrate.py` 只是一个便捷封装。
 
+独立模式不需要循环状态：
+
+```bash
+python scripts/benchmark.py ./kernel.cu --backend cuda --ref ./ref.py --N=1048576
+python scripts/analyze_ncu_rep.py ./kernel.ncu-rep --source ./kernel.cu
+```
+
 ## Skill 结构
 
 ```text
@@ -178,9 +195,12 @@ cuda-optimized-skill/
     ├── SKILL.md                     # skill 入口
     ├── scripts/
     │   ├── benchmark.py             # 内置 benchmark driver
+    │   ├── analyze_ncu_rep.py       # 分析现有 NCU 报告
+    │   ├── common_options.py        # 统一参数透传
     │   ├── check_env.py             # GPU/工具链环境检测
     │   ├── preflight.py             # baseline 与 reference 契约校验
     │   ├── state.py                 # state.json 写入者
+    │   ├── strategy_memory.py       # 按工作负载隔离的跨轮证据
     │   ├── validate_methods.py      # 优先级合规校验
     │   ├── run_iteration.py         # benchmark 执行与采集
     │   ├── profile_ncu.py           # 目标范围 ncu profiling
@@ -192,6 +212,8 @@ cuda-optimized-skill/
     │   └── orchestrate.py           # setup/close-iter/finalize CLI
     ├── references/
     │   ├── compatibility.md         # 版本与精确架构路由
+    │   ├── serving_evidence_protocol.md # 干净的端到端配对测试规则
+    │   ├── systems_and_ir_coverage.md # 主机路径、CUTLASS 与 Triton IR 指南
     │   ├── ncu_metrics_guide.md     # 瓶颈到优化方法映射
     │   ├── optimization_catalog.md  # 按优先级排序的优化目录
     │   ├── method_registry.json     # 机器可读方法注册表
@@ -218,7 +240,7 @@ cuda-optimized-skill/
    - counter 可用时用 `ncu` profile champion；否则保留完整命令、返回码和失败日志
    - 运行 `sass_check.py` → `iterv1/sass_check.json`
    - 运行 `ablate.py` → `iterv1/attribution.json`
-   - 更新 state：每个方法按 `SASS ✓/✗ × 归因值是否超过噪声` 进入 `effective_methods` / `ineffective_methods` / `implementation_failed_methods` 之一
+   - 更新 state：按可用消融和生成代码证据，把方法放入 `effective_methods`、`ineffective_methods`、`implementation_failed_methods` 或 `unverified_methods`
 9. 如果正确性失败（所有 K 个分支都失败）：检查 `bench.json.correctness` 与 `bench.stderr.txt`，重写 kernel，并重试（最多 3 次）
 10. 如果成功：若更快则推进 `best_file`；本轮 roofline 结果追加进 `roofline_history`
 11. 回到第 3 步，进入下一轮迭代
@@ -229,7 +251,7 @@ cuda-optimized-skill/
 ## 限制与真实注意事项
 
 - **上限**：如果你的 reference 已经是 cuBLAS / cuDNN / cuBLASLt，那么要获得显著提升通常需要算法级改动（如 split-K、stream-K、fused epilogues、mixed precision），3 轮预算内不一定能完成。baseline 是手写实现时，通常更容易得到大幅加速。
-- **噪声**：当 kernel 运行时间低于约 `50 μs` 时，launch overhead 会占主导。skill 默认的 2% 噪声阈值有所帮助，但如果 dims 很小，建议提高 `--repeat` 或直接增大维度。消融归因也使用同一阈值 —— 低于噪声的贡献会被归为 `ineffective_methods`。
+- **噪声**：低于约 `50 μs` 的 kernel 对 launch overhead 很敏感。默认 2% 阈值有所帮助，但小尺寸仍可能需要更多重复。低于噪声的有效消融记为 `ineffective`；缺失或无效消融记为 `unverified`。
 - **Triton + `@triton.autotune`**：在 `ncu` 下做 autotuning 会很慢，甚至超时。建议在 profiling 前先固定为单一 config，或者设置 `--launch-count 1` 并提高 warmup。
 - **ncu CSV 列名**：较旧版本的 `ncu`（< 2022.1）会输出 `"Metric Value"`，其大小写和单位格式可能不同；`profile_ncu.py` 做了兼容处理，但如果你看到全 0，先检查迭代目录下的 `.ncu.log` 文件。
 - **分支成本**：当 K=4 且开启消融时，每轮迭代最多要编译 K + (方法数) 个 kernel。在干净环境下首次构建会比较慢；如果更看重墙钟时间，可适当降低 `--branches`。

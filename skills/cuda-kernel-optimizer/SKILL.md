@@ -1,9 +1,9 @@
 ---
 name: cuda-kernel-optimizer
-description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, or Triton kernel against a reference implementation, especially for requests involving Nsight Compute, kernel benchmarking, roofline analysis, branch exploration, ablation, or SASS verification."
+description: "Use when benchmarking, optimizing, tuning, or profiling a CUDA, CUTLASS, or Triton kernel, directly analyzing an existing .ncu-rep report, running an iterative operator optimization loop, or validating kernels integrated through TensorRT or Triton Inference Server. Covers correctness benchmarks, Nsight Compute, Roofline evidence, branch exploration, ablation, SASS or generated-code verification, cross-run strategy memory, and serving-level validation."
 ---
 
-# CUDA Kernel Iterative Optimizer (v2.1)
+# CUDA Kernel Iterative Optimizer (v2.2)
 
 ## What this skill does
 
@@ -27,12 +27,18 @@ the skill runs an **evidence-guided, branch-and-select iterative optimization lo
    distributions, source inspection, and SASS evidence without inventing
    profiler conclusions.
 
+When the kernel is exercised through TensorRT, Triton Inference Server, or
+another serving runtime, also read `references/serving_evidence_protocol.md`.
+The bundled scripts automate the operator layer; an end-to-end claim additionally
+requires matched runtime and endpoint measurements from the deployment under
+test.
+
 ## Inputs the skill expects from the user
 
 Before starting, confirm you have:
 
 1. **Baseline operator file**, e.g. `./gemm.cu` or `./gemm_triton.py`
-2. **Reference file**, e.g. `./ref.py` (required — correctness validation depends on it)
+2. **Reference file**, e.g. `./ref.py` (required for the optimization loop and correctness claims; optional for timing-only standalone benchmarks)
 3. **Dimensions** — kernel-signature scalars like `--M=4096 --N=4096 --K=4096`
 4. **Iteration count `N`** (default 3)
 5. **`ncu_num`** — how many top metrics to extract per axis (default 5)
@@ -41,6 +47,34 @@ Before starting, confirm you have:
 > `benchmark.py` is bundled at `scripts/benchmark.py`; all scripts default to it automatically.
 
 If any of these are missing, ask the user once — briefly — then proceed.
+
+## Standalone entry points
+
+Use the smallest applicable mode instead of forcing every request through the
+iteration loop.
+
+Benchmark a CUDA, CUTLASS, or Triton implementation directly:
+
+```bash
+python <skill>/scripts/benchmark.py ./solution.cu \
+  --backend cuda --ref ./ref.py --M=4096 --N=4096 --K=4096 \
+  --gpu 0 --arch sm_120 --warmup 10 --repeat 20 \
+  --json-out ./benchmark.json
+```
+
+Without `--ref`, report timing only and explicitly say correctness is unverified.
+
+Analyze an existing report without starting an optimization run:
+
+```bash
+python <skill>/scripts/analyze_ncu_rep.py ./kernel.ncu-rep \
+  --source ./kernel.cu --out-dir ./kernel_ncu_analysis
+```
+
+This preserves summary, details, raw CSV, `analysis.json`, and `analysis.md`.
+Mark a report stale when the associated source, binary, shape, or environment no
+longer matches. The classification is heuristic unless the required measured
+Roofline inputs are available.
 
 ## The loop at a glance
 
@@ -62,7 +96,7 @@ If any of these are missing, ask the user once — briefly — then proceed.
         failed command, return code, and log
      i. ablate.py: single-method rollback bench    → attribution.json
      j. sass_check.py: verify SASS signatures      → sass_check.json
-     k. update state with attribution + SASS results
+     k. update state with attribution + SASS + profile-status results
 4. emit summary.md
 ```
 
@@ -114,8 +148,12 @@ Creates `./run_YYYYMMDD_HHMMSS/` next to the baseline file and writes `state.jso
   "ref_file": "...",
   "best_file": "<baseline>",
   "best_metric_ms": null,
-  "best_ncu_rep": null,
+  "best_profiled_file": null,
+  "best_profiled_metric_ms": null,
+  "best_profiled_ncu_rep": null,
   "env": {...},
+  "benchmark_options": {...},
+  "ncu_options": {...},
   "iterations_total": 3,
   "ncu_num": 5,
   "branches": 4,
@@ -123,6 +161,8 @@ Creates `./run_YYYYMMDD_HHMMSS/` next to the baseline file and writes `state.jso
   "effective_methods": [],
   "ineffective_methods": [],
   "implementation_failed_methods": [],
+  "unverified_methods": [],
+  "strategy_memory": {...},
   "dims": {...},
   "history": [],
   "roofline_history": [],
@@ -196,6 +236,7 @@ Writes `iterv{i}/roofline.json`:
 5. `state.json` — `best_file`, `selected_methods`, `effective_methods`, `ineffective_methods`
 6. The current `best_file` source code
 7. `references/ncu_metrics_guide.md` — metric → root cause mapping
+8. Workload-scoped constraints under `state.strategy_memory.constraints`
 
 **Selection rule — BUDGET-AWARE PRIORITY SCAN**:
 
@@ -213,8 +254,9 @@ Select the **first method that passes all four checks**. Continue scanning until
 1. If `memory.multi_stage_pipeline` (P5) and `latency.async_pipeline` (P3) are both selected, they count as one — replace one with next applicable method on that axis.
 2. Methods in `ineffective_methods` are **blocked** unless ncu bottleneck has fundamentally changed.
 3. Methods in `implementation_failed_methods` require explicit acknowledgment of the prior failure.
-4. All methods must be **arch-compatible** and **mutually orthogonal** (see catalog's Combining Rules).
-5. **Per-axis cap is 2** — no axis can receive more than 2 methods.
+4. Methods blocked by cross-run strategy memory require the same explicit evidence override.
+5. All methods must be **arch-compatible** and **mutually orthogonal** (see catalog's Combining Rules).
+6. **Per-axis cap is 2** — no axis can receive more than 2 methods.
 
 Save to `iterv{i}/analysis.md` using the template in `templates/iteration_report.md`.
 
@@ -268,7 +310,9 @@ For each method, generates an ablated kernel (champion minus that one method), b
 ```
 attribution(m) = ms_without_m - ms_champion
 ```
-Positive attribution = the method contributed positively. Near-zero or negative = the method was not helpful.
+Positive attribution above the recorded noise threshold = the method contributed
+positively. Near-zero or negative = the method was not helpful. A missing,
+invalid, or untimed ablation is `unknown`, not neutral or positive evidence.
 
 Writes `iterv{i}/attribution.json`.
 
@@ -292,16 +336,20 @@ python <skill>/scripts/state.py update \
   --bench iterv{i}/bench.json \
   --methods-json iterv{i}/methods.json \
   --attribution iterv{i}/attribution.json \
-  --sass-check iterv{i}/sass_check.json
+  --sass-check iterv{i}/sass_check.json \
+  --ncu-status iterv{i}/kernel_profile_status.json
 ```
 
 Rules:
 - `selected_methods += all methods` (always)
-- Method enters `effective_methods` **only if**: attribution > noise_threshold **AND** SASS verified
+- Method enters `effective_methods` **only if** attribution contributed and its applicable generated-code verification succeeded
 - Method enters `implementation_failed_methods` if: SASS check says signature missing
-- Method enters `ineffective_methods` if: attribution ≤ noise_threshold but SASS was fine
+- Method enters `ineffective_methods` if: ablation says it did not contribute
+- Missing/not-applicable attribution or SASS evidence enters `unverified_methods`; it is never silently treated as success
 - If `new_ms < best_ms` by more than noise_threshold → `best_file` updated
+- A candidate updates `best_profiled_file` only when its full NCU status is successful
 - Append record to `state.history` and `state.roofline_history`
+- Persist method/bundle outcomes to workload-scoped strategy memory for future runs
 
 ---
 
@@ -321,6 +369,8 @@ python <skill>/scripts/summarize.py \
 - **`references/optimization_catalog.md`** — Catalog of optimization methods by axis, with algorithmic methods section.
 - **`references/ncu_metrics_guide.md`** — How to read ncu output and map bottleneck signatures.
 - **`references/sass_signatures.json`** — Expected SASS instruction patterns per method.
+- **`references/serving_evidence_protocol.md`** — Evidence ladder for TensorRT/Triton integration, shared-host contamination control, matched A/B tests, and promotion decisions.
+- **`references/systems_and_ir_coverage.md`** — Host-device transfer, CUTLASS routing, Triton autotune/IR inspection, sparse/fused paths, and evidence-tier rules.
 
 ---
 
@@ -332,9 +382,13 @@ python <skill>/scripts/summarize.py \
 - **Triton + `@triton.autotune`** → hard-code config before profiling.
 - **Champion chosen but all methods have near-zero attribution** → the speedup came from hyperparameter change, not methods. Record in analysis.md.
 - **SASS signature missing but kernel is faster** → nvcc took a different path. Mark method as `implementation_failed` but keep the kernel if it's faster.
+- **SASS is unavailable or not applicable** → record `unknown` or `not_applicable`; never convert absence of evidence into `verified`.
 - **Branch explore: all K branches fail validation** → the agent must rewrite with a different approach.
 - **Early stop triggered** → all three evidenced Δ values are below 0.15; report
   the measured basis. Missing profiler metrics cannot trigger this conclusion.
+- **Standalone kernel is faster but serving is unverified** → report a
+  kernel-layer win only; do not promote it to an end-to-end claim. Follow
+  `references/serving_evidence_protocol.md` before deployment selection.
 
 ---
 
@@ -343,6 +397,9 @@ python <skill>/scripts/summarize.py \
 ```
 <baseline-dir>/run_YYYYMMDD_HHMMSS/
 ├── env.json
+├── preflight.json
+├── preflight.md
+├── run_manifest.json
 ├── state.json
 ├── baseline/
 │   ├── <baseline>           (copied)

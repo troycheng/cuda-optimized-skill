@@ -1,8 +1,8 @@
-# cuda-kernel-optimizer v2.1
+# cuda-kernel-optimizer v2.2
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Codex-compatible skill that iteratively optimizes a CUDA / CUTLASS / Triton kernel against a Python reference. It combines correctness checks, robust timing distributions, optional `nsight-compute` (`ncu`) profiling, branch selection, ablation, and SASS verification.
+A Codex-compatible skill for benchmarking, profiling, and iteratively optimizing CUDA / CUTLASS / Triton kernels. It combines correctness checks, timing distributions, optional `nsight-compute` (`ncu`) profiling, direct analysis of existing `.ncu-rep` files, branch selection, ablation, generated-code verification, and workload-scoped strategy memory.
 
 This is a **skill package**, not a standalone tool. An agent reads `SKILL.md` and drives the loop. The scripts under `scripts/` handle the deterministic parts (environment detection, profiling, benchmarking, and state).
 
@@ -32,11 +32,18 @@ The installer refuses to overwrite an existing skill. Back up or remove an
 older `cuda-kernel-optimizer` installation before using this command for an
 upgrade, then restart the Codex session so the new skill is discovered.
 
-## What's new in V2.1
+## What's new in V2.2
 
-V2.1 upgrades the loop from "try-and-log" into "try–attribute–verify–learn".
-Five mechanisms are added on top of V1; everything below reflects V2.1
-behavior:
+V2.2 retains V2.1's five mechanisms and closes the remaining gaps with the
+former benchmark, NCU-analysis, and optimization-loop skills:
+
+- **Standalone entry points** — run `benchmark.py` with or without a reference, or analyze an existing `.ncu-rep` with `analyze_ncu_rep.py` without creating a loop state.
+- **Reproducible orchestration** — backend, architecture, GPU, tolerances, seeds, and tool paths flow through benchmark, branch, ablation, and profiler commands. Each run records `preflight.json`, `preflight.md`, environment snapshots, file hashes, and `run_manifest.json`.
+- **Evidence-tiered winners** — the fastest validated benchmark and the fastest candidate with a successful current full NCU report remain separate. Serving promotion still requires a clean matched endpoint test.
+- **Cross-run learning** — workload-scoped strategy memory prioritizes verified methods and blocks previously negative or rejected methods unless new bottleneck evidence justifies a retry.
+- **Three-state evidence** — missing SASS or ablation evidence is `unknown` or `not_applicable`; it never becomes an implicit success or failure.
+
+V2.1 introduced these five mechanisms:
 
 - **Roofline-driven axis budget** — instead of V1's fixed 1-method-per-axis, V2.1 computes per-iteration compute/memory/latency gaps (Δc, Δm, Δl) and splits the 3-method budget proportionally (per-axis cap = 2). When all three evidenced gaps fall below 0.15 the loop early-stops with `near_peak: true`.
 - **Branch-and-Select exploration** — each iteration generates K branch candidates (default K=4) sharing the same methods but varying tile size, pipeline stages, warp count, and implementation variants. The fastest correct branch wins as champion; the rest are archived in `frontier`.
@@ -44,7 +51,7 @@ behavior:
 - **SASS instruction-level verification** — `cuobjdump --dump-sass` is grepped against a signature table (`sass_signatures.json`) to confirm each claimed optimization actually appears in the compiled machine code.
 - **Noise-aware measurements** — benchmark JSON preserves independent samples, median, nearest-rank p95, population standard deviation, and median-normalized CV. Branches are ranked by median and annotated when their difference is inside the configured noise band.
 
-These together change method classification from two buckets (effective / ineffective) to three: `effective_methods` (SASS ✓ and attribution > noise), `ineffective_methods` (SASS ✓ but attribution ≤ noise), and `implementation_failed_methods` (SASS ✗).
+Together, V2.2 uses four method states: `effective_methods`, `ineffective_methods`, `implementation_failed_methods`, and `unverified_methods`.
 
 ## RTX 5090 validation
 
@@ -107,9 +114,11 @@ A sibling directory of your baseline, `run_YYYYMMDD_HHMMSS/`, containing:
 ```text
 run_YYYYMMDD_HHMMSS/
 ├── state.json                   # global state, re-readable across sessions
-│                                #   V2.1 adds: branches, implementation_failed_methods,
-│                                #            roofline_history, frontier
+│                                # benchmark and fully-profiled winners stay separate
 ├── env.json                     # GPU / nvcc / ncu / CUTLASS snapshot
+├── preflight.json               # machine-readable contract check
+├── preflight.md                 # compact human-readable check
+├── run_manifest.json            # hashes, options, evidence-tiered winners
 ├── baseline/
 │   ├── <baseline>               # copied verbatim
 │   └── bench.json               # seed timing + correctness
@@ -172,6 +181,13 @@ python scripts/orchestrate.py finalize --run-dir run_20260418_143022
 
 Each script is independently invocable (`--help` on any of them); `orchestrate.py` is just a convenience wrapper.
 
+Standalone modes do not require loop state:
+
+```bash
+python scripts/benchmark.py ./kernel.cu --backend cuda --ref ./ref.py --N=1048576
+python scripts/analyze_ncu_rep.py ./kernel.ncu-rep --source ./kernel.cu
+```
+
 ## Skill layout
 
 ```text
@@ -182,9 +198,12 @@ cuda-optimized-skill/
     ├── SKILL.md                     # skill entry point
     ├── scripts/
     │   ├── benchmark.py             # bundled benchmark driver
+    │   ├── analyze_ncu_rep.py       # analyze an existing NCU report
+    │   ├── common_options.py        # stable option propagation
     │   ├── check_env.py             # GPU/toolchain environment probe
     │   ├── preflight.py             # baseline + reference contract validation
     │   ├── state.py                 # state.json writer
+    │   ├── strategy_memory.py       # workload-scoped cross-run evidence
     │   ├── validate_methods.py      # priority-compliance gate
     │   ├── run_iteration.py         # benchmark execution and capture
     │   ├── profile_ncu.py           # target-bounded ncu profiling
@@ -196,6 +215,8 @@ cuda-optimized-skill/
     │   └── orchestrate.py           # setup/close-iter/finalize CLI
     ├── references/
     │   ├── compatibility.md         # versions and exact architecture routing
+    │   ├── serving_evidence_protocol.md # clean matched serving A/B rules
+    │   ├── systems_and_ir_coverage.md # host path, CUTLASS, Triton IR guidance
     │   ├── ncu_metrics_guide.md     # bottleneck → optimization mapping
     │   ├── optimization_catalog.md  # priority-ordered catalog
     │   ├── method_registry.json     # machine-readable method registry
@@ -222,7 +243,7 @@ When a user says "optimize `gemm.cu`", the agent:
    - profiles the champion with `ncu` when counter access is available; otherwise preserves the exact command, return code, and failure log
    - runs `sass_check.py` → `iterv1/sass_check.json`
    - runs `ablate.py` → `iterv1/attribution.json`
-   - updates state: each method lands in one of `effective_methods` / `ineffective_methods` / `implementation_failed_methods` based on SASS ✓/✗ × attribution > noise
+   - updates state: each method lands in `effective_methods`, `ineffective_methods`, `implementation_failed_methods`, or `unverified_methods` based on available attribution and generated-code evidence
 9. on correctness failure (all K branches fail): inspects `bench.json.correctness` + `bench.stderr.txt`, rewrites the kernel, retries (up to 3×)
 10. on success: `best_file` advances if faster; `roofline_history` is appended
 11. loops back to step 3 for the next iteration
@@ -233,7 +254,7 @@ See `examples/walkthrough.md` for a full example and `SKILL.md` for the formal p
 ## Limits and honest caveats
 
 - **Ceiling**: if your reference is already cuBLAS / cuDNN / cuBLASLt, meaningful wins require algorithmic changes (split-K, stream-K, fused epilogues, mixed precision) that may not fit a 3-iteration budget. Large speedups are easier when the baseline is hand-rolled.
-- **Noise**: kernels running under ~50 μs are dominated by launch overhead. The skill's default 2% noise threshold helps, but if your dims are tiny, raise `--repeat` or the dimensions. Ablation attribution uses the same threshold — sub-noise contributions are classified as `ineffective_methods`.
+- **Noise**: kernels running under ~50 μs are sensitive to launch overhead. The default 2% threshold helps, but small dimensions may need more repetitions. Sub-noise measured ablations are `ineffective`; missing or invalid ablations are `unverified`.
 - **Triton + `@triton.autotune`**: autotuning under `ncu` is slow and can time out. Either pre-bake a single config before profiling, or set `--launch-count 1` and increase warmup.
 - **ncu CSV column names**: older `ncu` (< 2022.1) emits `"Metric Value"` with different capitalization/units; `profile_ncu.py` is tolerant but if you see all zeros check the `.ncu.log` file in the iteration directory.
 - **Branch cost**: with K=4 and ablation, each iteration compiles up to K + (num_methods) kernels. On a fresh build this can be slow; lower `--branches` if wall-clock matters more than exploration.
