@@ -229,6 +229,7 @@ class ObjectiveValidationTests(unittest.TestCase):
         for primary in (
             {},
             {"name": "", "direction": "lower"},
+            {"name": "   ", "direction": "lower"},
             {"name": "latency", "direction": "minimize"},
             {"name": "latency", "direction": "lower", "weight": 1},
         ):
@@ -260,6 +261,15 @@ class ObjectiveValidationTests(unittest.TestCase):
         cases = (
             ({**_objective(), "constraints": {}}, "constraints"),
             ({**_objective(), "constraints": ["latency"]}, "constraints"),
+            (
+                {
+                    **_objective(),
+                    "constraints": [
+                        {"name": "   ", "max_regression_pct": 1}
+                    ],
+                },
+                "constraints",
+            ),
             (
                 {
                     **_objective(),
@@ -454,7 +464,15 @@ class CommandWorkloadTests(unittest.TestCase):
                 self.assertEqual(json.loads(env["CUDA_OPTIMIZER_CASE"]), case)
                 output = Path(env["CUDA_OPTIMIZER_OUTPUT"])
                 self.assertFalse(output.exists())
-                output.write_text('{"latency_ms": 3.5}', "utf-8")
+                output.write_text(
+                    json.dumps(
+                        {
+                            "validation": {"valid": True},
+                            "benchmark": {"latency_ms": 3.5},
+                        }
+                    ),
+                    "utf-8",
+                )
                 return subprocess.CompletedProcess(
                     argv, 0, stdout='{"forged": true}', stderr="diagnostic"
                 )
@@ -470,7 +488,13 @@ class CommandWorkloadTests(unittest.TestCase):
                     timeout=12.5,
                 )
 
-            self.assertEqual(result, {"latency_ms": 3.5})
+            self.assertEqual(
+                result,
+                {
+                    "validation": {"valid": True},
+                    "benchmark": {"latency_ms": 3.5},
+                },
+            )
             self.assertEqual(run.call_args.kwargs["timeout"], 12.5)
             self.assertEqual(case, original_case)
 
@@ -525,6 +549,16 @@ class CommandWorkloadTests(unittest.TestCase):
                 ("not json", "JSON"),
                 ("[]", "object"),
                 ('{"a": 1}{"b": 2}', "JSON"),
+                ('{"benchmark": {}}', "validation"),
+                ('{"validation": true}', "benchmark"),
+                (
+                    '{"validation": "passed", "benchmark": {}}',
+                    "validation",
+                ),
+                (
+                    '{"validation": true, "benchmark": 1}',
+                    "benchmark",
+                ),
             ):
                 with self.subTest(payload=payload), mock.patch.object(
                     self.workloads.subprocess,
@@ -593,7 +627,7 @@ class ManifestTests(unittest.TestCase):
                 workload_manifest=manifest
             )
 
-            self.assertEqual(first.kind, "manifest")
+            self.assertEqual(first.kind, "python")
             self.assertEqual(first.source, str(adapter.resolve()))
             self.assertEqual(first.objective, _objective())
             self.assertEqual(first.cases, tuple(cases))
@@ -724,9 +758,278 @@ class ManifestTests(unittest.TestCase):
                 workload_manifest=manifest
             )
 
-            self.assertEqual(spec.kind, "manifest")
+            self.assertEqual(spec.kind, "command")
             self.assertEqual(spec.source[0], str(runner.resolve()))
             self.assertEqual(spec.source[1], "--quick")
+
+    def test_python_manifest_objective_must_match_adapter_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = root / "adapter.py"
+            _write_python_adapter(
+                adapter,
+                objective=_objective(name="throughput", direction="higher"),
+            )
+            manifest = root / "workload.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "kind": "python",
+                        "source": "adapter.py",
+                        "objective": _objective(),
+                        "cases": [],
+                    }
+                ),
+                "utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "conflicting objective"):
+                self.workloads.normalize_workload(workload_manifest=manifest)
+
+    def test_python_manifest_rejects_invalid_metrics_objective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = root / "adapter.py"
+            _write_python_adapter(adapter)
+            adapter.write_text(
+                adapter.read_text("utf-8").replace(
+                    f"return {_objective()!r}", "return {'invalid': True}"
+                ),
+                "utf-8",
+            )
+            manifest = root / "workload.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "kind": "python",
+                        "source": "adapter.py",
+                        "objective": _objective(),
+                        "cases": [],
+                    }
+                ),
+                "utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "objective"):
+                self.workloads.normalize_workload(workload_manifest=manifest)
+
+
+class UnifiedExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workloads = _load_workload_adapter()
+
+    @staticmethod
+    def _command_result(argv, **kwargs):
+        Path(kwargs["env"]["CUDA_OPTIMIZER_OUTPUT"]).write_text(
+            json.dumps(
+                {
+                    "validation": {"valid": True, "checks": 4},
+                    "benchmark": {"latency_ms": 2.5},
+                    "diagnostics": {"source": "user-workload"},
+                }
+            ),
+            "utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "ignored", "")
+
+    def _assert_unified(self, result: dict, *, case: dict) -> None:
+        self.assertEqual(result["role"], "candidate")
+        self.assertEqual(result["case"], case)
+        self.assertIn("validation", result)
+        self.assertIn("benchmark", result)
+        self.assertEqual(result["objective"], _objective())
+
+    def test_direct_python_and_command_share_run_spec_once_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = root / "adapter.py"
+            _write_python_adapter(adapter)
+            python_spec = self.workloads.normalize_workload(workload=adapter)
+            objective_path = root / "objective.json"
+            objective_path.write_text(json.dumps(_objective()), "utf-8")
+            command_spec = self.workloads.normalize_workload(
+                workload_cmd=["./user-runner", "--once"],
+                objective=objective_path,
+            )
+            case = {"batch": 4}
+
+            python_result = self.workloads.run_spec_once(
+                python_spec,
+                candidate="candidate.py",
+                role="candidate",
+                case=case,
+            )
+            with mock.patch.object(
+                self.workloads.subprocess,
+                "run",
+                side_effect=self._command_result,
+            ):
+                command_result = self.workloads.run_spec_once(
+                    command_spec,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case=case,
+                    timeout=10,
+                )
+
+            self._assert_unified(python_result, case=case)
+            self._assert_unified(command_result, case=case)
+            self.assertEqual(
+                set(python_result),
+                {"role", "case", "validation", "benchmark", "objective"},
+            )
+            self.assertEqual(
+                set(command_result),
+                {
+                    "role",
+                    "case",
+                    "validation",
+                    "benchmark",
+                    "objective",
+                    "diagnostics",
+                },
+            )
+
+    def test_manifest_python_and_command_dispatch_through_same_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = root / "adapter.py"
+            _write_python_adapter(adapter)
+            runner = root / "runner.sh"
+            runner.write_text("#!/bin/sh\n", "utf-8")
+            cases = [{"batch": 8}]
+            python_manifest = root / "python.json"
+            python_manifest.write_text(
+                json.dumps(
+                    {
+                        "kind": "python",
+                        "source": "adapter.py",
+                        "objective": _objective(),
+                        "cases": cases,
+                    }
+                ),
+                "utf-8",
+            )
+            command_manifest = root / "command.json"
+            command_manifest.write_text(
+                json.dumps(
+                    {
+                        "kind": "command",
+                        "source": ["./runner.sh"],
+                        "objective": _objective(),
+                        "cases": cases,
+                    }
+                ),
+                "utf-8",
+            )
+            python_spec = self.workloads.normalize_workload(
+                workload_manifest=python_manifest
+            )
+            command_spec = self.workloads.normalize_workload(
+                workload_manifest=command_manifest
+            )
+
+            self.assertEqual(python_spec.kind, "python")
+            self.assertEqual(command_spec.kind, "command")
+            python_result = self.workloads.run_spec_once(
+                python_spec,
+                candidate="candidate.py",
+                role="candidate",
+                case=cases[0],
+            )
+            with mock.patch.object(
+                self.workloads.subprocess,
+                "run",
+                side_effect=self._command_result,
+            ):
+                command_result = self.workloads.run_spec_once(
+                    command_spec,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case=cases[0],
+                )
+
+            self._assert_unified(python_result, case=cases[0])
+            self._assert_unified(command_result, case=cases[0])
+
+    def test_run_spec_rejects_source_or_metrics_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = root / "adapter.py"
+            _write_python_adapter(adapter)
+            source_spec = self.workloads.normalize_workload(workload=adapter)
+            adapter.write_text(adapter.read_text("utf-8") + "\n# changed\n", "utf-8")
+            with self.assertRaisesRegex(ValueError, "source_hash"):
+                self.workloads.run_spec_once(
+                    source_spec,
+                    candidate="candidate.py",
+                    role="candidate",
+                )
+
+            dynamic_objective = root / "dynamic-objective.json"
+            dynamic_objective.write_text(json.dumps(_objective()), "utf-8")
+            dynamic_adapter = root / "dynamic.py"
+            dynamic_adapter.write_text(
+                textwrap.dedent(
+                    """
+                    import json
+                    from pathlib import Path
+
+                    def prepare(candidate): return None
+                    def validate(candidate): return True
+                    def benchmark(candidate): return {"latency_ms": 1.0}
+                    def metrics():
+                        return json.loads(
+                            Path(__file__).with_name("dynamic-objective.json").read_text()
+                        )
+                    def cleanup(): return None
+                    """
+                ),
+                "utf-8",
+            )
+            metrics_spec = self.workloads.normalize_workload(
+                workload=dynamic_adapter
+            )
+            dynamic_objective.write_text(
+                json.dumps(_objective(name="throughput", direction="higher")),
+                "utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "conflicting objective"):
+                self.workloads.run_spec_once(
+                    metrics_spec,
+                    candidate="candidate.py",
+                    role="candidate",
+                )
+
+    def test_command_validation_failure_is_not_treated_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            objective_path = root / "objective.json"
+            objective_path.write_text(json.dumps(_objective()), "utf-8")
+            spec = self.workloads.normalize_workload(
+                workload_cmd=["./runner"], objective=objective_path
+            )
+
+            def invalid(argv, **kwargs):
+                Path(kwargs["env"]["CUDA_OPTIMIZER_OUTPUT"]).write_text(
+                    json.dumps(
+                        {
+                            "validation": {"valid": False, "reason": "wrong"},
+                            "benchmark": {"latency_ms": 0.1},
+                        }
+                    ),
+                    "utf-8",
+                )
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with mock.patch.object(
+                self.workloads.subprocess, "run", side_effect=invalid
+            ), self.assertRaisesRegex(ValueError, "validation failed"):
+                self.workloads.run_spec_once(
+                    spec,
+                    candidate="candidate.py",
+                    role="candidate",
+                )
 
 
 class TemplateAndPreflightTests(unittest.TestCase):
@@ -754,6 +1057,14 @@ class TemplateAndPreflightTests(unittest.TestCase):
             set(schema["required"]),
             {"primary_metric", "min_effect_pct", "constraints"},
         )
+        primary_name = schema["properties"]["primary_metric"]["properties"]["name"]
+        constraint_schema = schema["properties"]["constraints"]
+        constraint_name = constraint_schema["items"]["properties"]["name"]
+        self.assertIn("pattern", primary_name)
+        self.assertIn("pattern", constraint_name)
+        self.assertTrue(constraint_schema["uniqueItems"])
+        self.assertEqual(constraint_schema["x-unique-by"], "name")
+        self.assertIn("runtime", constraint_schema["$comment"].lower())
         template = (TEMPLATE_DIR / "workload.py").read_text("utf-8")
         for name in ("prepare", "validate", "benchmark", "metrics", "cleanup"):
             self.assertIn(f"def {name}(", template)
@@ -838,6 +1149,42 @@ class TemplateAndPreflightTests(unittest.TestCase):
             report = json.loads(completed.stdout)
             self.assertFalse(report["ok"])
             self.assertIn("exactly one workload form", " ".join(report["errors"]))
+
+    def test_preflight_rejects_manifest_python_metrics_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline, ref = self._valid_kernel_inputs(root)
+            adapter = root / "workload.py"
+            _write_python_adapter(
+                adapter,
+                objective=_objective(name="throughput", direction="higher"),
+            )
+            manifest = root / "workload.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "kind": "python",
+                        "source": "workload.py",
+                        "objective": _objective(),
+                        "cases": [],
+                    }
+                ),
+                "utf-8",
+            )
+            completed = self._preflight(
+                "--baseline",
+                baseline,
+                "--ref",
+                ref,
+                "--dims",
+                '{"n": 4}',
+                "--workload-manifest",
+                manifest,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            report = json.loads(completed.stdout)
+            self.assertIn("conflicting objective", " ".join(report["errors"]))
 
     def test_preflight_command_objective_and_help_without_site_packages(self) -> None:
         help_result = self._preflight("--help", no_site=True)

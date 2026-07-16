@@ -331,6 +331,32 @@ def _source_hash(payload: dict, paths: Sequence[Path]) -> str:
     return hashlib.sha256(_canonical_json(frozen)).hexdigest()
 
 
+def _normalized_source_hash(
+    kind: str,
+    source: str | Sequence[str],
+    objective: Mapping,
+    cases: Sequence[Mapping],
+) -> str:
+    """Hash the executable contract and the current referenced source bytes."""
+    if kind == "python":
+        if not isinstance(source, str):
+            raise ValueError("Python workload source must be a file path")
+        source_files = [_regular_file(source, "workload adapter")]
+    elif kind == "command":
+        if isinstance(source, str):
+            raise ValueError("command workload source must be an argv list")
+        source_files = _referenced_command_files(source, Path.cwd())
+    else:
+        raise ValueError(f"unknown workload kind: {kind}")
+    payload = {
+        "executor_kind": kind,
+        "source": source,
+        "objective": objective,
+        "cases": cases,
+    }
+    return _source_hash(payload, source_files)
+
+
 def _adapter_objective(adapter: ModuleType, path: Path) -> dict:
     try:
         value = adapter.metrics()
@@ -403,35 +429,32 @@ def _normalize_manifest(manifest_path, objective_path) -> WorkloadSpec:
     # The normalized payload below covers every allowed manifest field.  Do
     # not hash raw JSON bytes: insignificant key order and whitespace must not
     # change the frozen workload identity.
-    source_files = []
     if kind == "python":
         raw_source = _nonempty_string(manifest["source"], "manifest source")
         source_path = Path(raw_source).expanduser()
         if not source_path.is_absolute():
             source_path = base_dir / source_path
         source_path = _regular_file(source_path, "manifest Python source")
-        load_python_adapter(source_path)
+        adapter = load_python_adapter(source_path)
+        adapter_objective = _adapter_objective(adapter, source_path)
+        if adapter_objective != objective:
+            raise ValueError(
+                "conflicting objective: manifest objective does not match "
+                "Python adapter metrics()"
+            )
+        objective = adapter_objective
         source: str | list[str] = str(source_path)
-        source_files.append(source_path)
     else:
         source = _resolve_manifest_command(
             _command_argv(manifest["source"]), base_dir
         )
-        source_files.extend(_referenced_command_files(source, base_dir))
 
-    payload = {
-        "form": "manifest",
-        "executor_kind": kind,
-        "source": source,
-        "objective": objective,
-        "cases": cases,
-    }
     return WorkloadSpec(
-        kind="manifest",
+        kind=kind,
         source=source,
         objective=objective,
         cases=cases,
-        source_hash=_source_hash(payload, source_files),
+        source_hash=_normalized_source_hash(kind, source, objective, cases),
     )
 
 
@@ -470,18 +493,14 @@ def normalize_workload(
         adapter = load_python_adapter(source_path)
         normalized_objective = _adapter_objective(adapter, source_path)
         cases: tuple[dict, ...] = ()
-        payload = {
-            "form": "python",
-            "source": str(source_path),
-            "objective": normalized_objective,
-            "cases": cases,
-        }
         return WorkloadSpec(
             kind="python",
             source=str(source_path),
             objective=normalized_objective,
             cases=cases,
-            source_hash=_source_hash(payload, [source_path]),
+            source_hash=_normalized_source_hash(
+                "python", str(source_path), normalized_objective, cases
+            ),
         )
 
     if workload_cmd is not None:
@@ -490,19 +509,13 @@ def normalize_workload(
         argv = _command_argv(workload_cmd)
         normalized_objective = load_objective(objective)
         cases = ()
-        payload = {
-            "form": "command",
-            "source": argv,
-            "objective": normalized_objective,
-            "cases": cases,
-        }
         return WorkloadSpec(
             kind="command",
             source=argv,
             objective=normalized_objective,
             cases=cases,
-            source_hash=_source_hash(
-                payload, _referenced_command_files(argv, Path.cwd())
+            source_hash=_normalized_source_hash(
+                "command", argv, normalized_objective, cases
             ),
         )
 
@@ -622,6 +635,36 @@ def _read_command_output(path: Path) -> dict:
         raise RuntimeError(f"workload command output must be valid JSON: {error}") from error
     if not isinstance(value, dict):
         raise RuntimeError("workload command output must be a single JSON object")
+    required = {"validation", "benchmark"}
+    missing = sorted(required - set(value))
+    if missing:
+        raise RuntimeError(
+            "workload command output missing required fields: "
+            + ", ".join(missing)
+        )
+    unknown = sorted(set(value) - {"validation", "benchmark", "diagnostics"})
+    if unknown:
+        shown = ", ".join(unknown[:8])
+        suffix = " ..." if len(unknown) > 8 else ""
+        raise RuntimeError(
+            f"workload command output contains unknown fields: {shown}{suffix}"
+        )
+    validation = value["validation"]
+    if isinstance(validation, bool):
+        pass
+    elif isinstance(validation, dict):
+        if not isinstance(validation.get("valid"), bool):
+            raise RuntimeError(
+                "workload command validation object requires boolean valid"
+            )
+    else:
+        raise RuntimeError(
+            "workload command validation must be a boolean or object with boolean valid"
+        )
+    if not isinstance(value["benchmark"], dict):
+        raise RuntimeError("workload command benchmark must be a JSON object")
+    if "diagnostics" in value and not isinstance(value["diagnostics"], dict):
+        raise RuntimeError("workload command diagnostics must be a JSON object")
     return value
 
 
@@ -692,3 +735,97 @@ def run_command_once(
             raise RuntimeError(
                 f"{error}{_diagnostics(completed.stdout, completed.stderr)}"
             ) from error
+
+
+def _verify_source_hash(spec: WorkloadSpec) -> None:
+    try:
+        current = _normalized_source_hash(
+            spec.kind,
+            spec.source,
+            spec.objective,
+            spec.cases,
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"workload source_hash verification failed: {error}") from error
+    if current != spec.source_hash:
+        raise ValueError(
+            "workload source_hash mismatch; source or frozen contract changed "
+            "after normalization"
+        )
+
+
+def run_spec_once(
+    spec: WorkloadSpec,
+    *,
+    candidate,
+    role: str,
+    case: dict | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """Run any normalized workload through one lifecycle result contract."""
+    if not isinstance(spec, WorkloadSpec):
+        raise ValueError("spec must be a WorkloadSpec")
+    normalized_role = _nonempty_string(role, "role")
+    if case is None:
+        normalized_case = {}
+    elif isinstance(case, dict):
+        normalized_case = copy.deepcopy(case)
+    else:
+        raise ValueError("case must be an object")
+
+    frozen_objective = validate_objective(spec.objective)
+    _verify_source_hash(spec)
+
+    if spec.kind == "python":
+        if not isinstance(spec.source, str):
+            raise ValueError("Python workload source must be a file path")
+        if timeout is not None:
+            raise ValueError(
+                "timeout is only runner-enforced for command workloads; "
+                "Python adapters must raise TimeoutError themselves"
+            )
+        source_path = _regular_file(spec.source, "workload adapter")
+        adapter = load_python_adapter(source_path)
+        current_objective = _adapter_objective(adapter, source_path)
+        if current_objective != frozen_objective:
+            raise ValueError(
+                "conflicting objective: Python adapter metrics() changed after "
+                "normalization"
+            )
+        result = run_once(
+            adapter,
+            candidate=candidate,
+            role=normalized_role,
+            case=normalized_case,
+        )
+        if result["objective"] != frozen_objective:
+            raise ValueError(
+                "conflicting objective: Python adapter metrics() changed during run"
+            )
+        return result
+
+    if spec.kind == "command":
+        if not isinstance(spec.source, list):
+            raise ValueError("command workload source must be an argv list")
+        command_result = run_command_once(
+            spec,
+            candidate=candidate,
+            role=normalized_role,
+            case=normalized_case,
+            timeout=timeout,
+        )
+        validation = command_result["validation"]
+        if _validation_failed(validation):
+            raise ValueError("workload validation failed")
+        result = {
+            "role": normalized_role,
+            "case": normalized_case,
+            "validation": validation,
+            "benchmark": command_result["benchmark"],
+            "objective": frozen_objective,
+        }
+        if "diagnostics" in command_result:
+            result["diagnostics"] = command_result["diagnostics"]
+        return result
+
+    raise ValueError(f"unknown workload kind: {spec.kind}")

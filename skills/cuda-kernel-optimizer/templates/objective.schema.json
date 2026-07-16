@@ -11,19 +11,30 @@
       "additionalProperties": false,
       "required": ["name", "direction"],
       "properties": {
-        "name": {"type": "string", "minLength": 1},
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": ".*\\S.*"
+        },
         "direction": {"enum": ["lower", "higher"]}
       }
     },
     "min_effect_pct": {"type": "number", "minimum": 0},
     "constraints": {
       "type": "array",
+      "uniqueItems": true,
+      "x-unique-by": "name",
+      "$comment": "Standard uniqueItems rejects identical objects. Runtime validation additionally enforces unique constraint names using x-unique-by=name.",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["name", "max_regression_pct"],
         "properties": {
-          "name": {"type": "string", "minLength": 1},
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": ".*\\S.*"
+          },
           "max_regression_pct": {"type": "number", "minimum": 0}
         }
       }
