@@ -1123,6 +1123,8 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                 self._candidate(root, "b1", 1),
                 self._candidate(root, "b2", 2),
             ]
+            first_path = self.orchestrate._candidate_file(candidates[0])
+            second_path = self.orchestrate._candidate_file(candidates[1])
             calls = []
             should_timeout = {str(Path(candidates[1]["kernel"]).resolve()): True}
 
@@ -1201,6 +1203,131 @@ class OrchestratorSanitizerTests(unittest.TestCase):
         self.assertEqual(completed["status"], "passed")
         self.assertEqual(calls.count(first_path), 1)
         self.assertEqual(calls.count(second_path), 2)
+
+    def test_resume_discards_valid_raw_artifact_missing_parent_binding_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            methods = root / "methods.json"
+            methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+            candidates = [
+                self._candidate(root, "b1", 1),
+                self._candidate(root, "b2", 2),
+            ]
+            first_path = self.orchestrate._candidate_file(candidates[0])
+            second_path = self.orchestrate._candidate_file(candidates[1])
+            calls = []
+            interrupt_second = {"value": True}
+
+            def runner(command, **_kwargs):
+                candidate_file = command[command.index("--candidate-file") + 1]
+                calls.append(candidate_file)
+                output = Path(command[command.index("--out") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps(
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash="5" * 64,
+                            mode="full",
+                            method_ids=[],
+                            selected_tools=[
+                                "memcheck", "racecheck", "initcheck", "synccheck"
+                            ],
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                if candidate_file == self.orchestrate._candidate_file(
+                    candidates[1]
+                ) and interrupt_second["value"]:
+                    interrupt_second["value"] = False
+                    return SimpleNamespace(
+                        returncode=124, stdout="", stderr="", timed_out=True
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            with mock.patch.object(self.orchestrate, "_run", side_effect=runner):
+                interrupted = self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "5" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=candidates,
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+                completed = self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "5" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=candidates,
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+
+        self.assertTrue(interrupted["timed_out"])
+        self.assertEqual(completed["status"], "passed")
+        self.assertEqual(calls.count(first_path), 1)
+        self.assertEqual(calls.count(second_path), 2)
+
+    def test_resume_rejects_raw_artifact_with_wrong_parent_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            methods = root / "methods.json"
+            methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+            candidate = self._candidate(root, "b1", 1)
+
+            def runner(command, **_kwargs):
+                output = Path(command[command.index("--out") + 1])
+                candidate_file = command[command.index("--candidate-file") + 1]
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps(
+                        _sanitizer_report(
+                            candidate_file=candidate_file,
+                            input_hash="6" * 64,
+                            mode="full",
+                            method_ids=[],
+                            selected_tools=[
+                                "memcheck", "racecheck", "initcheck", "synccheck"
+                            ],
+                            benchmark_command=command[command.index("--") + 1 :],
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    returncode=0, stdout="", stderr="", timed_out=False
+                )
+
+            with mock.patch.object(self.orchestrate, "_run", side_effect=runner):
+                aggregate = self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "6" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            raw = Path(aggregate["candidates"][0]["artifact"])
+            payload = json.loads(raw.read_text("utf-8"))
+            payload["methods_sha256"] = "0" * 64
+            raw.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "methods_sha256 drifted"):
+                self.orchestrate._run_sanitizer_gate(
+                    state={"input_hash": "6" * 64, "dims": {}, "ptr_size": 0},
+                    policy=self.orchestrate.resolve_budget("thorough"),
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
 
     def test_profile_binding_requires_safe_unchanged_ncu_top(self):
         with tempfile.TemporaryDirectory() as tmp:

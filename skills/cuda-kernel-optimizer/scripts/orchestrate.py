@@ -2075,10 +2075,6 @@ def _run_sanitizer_gate(
             except (OSError, json.JSONDecodeError) as error:
                 raise ValueError(f"sanitizer candidate artifact is malformed: {error}") from error
             report["artifact"] = str(output.resolve(strict=True))
-            if report.get("methods_sha256") != methods_sha256:
-                raise ValueError("sanitizer candidate artifact methods_sha256 drifted")
-            if report.get("policy_sha256") != policy_sha256:
-                raise ValueError("sanitizer candidate artifact policy_sha256 drifted")
             validated = _validate_sanitizer_report(
                 report,
                 candidate=candidate,
@@ -2088,7 +2084,19 @@ def _run_sanitizer_gate(
                 expected_tools=selected_tools,
                 expected_command=benchmark_command,
             )
-            if validated["status"] == "timed_out":
+            has_methods_binding = "methods_sha256" in report
+            has_policy_binding = "policy_sha256" in report
+            if has_methods_binding != has_policy_binding:
+                raise ValueError(
+                    "sanitizer candidate artifact parent binding is incomplete"
+                )
+            if not has_methods_binding:
+                output.unlink()
+            elif report.get("methods_sha256") != methods_sha256:
+                raise ValueError("sanitizer candidate artifact methods_sha256 drifted")
+            elif report.get("policy_sha256") != policy_sha256:
+                raise ValueError("sanitizer candidate artifact policy_sha256 drifted")
+            elif validated["status"] == "timed_out":
                 output.unlink()
             else:
                 reports.append(validated)
