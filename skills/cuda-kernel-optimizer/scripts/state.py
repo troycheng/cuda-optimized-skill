@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import math
 import os
@@ -52,6 +53,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import asdict
 from numbers import Real
 from pathlib import Path
 
@@ -67,6 +69,7 @@ from artifact_store import (  # noqa: E402
     atomic_write_json,
     sha256_file,
 )
+from budget import BudgetPolicy, resolve_budget  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +421,98 @@ def _new_run_dir(output_root: str | os.PathLike) -> Path:
     raise ValueError("could not allocate a unique run directory")
 
 
+def _strict_json_value(text: str, field: str):
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            if key in result:
+                raise ValueError(f"{field} contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    def nonfinite(token):
+        raise ValueError(f"{field} contains non-finite JSON constant: {token}")
+
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=pairs,
+            parse_constant=nonfinite,
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{field} must be valid strict JSON: {error}") from error
+
+
+def _budget_from_json(text: str) -> dict:
+    payload = _strict_json_value(text, "--budget-json")
+    if not isinstance(payload, dict):
+        raise ValueError("--budget-json must be a JSON object")
+    fields = set(BudgetPolicy.__dataclass_fields__)
+    missing = sorted(fields - set(payload))
+    unknown = sorted(set(payload) - fields)
+    if missing:
+        raise ValueError("--budget-json missing required field: " + missing[0])
+    if unknown:
+        raise ValueError("--budget-json contains unknown field: " + unknown[0])
+    if not isinstance(payload["name"], str) or not payload["name"].strip():
+        raise ValueError("--budget-json name must be a non-empty string")
+    try:
+        declared = BudgetPolicy(**payload)
+        validated = resolve_budget(
+            "custom",
+            max_seconds=declared.max_seconds,
+            branches=declared.branches,
+            max_rounds=declared.max_rounds,
+            min_pairs=declared.min_pairs,
+            max_pairs=declared.max_pairs,
+            outer_candidates=declared.outer_candidates,
+            max_cases=declared.max_cases,
+            sanitizer_mode=declared.sanitizer_mode,
+            reserve_seconds=declared.reserve_seconds,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"--budget-json is invalid: {error}") from error
+    # The preset name is descriptive; all executable fields were validated
+    # through budget.py's public policy resolver.
+    clean = asdict(validated)
+    clean["name"] = declared.name
+    return clean
+
+
+def _frozen_input_hash(
+    manifest: Mapping,
+    *,
+    workload,
+    dims,
+    backend,
+    budget,
+    confidence,
+    min_effect_pct,
+    ptr_size,
+) -> str:
+    frozen = {
+        "inputs": {
+            key: value["sha256"]
+            for key, value in sorted(manifest["inputs"].items())
+        },
+        "workload": workload,
+        "dims": dims,
+        "backend": backend,
+        "budget": budget,
+        "confidence": confidence,
+        "min_effect_pct": min_effect_pct,
+        "ptr_size": ptr_size,
+    }
+    encoded = json.dumps(
+        frozen,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def initialize_state(
     *,
     run_dir: str | os.PathLike,
@@ -533,26 +628,86 @@ def cmd_init(args: argparse.Namespace) -> None:
     if args.env and os.path.isfile(args.env):
         env = _read(args.env)
 
-    try:
-        dims = json.loads(args.dims) if args.dims else {}
-    except json.JSONDecodeError as e:
-        sys.exit(f"--dims must be valid JSON: {e}")
+    dims = _strict_json_value(args.dims, "--dims") if args.dims else {}
+    if not isinstance(dims, dict):
+        raise ValueError("--dims must be a JSON object")
 
     supplied_budget = getattr(args, "budget", None)
-    budget = dict(supplied_budget) if supplied_budget is not None else {
-        "iterations_total": int(args.iterations),
-        "max_rounds": int(args.iterations),
-        "ncu_num": int(args.ncu_num),
-        "branches": int(args.branches),
-    }
+    budget_json = getattr(args, "budget_json", None)
+    if supplied_budget is not None:
+        budget = dict(supplied_budget)
+    elif budget_json is not None:
+        budget = _budget_from_json(budget_json)
+    else:
+        iterations = int(getattr(args, "iterations", 3))
+        budget = {
+            "iterations_total": iterations,
+            "max_rounds": iterations,
+            "ncu_num": int(args.ncu_num),
+            "branches": int(getattr(args, "branches", 4)),
+        }
+    workload = getattr(args, "workload", None)
+    workload_json = getattr(args, "workload_json", None)
+    if workload_json is not None:
+        workload = _strict_json_value(workload_json, "--workload-json")
+    mode = getattr(args, "mode", "kernel-only")
+    started_at = getattr(args, "started_at", None) or time.time()
+    backend = getattr(args, "backend", "auto")
+    confidence = getattr(args, "confidence", 0.95)
+    min_effect_pct = getattr(args, "min_effect_pct", 0.5)
     output_root = getattr(args, "output_root", None) or os.path.dirname(baseline)
-    run_dir = _new_run_dir(output_root)
-    store = ArtifactStore(run_dir)
-    manifest = store.initialize(
-        inputs={"baseline": baseline, "ref": ref},
-        budget=budget,
-        environment=env,
-    )
+    supplied_run_dir = getattr(args, "run_dir", None)
+    if supplied_run_dir is None:
+        run_dir = _new_run_dir(output_root)
+    else:
+        run_arg = Path(supplied_run_dir).expanduser()
+        if run_arg.is_symlink():
+            raise ValueError("run_dir must not be a symlink")
+        run_dir = run_arg.resolve(strict=True)
+        root = Path(output_root).expanduser().resolve(strict=True)
+        if not run_dir.is_dir() or run_dir.parent != root:
+            raise ValueError("run_dir must be a direct child of output_root")
+
+    manifest_arg = getattr(args, "manifest", None)
+    if manifest_arg is None:
+        store = ArtifactStore(run_dir)
+        manifest = store.initialize(
+            inputs={"baseline": baseline, "ref": ref},
+            budget=budget,
+            environment=env,
+        )
+        manifest.update(
+            {
+                "mode": mode,
+                "workload": workload,
+                "confidence": confidence,
+                "min_effect_pct": min_effect_pct,
+                "started_at": started_at,
+                "dims": dims,
+                "backend": backend,
+                "ptr_size": args.ptr_size,
+            }
+        )
+        manifest["input_hash"] = _frozen_input_hash(
+            manifest,
+            workload=workload,
+            dims=dims,
+            backend=backend,
+            budget=budget,
+            confidence=confidence,
+            min_effect_pct=min_effect_pct,
+            ptr_size=args.ptr_size,
+        )
+        atomic_write_json(run_dir / "manifest.json", manifest)
+    else:
+        manifest_path = Path(manifest_arg).expanduser()
+        if manifest_path.is_symlink():
+            raise ValueError("manifest must not be a symlink")
+        manifest_path = manifest_path.resolve(strict=True)
+        if manifest_path != run_dir / "manifest.json" or not manifest_path.is_file():
+            raise ValueError("manifest must be run_dir/manifest.json")
+        manifest = _read(str(manifest_path))
+
     state, state_path = initialize_state(
         run_dir=run_dir,
         baseline=baseline,
@@ -564,12 +719,12 @@ def cmd_init(args: argparse.Namespace) -> None:
         dims=dims,
         ptr_size=args.ptr_size,
         ncu_num=args.ncu_num,
-        mode=getattr(args, "mode", "kernel-only"),
-        workload=getattr(args, "workload", None),
-        started_at=getattr(args, "started_at", time.time()),
-        backend=getattr(args, "backend", "auto"),
-        confidence=getattr(args, "confidence", 0.95),
-        min_effect_pct=getattr(args, "min_effect_pct", 0.5),
+        mode=mode,
+        workload=workload,
+        started_at=started_at,
+        backend=backend,
+        confidence=confidence,
+        min_effect_pct=min_effect_pct,
         noise_threshold_pct=getattr(args, "noise_threshold_pct", None),
     )
     print(json.dumps({"run_dir": str(run_dir), "state": str(state_path)}, indent=2))
@@ -776,6 +931,36 @@ def cmd_update(args: argparse.Namespace) -> None:
             "candidate_sha256": candidate_binding["sha256"],
             "status": terminal_status,
         }
+        if mode == "full" and terminal_status == "kernel_only_win":
+            frontier_entry = {
+                "iter": int(args.iter),
+                "candidate_file": candidate_binding["path"],
+                "path": candidate_binding["path"],
+                "kernel": candidate_binding["path"],
+                "candidate_sha256": candidate_binding["sha256"],
+                "sha256": candidate_binding["sha256"],
+                "statistics": decision_statistics,
+                "kernel_statistics": decision_statistics,
+                "status": "kernel_only_win",
+                "mode": "full",
+            }
+            identity = (
+                frontier_entry["iter"],
+                frontier_entry["candidate_file"],
+                frontier_entry["candidate_sha256"],
+                frontier_entry["status"],
+            )
+            if not any(
+                isinstance(item, Mapping)
+                and (
+                    item.get("iter"),
+                    item.get("candidate_file") or item.get("kernel"),
+                    item.get("candidate_sha256"),
+                    item.get("status"),
+                ) == identity
+                for item in state["frontier"]
+            ):
+                state["frontier"].append(frontier_entry)
     _write(args.state, state)
     print(json.dumps({
         "iter": args.iter,
@@ -829,7 +1014,7 @@ def cmd_show(args: argparse.Namespace) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -841,8 +1026,23 @@ def main() -> None:
     pi.add_argument("--branches", type=int, default=4)
     pi.add_argument("--dims", type=str, default="{}", help="JSON dict of dim name -> int")
     pi.add_argument("--env", type=str, default="")
-    pi.add_argument("--noise-threshold-pct", type=float, default=2.0)
     pi.add_argument("--ptr-size", type=int, default=0)
+    pi.add_argument("--output-root", default=None)
+    pi.add_argument(
+        "--budget-json",
+        default=None,
+        help="strict JSON serialization of a complete BudgetPolicy",
+    )
+    # The orchestrator has already allocated and frozen these artifacts.  Keep
+    # the plumbing private while still using this public init command.
+    pi.add_argument("--run-dir", default=None, help=argparse.SUPPRESS)
+    pi.add_argument("--manifest", default=None, help=argparse.SUPPRESS)
+    pi.add_argument("--mode", choices=("full", "kernel-only"), default="kernel-only", help=argparse.SUPPRESS)
+    pi.add_argument("--workload-json", default=None, help=argparse.SUPPRESS)
+    pi.add_argument("--started-at", type=float, default=None, help=argparse.SUPPRESS)
+    pi.add_argument("--backend", default="auto", help=argparse.SUPPRESS)
+    pi.add_argument("--confidence", type=float, default=0.95, help=argparse.SUPPRESS)
+    pi.add_argument("--min-effect-pct", type=float, default=0.5, help=argparse.SUPPRESS)
     pi.set_defaults(func=cmd_init)
 
     pu = sub.add_parser("update")
@@ -878,6 +1078,12 @@ def main() -> None:
     ps = sub.add_parser("show")
     ps.add_argument("--state", required=True)
     ps.set_defaults(func=cmd_show)
+
+    return p
+
+
+def main() -> None:
+    p = build_parser()
 
     args = p.parse_args()
     args.func(args)

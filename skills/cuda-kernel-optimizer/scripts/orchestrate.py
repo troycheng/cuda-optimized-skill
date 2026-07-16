@@ -42,7 +42,11 @@ from budget import BudgetClock, BudgetPolicy, resolve_budget  # noqa: E402
 import decision as decision_engine  # noqa: E402
 import preflight  # noqa: E402
 import state as state_manager  # noqa: E402
-from workload_adapter import WorkloadSpec, normalize_workload  # noqa: E402
+from workload_adapter import (  # noqa: E402
+    WorkloadSpec,
+    normalize_workload,
+    run_spec_once,
+)
 import workload_evaluate  # noqa: E402
 
 _BRANCH_RESULT_STATUSES = {"shortlist_ready", "no_confirmed_kernel_win"}
@@ -245,6 +249,17 @@ def _validate_checkpoint(checkpoint, *, input_hash: str | None = None) -> dict:
         raise ValueError(
             "checkpoint candidate_status must be null or a non-empty string"
         )
+    stage_evidence = clean.get("stage_evidence", {})
+    if not isinstance(stage_evidence, Mapping):
+        raise ValueError("checkpoint stage_evidence must be a mapping")
+    for evidence_stage, evidence in stage_evidence.items():
+        if evidence_stage not in STAGES:
+            raise ValueError("checkpoint stage_evidence contains an unknown stage")
+        if not isinstance(evidence, Mapping):
+            raise ValueError("checkpoint stage evidence must be a mapping")
+        evidence_status = evidence.get("status")
+        if type(evidence_status) is not str or not evidence_status.strip():
+            raise ValueError("checkpoint stage evidence status must be non-empty")
     declared_run_dir = clean.get("run_dir")
     if declared_run_dir is not None and (
         type(declared_run_dir) is not str or not declared_run_dir.strip()
@@ -277,6 +292,7 @@ def transition_checkpoint(
     candidate_id=_UNSET,
     candidate_status=_UNSET,
     budget=None,
+    evidence=None,
     updated_at: float | None = None,
 ) -> dict:
     """Return an ordered, detached checkpoint transition."""
@@ -323,6 +339,14 @@ def transition_checkpoint(
     )
     if budget is not None:
         result["budget"] = _strict_json_copy(budget, "budget")
+    if evidence is not None:
+        clean_evidence = _strict_json_copy(evidence, f"stage_evidence.{stage}")
+        if not isinstance(clean_evidence, Mapping):
+            raise ValueError("stage evidence must be a mapping")
+        evidence_status = clean_evidence.get("status")
+        if type(evidence_status) is not str or not evidence_status.strip():
+            raise ValueError("stage evidence status must be a non-empty string")
+        result.setdefault("stage_evidence", {})[stage] = clean_evidence
     if stage == "complete":
         result["status"] = "complete"
     return _validate_checkpoint(result)
@@ -387,14 +411,19 @@ def schedule_next(
         "remaining_seconds": remaining,
     }
     checkpoint["updated_at"] = current_time
+    normalized_candidate_id = candidate_id
+    if normalized_candidate_id is not None:
+        normalized_candidate_id = str(normalized_candidate_id).strip()
+        if not normalized_candidate_id:
+            raise ValueError("candidate_id must be null or a non-empty string")
     checkpoint["checkpoint_written"] = False
     if clock.can_start(now=current_time, estimated_seconds=estimate):
         checkpoint["status"] = "in_progress"
-        checkpoint["candidate_id"] = candidate_id
+        checkpoint["candidate_id"] = normalized_candidate_id
         return checkpoint
 
     checkpoint["status"] = "budget_exhausted"
-    checkpoint["candidate_id"] = candidate_id
+    checkpoint["candidate_id"] = normalized_candidate_id
     checkpoint["candidate_status"] = "inconclusive"
     selected_store = store
     if selected_store is None:
@@ -411,6 +440,135 @@ def schedule_next(
         else:
             checkpoint = persisted
     return checkpoint
+
+
+def _checkpoint_budget(clock: BudgetClock, now: float) -> dict:
+    return {
+        "elapsed_seconds": max(0.0, now - clock.started_at),
+        "remaining_seconds": clock.remaining_seconds(now=now),
+    }
+
+
+def _persist_checkpoint(
+    store: ArtifactStore, checkpoint: Mapping, *, input_hash: str
+) -> dict:
+    """Atomically write, reload, and validate a checkpoint before continuing."""
+    store.write_checkpoint(dict(checkpoint))
+    reloaded = store.load_checkpoint(expected_input_hash=input_hash)
+    return _validate_checkpoint(reloaded, input_hash=input_hash)
+
+
+def _position_checkpoint(
+    checkpoint: Mapping,
+    stage: str,
+    *,
+    store: ArtifactStore,
+    clock: BudgetClock,
+    candidate_id=None,
+    now: float | None = None,
+) -> dict:
+    current = _validate_checkpoint(checkpoint)
+    current_time = time.time() if now is None else _finite_real(now, "now")
+    normalized_id = None if candidate_id is None else str(candidate_id).strip()
+    if normalized_id == "":
+        raise ValueError("candidate_id must be null or a non-empty string")
+    target_index = STAGES.index(stage)
+    if current["stage_index"] == target_index:
+        if current["status"] == "stage_complete":
+            return current
+        positioned = copy.deepcopy(current)
+        positioned["status"] = "ready"
+        positioned["candidate_id"] = normalized_id
+        positioned["candidate_status"] = None
+        positioned["budget"] = _checkpoint_budget(clock, current_time)
+        positioned["updated_at"] = current_time
+    else:
+        positioned = transition_checkpoint(
+            current,
+            stage,
+            status="ready",
+            candidate_id=normalized_id,
+            candidate_status=None,
+            budget=_checkpoint_budget(clock, current_time),
+            updated_at=current_time,
+        )
+    return _persist_checkpoint(
+        store, positioned, input_hash=positioned["input_hash"]
+    )
+
+
+def _admit_checkpoint_stage(
+    checkpoint: Mapping,
+    stage: str,
+    *,
+    store: ArtifactStore,
+    clock: BudgetClock,
+    estimated_seconds: float,
+    candidate_id=None,
+    now: float | None = None,
+) -> tuple[bool, dict]:
+    current_time = time.time() if now is None else _finite_real(now, "now")
+    positioned = _position_checkpoint(
+        checkpoint,
+        stage,
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+        now=current_time,
+    )
+    admitted = schedule_next(
+        positioned,
+        clock,
+        estimated_seconds,
+        now=current_time,
+        store=store,
+        candidate_id=candidate_id,
+    )
+    if admitted["status"] == "budget_exhausted":
+        return False, _validate_checkpoint(
+            store.load_checkpoint(expected_input_hash=positioned["input_hash"]),
+            input_hash=positioned["input_hash"],
+        )
+    admitted.pop("checkpoint_written", None)
+    admitted = _persist_checkpoint(
+        store, admitted, input_hash=positioned["input_hash"]
+    )
+    return True, admitted
+
+
+def _complete_checkpoint_stage(
+    checkpoint: Mapping,
+    stage: str,
+    evidence: Mapping,
+    *,
+    store: ArtifactStore,
+    clock: BudgetClock,
+    candidate_id=None,
+    candidate_status=None,
+    now: float | None = None,
+) -> dict:
+    current_time = time.time() if now is None else _finite_real(now, "now")
+    positioned = _position_checkpoint(
+        checkpoint,
+        stage,
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+        now=current_time,
+    )
+    completed = transition_checkpoint(
+        positioned,
+        stage,
+        status="stage_complete",
+        candidate_id=(None if candidate_id is None else str(candidate_id).strip()),
+        candidate_status=candidate_status,
+        budget=_checkpoint_budget(clock, current_time),
+        evidence=evidence,
+        updated_at=current_time,
+    )
+    return _persist_checkpoint(
+        store, completed, input_hash=completed["input_hash"]
+    )
 
 
 def execute_stage(
@@ -543,6 +701,7 @@ def evaluate_outer_candidate(
     candidate_root=None,
     retries: int = 2,
     seed: int = 0,
+    workload_runner=None,
 ) -> dict:
     """Evaluate one confirmed inner winner through the applicable outer loop."""
     candidate_path = Path(_candidate_file(candidate))
@@ -599,14 +758,46 @@ def evaluate_outer_candidate(
         selected_evaluator = (
             workload_evaluate.evaluate_pairs if evaluator is None else evaluator
         )
+        evaluation_spec = workload_spec
+        if policy.max_cases is not None and len(workload_spec.cases) > policy.max_cases:
+            evaluation_spec = WorkloadSpec(
+                kind=workload_spec.kind,
+                source=workload_spec.source,
+                objective=workload_spec.objective,
+                cases=tuple(workload_spec.cases[: policy.max_cases]),
+                source_hash=workload_spec.source_hash,
+            )
+        selected_workload_runner = (
+            run_spec_once if workload_runner is None else workload_runner
+        )
+        if not callable(selected_workload_runner):
+            raise ValueError("workload_runner must be callable")
+
+        def frozen_runner(
+            _evaluation_spec,
+            *,
+            candidate,
+            role,
+            case=None,
+            timeout=None,
+        ):
+            return selected_workload_runner(
+                workload_spec,
+                candidate=candidate,
+                role=role,
+                case=case,
+                timeout=timeout,
+            )
+
         workload_result = selected_evaluator(
-            workload_spec,
+            evaluation_spec,
             baseline,
             str(candidate_path),
             blocks=blocks,
             retries=retries,
             seed=seed,
             confidence=_finite_real(confidence, "confidence"),
+            runner=frozen_runner,
         )
     terminal = build_terminal_decision(
         mode=mode,
@@ -631,6 +822,7 @@ def apply_decision(
     retries: int = 0,
     attribution=None,
     sass_check=None,
+    skip_validation: bool = False,
     runner=None,
 ) -> dict:
     """Atomically publish a decision, then invoke state update with its path."""
@@ -668,12 +860,16 @@ def apply_decision(
         command.extend(["--attribution", str(attribution)])
     if sass_check is not None and Path(sass_check).is_file():
         command.extend(["--sass-check", str(sass_check)])
+    if skip_validation:
+        command.append("--skip-validation")
     selected_runner = _run if runner is None else runner
     completed = selected_runner(command)
     return {
         "decision_path": str(decision_path),
         "command": command,
         "returncode": completed.returncode,
+        "stdout": getattr(completed, "stdout", None),
+        "stderr": getattr(completed, "stderr", None),
     }
 
 
@@ -1003,6 +1199,7 @@ def cmd_setup(args):
                 "started_at": started_at,
                 "dims": copy.deepcopy(dims),
                 "backend": args.backend,
+                "ptr_size": args.ptr_size,
             }
         )
         manifest["input_hash"] = _frozen_input_hash(
@@ -1017,25 +1214,56 @@ def cmd_setup(args):
         )
         atomic_write_json(run_dir / "manifest.json", manifest)
 
-        state, state_path = state_manager.initialize_state(
-            run_dir=run_dir,
-            baseline=baseline,
-            ref=ref,
-            manifest=manifest,
-            budget=budget_payload,
-            environment=environment,
-            env_path=env_path,
-            dims=dims,
-            ptr_size=args.ptr_size,
-            ncu_num=args.ncu_num,
-            mode=mode,
-            workload=workload_snapshot,
-            started_at=started_at,
-            backend=args.backend,
-            confidence=confidence,
-            min_effect_pct=min_effect_pct,
-            noise_threshold_pct=None,
-        )
+        state_command = [
+            sys.executable,
+            str(SCRIPT_DIR / "state.py"),
+            "init",
+            "--baseline",
+            baseline,
+            "--ref",
+            ref,
+            "--dims",
+            json.dumps(dims, sort_keys=True, allow_nan=False),
+            "--env",
+            str(env_path),
+            "--ptr-size",
+            str(args.ptr_size),
+            "--ncu-num",
+            str(args.ncu_num),
+            "--output-root",
+            str(output_root),
+            "--budget-json",
+            json.dumps(budget_payload, sort_keys=True, allow_nan=False),
+            "--run-dir",
+            str(run_dir),
+            "--manifest",
+            str(run_dir / "manifest.json"),
+            "--mode",
+            mode,
+            "--workload-json",
+            json.dumps(workload_snapshot, sort_keys=True, allow_nan=False),
+            "--started-at",
+            str(started_at),
+            "--backend",
+            args.backend,
+            "--confidence",
+            str(confidence),
+            "--min-effect-pct",
+            str(min_effect_pct),
+        ]
+        initialized = _run(state_command, capture_output=True)
+        if initialized.returncode != 0:
+            raise ValueError(
+                "state init failed rc="
+                f"{initialized.returncode}: {(initialized.stderr or '').strip()}"
+            )
+        try:
+            initialized_output = json.loads(initialized.stdout)
+            state_path = Path(initialized_output["state"]).resolve(strict=True)
+            state = _read(str(state_path))
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(f"state init returned malformed output: {error}") from error
+        state_manager.validate_state(state)
         now = time.time()
         checkpoint = {
             "schema_version": CURRENT_SCHEMA_VERSION,
@@ -1043,9 +1271,10 @@ def cmd_setup(args):
             "run_dir": str(run_dir),
             "stage": STAGES[0],
             "stage_index": 0,
-            "status": "ready",
+            "status": "stage_complete",
             "candidate_id": None,
             "candidate_status": None,
+            "stage_evidence": {"baseline": {"status": "passed"}},
             "budget": {
                 "elapsed_seconds": max(0.0, now - started_at),
                 "remaining_seconds": max(
@@ -1070,7 +1299,7 @@ def cmd_setup(args):
                 "env": str(env_path),
                 "mode": mode,
                 "input_hash": state["input_hash"],
-                "next_stage": "baseline",
+                "next_stage": "candidate_correctness",
             },
             indent=2,
         )
@@ -1138,6 +1367,461 @@ def cmd_open_iter(args):
 # close-iter  —  branch explore → ncu champion → ablate → sass → update
 # ---------------------------------------------------------------------------
 
+_STAGE_ESTIMATES_SECONDS = {
+    "candidate_correctness": 300.0,
+    "candidate_profile": 180.0,
+    "ablation": 180.0,
+    "candidate_sanitizer": 120.0,
+    "workload_paired": 120.0,
+}
+
+
+def _budget_stop_output(args, checkpoint: Mapping) -> None:
+    print(
+        json.dumps(
+            {
+                "iter": args.iter,
+                "status": "budget_exhausted",
+                "stage": checkpoint["stage"],
+                "candidate_status": "inconclusive",
+                "checkpoint": str(Path(args.run_dir) / "checkpoint.json"),
+            },
+            indent=2,
+        )
+    )
+
+
+def _candidate_checkpoint_id(candidate: Mapping | None) -> str | None:
+    if not isinstance(candidate, Mapping):
+        return None
+    for key in ("branch_index", "id"):
+        value = candidate.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    path = candidate.get("candidate_file") or candidate.get("kernel")
+    if isinstance(path, str) and path.strip():
+        candidate_path = Path(path).expanduser()
+        if candidate_path.is_file() and not candidate_path.is_symlink():
+            return sha256_file(candidate_path)[:16]
+    return None
+
+
+def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
+    policy = _policy_from_state(state)
+    started_at = _finite_real(
+        state.get("started_at", time.time()), "state started_at"
+    )
+    clock = BudgetClock(policy, started_at=started_at)
+    store = ArtifactStore(args.run_dir)
+    checkpoint = _validate_checkpoint(
+        store.load_checkpoint(expected_input_hash=state["input_hash"]),
+        input_hash=state["input_hash"],
+    )
+
+    admitted, checkpoint = _admit_checkpoint_stage(
+        checkpoint,
+        "candidate_correctness",
+        store=store,
+        clock=clock,
+        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_correctness"],
+        candidate_id=None,
+    )
+    if not admitted:
+        _budget_stop_output(args, checkpoint)
+        return
+
+    branch_result = _run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "branch_explore.py"),
+            "--state",
+            state_path,
+            "--iter",
+            str(args.iter),
+            "--benchmark",
+            os.path.abspath(args.benchmark),
+            "--warmup",
+            str(args.warmup),
+            "--repeat",
+            str(args.repeat),
+        ],
+        capture_output=True,
+    )
+    sys.stderr.write(branch_result.stderr or "")
+    if branch_result.returncode == 2:
+        print(
+            json.dumps(
+                {
+                    "iter": args.iter,
+                    "status": "all_branches_failed",
+                    "guidance": "The agent should fix the kernels and retry close-iter.",
+                },
+                indent=2,
+            )
+        )
+        raise SystemExit(2)
+    if branch_result.returncode != 0:
+        raise SystemExit(f"branch_explore failed rc={branch_result.returncode}")
+
+    branch_results_path = os.path.join(iter_dir, "branch_results.json")
+    branch_payload = _read_branch_results(branch_results_path)
+    champion = branch_payload.get("champion")
+    candidate_id = _candidate_checkpoint_id(champion)
+    checkpoint = _complete_checkpoint_stage(
+        checkpoint,
+        "candidate_correctness",
+        {"status": "passed"},
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+    )
+    paired_status = (
+        "completed"
+        if branch_payload.get("status") == "no_confirmed_kernel_win"
+        else "passed"
+    )
+    checkpoint = _complete_checkpoint_stage(
+        checkpoint,
+        "candidate_paired",
+        {
+            "status": paired_status,
+            "completed_comparisons": branch_payload.get(
+                "completed_comparisons", 0
+            ),
+        },
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+    )
+
+    decision_path = os.path.join(iter_dir, "decision.json")
+    if branch_payload.get("status") == "no_confirmed_kernel_win":
+        checkpoint = _complete_checkpoint_stage(
+            checkpoint,
+            "candidate_profile",
+            {"status": "not_applicable"},
+            store=store,
+            clock=clock,
+        )
+        checkpoint = _complete_checkpoint_stage(
+            checkpoint,
+            "candidate_sanitizer",
+            {
+                "status": "deferred",
+                "reason": "sanitizer stage is not implemented yet",
+            },
+            store=store,
+            clock=clock,
+        )
+        checkpoint = _complete_checkpoint_stage(
+            checkpoint,
+            "workload_paired",
+            {"status": "not_applicable"},
+            store=store,
+            clock=clock,
+        )
+        _complete_checkpoint_stage(
+            checkpoint,
+            "decision",
+            {"status": "no_confirmed_kernel_win"},
+            store=store,
+            clock=clock,
+            candidate_status="no_confirmed_kernel_win",
+        )
+        print(
+            json.dumps(
+                {
+                    "iter": args.iter,
+                    "status": "no_confirmed_kernel_win",
+                    "decision": decision_path,
+                    "state": state_path,
+                    "next_step": (
+                        "No candidate was promoted. Continue with another iteration "
+                        "or finalize the run with the current best."
+                    ),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    mode = state.get("mode", "kernel-only")
+    if mode == "full":
+        candidates = select_outer_candidates(
+            branch_payload.get("shortlist", []), policy.outer_candidates
+        )
+        if not candidates:
+            raise ValueError("full mode shortlist contains no confirmed kernel win")
+        selected_candidate = candidates[0]
+    elif mode == "kernel-only":
+        if not isinstance(champion, Mapping):
+            raise ValueError("branch_results champion must be a mapping")
+        selected_candidate = dict(champion)
+        selected_candidate["candidate_file"] = branch_payload.get(
+            "selected_kernel"
+        )
+        candidates = [selected_candidate]
+    else:
+        raise ValueError("state mode must be full or kernel-only")
+
+    candidate_id = _candidate_checkpoint_id(selected_candidate)
+    kernel = _publish_outer_candidate(
+        selected_candidate, iter_dir=Path(iter_dir).resolve()
+    )
+    bench_json = os.path.join(iter_dir, "bench.json")
+    if not os.path.isfile(bench_json):
+        raise SystemExit("bench.json missing for champion")
+    bench = _read(bench_json)
+    if not bool(bench.get("correctness", {}).get("passed", False)):
+        print(
+            json.dumps(
+                {
+                    "iter": args.iter,
+                    "status": "validation_failed",
+                    "bench_json": bench_json,
+                    "guidance": "The agent should fix the kernel and re-run close-iter.",
+                },
+                indent=2,
+            )
+        )
+        raise SystemExit(2)
+
+    admitted, checkpoint = _admit_checkpoint_stage(
+        checkpoint,
+        "candidate_profile",
+        store=store,
+        clock=clock,
+        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_profile"],
+        candidate_id=candidate_id,
+    )
+    if not admitted:
+        _budget_stop_output(args, checkpoint)
+        return
+    profile_rc = _run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "profile_ncu.py"),
+            "--state",
+            state_path,
+            "--iter",
+            str(args.iter),
+            "--which",
+            "kernel",
+            "--benchmark",
+            os.path.abspath(args.benchmark),
+            "--promote-if-best",
+        ]
+    ).returncode
+    checkpoint = _complete_checkpoint_stage(
+        checkpoint,
+        "candidate_profile",
+        {"status": "passed" if profile_rc == 0 else "deferred", "returncode": profile_rc},
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+    )
+
+    admitted, checkpoint = _admit_checkpoint_stage(
+        checkpoint,
+        "candidate_sanitizer",
+        store=store,
+        clock=clock,
+        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_sanitizer"],
+        candidate_id=candidate_id,
+    )
+    if not admitted:
+        _budget_stop_output(args, checkpoint)
+        return
+    attribution_path = os.path.join(iter_dir, "attribution.json")
+    ablation_dir = os.path.join(iter_dir, "ablations")
+    if os.path.isdir(ablation_dir):
+        if not clock.can_start(
+            now=time.time(),
+            estimated_seconds=_STAGE_ESTIMATES_SECONDS["ablation"],
+        ):
+            denied = schedule_next(
+                checkpoint,
+                clock,
+                _STAGE_ESTIMATES_SECONDS["ablation"],
+                now=time.time(),
+                store=store,
+                candidate_id=candidate_id,
+            )
+            _budget_stop_output(args, denied)
+            return
+        _run(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "ablate.py"),
+                "--state",
+                state_path,
+                "--iter",
+                str(args.iter),
+                "--benchmark",
+                os.path.abspath(args.benchmark),
+            ]
+        )
+
+    if not clock.can_start(
+        now=time.time(),
+        estimated_seconds=_STAGE_ESTIMATES_SECONDS["candidate_sanitizer"],
+    ):
+        denied = schedule_next(
+            checkpoint,
+            clock,
+            _STAGE_ESTIMATES_SECONDS["candidate_sanitizer"],
+            now=time.time(),
+            store=store,
+            candidate_id=candidate_id,
+        )
+        _budget_stop_output(args, denied)
+        return
+    sass_check_path = os.path.join(iter_dir, "sass_check.json")
+    sass_rc = _run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "sass_check.py"),
+            "--state",
+            state_path,
+            "--iter",
+            str(args.iter),
+        ]
+    ).returncode
+    checkpoint = _complete_checkpoint_stage(
+        checkpoint,
+        "candidate_sanitizer",
+        {
+            "status": "deferred",
+            "reason": "sanitizer stage is not implemented yet",
+            "sass_status": "passed" if sass_rc == 0 else "failed",
+        },
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+    )
+
+    if mode == "kernel-only":
+        terminal_decision = evaluate_outer_candidate(
+            selected_candidate,
+            mode="kernel-only",
+            workload_spec=None,
+            baseline=state.get("best_file"),
+            policy=policy,
+            confidence=state.get("confidence", 0.95),
+            candidate_root=iter_dir,
+        )
+        checkpoint = _complete_checkpoint_stage(
+            checkpoint,
+            "workload_paired",
+            {"status": "not_applicable"},
+            store=store,
+            clock=clock,
+            candidate_id=candidate_id,
+        )
+    else:
+        pair_estimate = _finite_real(
+            state.get("estimated_workload_pair_seconds", 0.0),
+            "estimated_workload_pair_seconds",
+            minimum=0.0,
+        )
+        workload_estimate = max(
+            _STAGE_ESTIMATES_SECONDS["workload_paired"],
+            policy.min_pairs * pair_estimate,
+        )
+        admitted, checkpoint = _admit_checkpoint_stage(
+            checkpoint,
+            "workload_paired",
+            store=store,
+            clock=clock,
+            estimated_seconds=workload_estimate,
+            candidate_id=candidate_id,
+        )
+        if not admitted:
+            _budget_stop_output(args, checkpoint)
+            return
+        workload_spec = _workload_from_snapshot(state.get("workload"))
+        evaluated = []
+        for candidate in candidates:
+            evaluated.append(
+                (
+                    candidate,
+                    evaluate_outer_candidate(
+                        candidate,
+                        mode="full",
+                        workload_spec=workload_spec,
+                        baseline=state.get("best_file"),
+                        policy=policy,
+                        confidence=state.get("confidence", 0.95),
+                        estimated_seconds_per_pair=pair_estimate,
+                        budget_clock=clock,
+                        now=time.time(),
+                        candidate_root=iter_dir,
+                        retries=args.retries,
+                        seed=state.get("seed", 0),
+                    ),
+                )
+            )
+        selected_candidate, terminal_decision = _select_terminal_outer_result(
+            evaluated
+        )
+        candidate_id = _candidate_checkpoint_id(selected_candidate)
+        kernel = _publish_outer_candidate(
+            selected_candidate, iter_dir=Path(iter_dir).resolve()
+        )
+        checkpoint = _complete_checkpoint_stage(
+            checkpoint,
+            "workload_paired",
+            {"status": "evaluated"},
+            store=store,
+            clock=clock,
+            candidate_id=candidate_id,
+        )
+
+    terminal_decision["candidate_file"] = kernel
+    terminal_decision["candidate_sha256"] = sha256_file(kernel)
+    terminal_decision = _strict_json_copy(terminal_decision, "decision")
+    applied = apply_decision(
+        terminal_decision,
+        run_dir=args.run_dir,
+        iteration=args.iter,
+        state_path=state_path,
+        kernel=kernel,
+        bench=bench_json,
+        methods_json=methods_json,
+        retries=args.retries,
+        attribution=attribution_path,
+        sass_check=sass_check_path,
+        skip_validation=True,
+    )
+    if applied["returncode"] != 0:
+        diagnostic = (applied.get("stderr") or applied.get("stdout") or "").strip()
+        raise SystemExit(
+            "state update failed" + (f": {diagnostic}" if diagnostic else "")
+        )
+    checkpoint = _complete_checkpoint_stage(
+        checkpoint,
+        "decision",
+        {"status": terminal_decision["status"]},
+        store=store,
+        clock=clock,
+        candidate_id=candidate_id,
+        candidate_status=terminal_decision["status"],
+    )
+    updated_state = _read(state_path)
+    print(
+        json.dumps(
+            {
+                "iter": args.iter,
+                "status": "closed",
+                "best_ms": updated_state.get("best_metric_ms"),
+                "next_iter": None,
+                "early_stop": False,
+                "state": state_path,
+            },
+            indent=2,
+        )
+    )
+
 def cmd_close_iter(args):
     state_path = os.path.join(args.run_dir, "state.json")
     if not os.path.isfile(state_path):
@@ -1148,6 +1832,18 @@ def cmd_close_iter(args):
     methods_json = os.path.join(iter_dir, "methods.json")
     if not os.path.isfile(methods_json):
         sys.exit(f"methods.json missing at {methods_json}")
+
+    checkpoint_path = Path(args.run_dir) / "checkpoint.json"
+    if (
+        state.get("schema_version") == CURRENT_SCHEMA_VERSION
+        and isinstance(state.get("budget"), Mapping)
+        and isinstance(state.get("input_hash"), str)
+        and checkpoint_path.is_file()
+        and not checkpoint_path.is_symlink()
+    ):
+        return _cmd_close_iter_lifecycle(
+            args, state, state_path, iter_dir, methods_json
+        )
 
     # Step 3e: Branch explore — compile + benchmark all branches
     branch_result = _run([
@@ -1464,6 +2160,74 @@ def _verify_state_candidates(state: Mapping) -> None:
             raise ValueError(f"state candidate {candidate_id!r} file drifted")
 
 
+def _load_and_verify_manifest(run_dir: Path) -> tuple[dict, str]:
+    manifest_path = _safe_run_file(run_dir, "manifest.json")
+    try:
+        manifest = _read(str(manifest_path))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"run manifest is malformed: {error}") from error
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must contain a JSON object")
+    if manifest.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise ValueError("manifest schema_version is invalid")
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, Mapping) or not {"baseline", "ref"}.issubset(inputs):
+        raise ValueError("manifest inputs must contain baseline and ref")
+    for name, record in inputs.items():
+        if not isinstance(name, str) or not isinstance(record, Mapping):
+            raise ValueError("manifest input record is malformed")
+        path_value = record.get("path")
+        declared_hash = record.get("sha256")
+        if not isinstance(path_value, str) or not path_value:
+            raise ValueError(f"manifest input {name} path is malformed")
+        if (
+            not isinstance(declared_hash, str)
+            or len(declared_hash) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in declared_hash)
+        ):
+            raise ValueError(f"manifest input {name} sha256 is malformed")
+        source = Path(path_value).expanduser()
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"manifest input {name} drifted or is unsafe")
+        if sha256_file(source) != declared_hash.lower():
+            raise ValueError(f"manifest input {name} drifted from frozen sha256")
+        size = record.get("size_bytes")
+        if size is not None and (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or source.stat().st_size != size
+        ):
+            raise ValueError(f"manifest input {name} size drifted")
+
+    required = {
+        "workload",
+        "dims",
+        "backend",
+        "budget",
+        "confidence",
+        "min_effect_pct",
+        "ptr_size",
+        "input_hash",
+    }
+    missing = sorted(required - set(manifest))
+    if missing:
+        raise ValueError(f"manifest missing frozen field: {missing[0]}")
+    recomputed = _frozen_input_hash(
+        manifest,
+        workload=manifest["workload"],
+        dims=manifest["dims"],
+        backend=manifest["backend"],
+        budget=manifest["budget"],
+        confidence=manifest["confidence"],
+        min_effect_pct=manifest["min_effect_pct"],
+        ptr_size=manifest["ptr_size"],
+    )
+    if manifest.get("input_hash") != recomputed:
+        raise ValueError("manifest frozen input_hash does not match current inputs")
+    return dict(manifest), recomputed
+
+
 def cmd_resume(args) -> None:
     run_arg = Path(args.run_dir).expanduser()
     if run_arg.is_symlink():
@@ -1490,7 +2254,10 @@ def cmd_resume(args) -> None:
     if checkpoint.get("input_hash") != state.get("input_hash"):
         raise ValueError("checkpoint/state frozen input_hash mismatch")
     _verify_state_candidates(state)
-    restored = resume(checkpoint, input_hash=state["input_hash"])
+    _manifest, manifest_hash = _load_and_verify_manifest(run_dir)
+    if state.get("input_hash") != manifest_hash:
+        raise ValueError("manifest/state frozen input_hash mismatch")
+    restored = resume(checkpoint, input_hash=manifest_hash)
     print(
         json.dumps(
             {
