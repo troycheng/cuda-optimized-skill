@@ -205,6 +205,19 @@ def _failed_evaluation(base: dict, pairs: list[dict], reason: str) -> dict:
             "constraints": [],
         }
     )
+    for pair in pairs:
+        failures = pair.get("failures")
+        if not isinstance(failures, Mapping):
+            continue
+        for role in ("baseline", "candidate"):
+            diagnostic = failures.get(role)
+            if isinstance(diagnostic, Mapping):
+                result["failure"] = {
+                    "block": pair.get("block"),
+                    "role": role,
+                    **copy.deepcopy(dict(diagnostic)),
+                }
+                return result
     return result
 
 

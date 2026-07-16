@@ -36,6 +36,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from artifact_store import (  # noqa: E402
     ArtifactStore,
     CURRENT_SCHEMA_VERSION,
+    atomic_write_bytes,
     atomic_write_json,
     read_regular_bytes,
     sha256_file,
@@ -702,13 +703,43 @@ def select_outer_candidates(items, limit: int) -> list[dict]:
     return [item for _, _, item in selected[:limit]]
 
 
-def _candidate_file(candidate: Mapping) -> str:
+def _absolute_lexical_path(value: str) -> Path:
+    path = Path(os.path.abspath(os.path.expanduser(value)))
+    parts = path.parts
+    if len(parts) > 1:
+        root_entry = Path(path.anchor) / parts[1]
+        try:
+            metadata = os.lstat(root_entry)
+        except OSError:
+            metadata = None
+        if (
+            metadata is not None
+            and stat.S_ISLNK(metadata.st_mode)
+            and metadata.st_uid == 0
+        ):
+            target = os.readlink(root_entry)
+            root_target = Path(target)
+            if not root_target.is_absolute():
+                root_target = Path(path.anchor) / root_target
+            path = Path(os.path.normpath(root_target)) / Path(*parts[2:])
+    return path
+
+
+def _candidate_snapshot(candidate: Mapping) -> dict:
     value = candidate.get("candidate_file") or candidate.get("kernel")
     if not isinstance(value, str) or not value.strip():
         raise ValueError("candidate must provide candidate_file or kernel")
-    path = Path(os.path.abspath(os.path.expanduser(value)))
-    read_regular_bytes(path)
-    return str(path.resolve(strict=True))
+    path = _absolute_lexical_path(value)
+    payload = read_regular_bytes(path)
+    return {
+        "path": str(path),
+        "payload": payload,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _candidate_file(candidate: Mapping) -> str:
+    return _candidate_snapshot(candidate)["path"]
 
 
 def _candidate_identifier(candidate: Mapping, fallback: str | None = None):
@@ -726,6 +757,7 @@ def build_terminal_decision(
     candidate: Mapping,
     workload_result=None,
     decide_fn=None,
+    _snapshot=None,
 ) -> dict:
     """Build the authoritative terminal decision bound to candidate bytes."""
     selected_decider = decision_engine.decide if decide_fn is None else decide_fn
@@ -744,9 +776,9 @@ def build_terminal_decision(
             "statistics",
             _strict_json_copy(kernel["statistics"], "kernel statistics"),
         )
-    candidate_file = _candidate_file(candidate)
-    result["candidate_file"] = candidate_file
-    result["candidate_sha256"] = sha256_file(candidate_file)
+    snapshot = _candidate_snapshot(candidate) if _snapshot is None else _snapshot
+    result["candidate_file"] = snapshot["path"]
+    result["candidate_sha256"] = snapshot["sha256"]
     kernel_samples = candidate.get("paired_samples") or candidate.get(
         "kernel_paired_samples"
     )
@@ -793,7 +825,8 @@ def evaluate_outer_candidate(
     iteration: int | None = None,
 ) -> dict:
     """Evaluate one confirmed inner winner through the applicable outer loop."""
-    candidate_path = Path(_candidate_file(candidate))
+    candidate_snapshot = _candidate_snapshot(candidate)
+    candidate_path = Path(candidate_snapshot["path"])
     if candidate_path.suffix not in {".cu", ".py"}:
         raise ValueError("outer candidate must be a .cu or .py kernel")
     iteration_root = None
@@ -806,7 +839,11 @@ def evaluate_outer_candidate(
     normalized_candidate = dict(candidate)
     normalized_candidate["candidate_file"] = str(candidate_path)
     if mode == "kernel-only":
-        return build_terminal_decision(mode=mode, candidate=normalized_candidate)
+        return build_terminal_decision(
+            mode=mode,
+            candidate=normalized_candidate,
+            _snapshot=candidate_snapshot,
+        )
     if mode != "full" or workload_spec is None:
         raise ValueError("full mode requires a frozen WorkloadSpec")
     blocks = policy.max_pairs
@@ -841,7 +878,7 @@ def evaluate_outer_candidate(
                 "candidate_status": "inconclusive",
                 "budget_exhausted": True,
                 "candidate_file": str(candidate_path),
-                "candidate_sha256": sha256_file(candidate_path),
+                "candidate_sha256": candidate_snapshot["sha256"],
                 "statistics": None,
                 "kernel_evidence": {
                     "status": normalized_candidate.get("status"),
@@ -904,7 +941,7 @@ def evaluate_outer_candidate(
                 raise ValueError("workload result must contain raw pairs")
             if candidate_root is None or input_hash is None or iteration is None:
                 raise ValueError("workload pair persistence binding is incomplete")
-            candidate_digest = sha256_file(candidate_path)
+            candidate_digest = candidate_snapshot["sha256"]
             candidate_id = _candidate_identifier(
                 normalized_candidate, candidate_digest[:16]
             )
@@ -950,6 +987,7 @@ def evaluate_outer_candidate(
         mode=mode,
         candidate=normalized_candidate,
         workload_result=workload_result,
+        _snapshot=candidate_snapshot,
     )
     return terminal
 
@@ -1254,29 +1292,17 @@ def _policy_from_state(state: Mapping) -> BudgetPolicy:
     )
 
 
-def _publish_outer_candidate(candidate: Mapping, *, iter_dir: Path) -> str:
-    source = Path(_candidate_file(candidate))
+def _publish_outer_candidate(
+    candidate: Mapping, *, iter_dir: Path, _snapshot=None
+) -> str:
+    snapshot = _candidate_snapshot(candidate) if _snapshot is None else _snapshot
+    source = Path(snapshot["path"])
     suffix = source.suffix
     if suffix not in {".cu", ".py"}:
         raise ValueError("outer candidate must be a .cu or .py kernel")
     destination = iter_dir / f"kernel{suffix}"
     if source != destination.resolve(strict=False):
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.name}.", suffix=".tmp", dir=str(iter_dir)
-        )
-        os.close(descriptor)
-        temporary = Path(temporary_name)
-        try:
-            shutil.copy2(source, temporary)
-            with temporary.open("rb") as stream:
-                os.fsync(stream.fileno())
-            os.replace(temporary, destination)
-        except BaseException:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        atomic_write_bytes(destination, snapshot["payload"])
     for stale_suffix in {".cu", ".py"} - {suffix}:
         stale = iter_dir / f"kernel{stale_suffix}"
         if stale.is_symlink() or stale.is_file():
@@ -1938,10 +1964,11 @@ def _validate_sanitizer_report(
             raise ValueError("failed sanitizer report coverage is invalid")
     elif clean.get("coverage") != expected_coverage:
         raise ValueError("sanitizer report coverage conflicts with status")
-    candidate_file = _candidate_file(candidate)
+    candidate_snapshot = _candidate_snapshot(candidate)
+    candidate_file = candidate_snapshot["path"]
     if clean.get("candidate_file") != candidate_file:
         raise ValueError("sanitizer report candidate_file drifted")
-    if clean.get("candidate_sha256") != sha256_file(candidate_file):
+    if clean.get("candidate_sha256") != candidate_snapshot["sha256"]:
         raise ValueError("sanitizer report candidate_sha256 drifted")
     if clean.get("input_hash") != state.get("input_hash"):
         raise ValueError("sanitizer report input_hash drifted")
@@ -2056,8 +2083,9 @@ def _sanitizer_candidate_outcomes(
     eligible = []
     rejected = []
     for candidate in candidates:
-        candidate_digest = sha256_file(_candidate_file(candidate))
-        candidate_file = _candidate_file(candidate)
+        candidate_snapshot = _candidate_snapshot(candidate)
+        candidate_digest = candidate_snapshot["sha256"]
+        candidate_file = candidate_snapshot["path"]
         record = by_identity.get((candidate_file, candidate_digest))
         if record is None:
             raise ValueError("sanitizer aggregate is missing a candidate")
@@ -2065,7 +2093,11 @@ def _sanitizer_candidate_outcomes(
             failed_candidate = dict(candidate)
             failed_candidate["status"] = "rejected_correctness"
             rejected.append(
-                build_terminal_decision(mode=mode, candidate=failed_candidate)
+                build_terminal_decision(
+                    mode=mode,
+                    candidate=failed_candidate,
+                    _snapshot=candidate_snapshot,
+                )
             )
         elif record.get("status") in {
             "passed",
@@ -2134,12 +2166,13 @@ def _run_sanitizer_gate(
     timeout_provider = hard_timeout if callable(hard_timeout) else lambda: hard_timeout
     reports = []
     for candidate in candidate_list:
-        candidate_file = _candidate_file(candidate)
+        candidate_snapshot = _candidate_snapshot(candidate)
+        candidate_file = candidate_snapshot["path"]
         try:
             Path(candidate_file).relative_to(iteration_dir)
         except ValueError as error:
             raise ValueError("sanitizer candidate escapes the iteration") from error
-        digest = sha256_file(candidate_file)
+        digest = candidate_snapshot["sha256"]
         benchmark_command = [
             sys.executable,
             str(benchmark),
@@ -2415,8 +2448,9 @@ def _load_sanitizer_aggregate(
     for record, candidate in zip(records, candidate_list):
         if not isinstance(record, Mapping):
             raise ValueError("sanitizer.json candidate is malformed")
-        candidate_file = _candidate_file(candidate)
-        candidate_sha256 = sha256_file(candidate_file)
+        candidate_snapshot = _candidate_snapshot(candidate)
+        candidate_file = candidate_snapshot["path"]
+        candidate_sha256 = candidate_snapshot["sha256"]
         status = record.get("status")
         artifact_value = record.get("artifact")
         artifact_digest = record.get("artifact_sha256")
@@ -3166,15 +3200,16 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 selected_candidate = eligible_candidates[0]
                 previous_candidate_id = candidate_id
                 candidate_id = _candidate_checkpoint_id(selected_candidate)
-                selected_digest = sha256_file(
-                    _candidate_file(selected_candidate)
-                )
+                selected_snapshot = _candidate_snapshot(selected_candidate)
+                selected_digest = selected_snapshot["sha256"]
                 selection_changed = (
                     previous_candidate_id != candidate_id
                     or selection.get("candidate_sha256") != selected_digest
                 )
                 kernel = _publish_outer_candidate(
-                    selected_candidate, iter_dir=iteration_dir
+                    selected_candidate,
+                    iter_dir=iteration_dir,
+                    _snapshot=selected_snapshot,
                 )
                 _write_selection_artifact(
                     iteration_dir,

@@ -290,6 +290,21 @@ class StateSchemaTests(unittest.TestCase):
                 "kernel_paired_samples": paired,
             }
             decision_path.write_text(json.dumps(decision), encoding="utf-8")
+            (run_dir / "checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "input_hash": "a" * 64,
+                        "iteration": 1,
+                        "stage": "decision",
+                        "status": "in_progress",
+                        "budget": {},
+                        "candidate_id": "loss-1",
+                        "candidate_status": "confirmed_loss",
+                    }
+                ),
+                encoding="utf-8",
+            )
             args = argparse.Namespace(
                 state=str(state_path), iter=1, decision=str(decision_path)
             )
@@ -543,6 +558,26 @@ class StateDecisionPromotionTests(unittest.TestCase):
                     }
             decision.write_text(
                 json.dumps(decision_payload),
+                encoding="utf-8",
+            )
+            checkpoint_status = (
+                "kernel_only_win"
+                if decision_status == "confirmed_win"
+                else decision_status
+            )
+            (run_dir / "checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "input_hash": "abc",
+                        "iteration": 1,
+                        "stage": "decision",
+                        "status": "in_progress",
+                        "budget": {},
+                        "candidate_id": "b1",
+                        "candidate_status": checkpoint_status,
+                    }
+                ),
                 encoding="utf-8",
             )
         args = argparse.Namespace(
@@ -871,6 +906,18 @@ class StateDecisionPromotionTests(unittest.TestCase):
                 self.state.persist_checkpoint_snapshot(
                     state_path, stale, checkpoint_path
                 )
+
+    def test_candidate_terminal_rejects_missing_checkpoint_before_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            (state_path.parent / "checkpoint.json").unlink()
+
+            with self.assertRaisesRegex(ValueError, "checkpoint|resume"):
+                self._run_update(args)
+
+            self.assertEqual(json.loads(state_path.read_text("utf-8")), before)
 
     def test_faster_average_with_non_win_decision_never_promotes(self) -> None:
         for status in (

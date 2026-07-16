@@ -689,12 +689,36 @@ def _validate_terminal_snapshot(
     if not isinstance(resume, Mapping):
         raise ValueError("terminal_decision.resume must be a mapping")
     resume = _strict_json_copy(dict(resume), "terminal_decision.resume")
-    if resume.get("status") != "not_recorded":
+    resume_status = resume.get("status")
+    if candidate_id is not None and resume_status == "not_recorded":
+        raise ValueError(
+            "terminal_decision candidate requires a recorded checkpoint resume"
+        )
+    if resume_status != "not_recorded":
+        if type(resume_status) is not str or not resume_status.strip():
+            raise ValueError("terminal_decision.resume.status must be non-empty")
+        resume_stage = resume.get("stage")
+        if type(resume_stage) is not str or not resume_stage.strip():
+            raise ValueError("terminal_decision.resume.stage must be non-empty")
         resume_iteration = resume.get("iteration")
         if type(resume_iteration) is not int or resume_iteration < 0:
             raise ValueError("terminal_decision.resume.iteration must be non-negative")
         if resume.get("input_hash") != state.get("input_hash"):
             raise ValueError("terminal_decision.resume.input_hash does not match state")
+        if not isinstance(resume.get("budget"), Mapping):
+            raise ValueError("terminal_decision.resume.budget must be a mapping")
+        checkpoint_path = resume.get("checkpoint")
+        expected_checkpoint = os.path.abspath(
+            os.path.join(os.fspath(state.get("run_dir")), "checkpoint.json")
+        )
+        if (
+            type(checkpoint_path) is not str
+            or not os.path.isabs(checkpoint_path)
+            or os.path.abspath(checkpoint_path) != expected_checkpoint
+        ):
+            raise ValueError(
+                "terminal_decision.resume.checkpoint must bind run checkpoint.json"
+            )
         resume_candidate_id = resume.get("candidate_id")
         if resume_candidate_id is not None and (
             type(resume_candidate_id) is not str or not resume_candidate_id.strip()
@@ -730,6 +754,28 @@ def _validate_terminal_snapshot(
             if resume_candidate_status != status:
                 raise ValueError(
                     "terminal_decision.resume.candidate_status does not match terminal"
+                )
+        if verify_artifacts and candidate_id is not None:
+            checkpoint = _read(checkpoint_path)
+            if not isinstance(checkpoint, Mapping):
+                raise ValueError("terminal_decision checkpoint must contain a mapping")
+            expected_bindings = {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "input_hash": state.get("input_hash"),
+                "iteration": resume_iteration,
+                "stage": resume_stage,
+                "status": resume_status,
+                "candidate_id": resume_candidate_id,
+                "candidate_status": resume_candidate_status,
+            }
+            for field, expected in expected_bindings.items():
+                if checkpoint.get(field) != expected:
+                    raise ValueError(
+                        f"terminal_decision.resume.{field} does not match checkpoint"
+                    )
+            if checkpoint.get("budget", {}) != resume.get("budget"):
+                raise ValueError(
+                    "terminal_decision.resume.budget does not match checkpoint"
                 )
     clean["resume"] = resume
     for kind, stats in (("kernel", statistics), ("workload", workload_statistics)):
@@ -825,7 +871,10 @@ def persist_checkpoint_snapshot(
     checkpoint_path: str | os.PathLike,
 ) -> dict:
     """Persist the checkpoint resume binding before a summary is rendered."""
-    state = _read_state(str(state_path))
+    state = _read(str(state_path))
+    state_without_terminal = dict(state)
+    state_without_terminal.pop("terminal_decision", None)
+    validate_state(state_without_terminal)
     if not isinstance(checkpoint, Mapping):
         raise ValueError("checkpoint must be a mapping")
     if checkpoint.get("input_hash") != state["input_hash"]:

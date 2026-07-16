@@ -278,6 +278,31 @@ class ArtifactStoreTests(unittest.TestCase):
                 [{"index": 1}, {"index": 2}],
             )
 
+    def test_append_jsonl_rejects_parent_replacement_before_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            store = self.artifacts.ArtifactStore(root / "run")
+            events = store.root / "events"
+            events.mkdir(parents=True)
+            displaced = store.root / "events-displaced"
+            outside = root / "outside"
+            outside.mkdir()
+            original_resolve = store._resolve_relative
+
+            def replace_parent(relative_path):
+                target = original_resolve(relative_path)
+                events.rename(displaced)
+                events.symlink_to(outside, target_is_directory=True)
+                return target
+
+            with mock.patch.object(
+                store, "_resolve_relative", side_effect=replace_parent
+            ):
+                with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                    store.append_jsonl("events/history.jsonl", {"index": 1})
+
+            self.assertFalse((outside / "history.jsonl").exists())
+
     def test_write_methods_return_normalized_paths_inside_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self.artifacts.ArtifactStore(Path(tmp) / "parent" / ".." / "run")

@@ -160,6 +160,7 @@ def _full_win_state() -> dict:
             "candidate_id": "b1",
             "decision_sha256": "f" * 64,
             "statistics": copy.deepcopy(kernel),
+            "workload_status": "evaluated",
             "workload_statistics": copy.deepcopy(workload),
             "constraints": [
                 {
@@ -241,6 +242,7 @@ class SummarizeTests(unittest.TestCase):
         self.assertIn("correctness: passed", text)
         self.assertIn("SASS: passed", text)
         self.assertIn("## Real workload evidence", text)
+        self.assertIn("workload status: evaluated", text)
         self.assertIn("primary KPI: latency_ms (lower)", text)
         self.assertIn("constraint: memory_mb <= 2.000% regression", text)
         self.assertIn("paired_samples.jsonl", text)
@@ -499,6 +501,15 @@ class SummarizeTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.summarize.render(str(state_path), str(summary_path))
             self.assertTrue(summary_path.is_file())
+            checkpoint_bytes = checkpoint_path.read_bytes()
+            checkpoint_path.unlink()
+            rejected_checkpoint_summary = run_dir / "missing-checkpoint-summary.md"
+            with self.assertRaisesRegex(ValueError, "checkpoint|resume"):
+                self.summarize.render(
+                    str(state_path), str(rejected_checkpoint_summary)
+                )
+            self.assertFalse(rejected_checkpoint_summary.exists())
+            checkpoint_path.write_bytes(checkpoint_bytes)
             decision_bytes = decision_path.read_bytes()
             decision_path.write_text("{}", encoding="utf-8")
             rejected_decision_summary = run_dir / "rejected-decision-summary.md"

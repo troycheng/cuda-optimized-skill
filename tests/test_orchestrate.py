@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -2225,6 +2226,90 @@ class OuterLoopTests(unittest.TestCase):
                     {"candidate_file": str(linked / "kernel.py")}
                 )
 
+    def test_terminal_identity_reuses_snapshot_across_parent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            parent = root / "candidate"
+            parent.mkdir()
+            candidate_file = parent / "kernel.py"
+            original_bytes = b"# original\n"
+            candidate_file.write_bytes(original_bytes)
+            displaced = root / "candidate-displaced"
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "kernel.py").write_bytes(b"# attacker\n")
+            original_reader = self.orchestrate.read_regular_bytes
+            swapped = False
+
+            def replace_after_snapshot(path):
+                nonlocal swapped
+                payload = original_reader(path)
+                if not swapped:
+                    swapped = True
+                    parent.rename(displaced)
+                    parent.symlink_to(outside, target_is_directory=True)
+                return payload
+
+            candidate = {
+                "id": "b1",
+                "status": "confirmed_win",
+                "candidate_file": str(candidate_file),
+                "statistics": self.orchestrate_test_statistics(),
+            }
+            with mock.patch.object(
+                self.orchestrate,
+                "read_regular_bytes",
+                side_effect=replace_after_snapshot,
+            ):
+                decision = self.orchestrate.build_terminal_decision(
+                    mode="kernel-only",
+                    candidate=candidate,
+                    decide_fn=lambda **_kwargs: {"status": "kernel_only_win"},
+                )
+
+            self.assertEqual(decision["candidate_file"], str(candidate_file.absolute()))
+            self.assertEqual(
+                decision["candidate_sha256"],
+                hashlib.sha256(original_bytes).hexdigest(),
+            )
+
+    def test_publish_reuses_snapshot_across_parent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            parent = root / "candidate"
+            parent.mkdir()
+            candidate_file = parent / "kernel.py"
+            original_bytes = b"# original\n"
+            candidate_file.write_bytes(original_bytes)
+            displaced = root / "candidate-displaced"
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "kernel.py").write_bytes(b"# attacker\n")
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            original_reader = self.orchestrate.read_regular_bytes
+            swapped = False
+
+            def replace_after_snapshot(path):
+                nonlocal swapped
+                payload = original_reader(path)
+                if not swapped:
+                    swapped = True
+                    parent.rename(displaced)
+                    parent.symlink_to(outside, target_is_directory=True)
+                return payload
+
+            with mock.patch.object(
+                self.orchestrate,
+                "read_regular_bytes",
+                side_effect=replace_after_snapshot,
+            ):
+                published = self.orchestrate._publish_outer_candidate(
+                    {"candidate_file": str(candidate_file)}, iter_dir=iter_dir
+                )
+
+            self.assertEqual(Path(published).read_bytes(), original_bytes)
+
     def test_kernel_only_terminal_never_calls_workload_and_can_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidate = Path(tmp) / "kernel.py"
@@ -2639,7 +2724,9 @@ class OuterLoopTests(unittest.TestCase):
 
                 def workload_runner(_spec, *, role, case=None, **_kwargs):
                     if outcome["fail"] and role == "candidate":
-                        raise RuntimeError("workload failed")
+                        raise RuntimeError(
+                            "workload failed\n# forged [link](https://evil.invalid/)"
+                        )
                     memory = 100.0 if role == "baseline" else case["memory"]
                     latency = 100.0 if role == "baseline" else outcome["latency"]
                     return {
@@ -2693,6 +2780,27 @@ class OuterLoopTests(unittest.TestCase):
                 methods.write_text('{"methods":[]}', encoding="utf-8")
                 sass = iter_dir / "sass_check.json"
                 sass.write_text('{"status":"passed","checks":[]}', encoding="utf-8")
+                self.orchestrate.ArtifactStore(run_dir).write_checkpoint(
+                    {
+                        "schema_version": 2,
+                        "input_hash": input_hash,
+                        "run_dir": str(run_dir),
+                        "iteration": 1,
+                        "stage": "decision",
+                        "stage_index": self.orchestrate.STAGES.index("decision"),
+                        "status": "stage_complete",
+                        "candidate_id": "b1",
+                        "candidate_status": terminal["status"],
+                        "budget": {
+                            "elapsed_seconds": 1.0,
+                            "remaining_seconds": 59.0,
+                        },
+                        "updated_at": 1.0,
+                        "stage_evidence": {
+                            "decision": {"status": terminal["status"]}
+                        },
+                    }
+                )
                 applied = self.orchestrate.apply_decision(
                     terminal,
                     run_dir=run_dir,
@@ -2732,7 +2840,22 @@ class OuterLoopTests(unittest.TestCase):
                 )
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.orchestrate.cmd_finalize(SimpleNamespace(run_dir=str(run_dir)))
-                self.assertTrue((run_dir / "summary.md").is_file())
+                summary = (run_dir / "summary.md").read_text("utf-8")
+                expected_workload_status = (
+                    "workload_failed" if name == "workload_failed" else "evaluated"
+                )
+                self.assertIn(
+                    f"workload status: {expected_workload_status}", summary
+                )
+                if name == "workload_failed":
+                    self.assertIn(
+                        "workload failure reason: one or more workload roles exhausted retries",
+                        summary,
+                    )
+                    self.assertIn("workload failure diagnostic:", summary)
+                    self.assertIn("RuntimeError", summary)
+                    self.assertNotIn("\n# forged", summary)
+                    self.assertNotIn("[link](https://evil.invalid/)", summary)
 
     def test_outer_deadline_marks_candidate_inconclusive_without_workload_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

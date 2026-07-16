@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -357,14 +358,44 @@ class ArtifactStore:
         target = self._resolve_relative(relative_path)
         line = (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        directory_fd, leaf, stable_target = _open_parent_directory(
+            target, create=True
         )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        with os.fdopen(fd, "a", encoding="utf-8") as stream:
-            stream.write(line)
-            stream.flush()
-            os.fsync(stream.fileno())
-        return target
+        fd = None
+        try:
+            try:
+                fd = os.open(
+                    leaf,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_APPEND
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o644,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"JSONL target is missing, a symlink, or unsafe: {stable_target}"
+                    ) from error
+                raise
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError(
+                    f"JSONL target is not a regular file: {stable_target}"
+                )
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            offset = 0
+            while offset < len(line):
+                offset += os.write(fd, line[offset:])
+            os.fsync(fd)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.fsync(directory_fd)
+            return stable_target
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(directory_fd)
 
     def read_jsonl(self, relative_path: _PathLike) -> list:
         target = self._resolve_relative(relative_path)

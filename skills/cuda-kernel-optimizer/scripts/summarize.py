@@ -660,6 +660,18 @@ def render_text(state) -> str:
     lines.append("")
 
     lines.extend(["## Real workload evidence", ""])
+    decision = _latest_terminal_decision(source)
+    workload_status = decision.get("workload_status")
+    lines.append(f"- workload status: {_safe_text(workload_status)}")
+    if workload_status == "workload_failed":
+        failure = _mapping(decision.get("workload_failure"))
+        lines.append(
+            f"- workload failure reason: {_safe_text(failure.get('reason'))}"
+        )
+        lines.append(
+            "- workload failure diagnostic: "
+            f"{_safe_text(failure.get('failure'))}"
+        )
     if workload is None:
         lines.append("- No user workload was supplied; no end-to-end win is claimed.")
         lines.append("- primary KPI: not recorded")
@@ -679,7 +691,9 @@ def render_text(state) -> str:
                 f"({_safe_text(primary.get('direction'))})"
             )
         lines.extend(
-            _stats_lines(_statistics(source, workload=True), prefix="workload")
+            _stats_lines(
+                _statistics(source, workload=True), prefix="workload statistic"
+            )
         )
         constraints = _list(objective.get("constraints"))
         if not constraints:
@@ -694,7 +708,6 @@ def render_text(state) -> str:
                 f"- constraint: {_safe_text(constraint.get('name'))} "
                 f"<= {cap_text} regression"
             )
-        decision = _latest_terminal_decision(source)
         constraint_results = decision.get("constraints")
         if not isinstance(constraint_results, (list, tuple)):
             constraint_results = source.get("workload_constraint_results")
