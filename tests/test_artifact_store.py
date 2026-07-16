@@ -125,6 +125,74 @@ class ArtifactStoreTests(unittest.TestCase):
             self.assertLess(events.index("replace"), events.index("dir_fsync"))
             self.assertEqual(json.loads(target.read_text("utf-8")), {"ok": True})
 
+    def test_atomic_jsonl_replaces_once_and_fsyncs_file_and_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp).resolve() / "paired_samples.jsonl"
+            events = []
+            real_replace = self.artifacts.os.replace
+            real_fsync = self.artifacts.os.fsync
+
+            def tracked_replace(source, destination):
+                real_replace(source, destination)
+                events.append("replace")
+
+            def tracked_fsync(fd):
+                mode = os.fstat(fd).st_mode
+                events.append("dir_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+                return real_fsync(fd)
+
+            with mock.patch.object(
+                self.artifacts.os, "replace", side_effect=tracked_replace
+            ), mock.patch.object(
+                self.artifacts.os, "fsync", side_effect=tracked_fsync
+            ):
+                self.artifacts.atomic_write_jsonl(
+                    target, [{"index": 1}, {"index": 2}]
+                )
+
+            self.assertLess(events.index("file_fsync"), events.index("replace"))
+            self.assertLess(events.index("replace"), events.index("dir_fsync"))
+            self.assertEqual(
+                [json.loads(line) for line in target.read_text("utf-8").splitlines()],
+                [{"index": 1}, {"index": 2}],
+            )
+
+    def test_atomic_jsonl_rejects_symlink_in_parent_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real = root / "real"
+            real.mkdir()
+            linked = root / "linked"
+            try:
+                linked.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(ValueError, "parent.*symlink"):
+                self.artifacts.atomic_write_jsonl(
+                    linked / "paired_samples.jsonl", [{"index": 1}]
+                )
+            self.assertEqual(list(real.iterdir()), [])
+
+    def test_write_paired_samples_rejects_missing_candidate_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            candidate = root / "candidate.py"
+            candidate.write_text("candidate\n", encoding="utf-8")
+
+            for candidate_id in (None, "", "   ", True):
+                with self.subTest(candidate_id=candidate_id):
+                    with self.assertRaisesRegex(ValueError, "candidate_id"):
+                        self.artifacts.write_paired_samples(
+                            root / "paired_samples.jsonl",
+                            [{"baseline_ms": 1.0, "candidate_ms": 0.9}],
+                            kind="kernel",
+                            input_hash="a" * 64,
+                            iteration=1,
+                            candidate_id=candidate_id,
+                            candidate_file=candidate,
+                        )
+
     def test_append_jsonl_preserves_order_and_read_ignores_blank_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self.artifacts.ArtifactStore(Path(tmp) / "run")

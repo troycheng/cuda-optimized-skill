@@ -44,7 +44,6 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -54,7 +53,6 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
-from numbers import Real
 from pathlib import Path
 
 
@@ -70,6 +68,7 @@ from artifact_store import (  # noqa: E402
     sha256_file,
 )
 from budget import BudgetPolicy, resolve_budget  # noqa: E402
+import decision as decision_engine  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +94,9 @@ def validate_state(payload: dict) -> dict:
     for key in ("run_dir", "input_hash", "budget", "candidates"):
         if key not in payload:
             raise ValueError(f"v2.2 state is missing required field: {key}")
+    terminal = payload.get("terminal_decision")
+    if terminal is not None:
+        _validate_terminal_snapshot(terminal, state=payload, verify_artifacts=True)
     return payload
 
 
@@ -121,7 +123,6 @@ _DECISION_STATUSES = {
     "pareto_frontier",
 }
 _WIN_STATUSES = {"confirmed_win", "kernel_only_win", "end_to_end_win"}
-_EVIDENCE_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
 _STATISTIC_FIELDS = (
     "statistic",
     "estimate_pct",
@@ -288,39 +289,298 @@ def _validate_decision_statistics(
 ) -> dict | None:
     if payload is None and not required:
         return None
+    required_status = "confirmed_win" if required else None
+    try:
+        return decision_engine.validate_paired_statistics(
+            payload,
+            f"decision.json {field_name}",
+            required_status=required_status,
+        )
+    except ValueError:
+        raise
+
+
+_PAIRED_ARTIFACT_FIELDS = {
+    "schema_version",
+    "kind",
+    "path",
+    "sha256",
+    "pairs",
+    "input_hash",
+    "iteration",
+    "candidate_id",
+    "candidate_file",
+    "candidate_sha256",
+}
+
+
+def _strict_json_copy(value, field: str):
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be strict JSON") from error
+
+
+def _validate_paired_artifact(
+    payload,
+    *,
+    kind: str,
+    input_hash: str,
+    iteration: int,
+    candidate_id: str,
+    candidate_sha256: str,
+    expected_pairs: int | None,
+    verify_file: bool,
+) -> dict:
+    field = f"{kind}_paired_samples"
     if not isinstance(payload, Mapping):
-        raise ValueError(f"decision.json {field_name} must be a JSON object")
-    missing = [field for field in _STATISTIC_FIELDS if field not in payload]
+        raise ValueError(f"{field} must be a mapping")
+    missing = sorted(_PAIRED_ARTIFACT_FIELDS - set(payload))
     if missing:
-        raise ValueError(
-            f"decision.json {field_name} missing required field: {missing[0]}"
-        )
-    statistic = payload["statistic"]
-    if not isinstance(statistic, str) or not statistic.strip():
-        raise ValueError(
-            f"decision.json {field_name}.statistic must be a string"
-        )
-    status = payload["status"]
-    if type(status) is not str or status not in _EVIDENCE_STATUSES:
-        raise ValueError(
-            f"decision.json {field_name}.status must be a known string"
-        )
-    clean = dict(payload)
-    for field in ("estimate_pct", "ci_low_pct", "ci_high_pct"):
-        value = payload[field]
-        if value is None and not required:
-            continue
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise ValueError(
-                f"decision.json {field_name}.{field} must be finite"
-            )
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            raise ValueError(
-                f"decision.json {field_name}.{field} must be finite"
-            )
-        clean[field] = numeric
+        raise ValueError(f"{field} missing required field: {missing[0]}")
+    clean = _strict_json_copy(dict(payload), field)
+    if clean["schema_version"] != CURRENT_SCHEMA_VERSION:
+        raise ValueError(f"{field}.schema_version is invalid")
+    if clean["kind"] != kind:
+        raise ValueError(f"{field}.kind does not match its evidence role")
+    if clean["input_hash"] != input_hash:
+        raise ValueError(f"{field}.input_hash does not match frozen input")
+    if clean["iteration"] != iteration:
+        raise ValueError(f"{field}.iteration does not match terminal iteration")
+    if clean["candidate_sha256"] != candidate_sha256:
+        raise ValueError(f"{field}.candidate_sha256 does not match decision")
+    if clean["candidate_id"] != candidate_id:
+        raise ValueError(f"{field}.candidate_id does not match decision")
+    if (
+        type(clean["candidate_id"]) is not str
+        or not clean["candidate_id"].strip()
+    ):
+        raise ValueError(f"{field}.candidate_id must be non-empty")
+    if type(clean["pairs"]) is not int or clean["pairs"] < 0:
+        raise ValueError(f"{field}.pairs must be a non-negative integer")
+    if expected_pairs is not None and clean["pairs"] != expected_pairs:
+        raise ValueError(f"{field}.pairs does not match paired statistics")
+    for hash_field in ("sha256", "candidate_sha256"):
+        digest = clean[hash_field]
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            raise ValueError(f"{field}.{hash_field} must be a sha256 digest")
+    if not isinstance(clean["path"], str) or not Path(clean["path"]).is_absolute():
+        raise ValueError(f"{field}.path must be absolute")
+    if (
+        not isinstance(clean["candidate_file"], str)
+        or not Path(clean["candidate_file"]).is_absolute()
+    ):
+        raise ValueError(f"{field}.candidate_file must be absolute")
+    if not verify_file:
+        return clean
+
+    artifact = Path(clean["path"])
+    if artifact.is_symlink() or not artifact.is_file():
+        raise ValueError(f"{field}.path must be a regular non-symlink file")
+    if sha256_file(artifact) != clean["sha256"].lower():
+        raise ValueError(f"{field}.sha256 does not match artifact content")
+    sample_candidate = Path(clean["candidate_file"])
+    if sample_candidate.is_symlink() or not sample_candidate.is_file():
+        raise ValueError(f"{field}.candidate_file is unsafe or missing")
+    if sha256_file(sample_candidate) != candidate_sha256:
+        raise ValueError(f"{field}.candidate_file does not match decision content")
+
+    records = []
+    try:
+        with artifact.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    raise ValueError(f"{field} contains blank line {line_number}")
+                records.append(
+                    json.loads(
+                        line,
+                        parse_constant=lambda token: (_ for _ in ()).throw(
+                            ValueError(f"non-finite JSON constant: {token}")
+                        ),
+                    )
+                )
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"{field} is malformed: {error}") from error
+    if len(records) != clean["pairs"]:
+        raise ValueError(f"{field}.pairs does not match JSONL record count")
+    bindings = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "kind": kind,
+        "input_hash": input_hash,
+        "iteration": iteration,
+        "candidate_id": candidate_id,
+        "candidate_file": clean["candidate_file"],
+        "candidate_sha256": candidate_sha256,
+    }
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping) or record.get("pair_index") != index:
+            raise ValueError(f"{field} record {index} has invalid pair_index")
+        if any(record.get(key) != value for key, value in bindings.items()):
+            raise ValueError(f"{field} record {index} has drifted bindings")
+        if "pair" not in record:
+            raise ValueError(f"{field} record {index} is missing pair")
     return clean
+
+
+def _paired_count(statistics: Mapping | None) -> int | None:
+    if not isinstance(statistics, Mapping):
+        return None
+    valid = statistics.get("valid_pairs")
+    invalid = statistics.get("invalid_pairs")
+    if type(valid) is int and type(invalid) is int:
+        return valid + invalid
+    return None
+
+
+def _validate_terminal_snapshot(
+    terminal, *, state: Mapping, verify_artifacts: bool
+) -> dict:
+    if not isinstance(terminal, Mapping):
+        raise ValueError("state terminal_decision must be a mapping")
+    clean = _strict_json_copy(dict(terminal), "terminal_decision")
+    iteration = clean.get("iteration")
+    if type(iteration) is not int or iteration <= 0:
+        raise ValueError("terminal_decision.iteration must be positive")
+    if clean.get("input_hash") != state.get("input_hash"):
+        raise ValueError("terminal_decision.input_hash does not match state")
+    mode = clean.get("mode")
+    if mode not in {"full", "kernel-only"}:
+        raise ValueError("terminal_decision.mode is invalid")
+    if mode != _state_mode(dict(state)):
+        raise ValueError("terminal_decision.mode does not match state")
+    status = clean.get("status")
+    if type(status) is not str or status not in _DECISION_STATUSES:
+        raise ValueError("terminal_decision.status is invalid")
+    statistics = _validate_decision_statistics(
+        clean.get("statistics"), required=status in _WIN_STATUSES,
+        field_name="terminal_decision.statistics",
+    )
+    workload_statistics = _validate_decision_statistics(
+        clean.get("workload_statistics"),
+        required=status == "end_to_end_win",
+        field_name="terminal_decision.workload_statistics",
+    )
+    if status in _WIN_STATUSES and statistics["status"] != "confirmed_win":
+        raise ValueError("terminal_decision win requires confirmed kernel evidence")
+    if status == "end_to_end_win" and workload_statistics["status"] != "confirmed_win":
+        raise ValueError("terminal_decision end_to_end_win requires workload evidence")
+    candidate_sha256 = clean.get("candidate_sha256")
+    if candidate_sha256 is not None and (
+        not isinstance(candidate_sha256, str) or not _SHA256.fullmatch(candidate_sha256)
+    ):
+        raise ValueError("terminal_decision.candidate_sha256 is invalid")
+    candidate_id = clean.get("candidate_id")
+    if status in _WIN_STATUSES and (
+        type(candidate_id) is not str or not candidate_id.strip()
+    ):
+        raise ValueError("terminal_decision win requires candidate_id")
+    decision_sha256 = clean.get("decision_sha256")
+    if not isinstance(decision_sha256, str) or not _SHA256.fullmatch(decision_sha256):
+        raise ValueError("terminal_decision.decision_sha256 is invalid")
+    for kind, stats in (("kernel", statistics), ("workload", workload_statistics)):
+        field = f"{kind}_paired_samples"
+        evidence = clean.get(field)
+        required_evidence = (
+            kind == "kernel" and status in _WIN_STATUSES
+        ) or (kind == "workload" and status == "end_to_end_win")
+        if evidence is None and required_evidence:
+            raise ValueError(f"terminal_decision win requires {field}")
+        if evidence is not None:
+            if candidate_sha256 is None or type(candidate_id) is not str:
+                raise ValueError(f"{field} requires candidate binding")
+            clean[field] = _validate_paired_artifact(
+                evidence,
+                kind=kind,
+                input_hash=state["input_hash"],
+                iteration=iteration,
+                candidate_id=candidate_id,
+                candidate_sha256=candidate_sha256,
+                expected_pairs=_paired_count(stats),
+                verify_file=verify_artifacts,
+            )
+    clean["statistics"] = statistics
+    clean["workload_statistics"] = workload_statistics
+    return clean
+
+
+def _checkpoint_runtime_evidence(state: Mapping, *, iteration: int) -> tuple[dict, dict]:
+    path = Path(state["run_dir"]) / "checkpoint.json"
+    if path.is_symlink() or not path.is_file():
+        return {}, {"status": "not_recorded"}
+    payload = _read(str(path))
+    if not isinstance(payload, Mapping):
+        raise ValueError("checkpoint.json must contain a mapping")
+    if payload.get("input_hash") != state["input_hash"]:
+        raise ValueError("checkpoint.json does not match frozen input")
+    checkpoint_iteration = payload.get("iteration")
+    if checkpoint_iteration not in {0, iteration}:
+        raise ValueError("checkpoint.json iteration does not match state update")
+    stage = payload.get("stage")
+    status = payload.get("status")
+    if type(stage) is not str or type(status) is not str:
+        raise ValueError("checkpoint.json stage and status must be strings")
+    resume = {
+        "status": status,
+        "stage": stage,
+        "iteration": checkpoint_iteration,
+        "checkpoint": str(path.resolve(strict=True)),
+        "input_hash": state["input_hash"],
+        "budget": _strict_json_copy(payload.get("budget", {}), "checkpoint budget"),
+    }
+    stage_evidence = payload.get("stage_evidence", {})
+    if not isinstance(stage_evidence, Mapping):
+        raise ValueError("checkpoint.json stage_evidence must be a mapping")
+    sanitizer = stage_evidence.get("candidate_sanitizer")
+    if sanitizer is None:
+        sanitizer_snapshot = {"status": "not_recorded"}
+    elif not isinstance(sanitizer, Mapping):
+        raise ValueError("checkpoint sanitizer evidence must be a mapping")
+    else:
+        sanitizer_snapshot = _strict_json_copy(
+            dict(sanitizer), "checkpoint sanitizer evidence"
+        )
+    return resume, sanitizer_snapshot
+
+
+def persist_checkpoint_snapshot(
+    state_path: str | os.PathLike,
+    checkpoint: Mapping,
+    checkpoint_path: str | os.PathLike,
+) -> dict:
+    """Persist the checkpoint resume binding before a summary is rendered."""
+    state = _read_state(str(state_path))
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("checkpoint must be a mapping")
+    if checkpoint.get("input_hash") != state["input_hash"]:
+        raise ValueError("checkpoint does not match state frozen input")
+    stage = checkpoint.get("stage")
+    status = checkpoint.get("status")
+    iteration = checkpoint.get("iteration")
+    if type(stage) is not str or type(status) is not str:
+        raise ValueError("checkpoint stage and status must be strings")
+    if type(iteration) is not int or iteration < 0:
+        raise ValueError("checkpoint iteration must be non-negative")
+    path = Path(checkpoint_path).expanduser()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("checkpoint path must be a regular non-symlink file")
+    resume = {
+        "status": status,
+        "stage": stage,
+        "iteration": iteration,
+        "checkpoint": str(path.resolve(strict=True)),
+        "input_hash": state["input_hash"],
+        "budget": _strict_json_copy(checkpoint.get("budget", {}), "checkpoint budget"),
+    }
+    state["resume"] = resume
+    terminal = state.get("terminal_decision")
+    if isinstance(terminal, Mapping):
+        terminal = _strict_json_copy(dict(terminal), "terminal_decision")
+        terminal["resume"] = resume
+        state["terminal_decision"] = _validate_terminal_snapshot(
+            terminal, state=state, verify_artifacts=True
+        )
+    _write(str(state_path), state)
+    return resume
 
 
 def _load_decision(
@@ -828,9 +1088,12 @@ def cmd_update(args: argparse.Namespace) -> None:
             attribution_data[a["method_id"]] = a
 
     sass_data = {}
+    sass_document = {}
     if args.sass_check and os.path.isfile(args.sass_check):
-        sass = _read(args.sass_check)
-        for c in sass.get("checks", []):
+        sass_document = _read(args.sass_check)
+        if not isinstance(sass_document, Mapping):
+            raise ValueError("sass_check.json must contain a mapping")
+        for c in sass_document.get("checks", []):
             sass_data[c["method_id"]] = c
 
     # A benchmark average is diagnostic only. Promotion comes exclusively from
@@ -971,6 +1234,62 @@ def cmd_update(args: argparse.Namespace) -> None:
                 for item in state["frontier"]
             ):
                 state["frontier"].append(frontier_entry)
+    resume_evidence, sanitizer_evidence = _checkpoint_runtime_evidence(
+        state, iteration=int(args.iter)
+    )
+    compiler_evidence = bench.get("compiler_evidence", {})
+    if not isinstance(compiler_evidence, Mapping):
+        raise ValueError("bench compiler_evidence must be a mapping")
+    constraints = decision.get("constraints", [])
+    if (
+        isinstance(constraints, (str, bytes, bytearray, Mapping))
+        or not isinstance(constraints, list)
+        or not all(isinstance(item, Mapping) for item in constraints)
+    ):
+        raise ValueError("decision constraints must be a sequence of mappings")
+    terminal_decision = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "iteration": int(args.iter),
+        "input_hash": state["input_hash"],
+        "mode": mode,
+        "status": terminal_status,
+        "decision_status": decision_status,
+        "candidate_file": (
+            candidate_binding["path"] if candidate_binding is not None else None
+        ),
+        "candidate_sha256": (
+            candidate_binding["sha256"] if candidate_binding is not None else None
+        ),
+        "candidate_id": decision.get("candidate_id"),
+        "decision_json": os.path.abspath(decision_path),
+        "decision_sha256": sha256_file(decision_path),
+        "statistics": decision_statistics,
+        "workload_statistics": workload_statistics,
+        "constraints": _strict_json_copy(constraints, "decision constraints"),
+        "correctness": {
+            "status": "passed" if validation_passed else "failed",
+            "passed": validation_passed,
+        },
+        "compiler_evidence": _strict_json_copy(
+            dict(compiler_evidence), "compiler evidence"
+        ),
+        "sass": _strict_json_copy(dict(sass_document), "SASS evidence"),
+        "sanitizer": sanitizer_evidence,
+        "resume": resume_evidence,
+    }
+    for field in ("kernel_paired_samples", "workload_paired_samples"):
+        if field in decision:
+            terminal_decision[field] = _strict_json_copy(
+                decision[field], field
+            )
+    terminal_decision = _validate_terminal_snapshot(
+        terminal_decision, state=state, verify_artifacts=True
+    )
+    state["terminal_decision"] = terminal_decision
+    state["compiler_evidence"] = terminal_decision["compiler_evidence"]
+    state["sass_verification"] = terminal_decision["sass"]
+    state["sanitizer_coverage"] = terminal_decision["sanitizer"].get("coverage")
+    state["resume"] = terminal_decision["resume"]
     _write(args.state, state)
     print(json.dumps({
         "iter": args.iter,

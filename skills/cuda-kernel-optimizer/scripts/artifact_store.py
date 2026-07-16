@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path, PureWindowsPath
 from typing import Any, Optional, Union
@@ -47,6 +48,22 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _reject_symlink_components(path: _PathLike) -> Path:
+    """Return an absolute path only when no existing component is a symlink."""
+    target = Path(path).expanduser().absolute()
+    current = Path(target.anchor)
+    for component in target.parts[1:]:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            role = "target" if current == target else "parent"
+            raise ValueError(f"JSONL {role} path contains a symlink: {current}")
+    return target
+
+
 def atomic_write_json(path: _PathLike, payload: Any) -> None:
     """Atomically replace *path* with a formatted UTF-8 JSON document."""
     target = Path(path)
@@ -68,6 +85,116 @@ def atomic_write_json(path: _PathLike, payload: Any) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_write_jsonl(path: _PathLike, records) -> None:
+    """Atomically replace *path* with strict JSON Lines and durable metadata."""
+    if isinstance(records, (str, bytes, bytearray, dict)):
+        raise ValueError("JSONL records must be a sequence")
+    try:
+        snapshot = list(records)
+    except TypeError as error:
+        raise ValueError("JSONL records must be a sequence") from error
+    encoded = []
+    for index, record in enumerate(snapshot):
+        try:
+            encoded.append(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"JSONL record {index} is not strict JSON") from error
+
+    target = _reject_symlink_components(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(target.parent)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            for line in encoded:
+                stream.write(line)
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_paired_samples(
+    path: _PathLike,
+    pairs,
+    *,
+    kind: str,
+    input_hash: str,
+    iteration: int,
+    candidate_id,
+    candidate_file: _PathLike,
+) -> dict:
+    """Persist raw paired observations with candidate/input/iteration bindings."""
+    if kind not in {"kernel", "workload"}:
+        raise ValueError("paired sample kind must be kernel or workload")
+    if not isinstance(input_hash, str) or not input_hash.strip():
+        raise ValueError("paired sample input_hash must be non-empty")
+    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration <= 0:
+        raise ValueError("paired sample iteration must be positive")
+    if candidate_id is None or isinstance(candidate_id, bool):
+        raise ValueError("paired sample candidate_id must be non-empty")
+    candidate_name = str(candidate_id).strip()
+    if not candidate_name:
+        raise ValueError("paired sample candidate_id must be non-empty")
+    candidate = Path(candidate_file).expanduser()
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("paired sample candidate must be a regular non-symlink file")
+    candidate = candidate.resolve(strict=True)
+    candidate_sha256 = sha256_file(candidate)
+    if isinstance(pairs, (str, bytes, bytearray, dict)):
+        raise ValueError("paired samples must be a sequence")
+    try:
+        raw_pairs = copy.deepcopy(list(pairs))
+    except TypeError as error:
+        raise ValueError("paired samples must be a sequence") from error
+    records = [
+        {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "kind": kind,
+            "input_hash": input_hash,
+            "iteration": iteration,
+            "candidate_id": candidate_name,
+            "candidate_file": str(candidate),
+            "candidate_sha256": candidate_sha256,
+            "pair_index": index,
+            "pair": pair,
+        }
+        for index, pair in enumerate(raw_pairs)
+    ]
+    target = Path(path).expanduser().absolute()
+    atomic_write_jsonl(target, records)
+    target = target.resolve(strict=True)
+    return {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "kind": kind,
+        "path": str(target),
+        "sha256": sha256_file(target),
+        "pairs": len(records),
+        "input_hash": input_hash,
+        "iteration": iteration,
+        "candidate_id": candidate_name,
+        "candidate_file": str(candidate),
+        "candidate_sha256": candidate_sha256,
+    }
 
 
 class ArtifactStore:

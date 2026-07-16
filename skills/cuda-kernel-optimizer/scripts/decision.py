@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics as statistics_module
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -211,9 +212,14 @@ def _validate_paired_statistics(
         _finite_real(item, f"{field}.improvements_pct[{index}]")
         for index, item in enumerate(improvements)
     ]
-    if len(normalized_improvements) < valid_pairs:
+    if len(normalized_improvements) != valid_pairs:
         raise ValueError(
-            f"{field}.improvements_pct must contain at least valid_pairs values"
+            f"{field}.improvements_pct must contain exactly valid_pairs values"
+        )
+    observed_estimate = statistics_module.median(normalized_improvements)
+    if not math.isclose(estimate, observed_estimate, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError(
+            f"{field}.estimate_pct must equal the median of improvements_pct"
         )
 
     status = _literal_status(
@@ -240,6 +246,26 @@ def _validate_paired_statistics(
         "invalid_pairs": invalid_pairs,
         "improvements_pct": normalized_improvements,
     }
+
+
+def validate_paired_statistics(
+    value,
+    field: str = "statistics",
+    *,
+    expected_direction: str | None = None,
+    expected_min_effect: float | None = None,
+    required_status: str | None = None,
+) -> dict:
+    """Public shared validator for decision, state, and summary consumers."""
+    if not isinstance(field, str) or not field.strip():
+        raise ValueError("paired statistics field name must be non-empty")
+    return _validate_paired_statistics(
+        value,
+        field,
+        expected_direction=expected_direction,
+        expected_min_effect=expected_min_effect,
+        required_status=required_status,
+    )
 
 
 def _normalize_mode(mode) -> str:
@@ -609,4 +635,4 @@ def decide(*, mode, kernel, workload=None, constraints=None, pareto=None) -> dic
     )
 
 
-__all__ = ["TERMINAL_STATUSES", "decide"]
+__all__ = ["TERMINAL_STATUSES", "decide", "validate_paired_statistics"]

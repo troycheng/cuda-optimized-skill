@@ -124,6 +124,23 @@ def _pareto() -> dict:
 
 
 class DecisionTests(unittest.TestCase):
+    def test_public_paired_validator_is_the_strict_shared_schema(self) -> None:
+        module = _load_decision()
+        valid = _statistics()
+        self.assertEqual(
+            module.validate_paired_statistics(valid, "summary.kernel"), valid
+        )
+        contradictory = copy.deepcopy(valid)
+        contradictory.update(
+            status="confirmed_win",
+            estimate_pct=-5.0,
+            ci_low_pct=-7.0,
+            ci_high_pct=-3.0,
+            improvements_pct=[-5.0, -5.0, -5.0],
+        )
+        with self.assertRaisesRegex(ValueError, "contradicts"):
+            module.validate_paired_statistics(contradictory, "summary.kernel")
+
     def test_terminal_statuses_are_exactly_the_public_set(self) -> None:
         module = _load_decision()
         self.assertEqual(

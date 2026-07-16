@@ -38,6 +38,7 @@ from artifact_store import (  # noqa: E402
     CURRENT_SCHEMA_VERSION,
     atomic_write_json,
     sha256_file,
+    write_paired_samples,
 )
 from budget import BudgetClock, BudgetPolicy, resolve_budget  # noqa: E402
 import decision as decision_engine  # noqa: E402
@@ -732,6 +733,28 @@ def build_terminal_decision(
     candidate_file = _candidate_file(candidate)
     result["candidate_file"] = candidate_file
     result["candidate_sha256"] = sha256_file(candidate_file)
+    kernel_samples = candidate.get("paired_samples") or candidate.get(
+        "kernel_paired_samples"
+    )
+    if isinstance(kernel_samples, Mapping):
+        result["kernel_paired_samples"] = _strict_json_copy(
+            kernel_samples, "kernel paired samples"
+        )
+    candidate_id = candidate.get("id") or candidate.get("branch_index")
+    if candidate_id is None and isinstance(kernel_samples, Mapping):
+        candidate_id = kernel_samples.get("candidate_id")
+    if candidate_id is None:
+        candidate_id = result["candidate_sha256"][:16]
+    if isinstance(candidate_id, bool) or not str(candidate_id).strip():
+        raise ValueError("candidate_id must be non-empty")
+    result["candidate_id"] = str(candidate_id).strip()
+    workload_samples = workload_result if isinstance(workload_result, Mapping) else None
+    if workload_samples is not None and isinstance(
+        workload_samples.get("paired_samples"), Mapping
+    ):
+        result["workload_paired_samples"] = _strict_json_copy(
+            workload_samples["paired_samples"], "workload paired samples"
+        )
     return _strict_json_copy(result, "decision")
 
 
@@ -752,11 +775,14 @@ def evaluate_outer_candidate(
     retries: int = 2,
     seed: int = 0,
     workload_runner=None,
+    input_hash: str | None = None,
+    iteration: int | None = None,
 ) -> dict:
     """Evaluate one confirmed inner winner through the applicable outer loop."""
     candidate_path = Path(_candidate_file(candidate))
     if candidate_path.suffix not in {".cu", ".py"}:
         raise ValueError("outer candidate must be a .cu or .py kernel")
+    iteration_root = None
     if candidate_root is not None:
         iteration_root = Path(candidate_root).expanduser().resolve(strict=True)
         try:
@@ -856,6 +882,36 @@ def evaluate_outer_candidate(
             confidence=_finite_real(confidence, "confidence"),
             runner=frozen_runner,
         )
+        if input_hash is not None or iteration is not None:
+            if not isinstance(workload_result, Mapping):
+                raise ValueError("workload result must be a mapping")
+            pairs = workload_result.get("pairs")
+            if not isinstance(pairs, list):
+                raise ValueError("workload result must contain raw pairs")
+            if candidate_root is None or input_hash is None or iteration is None:
+                raise ValueError("workload pair persistence binding is incomplete")
+            candidate_digest = sha256_file(candidate_path)
+            candidate_id = normalized_candidate.get("id") or normalized_candidate.get(
+                "branch_index"
+            ) or candidate_digest[:16]
+            evidence_path = (
+                iteration_root
+                / "workload"
+                / candidate_digest[:16]
+                / "paired_samples.jsonl"
+            )
+            evidence = write_paired_samples(
+                evidence_path,
+                pairs,
+                kind="workload",
+                input_hash=input_hash,
+                iteration=iteration,
+                candidate_id=candidate_id,
+                candidate_file=candidate_path,
+            )
+            workload_result = copy.deepcopy(dict(workload_result))
+            workload_result.pop("pairs", None)
+            workload_result["paired_samples"] = evidence
     terminal = build_terminal_decision(
         mode=mode,
         candidate=normalized_candidate,
@@ -3323,6 +3379,8 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     policy=policy,
                     confidence=state.get("confidence", 0.95),
                     candidate_root=iteration_dir,
+                    input_hash=state["input_hash"],
+                    iteration=args.iter,
                 )
                 workload_evidence = {"status": "not_applicable"}
             else:
@@ -3343,6 +3401,8 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                             candidate_root=iteration_dir,
                             retries=args.retries,
                             seed=state.get("seed", 0),
+                            input_hash=state["input_hash"],
+                            iteration=args.iter,
                         ),
                     )
                     for candidate in eligible_candidates
@@ -3650,6 +3710,8 @@ def cmd_close_iter(args):
                     candidate_root=iter_dir,
                     retries=args.retries,
                     seed=state.get("seed", 0),
+                    input_hash=state["input_hash"],
+                    iteration=args.iter,
                 )
                 evaluated.append((candidate, terminal))
             selected_candidate, terminal_decision = _select_terminal_outer_result(
@@ -3671,6 +3733,8 @@ def cmd_close_iter(args):
                 policy=policy,
                 confidence=state.get("confidence", 0.95),
                 candidate_root=iter_dir,
+                input_hash=state["input_hash"],
+                iteration=args.iter,
             )
         else:
             raise ValueError("state mode must be full or kernel-only")
@@ -3815,6 +3879,11 @@ def cmd_finalize(args):
             raise ValueError(
                 "cannot finalize before the decision stage checkpoint is complete"
             )
+    if complete_checkpoint is not None:
+        ArtifactStore(args.run_dir).write_checkpoint(complete_checkpoint)
+        state_manager.persist_checkpoint_snapshot(
+            state_path, complete_checkpoint, checkpoint_path
+        )
     rc = _run([
         sys.executable, str(SCRIPT_DIR / "summarize.py"),
         "--state", state_path,
@@ -3822,8 +3891,6 @@ def cmd_finalize(args):
     ]).returncode
     if rc != 0:
         sys.exit("summarize failed")
-    if complete_checkpoint is not None:
-        ArtifactStore(args.run_dir).write_checkpoint(complete_checkpoint)
     print(json.dumps({"summary": summary_path}, indent=2))
 
 

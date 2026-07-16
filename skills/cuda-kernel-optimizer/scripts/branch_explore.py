@@ -37,7 +37,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from paired_benchmark import run_paired  # noqa: E402
 from paired_stats import classify_pairs  # noqa: E402
-from artifact_store import sha256_file  # noqa: E402
+from artifact_store import sha256_file, write_paired_samples  # noqa: E402
 
 
 _PAIRED_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
@@ -179,6 +179,10 @@ def _paired_candidate(
     bootstrap_samples: int = 10000,
     max_temperature_delta_c: float = 5,
     max_clock_delta_pct: float = 5,
+    artifact_path=None,
+    input_hash: str | None = None,
+    iteration: int | None = None,
+    candidate_id=None,
 ) -> dict:
     """Collect paired samples and return the shared classification payload."""
     paired = run_paired(
@@ -195,7 +199,7 @@ def _paired_candidate(
         max_temperature_delta_c=max_temperature_delta_c,
         max_clock_delta_pct=max_clock_delta_pct,
     )
-    return classify_pairs(
+    statistics = classify_pairs(
         paired["pairs"],
         direction="lower",
         min_effect_pct=min_effect_pct,
@@ -203,6 +207,21 @@ def _paired_candidate(
         bootstrap_samples=bootstrap_samples,
         seed=seed,
     )
+    evidence_args = (artifact_path, input_hash, iteration, candidate_id)
+    if all(value is None for value in evidence_args):
+        return statistics
+    if any(value is None for value in evidence_args):
+        raise ValueError("paired sample persistence binding is incomplete")
+    evidence = write_paired_samples(
+        artifact_path,
+        paired["pairs"],
+        kind="kernel",
+        input_hash=input_hash,
+        iteration=iteration,
+        candidate_id=candidate_id,
+        candidate_file=candidate_file,
+    )
+    return {"statistics": statistics, "paired_samples": evidence}
 
 
 def _finite_statistic(value, field: str, *, required: bool) -> float | None:
@@ -352,8 +371,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
 
         if passed:
             try:
-                statistics = _validate_statistics(
-                    _paired_candidate(
+                paired_result = _paired_candidate(
                         baseline_file,
                         kernel,
                         backend=backend,
@@ -369,8 +387,30 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
                         bootstrap_samples=bootstrap_samples,
                         max_temperature_delta_c=max_temperature_delta_c,
                         max_clock_delta_pct=max_clock_delta_pct,
+                        **(
+                            {
+                                "artifact_path": os.path.join(
+                                    branch["dir"], "paired_samples.jsonl"
+                                ),
+                                "input_hash": state["input_hash"],
+                                "iteration": iteration,
+                                "candidate_id": str(idx),
+                            }
+                            if isinstance(state.get("input_hash"), str)
+                            and state["input_hash"].strip()
+                            else {}
+                        ),
                     )
-                )
+                if isinstance(paired_result, Mapping) and isinstance(
+                    paired_result.get("statistics"), Mapping
+                ):
+                    statistics_payload = paired_result["statistics"]
+                    result["paired_samples"] = copy.deepcopy(
+                        paired_result.get("paired_samples")
+                    )
+                else:
+                    statistics_payload = paired_result
+                statistics = _validate_statistics(statistics_payload)
             except Exception as error:
                 result["error"] = _bounded_candidate_error(error)
             else:
@@ -459,8 +499,12 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "status": champion["statistics"]["status"],
             "candidate_file": os.path.abspath(dest),
             "candidate_sha256": candidate_sha256,
+            "candidate_id": str(champion["branch_index"]),
             "source_candidate_file": os.path.abspath(champ_kernel),
             "statistics": copy.deepcopy(champion["statistics"]),
+            "kernel_paired_samples": copy.deepcopy(
+                champion.get("paired_samples")
+            ),
         },
     )
     print(json.dumps(output, indent=2))

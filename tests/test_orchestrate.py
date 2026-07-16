@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -352,6 +353,15 @@ class CloseIterationDecisionTests(unittest.TestCase):
                 "objective": state["workload"]["objective"],
                 "primary": statistics,
                 "constraints": [],
+                "pairs": [
+                    {
+                        "block": 0,
+                        "order": "AB",
+                        "baseline_metrics": {"latency": 2.0},
+                        "candidate_metrics": {"latency": 1.0},
+                        "valid": True,
+                    }
+                ],
             }
             workload_pairs = mock.Mock(return_value=workload_result)
             apply = mock.Mock(
@@ -363,12 +373,19 @@ class CloseIterationDecisionTests(unittest.TestCase):
                     mock.patch.object(orchestrate, "apply_decision", apply), \
                     contextlib.redirect_stdout(io.StringIO()):
                 orchestrate.cmd_close_iter(args)
+            persisted_workload_samples = Path(
+                apply.call_args.args[0]["workload_paired_samples"]["path"]
+            ).is_file()
 
         self.assertEqual(workload_pairs.call_count, 1)
         self.assertEqual(workload_pairs.call_args.args[1], str(baseline))
         self.assertEqual(workload_pairs.call_args.args[2], str(confirmed.resolve()))
         self.assertEqual(apply.call_count, 1)
         self.assertEqual(apply.call_args.args[0]["status"], "end_to_end_win")
+        evidence = apply.call_args.args[0]["workload_paired_samples"]
+        self.assertEqual(evidence["input_hash"], "frozen")
+        self.assertEqual(evidence["iteration"], 1)
+        self.assertTrue(persisted_workload_samples)
 
     def test_budgeted_kernel_only_close_never_calls_workload_and_builds_terminal_win(self) -> None:
         orchestrate = _load_orchestrate()
@@ -978,6 +995,28 @@ class LifecycleIntegrationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_kernel_pair_evidence(
+        self, run_dir: Path, selected: Path
+    ) -> dict:
+        state = json.loads((run_dir / "state.json").read_text("utf-8"))
+        return self.orchestrate.write_paired_samples(
+            run_dir / "iterv1" / "kernel-pairs" / "paired_samples.jsonl",
+            [
+                {
+                    "block": index,
+                    "baseline_ms": 2.0,
+                    "candidate_ms": 1.0,
+                    "valid": True,
+                }
+                for index in range(20)
+            ],
+            kind="kernel",
+            input_hash=state["input_hash"],
+            iteration=1,
+            candidate_id="1",
+            candidate_file=selected,
+        )
+
     def _write_winner_artifacts(self, run_dir: Path) -> Path:
         iter_dir = run_dir / "iterv1"
         selected = iter_dir / "kernel.py"
@@ -996,6 +1035,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
             encoding="utf-8",
         )
         statistics = self._statistics()
+        paired_samples = self._write_kernel_pair_evidence(run_dir, selected)
         branch_payload = {
             "status": "shortlist_ready",
             "selected_kernel": str(selected),
@@ -1004,6 +1044,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 "kernel": str(selected),
                 "branch_index": 1,
                 "statistics": statistics,
+                "paired_samples": paired_samples,
             },
             "shortlist": [],
             "valid_branches": 1,
@@ -1018,7 +1059,9 @@ class LifecycleIntegrationTests(unittest.TestCase):
                     "status": "confirmed_win",
                     "candidate_file": str(selected),
                     "candidate_sha256": self.orchestrate.sha256_file(selected),
+                    "candidate_id": "1",
                     "statistics": statistics,
+                    "kernel_paired_samples": paired_samples,
                 }
             ),
             encoding="utf-8",
@@ -1458,6 +1501,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             statistics = self._statistics()
+            paired_samples = self._write_kernel_pair_evidence(run_dir, selected)
             branch_payload = {
                 "status": "shortlist_ready",
                 "selected_kernel": str(selected),
@@ -1466,6 +1510,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
                     "kernel": str(selected),
                     "branch_index": 1,
                     "statistics": statistics,
+                    "paired_samples": paired_samples,
                 },
                 "shortlist": [],
                 "valid_branches": 1,
@@ -1480,7 +1525,9 @@ class LifecycleIntegrationTests(unittest.TestCase):
                         "status": "confirmed_win",
                         "candidate_file": str(selected),
                         "candidate_sha256": self.orchestrate.sha256_file(selected),
+                        "candidate_id": "1",
                         "statistics": statistics,
+                        "kernel_paired_samples": paired_samples,
                     }
                 ),
                 encoding="utf-8",
@@ -2012,7 +2059,7 @@ class CheckpointAndResumeTests(unittest.TestCase):
 
     def test_finalize_advances_a_completed_decision_checkpoint_to_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             checkpoint = self._checkpoint(root)
             checkpoint.update(
                 stage="decision",
@@ -2020,11 +2067,33 @@ class CheckpointAndResumeTests(unittest.TestCase):
                 status="stage_complete",
             )
             self.orchestrate.ArtifactStore(root).write_checkpoint(checkpoint)
+            (root / "state.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "run_dir": str(root),
+                        "input_hash": checkpoint["input_hash"],
+                        "budget": {},
+                        "candidates": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
             args = SimpleNamespace(run_dir=str(root))
+
+            def summarize_after_complete(_command, **_kwargs):
+                stored_checkpoint = json.loads(
+                    (root / "checkpoint.json").read_text("utf-8")
+                )
+                stored_state = json.loads((root / "state.json").read_text("utf-8"))
+                self.assertEqual(stored_checkpoint["status"], "complete")
+                self.assertEqual(stored_state["resume"]["status"], "complete")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
             with mock.patch.object(
                 self.orchestrate,
                 "_run",
-                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+                side_effect=summarize_after_complete,
             ), contextlib.redirect_stdout(io.StringIO()):
                 self.orchestrate.cmd_finalize(args)
             persisted = json.loads((root / "checkpoint.json").read_text("utf-8"))
@@ -2152,6 +2221,73 @@ class OuterLoopTests(unittest.TestCase):
         self.assertEqual(evaluator.call_args.args[1], "best.py")
         self.assertEqual(evaluator.call_args.kwargs["blocks"], 50)
         self.assertEqual(result["candidate_sha256"], "2a283e1acf58a80beaf171b3e8df6cbb378e33419c4aac17082b41bee540b84a")
+
+    def test_full_outer_evaluation_persists_bound_workload_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iter_dir = root / "run" / "iterv2"
+            iter_dir.mkdir(parents=True)
+            candidate_file = iter_dir / "candidate.py"
+            candidate_file.write_text("# candidate\n", encoding="utf-8")
+            candidate = {
+                "id": "b1",
+                "status": "confirmed_win",
+                "candidate_file": str(candidate_file),
+                "statistics": self.orchestrate_test_statistics(),
+            }
+            spec = self.orchestrate.WorkloadSpec(
+                kind="command",
+                source=["/bin/echo"],
+                objective={
+                    "primary_metric": {"name": "latency", "direction": "lower"},
+                    "min_effect_pct": 0.5,
+                    "constraints": [],
+                },
+                cases=(),
+                source_hash="c" * 64,
+            )
+            raw_pairs = [
+                {
+                    "block": 0,
+                    "order": "AB",
+                    "case": {},
+                    "baseline_metrics": {"latency": 2.0},
+                    "candidate_metrics": {"latency": 1.0},
+                    "valid": True,
+                    "attempts": {"baseline": 1, "candidate": 1},
+                    "attempt_records": {"baseline": [], "candidate": []},
+                }
+            ]
+            workload_result = {
+                "status": "evaluated",
+                "objective": dict(spec.objective),
+                "primary": self.orchestrate_test_statistics(),
+                "constraints": [],
+                "pairs": copy.deepcopy(raw_pairs),
+            }
+            result = self.orchestrate.evaluate_outer_candidate(
+                candidate,
+                mode="full",
+                workload_spec=spec,
+                baseline="best.py",
+                policy=self.orchestrate.resolve_budget("quick"),
+                confidence=0.95,
+                evaluator=mock.Mock(return_value=workload_result),
+                candidate_root=iter_dir,
+                input_hash="a" * 64,
+                iteration=2,
+            )
+            evidence = result["workload_paired_samples"]
+            artifact = Path(evidence["path"])
+            records = [
+                json.loads(line) for line in artifact.read_text("utf-8").splitlines()
+            ]
+
+        self.assertEqual(evidence["input_hash"], "a" * 64)
+        self.assertEqual(evidence["iteration"], 2)
+        self.assertEqual(evidence["candidate_id"], "b1")
+        self.assertEqual(evidence["pairs"], 1)
+        self.assertEqual(records[0]["pair"], raw_pairs[0])
 
     def test_outer_deadline_marks_candidate_inconclusive_without_workload_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

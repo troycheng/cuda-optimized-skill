@@ -91,6 +91,58 @@ class BranchExploreTests(unittest.TestCase):
         state_path.write_text(json.dumps(payload), encoding="utf-8")
         return state_path, payload
 
+    def test_paired_candidate_atomically_persists_bound_raw_pairs(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            baseline = root / "baseline.py"
+            candidate = root / "kernel.py"
+            baseline.write_text("# baseline\n", encoding="utf-8")
+            candidate.write_text("# candidate\n", encoding="utf-8")
+            artifact = root / "paired_samples.jsonl"
+            pairs = [
+                {"block": 0, "baseline": 2.0, "candidate": 1.0, "valid": True},
+                {"block": 1, "baseline": 2.2, "candidate": 1.1, "valid": True},
+            ]
+            with mock.patch.object(
+                branch_explore,
+                "run_paired",
+                return_value={"pairs": copy.deepcopy(pairs)},
+            ):
+                result = branch_explore._paired_candidate(
+                    str(baseline),
+                    str(candidate),
+                    backend="triton",
+                    dims={},
+                    ptr_size=0,
+                    arch="sm_120",
+                    nvcc_bin="nvcc",
+                    seed=7,
+                    blocks=2,
+                    warmup=0,
+                    min_effect_pct=0.5,
+                    bootstrap_samples=100,
+                    artifact_path=artifact,
+                    input_hash="a" * 64,
+                    iteration=3,
+                    candidate_id="b2",
+                )
+
+            records = [
+                json.loads(line) for line in artifact.read_text("utf-8").splitlines()
+            ]
+
+        self.assertEqual(result["paired_samples"]["path"], str(artifact.resolve()))
+        self.assertEqual(result["paired_samples"]["pairs"], 2)
+        self.assertEqual(result["statistics"]["valid_pairs"], 2)
+        self.assertEqual([record["pair"] for record in records], pairs)
+        for index, record in enumerate(records):
+            self.assertEqual(record["pair_index"], index)
+            self.assertEqual(record["input_hash"], "a" * 64)
+            self.assertEqual(record["iteration"], 3)
+            self.assertEqual(record["candidate_id"], "b2")
+            self.assertEqual(record["candidate_sha256"], result["paired_samples"]["candidate_sha256"])
+
     def test_only_confirmed_win_enters_shortlist_and_writes_decision(self) -> None:
         branch_explore = _load_branch_explore()
         with tempfile.TemporaryDirectory() as tmp:

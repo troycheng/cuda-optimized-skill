@@ -264,43 +264,104 @@ class StateDecisionPromotionTests(unittest.TestCase):
                 if decision_status == "end_to_end_win"
                 else statistics_status
             )
+        evidence_values = {
+            "confirmed_win": (3.0, 2.0, 4.0),
+            "confirmed_loss": (-3.0, -4.0, -2.0),
+            "inconclusive": (0.0, -1.0, 1.0),
+        }
+        estimate, ci_low, ci_high = evidence_values.get(
+            statistics_status, (3.0, 2.0, 4.0)
+        )
         statistics = {
             "statistic": "median_paired_improvement_pct",
-            "estimate_pct": 3.0,
-            "ci_low_pct": 2.0,
-            "ci_high_pct": 4.0,
+            "direction": "lower",
+            "min_effect_pct": 1.0,
+            "confidence": 0.95,
+            "estimate_pct": estimate,
+            "ci_low_pct": ci_low,
+            "ci_high_pct": ci_high,
             "status": statistics_status,
+            "valid_pairs": 3,
+            "invalid_pairs": 0,
+            "improvements_pct": [estimate, estimate, estimate],
         }
         has_kernel_statistics = decision_status not in {
             "no_confirmed_kernel_win",
             "workload_failed",
+            "invalid",
         }
         has_workload_statistics = decision_status == "end_to_end_win"
         if write_decision:
             candidate_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            decision.write_text(
-                json.dumps(
-                    {
-                        "status": decision_status,
-                        "candidate_file": candidate_override or str(candidate),
-                        "candidate_sha256": (
-                            candidate_sha256
-                            if decision_status
-                            in {"confirmed_win", "kernel_only_win", "end_to_end_win"}
-                            else None
-                        ),
-                        "statistics": statistics if has_kernel_statistics else None,
-                        "workload_statistics": (
-                            {
-                                **statistics,
-                                "statistic": "median_paired_workload_improvement_pct",
-                                "status": workload_statistics_status,
-                            }
-                            if has_workload_statistics
-                            else None
-                        ),
-                    }
+            decision_payload = {
+                "status": decision_status,
+                "candidate_id": "b1",
+                "candidate_file": candidate_override or str(candidate),
+                "candidate_sha256": (
+                    candidate_sha256
+                    if decision_status
+                    in {"confirmed_win", "kernel_only_win", "end_to_end_win"}
+                    else None
                 ),
+                "statistics": statistics if has_kernel_statistics else None,
+                "workload_statistics": (
+                    {
+                        **statistics,
+                        "status": workload_statistics_status,
+                    }
+                    if has_workload_statistics
+                    else None
+                ),
+            }
+            if decision_status in {
+                "confirmed_win",
+                "kernel_only_win",
+                "end_to_end_win",
+            }:
+                for kind in (
+                    "kernel",
+                    *( ("workload",) if decision_status == "end_to_end_win" else () ),
+                ):
+                    samples = iter_dir / kind / "paired_samples.jsonl"
+                    samples.parent.mkdir(parents=True, exist_ok=True)
+                    records = [
+                        {
+                            "schema_version": 2,
+                            "kind": kind,
+                            "input_hash": "abc",
+                            "iteration": 1,
+                            "candidate_id": "b1",
+                            "candidate_file": str(candidate.resolve()),
+                            "candidate_sha256": candidate_sha256,
+                            "pair_index": index,
+                            "pair": {
+                                "baseline_ms": 2.0,
+                                "candidate_ms": 1.0,
+                            },
+                        }
+                        for index in range(3)
+                    ]
+                    samples.write_text(
+                        "".join(
+                            json.dumps(record, separators=(",", ":")) + "\n"
+                            for record in records
+                        ),
+                        encoding="utf-8",
+                    )
+                    decision_payload[f"{kind}_paired_samples"] = {
+                        "schema_version": 2,
+                        "kind": kind,
+                        "path": str(samples.resolve()),
+                        "sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+                        "pairs": 3,
+                        "input_hash": "abc",
+                        "iteration": 1,
+                        "candidate_id": "b1",
+                        "candidate_file": str(candidate.resolve()),
+                        "candidate_sha256": candidate_sha256,
+                    }
+            decision.write_text(
+                json.dumps(decision_payload),
                 encoding="utf-8",
             )
         args = argparse.Namespace(
@@ -403,6 +464,23 @@ class StateDecisionPromotionTests(unittest.TestCase):
         self.assertEqual(binding["candidate_file"], str(candidate.resolve()))
         self.assertEqual(binding["candidate_sha256"], candidate_hash)
 
+    def test_winning_decision_without_raw_pairs_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            decision_path = Path(tmp) / "run" / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            decision.pop("kernel_paired_samples")
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "kernel_paired_samples"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+        self.assertNotIn("terminal_decision", unchanged)
+
     def test_full_mode_end_to_end_win_is_the_only_global_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args, state_path, candidate, _before = self._fixture(
@@ -416,8 +494,125 @@ class StateDecisionPromotionTests(unittest.TestCase):
         self.assertEqual(output["status"], "end_to_end_win")
         self.assertEqual(
             updated["best_workload_statistics"]["statistic"],
-            "median_paired_workload_improvement_pct",
+            "median_paired_improvement_pct",
         )
+
+    def test_update_persists_one_bound_terminal_evidence_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, candidate, _before = self._fixture(
+                Path(tmp), mode="full", decision_status="end_to_end_win"
+            )
+            run_dir = Path(tmp) / "run"
+            iter_dir = run_dir / "iterv1"
+            candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+            def paired_metadata(kind: str) -> dict:
+                path = iter_dir / kind / "paired_samples.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                records = [
+                    {
+                        "schema_version": 2,
+                        "kind": kind,
+                        "input_hash": "abc",
+                        "iteration": 1,
+                        "candidate_id": "b1",
+                        "candidate_file": str(candidate.resolve()),
+                        "candidate_sha256": candidate_sha,
+                        "pair_index": index,
+                        "pair": {"baseline_ms": 2.0, "candidate_ms": 1.0},
+                    }
+                    for index in range(3)
+                ]
+                path.write_text(
+                    "".join(
+                        json.dumps(record, separators=(",", ":")) + "\n"
+                        for record in records
+                    ),
+                    encoding="utf-8",
+                )
+                return {
+                    "schema_version": 2,
+                    "kind": kind,
+                    "path": str(path.resolve()),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "pairs": 3,
+                    "input_hash": "abc",
+                    "iteration": 1,
+                    "candidate_id": "b1",
+                    "candidate_file": str(candidate.resolve()),
+                    "candidate_sha256": candidate_sha,
+                }
+
+            decision_path = iter_dir / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            decision.update(
+                candidate_id="b1",
+                constraints=[
+                    {
+                        "name": "memory_mb",
+                        "status": "passed",
+                        "estimate_pct": 0.5,
+                        "ci_low_pct": 0.1,
+                        "ci_high_pct": 0.9,
+                        "max_regression_pct": 2.0,
+                        "cap_pct": 2.0,
+                        "values_pct": [0.5],
+                    }
+                ],
+                kernel_paired_samples=paired_metadata("kernel"),
+                workload_paired_samples=paired_metadata("workload"),
+            )
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+            decision_sha = hashlib.sha256(decision_path.read_bytes()).hexdigest()
+
+            bench_path = Path(args.bench)
+            bench = json.loads(bench_path.read_text("utf-8"))
+            bench["compiler_evidence"] = {
+                "status": "available",
+                "stages": ["source", "ptx", "sass"],
+            }
+            bench_path.write_text(json.dumps(bench), encoding="utf-8")
+            sass_path = iter_dir / "sass_check.json"
+            sass_path.write_text(
+                json.dumps({"status": "passed", "checks": []}),
+                encoding="utf-8",
+            )
+            args.sass_check = str(sass_path)
+            checkpoint_path = run_dir / "checkpoint.json"
+            checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "input_hash": "abc",
+                        "iteration": 1,
+                        "stage": "decision",
+                        "status": "in_progress",
+                        "stage_evidence": {
+                            "candidate_sanitizer": {
+                                "status": "passed",
+                                "coverage": "complete",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self._run_update(args)
+            updated = json.loads(state_path.read_text("utf-8"))
+
+        terminal = updated["terminal_decision"]
+        self.assertEqual(terminal["input_hash"], "abc")
+        self.assertEqual(terminal["iteration"], 1)
+        self.assertEqual(terminal["status"], "end_to_end_win")
+        self.assertEqual(terminal["candidate_sha256"], candidate_sha)
+        self.assertEqual(terminal["decision_sha256"], decision_sha)
+        self.assertEqual(terminal["kernel_paired_samples"]["pairs"], 3)
+        self.assertEqual(terminal["workload_paired_samples"]["pairs"], 3)
+        self.assertEqual(terminal["compiler_evidence"]["status"], "available")
+        self.assertEqual(terminal["sass"]["status"], "passed")
+        self.assertEqual(terminal["sanitizer"]["coverage"], "complete")
+        self.assertEqual(terminal["resume"]["stage"], "decision")
 
     def test_faster_average_with_non_win_decision_never_promotes(self) -> None:
         for status in (
@@ -630,7 +825,7 @@ class StateDecisionPromotionTests(unittest.TestCase):
             decision["statistics"]["status"] = "confirmed_loss"
             decision_path.write_text(json.dumps(decision), encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "statistics.status.*decision"):
+            with self.assertRaisesRegex(ValueError, "statistics.status"):
                 self._run_update(args)
             unchanged = json.loads(state_path.read_text("utf-8"))
 
@@ -675,7 +870,9 @@ class StateDecisionPromotionTests(unittest.TestCase):
                     statistics_status=kernel_status,
                     workload_statistics_status=workload_status,
                 )
-                with self.assertRaisesRegex(ValueError, "confirmed_win evidence"):
+                with self.assertRaisesRegex(
+                    ValueError, "statistics.status|confirmed_win evidence"
+                ):
                     self._run_update(args)
                 unchanged = json.loads(state_path.read_text("utf-8"))
                 self.assertEqual(unchanged["best_file"], before["best_file"])
