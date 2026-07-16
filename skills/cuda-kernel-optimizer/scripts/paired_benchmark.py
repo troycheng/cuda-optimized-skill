@@ -187,6 +187,9 @@ def run_paired(
                         "temperature_delta_c"
                     ),
                     "clock_delta_pct": validation.get("clock_delta_pct"),
+                    "clock_delta_capped": validation.get(
+                        "clock_delta_capped", False
+                    ),
                 },
             }
         )

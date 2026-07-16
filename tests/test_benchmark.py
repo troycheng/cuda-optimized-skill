@@ -101,6 +101,7 @@ class BenchmarkTests(unittest.TestCase):
             calls.append((args, kwargs))
             return expected
 
+        benchmark._require_torch = lambda: None
         benchmark._setup_backend = setup
         result = benchmark.prepare_solution(
             "kernel.py",
@@ -122,6 +123,45 @@ class BenchmarkTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_prepare_solution_initializes_torch_before_real_triton_setup(self) -> None:
+        benchmark = _load_benchmark()
+        self.assertIsNone(benchmark.torch)
+        initialized = []
+
+        class FakeTensor:
+            pass
+
+        fake_torch = SimpleNamespace(Tensor=FakeTensor)
+
+        def require_torch():
+            initialized.append(True)
+            benchmark.torch = fake_torch
+            return fake_torch
+
+        benchmark._require_torch = require_torch
+        source = (
+            "def setup(**kwargs):\n"
+            "    return {'inputs': {'n': kwargs['n']}, 'outputs': []}\n"
+            "def run_kernel(**kwargs):\n"
+            "    return None\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            solution = Path(tmp) / "kernel.py"
+            solution.write_text(source, encoding="utf-8")
+            state = benchmark.prepare_solution(
+                str(solution),
+                backend="triton",
+                dims={"n": 128},
+                ptr_size=0,
+                arch="sm_120",
+                nvcc_bin="nvcc",
+                seed=17,
+            )
+
+        self.assertEqual(initialized, [True])
+        self.assertEqual(state["backend"], "triton")
+        self.assertEqual(state["reference_inputs"], {"n": 128})
 
     def test_warm_solution_resets_before_every_call_and_synchronizes(self) -> None:
         benchmark = _load_benchmark()

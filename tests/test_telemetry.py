@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import math
 import subprocess
 import unittest
@@ -95,6 +96,22 @@ class ReadGpuTelemetryTests(unittest.TestCase):
             self.assertFalse(result["available"])
             self.assertIn(reason, result["reason"])
 
+    def test_physically_invalid_command_values_are_unavailable(self) -> None:
+        telemetry = _load_telemetry()
+        for stdout in (
+            "60, -1, 300, 4096, 80\n",
+            "60, 2100, 300, 4096, 101\n",
+        ):
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=stdout, stderr=""
+            )
+            with self.subTest(stdout=stdout), mock.patch.object(
+                telemetry.subprocess, "run", return_value=completed
+            ):
+                result = telemetry.read_gpu_telemetry()
+            self.assertFalse(result["available"])
+            self.assertIn("parse_error", result["reason"])
+
     def test_timeout_must_be_a_positive_finite_real(self) -> None:
         telemetry = _load_telemetry()
         for value in (0, -1, True, "1", math.nan, math.inf, -math.inf):
@@ -154,6 +171,29 @@ class ValidateBlockTests(unittest.TestCase):
         self.assertIn("before_unavailable", result["unknown_reasons"])
         self.assertEqual((before, after), originals)
 
+    def test_metrics_without_available_flag_still_gate_real_drift(self) -> None:
+        telemetry = _load_telemetry()
+        result = telemetry.validate_block(
+            {"temperature_c": 60, "sm_clock_mhz": 2500},
+            {"temperature_c": 67, "sm_clock_mhz": 2250},
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(
+            result["invalid_reasons"], ["temperature_delta", "clock_delta"]
+        )
+        self.assertEqual(result["telemetry_status"], "available")
+
+    def test_empty_mapping_is_unknown_not_invalid(self) -> None:
+        telemetry = _load_telemetry()
+        result = telemetry.validate_block({}, {})
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["telemetry_status"], "unknown")
+        self.assertEqual(
+            result["unknown_reasons"], ["before_no_metrics", "after_no_metrics"]
+        )
+
     def test_missing_or_zero_clock_is_unknown_without_dividing_by_zero(self) -> None:
         telemetry = _load_telemetry()
         for before in (self.reading(clock=0), {"available": True, "temperature_c": 60}):
@@ -186,13 +226,53 @@ class ValidateBlockTests(unittest.TestCase):
                 ):
                     telemetry.validate_block(before, self.reading())
 
-    def test_non_finite_computed_temperature_delta_is_rejected(self) -> None:
+    def test_extreme_nonnegative_temperature_delta_is_invalid(self) -> None:
         telemetry = _load_telemetry()
-        with self.assertRaisesRegex(ValueError, "temperature_delta"):
-            telemetry.validate_block(
-                self.reading(temperature=-1e308),
-                self.reading(temperature=1e308),
-            )
+        result = telemetry.validate_block(
+            self.reading(temperature=0),
+            self.reading(temperature=1e308),
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertIn("temperature_delta", result["invalid_reasons"])
+        self.assertTrue(math.isfinite(result["temperature_delta_c"]))
+
+    def test_extreme_finite_clock_delta_is_invalid_and_json_safe(self) -> None:
+        telemetry = _load_telemetry()
+        result = telemetry.validate_block(
+            self.reading(clock=1e-308),
+            self.reading(clock=1e308),
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertIn("clock_delta", result["invalid_reasons"])
+        self.assertTrue(result["clock_delta_capped"])
+        self.assertTrue(math.isfinite(result["clock_delta_pct"]))
+        self.assertGreater(result["clock_delta_pct"], 5)
+        self.assertIsInstance(json.dumps(result, allow_nan=False), str)
+
+    def test_negative_physical_metrics_and_utilization_above_100_are_rejected(
+        self,
+    ) -> None:
+        telemetry = _load_telemetry()
+        for field in (
+            "temperature_c",
+            "sm_clock_mhz",
+            "power_w",
+            "memory_used_mb",
+            "gpu_utilization_pct",
+        ):
+            before = self.reading()
+            before[field] = -0.1
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                telemetry.validate_block(before, self.reading())
+
+        before = self.reading()
+        before["gpu_utilization_pct"] = 100.1
+        with self.assertRaisesRegex(ValueError, "gpu_utilization_pct"):
+            telemetry.validate_block(before, self.reading())
 
     def test_inputs_must_be_mappings_and_available_must_be_bool(self) -> None:
         telemetry = _load_telemetry()

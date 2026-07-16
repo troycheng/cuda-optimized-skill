@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import math
 import subprocess
+import sys
 from collections.abc import Mapping
 from numbers import Real
 
@@ -42,6 +43,15 @@ def _nonnegative_finite(value, name: str) -> float:
     parsed = _finite_real(value, name)
     if parsed < 0:
         raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def _physical_metric(value, field: str, name: str) -> float:
+    parsed = _finite_real(value, name)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    if field == "gpu_utilization_pct" and parsed > 100:
+        raise ValueError(f"{name} must be at most 100")
     return parsed
 
 
@@ -93,9 +103,10 @@ def read_gpu_telemetry(*, timeout: float = 2.0) -> dict:
         ]
         if not rows or len(rows[0]) != len(_RESULT_FIELDS):
             raise ValueError("expected five CSV fields")
-        values = [float(cell.strip()) for cell in rows[0]]
-        if not all(math.isfinite(value) for value in values):
-            raise ValueError("non-finite CSV value")
+        values = [
+            _physical_metric(float(cell.strip()), field, f"nvidia_smi.{field}")
+            for field, cell in zip(_RESULT_FIELDS, rows[0])
+        ]
     except (TypeError, ValueError):
         return _unavailable("nvidia_smi_parse_error")
 
@@ -105,21 +116,24 @@ def read_gpu_telemetry(*, timeout: float = 2.0) -> dict:
     }
 
 
-def _validated_reading(payload, name: str) -> tuple[dict, bool]:
+def _validated_reading(payload, name: str) -> tuple[dict, bool, str | None]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{name} must be a mapping")
     reading = dict(payload)
+    has_metrics = any(field in reading for field in _RESULT_FIELDS)
     if "available" not in reading:
-        available = False
+        available = has_metrics
+        unavailable_reason = None if has_metrics else f"{name}_no_metrics"
     else:
         available = reading["available"]
         if type(available) is not bool:
             raise ValueError(f"{name}.available must be a bool")
+        unavailable_reason = f"{name}_unavailable" if not available else None
 
     for field in _RESULT_FIELDS:
         if field in reading:
-            _finite_real(reading[field], f"{name}.{field}")
-    return reading, available
+            _physical_metric(reading[field], field, f"{name}.{field}")
+    return reading, available, unavailable_reason
 
 
 def validate_block(
@@ -139,18 +153,23 @@ def validate_block(
     clock_limit = _nonnegative_finite(
         max_clock_delta_pct, "max_clock_delta_pct"
     )
-    before_copy, before_available = _validated_reading(before, "before")
-    after_copy, after_available = _validated_reading(after, "after")
+    before_copy, before_available, before_unknown = _validated_reading(
+        before, "before"
+    )
+    after_copy, after_available, after_unknown = _validated_reading(
+        after, "after"
+    )
 
     invalid_reasons: list[str] = []
     unknown_reasons: list[str] = []
     temperature_delta = None
     clock_delta_pct = None
+    clock_delta_capped = False
 
     if not before_available:
-        unknown_reasons.append("before_unavailable")
+        unknown_reasons.append(before_unknown or "before_unavailable")
     if not after_available:
-        unknown_reasons.append("after_unavailable")
+        unknown_reasons.append(after_unknown or "after_unavailable")
 
     if before_available and after_available:
         before_temperature = before_copy.get("temperature_c")
@@ -178,12 +197,13 @@ def validate_block(
         else:
             clock_delta_pct = (
                 abs(float(after_clock) - float(before_clock))
-                / abs(float(before_clock))
+                / float(before_clock)
                 * 100.0
             )
             if not math.isfinite(clock_delta_pct):
-                unknown_reasons.append("clock_delta_unknown")
-                clock_delta_pct = None
+                clock_delta_pct = sys.float_info.max
+                clock_delta_capped = True
+                invalid_reasons.append("clock_delta")
             elif clock_delta_pct > clock_limit:
                 invalid_reasons.append("clock_delta")
 
@@ -194,4 +214,5 @@ def validate_block(
         "unknown_reasons": unknown_reasons,
         "temperature_delta_c": temperature_delta,
         "clock_delta_pct": clock_delta_pct,
+        "clock_delta_capped": clock_delta_capped,
     }

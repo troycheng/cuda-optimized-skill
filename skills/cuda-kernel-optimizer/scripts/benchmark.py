@@ -770,6 +770,7 @@ def prepare_solution(
     seed,
 ):
     """Prepare one solution for repeated warm-up and single-shot timing."""
+    _require_torch()
     resolved_backend = infer_backend(solution_file, backend)
     return _setup_backend(
         solution_file,
