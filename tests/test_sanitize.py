@@ -1769,6 +1769,9 @@ class SanitizerLifecycleTests(unittest.TestCase):
             second_file.parent.mkdir(parents=True)
             first_file.write_text("# sanitizer rejects first\n", encoding="utf-8")
             second_file.write_text("# sanitizer accepts second\n", encoding="utf-8")
+            bench_payload = (iter_dir / "bench.json").read_bytes()
+            (first_file.parent / "bench.json").write_bytes(bench_payload)
+            (second_file.parent / "bench.json").write_bytes(bench_payload)
             expected_profiled_hashes = [
                 self.orchestrate.sha256_file(first_file),
                 self.orchestrate.sha256_file(second_file),

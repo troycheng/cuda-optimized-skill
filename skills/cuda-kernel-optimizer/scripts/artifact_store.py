@@ -67,12 +67,10 @@ def _open_parent_directory(
         raise
 
 
-def read_regular_bytes(path: _PathLike) -> bytes:
-    """Read regular-file bytes through no-follow parent and leaf descriptors."""
-    try:
-        directory_fd, leaf, target = _open_parent_directory(path, create=False)
-    except FileNotFoundError as error:
-        raise ValueError(f"artifact file does not exist: {path}") from error
+def _read_regular_leaf(
+    directory_fd: int, leaf: str, target: Path, *, missing_ok: bool
+) -> Optional[bytes]:
+    """Read one no-follow regular leaf from an already stable parent dirfd."""
     fd = None
     try:
         try:
@@ -82,6 +80,8 @@ def read_regular_bytes(path: _PathLike) -> bytes:
                 dir_fd=directory_fd,
             )
         except OSError as error:
+            if missing_ok and error.errno == errno.ENOENT:
+                return None
             if error.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
                 raise ValueError(
                     f"artifact file is missing, a symlink, or unsafe: {target}"
@@ -99,6 +99,75 @@ def read_regular_bytes(path: _PathLike) -> bytes:
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def read_regular_bytes(path: _PathLike) -> bytes:
+    """Read regular-file bytes through no-follow parent and leaf descriptors."""
+    try:
+        directory_fd, leaf, target = _open_parent_directory(path, create=False)
+    except FileNotFoundError as error:
+        raise ValueError(f"artifact file does not exist: {path}") from error
+    try:
+        return _read_regular_leaf(
+            directory_fd, leaf, target, missing_ok=False
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def read_regular_with_optional_sibling(
+    path: _PathLike, sibling_name: str
+) -> tuple[bytes, Optional[bytes]]:
+    """Read a regular file and optional sibling through one stable parent dirfd."""
+    sibling = Path(sibling_name)
+    if (
+        not sibling_name
+        or sibling.is_absolute()
+        or len(sibling.parts) != 1
+        or sibling_name in {".", ".."}
+    ):
+        raise ValueError("sibling_name must name one relative file")
+    try:
+        directory_fd, leaf, target = _open_parent_directory(path, create=False)
+    except FileNotFoundError as error:
+        raise ValueError(f"artifact file does not exist: {path}") from error
+
+    try:
+        primary = _read_regular_leaf(
+            directory_fd, leaf, target, missing_ok=False
+        )
+        sibling_payload = _read_regular_leaf(
+            directory_fd,
+            sibling_name,
+            target.with_name(sibling_name),
+            missing_ok=True,
+        )
+        return primary, sibling_payload
+    finally:
+        os.close(directory_fd)
+
+
+def remove_regular_file(path: _PathLike, *, missing_ok: bool = True) -> bool:
+    """Remove one regular file relative to a stable, no-follow parent dirfd."""
+    try:
+        directory_fd, leaf, target = _open_parent_directory(path, create=False)
+    except FileNotFoundError as error:
+        if missing_ok:
+            return False
+        raise ValueError(f"artifact file does not exist: {path}") from error
+    try:
+        try:
+            metadata = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            if missing_ok:
+                return False
+            raise ValueError(f"artifact file does not exist: {target}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"artifact path is not a regular file: {target}")
+        os.unlink(leaf, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        return True
+    finally:
         os.close(directory_fd)
 
 

@@ -39,6 +39,8 @@ from artifact_store import (  # noqa: E402
     atomic_write_bytes,
     atomic_write_json,
     read_regular_bytes,
+    read_regular_with_optional_sibling,
+    remove_regular_file,
     sha256_file,
     write_paired_samples,
 )
@@ -730,11 +732,21 @@ def _candidate_snapshot(candidate: Mapping) -> dict:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("candidate must provide candidate_file or kernel")
     path = _absolute_lexical_path(value)
-    payload = read_regular_bytes(path)
+    payload, bench_payload = read_regular_with_optional_sibling(
+        path, "bench.json"
+    )
     return {
         "path": str(path),
         "payload": payload,
         "sha256": hashlib.sha256(payload).hexdigest(),
+        "bench": (
+            None
+            if bench_payload is None
+            else {
+                "payload": bench_payload,
+                "sha256": hashlib.sha256(bench_payload).hexdigest(),
+            }
+        ),
     }
 
 
@@ -1301,19 +1313,31 @@ def _publish_outer_candidate(
     if suffix not in {".cu", ".py"}:
         raise ValueError("outer candidate must be a .cu or .py kernel")
     destination = iter_dir / f"kernel{suffix}"
-    if source != destination.resolve(strict=False):
-        atomic_write_bytes(destination, snapshot["payload"])
+    if hashlib.sha256(snapshot["payload"]).hexdigest() != snapshot["sha256"]:
+        raise ValueError("candidate snapshot payload does not match sha256")
+    atomic_write_bytes(destination, snapshot["payload"])
+    if sha256_file(destination) != snapshot["sha256"]:
+        raise ValueError("published candidate does not match captured snapshot")
     for stale_suffix in {".cu", ".py"} - {suffix}:
         stale = iter_dir / f"kernel{stale_suffix}"
         if stale.is_symlink() or stale.is_file():
             stale.unlink()
         elif stale.exists():
             raise ValueError("stale iteration kernel is not a regular file")
-    source_bench = source.parent / "bench.json"
     destination_bench = iter_dir / "bench.json"
-    if source_bench.is_file() and source_bench.resolve() != destination_bench.resolve():
-        shutil.copy2(source_bench, destination_bench)
-    return str(destination.resolve(strict=True))
+    bench_snapshot = snapshot.get("bench")
+    if bench_snapshot is not None:
+        if (
+            hashlib.sha256(bench_snapshot["payload"]).hexdigest()
+            != bench_snapshot["sha256"]
+        ):
+            raise ValueError("bench snapshot payload does not match sha256")
+        atomic_write_bytes(destination_bench, bench_snapshot["payload"])
+        if sha256_file(destination_bench) != bench_snapshot["sha256"]:
+            raise ValueError("published bench does not match captured snapshot")
+    else:
+        remove_regular_file(destination_bench, missing_ok=True)
+    return str(Path(os.path.abspath(destination)))
 
 
 def _select_terminal_outer_result(results: list[tuple[dict, dict]]) -> tuple[dict, dict]:

@@ -280,9 +280,11 @@ class CloseIterationDecisionTests(unittest.TestCase):
             rejected.write_text("# rejected\n", encoding="utf-8")
             selected = iter_dir / "kernel.py"
             selected.write_text("# confirmed\n", encoding="utf-8")
-            (iter_dir / "bench.json").write_text(
-                json.dumps({"correctness": {"passed": True}}), encoding="utf-8"
+            bench_payload = json.dumps({"correctness": {"passed": True}})
+            (confirmed.parent / "bench.json").write_text(
+                bench_payload, encoding="utf-8"
             )
+            (iter_dir / "bench.json").write_text(bench_payload, encoding="utf-8")
             state = {
                 "schema_version": 2,
                 "run_dir": str((root / "run").resolve()),
@@ -2238,17 +2240,17 @@ class OuterLoopTests(unittest.TestCase):
             outside = root / "outside"
             outside.mkdir()
             (outside / "kernel.py").write_bytes(b"# attacker\n")
-            original_reader = self.orchestrate.read_regular_bytes
+            original_reader = self.orchestrate.read_regular_with_optional_sibling
             swapped = False
 
-            def replace_after_snapshot(path):
+            def replace_after_snapshot(path, sibling_name):
                 nonlocal swapped
-                payload = original_reader(path)
+                bundle = original_reader(path, sibling_name)
                 if not swapped:
                     swapped = True
                     parent.rename(displaced)
                     parent.symlink_to(outside, target_is_directory=True)
-                return payload
+                return bundle
 
             candidate = {
                 "id": "b1",
@@ -2258,7 +2260,7 @@ class OuterLoopTests(unittest.TestCase):
             }
             with mock.patch.object(
                 self.orchestrate,
-                "read_regular_bytes",
+                "read_regular_with_optional_sibling",
                 side_effect=replace_after_snapshot,
             ):
                 decision = self.orchestrate.build_terminal_decision(
@@ -2287,21 +2289,21 @@ class OuterLoopTests(unittest.TestCase):
             (outside / "kernel.py").write_bytes(b"# attacker\n")
             iter_dir = root / "iterv1"
             iter_dir.mkdir()
-            original_reader = self.orchestrate.read_regular_bytes
+            original_reader = self.orchestrate.read_regular_with_optional_sibling
             swapped = False
 
-            def replace_after_snapshot(path):
+            def replace_after_snapshot(path, sibling_name):
                 nonlocal swapped
-                payload = original_reader(path)
+                bundle = original_reader(path, sibling_name)
                 if not swapped:
                     swapped = True
                     parent.rename(displaced)
                     parent.symlink_to(outside, target_is_directory=True)
-                return payload
+                return bundle
 
             with mock.patch.object(
                 self.orchestrate,
-                "read_regular_bytes",
+                "read_regular_with_optional_sibling",
                 side_effect=replace_after_snapshot,
             ):
                 published = self.orchestrate._publish_outer_candidate(
@@ -2309,6 +2311,109 @@ class OuterLoopTests(unittest.TestCase):
                 )
 
             self.assertEqual(Path(published).read_bytes(), original_bytes)
+
+    def test_publish_same_path_restores_captured_kernel_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            iter_dir = Path(tmp).resolve() / "iterv1"
+            iter_dir.mkdir()
+            candidate_file = iter_dir / "kernel.py"
+            original_bytes = b"# original\n"
+            candidate_file.write_bytes(original_bytes)
+            candidate = {"candidate_file": str(candidate_file)}
+            snapshot = self.orchestrate._candidate_snapshot(candidate)
+
+            candidate_file.write_bytes(b"# attacker\n")
+            published = self.orchestrate._publish_outer_candidate(
+                candidate,
+                iter_dir=iter_dir,
+                _snapshot=snapshot,
+            )
+
+            self.assertEqual(Path(published).read_bytes(), original_bytes)
+
+    def test_publish_bench_reuses_snapshot_across_parent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            parent = root / "candidate"
+            parent.mkdir()
+            candidate_file = parent / "kernel.py"
+            candidate_file.write_bytes(b"# original\n")
+            original_bench = b'{"correctness":{"passed":true}}\n'
+            (parent / "bench.json").write_bytes(original_bench)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "kernel.py").write_bytes(b"# attacker\n")
+            (outside / "bench.json").write_bytes(
+                b'{"correctness":{"passed":false}}\n'
+            )
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            candidate = {"candidate_file": str(candidate_file)}
+            snapshot = self.orchestrate._candidate_snapshot(candidate)
+
+            parent.rename(root / "candidate-displaced")
+            parent.symlink_to(outside, target_is_directory=True)
+            self.orchestrate._publish_outer_candidate(
+                candidate,
+                iter_dir=iter_dir,
+                _snapshot=snapshot,
+            )
+
+            self.assertEqual((iter_dir / "bench.json").read_bytes(), original_bench)
+
+    def test_publish_without_bench_removes_stale_destination_bench(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            candidate_dir = root / "candidate"
+            candidate_dir.mkdir()
+            candidate_file = candidate_dir / "kernel.py"
+            candidate_file.write_bytes(b"# candidate\n")
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            stale_bench = iter_dir / "bench.json"
+            stale_bench.write_bytes(b'{"correctness":{"passed":false}}\n')
+
+            self.orchestrate._publish_outer_candidate(
+                {"candidate_file": str(candidate_file)},
+                iter_dir=iter_dir,
+            )
+
+            self.assertFalse(stale_bench.exists())
+
+    def test_publish_rejects_destination_parent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            candidate_dir = root / "candidate"
+            candidate_dir.mkdir()
+            candidate_file = candidate_dir / "kernel.py"
+            candidate_file.write_bytes(b"# candidate\n")
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            displaced = root / "iterv1-displaced"
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "kernel.py").write_bytes(b"# attacker\n")
+            original_writer = self.orchestrate.atomic_write_bytes
+            swapped = False
+
+            def replace_parent_after_write(path, payload):
+                nonlocal swapped
+                original_writer(path, payload)
+                if not swapped and Path(path).name == "kernel.py":
+                    swapped = True
+                    iter_dir.rename(displaced)
+                    iter_dir.symlink_to(outside, target_is_directory=True)
+
+            with mock.patch.object(
+                self.orchestrate,
+                "atomic_write_bytes",
+                side_effect=replace_parent_after_write,
+            ):
+                with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                    self.orchestrate._publish_outer_candidate(
+                        {"candidate_file": str(candidate_file)},
+                        iter_dir=iter_dir,
+                    )
 
     def test_kernel_only_terminal_never_calls_workload_and_can_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
