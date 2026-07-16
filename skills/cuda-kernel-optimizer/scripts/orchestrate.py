@@ -908,6 +908,26 @@ def evaluate_outer_candidate(
                 iteration=iteration,
                 candidate_id=candidate_id,
                 candidate_file=candidate_path,
+                classifier_config={
+                    "objective": _strict_json_copy(
+                        workload_result.get("objective"), "workload objective"
+                    ),
+                    "objective_sha256": hashlib.sha256(
+                        json.dumps(
+                            workload_result.get("objective"),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "confidence": workload_result.get("confidence", confidence),
+                    "bootstrap_samples": workload_result.get(
+                        "bootstrap_samples",
+                        workload_evaluate.DEFAULT_BOOTSTRAP_SAMPLES,
+                    ),
+                    "seed": workload_result.get("seed", seed),
+                },
             )
             workload_result = copy.deepcopy(dict(workload_result))
             workload_result.pop("pairs", None)

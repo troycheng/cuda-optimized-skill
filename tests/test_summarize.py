@@ -111,6 +111,7 @@ def _full_win_state() -> dict:
             },
         },
         "best_file": "/tmp/cuda-run/iterv1/kernel.py",
+        "candidates": {},
         "best_metric_ms": 0.42,
         "best_kernel_statistics": kernel,
         "best_workload_statistics": workload,
@@ -157,6 +158,7 @@ def _full_win_state() -> dict:
             "candidate_file": "/tmp/cuda-run/iterv1/kernel.py",
             "candidate_sha256": "c" * 64,
             "candidate_id": "b1",
+            "decision_sha256": "f" * 64,
             "statistics": copy.deepcopy(kernel),
             "workload_statistics": copy.deepcopy(workload),
             "constraints": [
@@ -210,6 +212,19 @@ def _full_win_state() -> dict:
     }
 
 
+def _minimal_state(run_dir: Path) -> dict:
+    return {
+        "schema_version": 2,
+        "run_dir": str(run_dir),
+        "input_hash": "a" * 64,
+        "budget": {},
+        "candidates": {},
+        "mode": "kernel-only",
+        "workload": None,
+        "history": [],
+    }
+
+
 class SummarizeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.summarize = _load_summarize()
@@ -244,6 +259,20 @@ class SummarizeTests(unittest.TestCase):
             candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
             kernel_statistics = _statistics(estimate=6.0)
             workload_statistics = _statistics(estimate=4.0)
+            kernel_statistics.update(
+                ci_low_pct=6.0,
+                ci_high_pct=6.0,
+                valid_pairs=9,
+                invalid_pairs=1,
+                improvements_pct=[6.0] * 9,
+            )
+            workload_statistics.update(
+                ci_low_pct=4.0,
+                ci_high_pct=4.0,
+                valid_pairs=10,
+                invalid_pairs=0,
+                improvements_pct=[4.0] * 10,
+            )
             workload = {
                 "kind": "command",
                 "source": ["/bin/echo"],
@@ -292,6 +321,29 @@ class SummarizeTests(unittest.TestCase):
             def paired_metadata(kind: str) -> dict:
                 path = iter_dir / kind / "paired_samples.jsonl"
                 path.parent.mkdir(parents=True, exist_ok=True)
+                classifier = (
+                    {
+                        "direction": "lower",
+                        "min_effect_pct": 1.0,
+                        "confidence": 0.95,
+                        "bootstrap_samples": 20,
+                        "seed": 0,
+                    }
+                    if kind == "kernel"
+                    else {
+                        "objective": workload["objective"],
+                        "objective_sha256": hashlib.sha256(
+                            json.dumps(
+                                workload["objective"],
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                        "confidence": 0.95,
+                        "bootstrap_samples": 20,
+                        "seed": 0,
+                    }
+                )
                 records = [
                     {
                         "schema_version": 2,
@@ -301,8 +353,35 @@ class SummarizeTests(unittest.TestCase):
                         "candidate_id": "b1",
                         "candidate_file": str(candidate),
                         "candidate_sha256": candidate_sha,
+                        "classifier": classifier,
                         "pair_index": index,
-                        "pair": {"baseline_ms": 2.0, "candidate_ms": 1.0},
+                        "pair": (
+                            {
+                                "baseline": 100.0,
+                                "candidate": 94.0,
+                                "valid": index < 9,
+                            }
+                            if kind == "kernel"
+                            else {
+                                "block": index,
+                                "order": "AB",
+                                "case": None,
+                                "baseline_metrics": {
+                                    "latency_ms": 100.0,
+                                    "memory_mb": 100.0,
+                                },
+                                "candidate_metrics": {
+                                    "latency_ms": 96.0,
+                                    "memory_mb": 100.5,
+                                },
+                                "valid": True,
+                                "attempts": {"baseline": 1, "candidate": 1},
+                                "attempt_records": {
+                                    "baseline": [],
+                                    "candidate": [],
+                                },
+                            }
+                        ),
                     }
                     for index in range(10)
                 ]
@@ -324,17 +403,18 @@ class SummarizeTests(unittest.TestCase):
                     "candidate_id": "b1",
                     "candidate_file": str(candidate),
                     "candidate_sha256": candidate_sha,
+                    "classifier": classifier,
                 }
 
             constraint = {
                 "name": "memory_mb",
                 "status": "passed",
                 "estimate_pct": 0.5,
-                "ci_low_pct": 0.1,
-                "ci_high_pct": 0.9,
+                "ci_low_pct": 0.5,
+                "ci_high_pct": 0.5,
                 "max_regression_pct": 2.0,
                 "cap_pct": 2.0,
-                "values_pct": [0.5],
+                "values_pct": [0.5] * 10,
             }
             decision_path = iter_dir / "decision.json"
             decision_path.write_text(
@@ -411,6 +491,29 @@ class SummarizeTests(unittest.TestCase):
                 state_module.cmd_update(args)
             updated = json.loads(state_path.read_text("utf-8"))
             text = self.summarize.render_text(updated)
+            summary_path = run_dir / "summary.md"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.summarize.render(str(state_path), str(summary_path))
+            self.assertTrue(summary_path.is_file())
+            decision_bytes = decision_path.read_bytes()
+            decision_path.write_text("{}", encoding="utf-8")
+            rejected_decision_summary = run_dir / "rejected-decision-summary.md"
+            with self.assertRaisesRegex(ValueError, "decision.*sha256|sha256.*decision"):
+                self.summarize.render(
+                    str(state_path), str(rejected_decision_summary)
+                )
+            self.assertFalse(rejected_decision_summary.exists())
+            decision_path.write_bytes(decision_bytes)
+            kernel_raw = Path(
+                updated["terminal_decision"]["kernel_paired_samples"]["path"]
+            )
+            kernel_raw.write_text(
+                kernel_raw.read_text("utf-8") + "{}\n", encoding="utf-8"
+            )
+            rejected_summary = run_dir / "rejected-summary.md"
+            with self.assertRaisesRegex(ValueError, "sha256|record|paired"):
+                self.summarize.render(str(state_path), str(rejected_summary))
+            self.assertFalse(rejected_summary.exists())
 
         self.assertIn("# Result: end_to_end_win", text)
         self.assertIn("budget preset: balanced", text)
@@ -553,6 +656,38 @@ class SummarizeTests(unittest.TestCase):
         self.assertIn("## Historical best evidence", text)
         self.assertIn("estimate: 9.000%", text)
 
+    def test_later_no_win_history_invalidates_an_older_terminal_win(self) -> None:
+        state = copy.deepcopy(self.full_win_state)
+        state["history"].append(
+            {
+                "event": "decision_record",
+                "iter": 2,
+                "status": "no_confirmed_kernel_win",
+                "decision_sha256": "1" * 64,
+            }
+        )
+
+        text = self.summarize.render_text(state)
+
+        self.assertIn("# Result: inconclusive", text)
+        self.assertIn("newer decision", text)
+        self.assertNotIn("# Result: end_to_end_win", text)
+
+    def test_newer_checkpoint_candidate_state_invalidates_an_older_win(self) -> None:
+        state = copy.deepcopy(self.full_win_state)
+        state["terminal_decision"]["resume"].update(
+            iteration=2,
+            candidate_status="inconclusive",
+            candidate_id=None,
+            input_hash=state["input_hash"],
+        )
+
+        text = self.summarize.render_text(state)
+
+        self.assertIn("# Result: inconclusive", text)
+        self.assertIn("newer checkpoint", text)
+        self.assertNotIn("# Result: end_to_end_win", text)
+
     def test_missing_evidence_is_explicit_and_never_fabricated(self) -> None:
         state = {
             "schema_version": 2,
@@ -684,20 +819,37 @@ class SummarizeTests(unittest.TestCase):
             root = Path(tmp).resolve()
             state_path = root / "state.json"
             output_path = root / "summary.md"
-            state_path.write_text(json.dumps(state), encoding="utf-8")
+            io_state = _minimal_state(root)
+            state_path.write_text(json.dumps(io_state), encoding="utf-8")
             with mock.patch.object(
                 self.summarize, "render_text", return_value="delegated\n"
             ) as render_text:
                 self.summarize.render(str(state_path), str(output_path))
 
-            render_text.assert_called_once_with(state)
+            render_text.assert_called_once_with(io_state)
             self.assertEqual(output_path.read_text("utf-8"), "delegated\n")
+
+    def test_render_rejects_win_when_raw_artifact_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_path = root / "state.json"
+            output_path = root / "summary.md"
+            state_path.write_text(
+                json.dumps(self.full_win_state), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "decision_json|paired_samples|artifact|file"
+            ):
+                self.summarize.render(str(state_path), str(output_path))
+
+            self.assertFalse(output_path.exists())
 
     def test_render_rejects_state_and_output_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             real_state = root / "real-state.json"
-            real_state.write_text(json.dumps(self.full_win_state), encoding="utf-8")
+            real_state.write_text(json.dumps(_minimal_state(root)), encoding="utf-8")
             linked_state = root / "state.json"
             output = root / "summary.md"
             target = root / "target.md"
@@ -723,7 +875,7 @@ class SummarizeTests(unittest.TestCase):
             real = root / "real"
             real.mkdir()
             state = real / "state.json"
-            state.write_text(json.dumps(self.full_win_state), encoding="utf-8")
+            state.write_text(json.dumps(_minimal_state(real)), encoding="utf-8")
             linked = root / "linked"
             try:
                 linked.symlink_to(real, target_is_directory=True)
@@ -745,7 +897,7 @@ class SummarizeTests(unittest.TestCase):
             state_path = root / "state.json"
             output_path = root / "summary.md"
             state_path.write_text(
-                json.dumps(self.full_win_state), encoding="utf-8"
+                json.dumps(_minimal_state(root)), encoding="utf-8"
             )
             real_replace = os.replace
             real_fsync = os.fsync
@@ -758,7 +910,7 @@ class SummarizeTests(unittest.TestCase):
 
             replace.assert_called_once()
             self.assertGreaterEqual(fsync.call_count, 2)
-            self.assertIn("# Result: end_to_end_win", output_path.read_text("utf-8"))
+            self.assertIn("# Result: inconclusive", output_path.read_text("utf-8"))
             self.assertEqual(list(root.glob(".summary.md.*.tmp")), [])
 
 

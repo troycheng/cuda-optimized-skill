@@ -21,6 +21,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import decision as decision_engine  # noqa: E402
+import state as state_manager  # noqa: E402
 
 
 _TERMINAL_STATUSES = {
@@ -322,6 +323,55 @@ def _terminal_result(state) -> tuple[str, list[str]]:
             return "inconclusive", ["terminal decision iteration binding is invalid"]
         if decision.get("mode") != state.get("mode"):
             return "inconclusive", ["terminal decision mode binding is invalid"]
+
+        history = state.get("history")
+        if isinstance(history, list):
+            newer_decisions = [
+                item
+                for item in history
+                if isinstance(item, Mapping)
+                and item.get("event") == "decision_record"
+                and type(item.get("iter")) is int
+                and item["iter"] > iteration
+            ]
+            if newer_decisions:
+                return "inconclusive", [
+                    "a newer decision exists than the terminal evidence snapshot"
+                ]
+
+        resume = _mapping(decision.get("resume"))
+        resume_iteration = resume.get("iteration")
+        if (
+            type(resume_iteration) is int
+            and resume_iteration > iteration
+        ):
+            return "inconclusive", [
+                "a newer checkpoint exists than the terminal evidence snapshot"
+            ]
+        resume_candidate_id = resume.get("candidate_id")
+        resume_candidate_status = _status(resume.get("candidate_status"))
+        if (
+            type(resume_iteration) is int
+            and resume_iteration == iteration
+            and claimed in {"kernel_only_win", "end_to_end_win"}
+            and resume_candidate_status is not None
+            and resume_candidate_status not in {
+                "confirmed_win",
+                "kernel_only_win",
+                "end_to_end_win",
+            }
+        ):
+            return "inconclusive", [
+                "checkpoint candidate status contradicts the terminal win"
+            ]
+        if (
+            resume_candidate_id is not None
+            and decision.get("candidate_id") is not None
+            and resume_candidate_id != decision.get("candidate_id")
+        ):
+            return "inconclusive", [
+                "checkpoint candidate binding contradicts terminal evidence"
+            ]
 
     kernel_statistics = _statistics(state, workload=False)
     workload_statistics = _statistics(state, workload=True)
@@ -805,7 +855,11 @@ def render_text(state) -> str:
 
 def render(state_path: str, out_path: str) -> None:
     state = _read(state_path)
+    state_manager.validate_state(state)
     text = render_text(state)
+    # Revalidate immediately before publication so artifact drift during
+    # rendering cannot turn stale evidence into a visible win.
+    state_manager.validate_state(state)
     _atomic_write_text(out_path, text)
     print(json.dumps({"summary": out_path}, indent=2))
 

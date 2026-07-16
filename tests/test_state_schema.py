@@ -223,7 +223,24 @@ class StateDecisionPromotionTests(unittest.TestCase):
             "budget": {},
             "candidates": {},
             "mode": mode,
-            "workload": {"kind": "command"} if mode == "full" else None,
+            "workload": (
+                {
+                    "kind": "command",
+                    "source": ["/bin/echo"],
+                    "cases": [],
+                    "source_hash": "b" * 64,
+                    "objective": {
+                        "primary_metric": {
+                            "name": "latency_ms",
+                            "direction": "lower",
+                        },
+                        "min_effect_pct": 1.0,
+                        "constraints": [],
+                    },
+                }
+                if mode == "full"
+                else None
+            ),
             "best_file": str(best),
             "best_metric_ms": 10.0,
             "best_kernel_statistics": None,
@@ -272,6 +289,8 @@ class StateDecisionPromotionTests(unittest.TestCase):
         estimate, ci_low, ci_high = evidence_values.get(
             statistics_status, (3.0, 2.0, 4.0)
         )
+        if statistics_status == "confirmed_win":
+            ci_low = ci_high = estimate
         statistics = {
             "statistic": "median_paired_improvement_pct",
             "direction": "lower",
@@ -333,11 +352,47 @@ class StateDecisionPromotionTests(unittest.TestCase):
                             "candidate_id": "b1",
                             "candidate_file": str(candidate.resolve()),
                             "candidate_sha256": candidate_sha256,
+                            "classifier": (
+                                {
+                                    "direction": "lower",
+                                    "min_effect_pct": 1.0,
+                                    "confidence": 0.95,
+                                    "bootstrap_samples": 20,
+                                    "seed": 0,
+                                }
+                                if kind == "kernel"
+                                else {
+                                    "objective": payload["workload"]["objective"],
+                                    "objective_sha256": hashlib.sha256(
+                                        json.dumps(
+                                            payload["workload"]["objective"],
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        ).encode("utf-8")
+                                    ).hexdigest(),
+                                    "confidence": 0.95,
+                                    "bootstrap_samples": 20,
+                                    "seed": 0,
+                                }
+                            ),
                             "pair_index": index,
-                            "pair": {
-                                "baseline_ms": 2.0,
-                                "candidate_ms": 1.0,
-                            },
+                            "pair": (
+                                {"baseline": 100.0, "candidate": 97.0, "valid": True}
+                                if kind == "kernel"
+                                else {
+                                    "block": index,
+                                    "order": "AB",
+                                    "case": None,
+                                    "baseline_metrics": {"latency_ms": 100.0},
+                                    "candidate_metrics": {"latency_ms": 97.0},
+                                    "valid": True,
+                                    "attempts": {"baseline": 1, "candidate": 1},
+                                    "attempt_records": {
+                                        "baseline": [],
+                                        "candidate": [],
+                                    },
+                                }
+                            ),
                         }
                         for index in range(3)
                     ]
@@ -359,6 +414,7 @@ class StateDecisionPromotionTests(unittest.TestCase):
                         "candidate_id": "b1",
                         "candidate_file": str(candidate.resolve()),
                         "candidate_sha256": candidate_sha256,
+                        "classifier": records[0]["classifier"],
                     }
             decision.write_text(
                 json.dumps(decision_payload),
@@ -481,6 +537,37 @@ class StateDecisionPromotionTests(unittest.TestCase):
         self.assertEqual(unchanged["best_file"], before["best_file"])
         self.assertNotIn("terminal_decision", unchanged)
 
+    def test_raw_pair_content_must_recompute_the_declared_statistics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            decision_path = Path(tmp) / "run" / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            evidence = decision["kernel_paired_samples"]
+            artifact = Path(evidence["path"])
+            records = [
+                json.loads(line) for line in artifact.read_text("utf-8").splitlines()
+            ]
+            for record in records:
+                record["pair"]["candidate"] = 96.0
+            artifact.write_text(
+                "".join(
+                    json.dumps(record, separators=(",", ":")) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            evidence["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "recompute|statistics"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+        self.assertNotIn("terminal_decision", unchanged)
+
     def test_full_mode_end_to_end_win_is_the_only_global_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args, state_path, candidate, _before = self._fixture(
@@ -506,62 +593,9 @@ class StateDecisionPromotionTests(unittest.TestCase):
             iter_dir = run_dir / "iterv1"
             candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
 
-            def paired_metadata(kind: str) -> dict:
-                path = iter_dir / kind / "paired_samples.jsonl"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                records = [
-                    {
-                        "schema_version": 2,
-                        "kind": kind,
-                        "input_hash": "abc",
-                        "iteration": 1,
-                        "candidate_id": "b1",
-                        "candidate_file": str(candidate.resolve()),
-                        "candidate_sha256": candidate_sha,
-                        "pair_index": index,
-                        "pair": {"baseline_ms": 2.0, "candidate_ms": 1.0},
-                    }
-                    for index in range(3)
-                ]
-                path.write_text(
-                    "".join(
-                        json.dumps(record, separators=(",", ":")) + "\n"
-                        for record in records
-                    ),
-                    encoding="utf-8",
-                )
-                return {
-                    "schema_version": 2,
-                    "kind": kind,
-                    "path": str(path.resolve()),
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                    "pairs": 3,
-                    "input_hash": "abc",
-                    "iteration": 1,
-                    "candidate_id": "b1",
-                    "candidate_file": str(candidate.resolve()),
-                    "candidate_sha256": candidate_sha,
-                }
-
             decision_path = iter_dir / "decision.json"
             decision = json.loads(decision_path.read_text("utf-8"))
-            decision.update(
-                candidate_id="b1",
-                constraints=[
-                    {
-                        "name": "memory_mb",
-                        "status": "passed",
-                        "estimate_pct": 0.5,
-                        "ci_low_pct": 0.1,
-                        "ci_high_pct": 0.9,
-                        "max_regression_pct": 2.0,
-                        "cap_pct": 2.0,
-                        "values_pct": [0.5],
-                    }
-                ],
-                kernel_paired_samples=paired_metadata("kernel"),
-                workload_paired_samples=paired_metadata("workload"),
-            )
+            decision.update(candidate_id="b1", constraints=[])
             decision_path.write_text(json.dumps(decision), encoding="utf-8")
             decision_sha = hashlib.sha256(decision_path.read_bytes()).hexdigest()
 

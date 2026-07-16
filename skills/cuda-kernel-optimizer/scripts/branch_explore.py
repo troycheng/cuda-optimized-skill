@@ -220,6 +220,13 @@ def _paired_candidate(
         iteration=iteration,
         candidate_id=candidate_id,
         candidate_file=candidate_file,
+        classifier_config={
+            "direction": "lower",
+            "min_effect_pct": min_effect_pct,
+            "confidence": confidence,
+            "bootstrap_samples": bootstrap_samples,
+            "seed": seed,
+        },
     )
     return {"statistics": statistics, "paired_samples": evidence}
 

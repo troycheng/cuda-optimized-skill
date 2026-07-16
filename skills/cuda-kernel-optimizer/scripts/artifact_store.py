@@ -142,6 +142,7 @@ def write_paired_samples(
     iteration: int,
     candidate_id,
     candidate_file: _PathLike,
+    classifier_config=None,
 ) -> dict:
     """Persist raw paired observations with candidate/input/iteration bindings."""
     if kind not in {"kernel", "workload"}:
@@ -155,6 +156,14 @@ def write_paired_samples(
     candidate_name = str(candidate_id).strip()
     if not candidate_name:
         raise ValueError("paired sample candidate_id must be non-empty")
+    if not isinstance(classifier_config, dict) or not classifier_config:
+        raise ValueError("paired sample classifier_config must be a non-empty mapping")
+    try:
+        classifier = json.loads(
+            json.dumps(classifier_config, allow_nan=False)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("paired sample classifier_config must be strict JSON") from error
     candidate = Path(candidate_file).expanduser()
     if candidate.is_symlink() or not candidate.is_file():
         raise ValueError("paired sample candidate must be a regular non-symlink file")
@@ -175,6 +184,7 @@ def write_paired_samples(
             "candidate_id": candidate_name,
             "candidate_file": str(candidate),
             "candidate_sha256": candidate_sha256,
+            "classifier": copy.deepcopy(classifier),
             "pair_index": index,
             "pair": pair,
         }
@@ -194,6 +204,7 @@ def write_paired_samples(
         "candidate_id": candidate_name,
         "candidate_file": str(candidate),
         "candidate_sha256": candidate_sha256,
+        "classifier": classifier,
     }
 
 

@@ -69,6 +69,8 @@ from artifact_store import (  # noqa: E402
 )
 from budget import BudgetPolicy, resolve_budget  # noqa: E402
 import decision as decision_engine  # noqa: E402
+import paired_stats  # noqa: E402
+import workload_evaluate  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +313,7 @@ _PAIRED_ARTIFACT_FIELDS = {
     "candidate_id",
     "candidate_file",
     "candidate_sha256",
+    "classifier",
 }
 
 
@@ -330,6 +333,9 @@ def _validate_paired_artifact(
     candidate_id: str,
     candidate_sha256: str,
     expected_pairs: int | None,
+    expected_statistics: Mapping | None,
+    expected_constraints,
+    expected_objective,
     verify_file: bool,
 ) -> dict:
     field = f"{kind}_paired_samples"
@@ -371,6 +377,9 @@ def _validate_paired_artifact(
         or not Path(clean["candidate_file"]).is_absolute()
     ):
         raise ValueError(f"{field}.candidate_file must be absolute")
+    classifier = clean.get("classifier")
+    if not isinstance(classifier, Mapping):
+        raise ValueError(f"{field}.classifier must be a mapping")
     if not verify_file:
         return clean
 
@@ -419,6 +428,64 @@ def _validate_paired_artifact(
             raise ValueError(f"{field} record {index} has drifted bindings")
         if "pair" not in record:
             raise ValueError(f"{field} record {index} is missing pair")
+        if record.get("classifier") != classifier:
+            raise ValueError(f"{field} record {index} has drifted classifier")
+    raw_pairs = [record["pair"] for record in records]
+    if kind == "kernel":
+        required_classifier = {
+            "direction",
+            "min_effect_pct",
+            "confidence",
+            "bootstrap_samples",
+            "seed",
+        }
+        if set(classifier) != required_classifier:
+            raise ValueError(f"{field}.classifier fields are invalid")
+        recomputed = paired_stats.classify_pairs(
+            raw_pairs,
+            direction=classifier["direction"],
+            min_effect_pct=classifier["min_effect_pct"],
+            confidence=classifier["confidence"],
+            bootstrap_samples=classifier["bootstrap_samples"],
+            seed=classifier["seed"],
+        )
+        if recomputed != expected_statistics:
+            raise ValueError(f"{field} raw pairs do not recompute declared statistics")
+    else:
+        required_classifier = {
+            "objective",
+            "objective_sha256",
+            "confidence",
+            "bootstrap_samples",
+            "seed",
+        }
+        if set(classifier) != required_classifier:
+            raise ValueError(f"{field}.classifier fields are invalid")
+        objective = classifier["objective"]
+        encoded = json.dumps(
+            objective,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if hashlib.sha256(encoded).hexdigest() != classifier["objective_sha256"]:
+            raise ValueError(f"{field}.classifier objective hash is invalid")
+        if objective != expected_objective:
+            raise ValueError(f"{field}.classifier objective does not match frozen workload")
+        recomputed = workload_evaluate.classify_recorded_pairs(
+            objective,
+            raw_pairs,
+            confidence=classifier["confidence"],
+            bootstrap_samples=classifier["bootstrap_samples"],
+            seed=classifier["seed"],
+        )
+        if recomputed.get("status") != "evaluated":
+            raise ValueError(f"{field} raw pairs do not form evaluated workload evidence")
+        if recomputed.get("primary") != expected_statistics:
+            raise ValueError(f"{field} raw pairs do not recompute declared statistics")
+        if recomputed.get("constraints") != expected_constraints:
+            raise ValueError(f"{field} raw pairs do not recompute declared constraints")
     return clean
 
 
@@ -477,6 +544,17 @@ def _validate_terminal_snapshot(
     decision_sha256 = clean.get("decision_sha256")
     if not isinstance(decision_sha256, str) or not _SHA256.fullmatch(decision_sha256):
         raise ValueError("terminal_decision.decision_sha256 is invalid")
+    decision_json = clean.get("decision_json")
+    if type(decision_json) is not str or not os.path.isabs(decision_json):
+        raise ValueError("terminal_decision.decision_json must be an absolute path")
+    if verify_artifacts:
+        decision_path = Path(decision_json)
+        if decision_path.is_symlink() or not decision_path.is_file():
+            raise ValueError(
+                "terminal_decision.decision_json must be a regular non-symlink file"
+            )
+        if sha256_file(decision_path) != decision_sha256:
+            raise ValueError("terminal_decision.decision_sha256 does not match file")
     for kind, stats in (("kernel", statistics), ("workload", workload_statistics)):
         field = f"{kind}_paired_samples"
         evidence = clean.get(field)
@@ -496,6 +574,13 @@ def _validate_terminal_snapshot(
                 candidate_id=candidate_id,
                 candidate_sha256=candidate_sha256,
                 expected_pairs=_paired_count(stats),
+                expected_statistics=stats,
+                expected_constraints=clean.get("constraints", []),
+                expected_objective=(
+                    state.get("workload", {}).get("objective")
+                    if isinstance(state.get("workload"), Mapping)
+                    else None
+                ),
                 verify_file=verify_artifacts,
             )
     clean["statistics"] = statistics

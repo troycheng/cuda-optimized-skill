@@ -193,6 +193,35 @@ class ArtifactStoreTests(unittest.TestCase):
                             candidate_file=candidate,
                         )
 
+    def test_paired_samples_persist_exact_classifier_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            candidate = root / "candidate.py"
+            candidate.write_text("candidate\n", encoding="utf-8")
+            classifier = {
+                "direction": "lower",
+                "min_effect_pct": 1.0,
+                "confidence": 0.95,
+                "bootstrap_samples": 100,
+                "seed": 7,
+            }
+            metadata = self.artifacts.write_paired_samples(
+                root / "paired_samples.jsonl",
+                [{"baseline": 2.0, "candidate": 1.0, "valid": True}],
+                kind="kernel",
+                input_hash="a" * 64,
+                iteration=1,
+                candidate_id="b1",
+                candidate_file=candidate,
+                classifier_config=classifier,
+            )
+            record = json.loads(
+                Path(metadata["path"]).read_text("utf-8").splitlines()[0]
+            )
+
+        self.assertEqual(metadata["classifier"], classifier)
+        self.assertEqual(record["classifier"], classifier)
+
     def test_append_jsonl_preserves_order_and_read_ignores_blank_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self.artifacts.ArtifactStore(Path(tmp) / "run")

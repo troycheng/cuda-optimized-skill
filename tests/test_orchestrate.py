@@ -923,8 +923,8 @@ class LifecycleIntegrationTests(unittest.TestCase):
             "min_effect_pct": 0.5,
             "confidence": 0.95,
             "estimate_pct": 3.0,
-            "ci_low_pct": 1.0,
-            "ci_high_pct": 4.0,
+            "ci_low_pct": 3.0,
+            "ci_high_pct": 3.0,
             "valid_pairs": 20,
             "invalid_pairs": 0,
             "improvements_pct": [3.0] * 20,
@@ -1004,8 +1004,8 @@ class LifecycleIntegrationTests(unittest.TestCase):
             [
                 {
                     "block": index,
-                    "baseline_ms": 2.0,
-                    "candidate_ms": 1.0,
+                    "baseline": 100.0,
+                    "candidate": 97.0,
                     "valid": True,
                 }
                 for index in range(20)
@@ -1015,6 +1015,13 @@ class LifecycleIntegrationTests(unittest.TestCase):
             iteration=1,
             candidate_id="1",
             candidate_file=selected,
+            classifier_config={
+                "direction": "lower",
+                "min_effect_pct": 0.5,
+                "confidence": 0.95,
+                "bootstrap_samples": 10000,
+                "seed": 0,
+            },
         )
 
     def _write_winner_artifacts(self, run_dir: Path) -> Path:

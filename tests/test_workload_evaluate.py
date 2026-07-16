@@ -668,6 +668,41 @@ class EvaluatePairsTests(unittest.TestCase):
         )
         self.assertEqual((baseline, candidate, objective), before)
 
+    def test_recorded_pairs_recompute_primary_and_constraints_exactly(self) -> None:
+        module = _load_workload_evaluate()
+        objective = _objective()
+
+        def runner(spec, *, candidate, role, case, timeout):
+            metrics = {
+                "latency_ms": 100.0 if role == "baseline" else 90.0,
+                "memory_mb": 100.0 if role == "baseline" else 101.0,
+            }
+            return _observation(spec, role=role, case=case, metrics=metrics)
+
+        measured = module.evaluate_pairs(
+            _workload(module, objective=objective),
+            "baseline.py",
+            "candidate.py",
+            blocks=4,
+            retries=0,
+            confidence=0.9,
+            bootstrap_samples=40,
+            seed=7,
+            runner=runner,
+        )
+        recomputed = module.classify_recorded_pairs(
+            objective,
+            measured["pairs"],
+            confidence=0.9,
+            bootstrap_samples=40,
+            seed=7,
+        )
+
+        self.assertEqual(recomputed["status"], "evaluated")
+        self.assertEqual(recomputed["primary"], measured["primary"])
+        self.assertEqual(recomputed["constraints"], measured["constraints"])
+        self.assertEqual(recomputed["pairs"], measured["pairs"])
+
 
 if __name__ == "__main__":
     unittest.main()

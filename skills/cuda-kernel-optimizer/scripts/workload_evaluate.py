@@ -332,15 +332,54 @@ def evaluate_pairs(
             pair["failures"] = failures
         pairs.append(pair)
 
+    classified = classify_recorded_pairs(
+        objective_snapshot,
+        pairs,
+        confidence=confidence_value,
+        bootstrap_samples=bootstrap_count,
+        seed=seed,
+    )
+    classified["blocks"] = block_count
+    return classified
+
+
+def classify_recorded_pairs(
+    objective,
+    pairs,
+    *,
+    confidence=0.95,
+    bootstrap_samples=DEFAULT_BOOTSTRAP_SAMPLES,
+    seed=0,
+) -> dict:
+    """Recompute workload statistics from frozen raw paired observations."""
+    objective = validate_objective(objective)
+    objective_snapshot = _json_copy(objective, "objective")
+    confidence_value = _finite_real(confidence, "confidence")
+    if not 0.0 < confidence_value < 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    bootstrap_count = _positive_int(bootstrap_samples, "bootstrap_samples")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
+    if isinstance(pairs, (str, bytes, bytearray, Mapping)):
+        raise ValueError("pairs must be a sequence")
+    try:
+        recorded_pairs = _json_copy(list(pairs), "pairs")
+    except TypeError as error:
+        raise ValueError("pairs must be a sequence") from error
+    if not all(isinstance(pair, Mapping) for pair in recorded_pairs):
+        raise ValueError("pairs must contain mappings")
     base = {
         "objective": objective_snapshot,
+        "confidence": confidence_value,
+        "bootstrap_samples": bootstrap_count,
         "seed": seed,
-        "blocks": block_count,
-        "pairs": pairs,
+        "pairs": recorded_pairs,
     }
-    if any(not pair["valid"] for pair in pairs):
+    if any(pair.get("valid") is not True for pair in recorded_pairs):
         return _failed_evaluation(
-            base, pairs, "one or more workload roles exhausted retries"
+            base,
+            recorded_pairs,
+            "one or more workload roles exhausted retries",
         )
 
     primary = objective["primary_metric"]
@@ -349,7 +388,7 @@ def evaluate_pairs(
     ]
     numeric = []
     metric_failed = False
-    for index, pair in enumerate(pairs):
+    for pair in recorded_pairs:
         values = {"baseline": {}, "candidate": {}}
         errors = []
         for metric_name in metric_names:
@@ -362,7 +401,7 @@ def evaluate_pairs(
                     if role == "baseline" and value == 0.0:
                         raise ValueError(f"{key}.{metric_name} must be nonzero")
                     values[role][metric_name] = value
-                except ValueError as error:
+                except (KeyError, TypeError, ValueError) as error:
                     errors.append(_error_diagnostic(error))
         if errors:
             pair["valid"] = False
@@ -370,29 +409,23 @@ def evaluate_pairs(
             metric_failed = True
         numeric.append(values)
     if metric_failed:
-        return _failed_evaluation(base, pairs, "objective metrics are invalid")
+        return _failed_evaluation(base, recorded_pairs, "objective metrics are invalid")
 
     primary_pairs = []
     constraint_regressions = {
         constraint["name"]: [] for constraint in objective["constraints"]
     }
     derived_failed = False
-    for pair, values in zip(pairs, numeric):
+    for pair, values in zip(recorded_pairs, numeric):
         primary_baseline = values["baseline"][primary["name"]]
         primary_candidate = values["candidate"][primary["name"]]
         primary_pairs.append(
-            {
-                "baseline": primary_baseline,
-                "candidate": primary_candidate,
-                "valid": True,
-            }
+            {"baseline": primary_baseline, "candidate": primary_candidate, "valid": True}
         )
         errors = []
         try:
             paired_stats.improvement_pct(
-                primary_baseline,
-                primary_candidate,
-                primary["direction"],
+                primary_baseline, primary_candidate, primary["direction"]
             )
         except ValueError as error:
             errors.append(_error_diagnostic(error))
@@ -401,13 +434,11 @@ def evaluate_pairs(
             baseline_value = values["baseline"][name]
             candidate_value = values["candidate"][name]
             try:
-                regression = (
+                regression = _finite_real(
                     (candidate_value - baseline_value)
                     / abs(baseline_value)
-                    * 100.0
-                )
-                regression = _finite_real(
-                    regression, f"constraint {name} regression_pct"
+                    * 100.0,
+                    f"constraint {name} regression_pct",
                 )
                 constraint_regressions[name].append(regression)
             except (ArithmeticError, ValueError) as error:
@@ -418,7 +449,7 @@ def evaluate_pairs(
             derived_failed = True
     if derived_failed:
         return _failed_evaluation(
-            base, pairs, "objective metric derivation is invalid"
+            base, recorded_pairs, "objective metric derivation is invalid"
         )
 
     try:
@@ -442,12 +473,11 @@ def evaluate_pairs(
                 samples=bootstrap_count,
                 seed=seed + index + 1,
             )
-            if ci_high <= cap:
-                status = "passed"
-            elif ci_low > cap:
-                status = "failed"
-            else:
-                status = "inconclusive"
+            status = (
+                "passed"
+                if ci_high <= cap
+                else "failed" if ci_low > cap else "inconclusive"
+            )
             constraint_statistics.append(
                 {
                     "name": name,
@@ -463,8 +493,7 @@ def evaluate_pairs(
         _validate_statistical_evidence(primary_statistics, "primary")
         _validate_statistical_evidence(constraint_statistics, "constraints")
     except (ArithmeticError, ValueError) as error:
-        return _failed_statistics(base, pairs, error)
-
+        return _failed_statistics(base, recorded_pairs, error)
     return {
         **base,
         "status": "evaluated",
@@ -473,4 +502,9 @@ def evaluate_pairs(
     }
 
 
-__all__ = ["WorkloadSpec", "evaluate_pairs", "measure_candidate"]
+__all__ = [
+    "WorkloadSpec",
+    "classify_recorded_pairs",
+    "evaluate_pairs",
+    "measure_candidate",
+]
