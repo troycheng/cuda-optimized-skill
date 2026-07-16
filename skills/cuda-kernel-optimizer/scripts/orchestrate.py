@@ -2067,6 +2067,7 @@ def _run_sanitizer_gate(
             f"{candidate_file}\0{digest}".encode("utf-8")
         ).hexdigest()
         output = sanitizer_dir / f"{identity_digest}.json"
+        unbound_output = sanitizer_dir / f"{identity_digest}.unbound.json"
         if output.is_symlink():
             raise ValueError("sanitizer candidate artifact must not be a symlink")
         if output.is_file():
@@ -2086,23 +2087,55 @@ def _run_sanitizer_gate(
             )
             has_methods_binding = "methods_sha256" in report
             has_policy_binding = "policy_sha256" in report
-            if has_methods_binding != has_policy_binding:
+            if not has_methods_binding or not has_policy_binding:
                 raise ValueError(
-                    "sanitizer candidate artifact parent binding is incomplete"
+                    "sanitizer candidate artifact parent binding is missing or incomplete"
                 )
-            if not has_methods_binding:
-                output.unlink()
-            elif report.get("methods_sha256") != methods_sha256:
+            if report.get("methods_sha256") != methods_sha256:
                 raise ValueError("sanitizer candidate artifact methods_sha256 drifted")
-            elif report.get("policy_sha256") != policy_sha256:
+            if report.get("policy_sha256") != policy_sha256:
                 raise ValueError("sanitizer candidate artifact policy_sha256 drifted")
-            elif validated["status"] == "timed_out":
-                output.unlink()
-            else:
-                reports.append(validated)
-                continue
+            if validated["status"] == "timed_out":
+                raise ValueError("final sanitizer artifact must not be timed_out")
+            if unbound_output.is_symlink():
+                raise ValueError("sanitizer unbound artifact must not be a symlink")
+            if unbound_output.is_file():
+                unbound_output.unlink()
+            elif unbound_output.exists():
+                raise ValueError("sanitizer unbound artifact must be a regular file")
+            reports.append(validated)
+            continue
         if output.exists():
             raise ValueError("sanitizer candidate artifact must be a regular file")
+
+        if unbound_output.is_symlink():
+            raise ValueError("sanitizer unbound artifact must not be a symlink")
+        if unbound_output.is_file():
+            try:
+                unbound_report = _read(str(unbound_output))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"sanitizer unbound artifact is malformed: {error}"
+                ) from error
+            if (
+                "methods_sha256" in unbound_report
+                or "policy_sha256" in unbound_report
+            ):
+                raise ValueError(
+                    "sanitizer unbound artifact must not contain parent binding"
+                )
+            _validate_sanitizer_report(
+                unbound_report,
+                candidate=candidate,
+                state=state,
+                mode=policy.sanitizer_mode,
+                expected_method_ids=method_ids,
+                expected_tools=selected_tools,
+                expected_command=benchmark_command,
+            )
+            unbound_output.unlink()
+        elif unbound_output.exists():
+            raise ValueError("sanitizer unbound artifact must be a regular file")
 
         if not selected_tools:
             report = sanitizer_engine.run_tools(
@@ -2144,7 +2177,7 @@ def _run_sanitizer_gate(
             "--input-hash",
             state["input_hash"],
             "--out",
-            str(output),
+            str(unbound_output),
             "--",
             *benchmark_command,
         ]
@@ -2168,26 +2201,22 @@ def _run_sanitizer_gate(
                 f"sanitize failed rc={completed.returncode}"
                 + (f": {diagnostic}" if diagnostic else "")
             )
-        if not output.is_file() or output.is_symlink():
-            raise ValueError("sanitize did not write a safe candidate artifact")
+        if not unbound_output.is_file() or unbound_output.is_symlink():
+            raise ValueError("sanitize did not write a safe unbound artifact")
         try:
-            report = _read(str(output))
+            report = _read(str(unbound_output))
         except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"sanitizer candidate artifact is malformed: {error}") from error
+            raise ValueError(f"sanitizer unbound artifact is malformed: {error}") from error
+        if "methods_sha256" in report or "policy_sha256" in report:
+            raise ValueError(
+                "sanitizer unbound artifact must not contain parent binding"
+            )
         if sha256_file(candidate_file) != digest:
             raise ValueError("sanitizer candidate changed during execution")
         if sha256_file(methods_path) != methods_sha256:
             raise ValueError("methods.json changed during sanitizer execution")
         if sha256_file(sanitizer_policy_path) != policy_sha256:
             raise ValueError("sanitizer policy changed during execution")
-        report.update(
-            {
-                "methods_sha256": methods_sha256,
-                "policy_sha256": policy_sha256,
-            }
-        )
-        atomic_write_json(output, report)
-        report["artifact"] = str(output.resolve(strict=True))
         validated = _validate_sanitizer_report(
             report,
             candidate=candidate,
@@ -2206,7 +2235,17 @@ def _run_sanitizer_gate(
             }
         if validated["status"] == "timed_out":
             raise ValueError("timed_out sanitizer report requires rc=124")
-        reports.append(validated)
+        bound_report = dict(validated)
+        bound_report.update(
+            {
+                "methods_sha256": methods_sha256,
+                "policy_sha256": policy_sha256,
+            }
+        )
+        atomic_write_json(output, bound_report)
+        unbound_output.unlink()
+        bound_report["artifact"] = str(output.resolve(strict=True))
+        reports.append(bound_report)
 
     aggregate = _aggregate_sanitizer_results(
         state=state,

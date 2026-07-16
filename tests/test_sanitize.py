@@ -625,6 +625,48 @@ class OrchestratorSanitizerTests(unittest.TestCase):
             "statistics": {"estimate_pct": float(10 - branch_index)},
         }
 
+    def _completed_full_gate(self, root: Path, input_hash: str):
+        methods = root / "methods.json"
+        methods.write_text(json.dumps({"methods": []}), encoding="utf-8")
+        candidate = self._candidate(root, "b1", 1)
+        state = {"input_hash": input_hash, "dims": {}, "ptr_size": 0}
+        policy = self.orchestrate.resolve_budget("thorough")
+
+        def runner(command, **_kwargs):
+            child_output = Path(command[command.index("--out") + 1])
+            candidate_file = command[command.index("--candidate-file") + 1]
+            child_output.parent.mkdir(parents=True, exist_ok=True)
+            child_output.write_text(
+                json.dumps(
+                    _sanitizer_report(
+                        candidate_file=candidate_file,
+                        input_hash=input_hash,
+                        mode="full",
+                        method_ids=[],
+                        selected_tools=[
+                            "memcheck", "racecheck", "initcheck", "synccheck"
+                        ],
+                        benchmark_command=command[command.index("--") + 1 :],
+                    )
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                returncode=0, stdout="", stderr="", timed_out=False
+            )
+
+        with mock.patch.object(self.orchestrate, "_run", side_effect=runner):
+            aggregate = self.orchestrate._run_sanitizer_gate(
+                state=state,
+                policy=policy,
+                candidates=[candidate],
+                iter_dir=root,
+                methods_json=methods,
+                benchmark="benchmark.py",
+                hard_timeout=10.0,
+            )
+        return state, policy, methods, candidate, aggregate
+
     def test_quick_targeted_runs_only_policy_selected_tools_for_champion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1126,6 +1168,7 @@ class OrchestratorSanitizerTests(unittest.TestCase):
             first_path = self.orchestrate._candidate_file(candidates[0])
             second_path = self.orchestrate._candidate_file(candidates[1])
             calls = []
+            child_outputs = []
             should_timeout = {str(Path(candidates[1]["kernel"]).resolve()): True}
 
             def runner(command, **_kwargs):
@@ -1154,6 +1197,7 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                         returncode=124, stdout="", stderr="", timed_out=False
                     )
                 output = Path(command[command.index("--out") + 1])
+                child_outputs.append(output)
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(
                     json.dumps(
@@ -1203,6 +1247,9 @@ class OrchestratorSanitizerTests(unittest.TestCase):
         self.assertEqual(completed["status"], "passed")
         self.assertEqual(calls.count(first_path), 1)
         self.assertEqual(calls.count(second_path), 2)
+        self.assertTrue(
+            all(path.name.endswith(".unbound.json") for path in child_outputs)
+        )
 
     def test_resume_discards_valid_raw_artifact_missing_parent_binding_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1328,6 +1375,116 @@ class OrchestratorSanitizerTests(unittest.TestCase):
                     benchmark="benchmark.py",
                     hard_timeout=10.0,
                 )
+
+    def test_final_missing_both_parent_bindings_is_rejected_without_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state, policy, methods, candidate, aggregate = self._completed_full_gate(
+                root, "7" * 64
+            )
+            final = Path(aggregate["candidates"][0]["artifact"])
+            payload = json.loads(final.read_text("utf-8"))
+            payload.pop("methods_sha256")
+            payload.pop("policy_sha256")
+            final.write_text(json.dumps(payload), encoding="utf-8")
+            runner = mock.Mock()
+            with mock.patch.object(
+                self.orchestrate, "_run", runner
+            ), self.assertRaisesRegex(ValueError, "parent binding"):
+                self.orchestrate._run_sanitizer_gate(
+                    state=state,
+                    policy=policy,
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            runner.assert_not_called()
+
+    def test_final_is_authoritative_when_unbound_also_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state, policy, methods, candidate, aggregate = self._completed_full_gate(
+                root, "8" * 64
+            )
+            final = Path(aggregate["candidates"][0]["artifact"])
+            unbound = final.with_name(f"{final.stem}.unbound.json")
+            unbound.write_text("{}", encoding="utf-8")
+            runner = mock.Mock()
+            with mock.patch.object(self.orchestrate, "_run", runner):
+                reused = self.orchestrate._run_sanitizer_gate(
+                    state=state,
+                    policy=policy,
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            self.assertEqual(reused["status"], "passed")
+            runner.assert_not_called()
+            self.assertFalse(unbound.exists())
+            unbound.write_text("{}", encoding="utf-8")
+            payload = json.loads(final.read_text("utf-8"))
+            payload["policy_sha256"] = "0" * 64
+            final.write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch.object(
+                self.orchestrate, "_run", runner
+            ), self.assertRaisesRegex(ValueError, "policy_sha256 drifted"):
+                self.orchestrate._run_sanitizer_gate(
+                    state=state,
+                    policy=policy,
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            runner.assert_not_called()
+            self.assertTrue(final.is_file())
+            self.assertTrue(unbound.is_file())
+
+    def test_unbound_symlink_and_non_regular_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state, policy, methods, candidate, aggregate = self._completed_full_gate(
+                root, "9" * 64
+            )
+            final = Path(aggregate["candidates"][0]["artifact"])
+            unbound = final.with_name(f"{final.stem}.unbound.json")
+            final.unlink()
+            target = root / "outside.json"
+            target.write_text("{}", encoding="utf-8")
+            unbound.symlink_to(target)
+            runner = mock.Mock()
+            with mock.patch.object(
+                self.orchestrate, "_run", runner
+            ), self.assertRaisesRegex(ValueError, "unbound.*symlink"):
+                self.orchestrate._run_sanitizer_gate(
+                    state=state,
+                    policy=policy,
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            unbound.unlink()
+            unbound.mkdir()
+            with mock.patch.object(
+                self.orchestrate, "_run", runner
+            ), self.assertRaisesRegex(ValueError, "unbound.*regular"):
+                self.orchestrate._run_sanitizer_gate(
+                    state=state,
+                    policy=policy,
+                    candidates=[candidate],
+                    iter_dir=root,
+                    methods_json=methods,
+                    benchmark="benchmark.py",
+                    hard_timeout=10.0,
+                )
+            runner.assert_not_called()
 
     def test_profile_binding_requires_safe_unchanged_ncu_top(self):
         with tempfile.TemporaryDirectory() as tmp:
