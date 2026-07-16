@@ -1,4 +1,4 @@
 interface:
   display_name: "CUDA Kernel Optimizer"
-  short_description: "Profile and iteratively optimize GPU kernels"
-  default_prompt: "Use $cuda-kernel-optimizer to optimize this CUDA, CUTLASS, or Triton kernel against its reference implementation."
+  short_description: "Trustworthy CUDA kernel and workload optimization"
+  default_prompt: "Use $cuda-kernel-optimizer to optimize this CUDA, CUTLASS, or Triton kernel against its reference implementation and optional user-provided workload."

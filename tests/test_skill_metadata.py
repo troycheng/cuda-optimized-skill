@@ -31,7 +31,45 @@ class SkillMetadataTests(unittest.TestCase):
         text = OPENAI_YAML.read_text(encoding="utf-8")
         self.assertRegex(text, r'(?m)^interface:\s*$')
         self.assertIn('display_name: "CUDA Kernel Optimizer"', text)
+        self.assertIn(
+            'short_description: "Trustworthy CUDA kernel and workload optimization"',
+            text,
+        )
         self.assertIn("$cuda-kernel-optimizer", text)
+        prompt = next(
+            line for line in text.splitlines() if line.strip().startswith("default_prompt:")
+        ).lower()
+        self.assertIn("reference", prompt)
+        self.assertIn("optional user-provided workload", prompt)
+
+    def test_skill_requires_user_owned_workload_for_end_to_end_claims(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("user-provided workload", text)
+        self.assertIn("paired", text.lower())
+        self.assertIn("inconclusive", text)
+        self.assertIn("ERR_NVGPUCTRPERM", text)
+        self.assertIn("kernel_only_win", text)
+        self.assertIn("end_to_end_win", text)
+
+    def test_skill_documents_budget_default_and_delegates_details(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertLessEqual(len(text.splitlines()), 500)
+        self.assertIn("balanced", text)
+        self.assertIn("default", text.lower())
+        self.assertIn("references/compatibility.md", text)
+        self.assertIn("references/sanitizer_policy.json", text)
+        self.assertIn("templates/objective.schema.json", text)
+
+    def test_skill_output_contract_contains_durable_evidence(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for artifact in (
+            "manifest.json",
+            "checkpoint.json",
+            "paired_samples.jsonl",
+            "decision.json",
+            "summary.md",
+        ):
+            self.assertIn(artifact, text)
 
     def test_skill_artifacts_are_agent_neutral(self) -> None:
         suffixes = {".md", ".py", ".json", ".yaml", ".yml"}

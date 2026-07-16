@@ -1,127 +1,107 @@
-# Iteration {{iter}} — Analysis
+# Iteration {{iter}} — V2.2 decision record
 
-**Kernel profiled (input)**: `{{best_file_before}}`
-**Time before**: {{best_ms_before}} ms
-**GPU / arch**: {{gpu_name}} / {{sm_arch}}
+## Frozen context
 
----
+- **Run input hash**: `{{input_hash}}`
+- **Mode**: {{mode}} (`kernel-only` / `full`)
+- **Budget preset**: {{budget_name}}
+- **Current best**: `{{best_file_before}}`
+- **GPU / architecture**: {{gpu_name}} / {{sm_arch}}
+- **Reference**: `{{ref_file}}`
+- **User-provided workload**: {{workload_source_or_none}}
 
-## Bottleneck and Roofline Evidence (from `roofline.json`)
+## Available evidence
 
-- **Analysis model**: {{analysis_model}}
-- **Evidence quality**: {{analysis_quality}}
-- **Roofline ridge / arithmetic intensity**: {{ai_ridge}} / {{arithmetic_intensity}}
+- **NCU counter access**: {{ncu_counter_status}}
+- **NCU failure, if any**: {{ncu_error_or_none}}
+- **Sanitizer policy / coverage**: {{sanitizer_mode}} / {{sanitizer_coverage}}
+- **Compiler evidence**: {{compiler_evidence_status}}
+- **SASS evidence**: {{sass_evidence_status}}
 
-| Axis | Δ (gap) | Utilization | Budget |
-|------|---------|-------------|--------|
-| Compute | {{delta_compute}} | {{compute_util_pct}}% | {{budget_compute}} |
-| Memory | {{delta_memory}} | {{memory_util_pct}}% | {{budget_memory}} |
-| Latency | {{delta_latency}} | max stall {{max_stall_pct}}% | {{budget_latency}} |
+Missing or degraded evidence stays missing or degraded. In particular,
+`ERR_NVGPUCTRPERM` is not a reason to add privileges automatically.
 
-**Primary bound**: {{bound}}
+## Bottleneck evidence
 
----
+| Axis | Observed evidence | Gap | Method budget |
+|---|---|---:|---:|
+| Compute | {{compute_evidence}} | {{delta_compute}} | {{budget_compute}} |
+| Memory | {{memory_evidence}} | {{delta_memory}} | {{budget_memory}} |
+| Latency | {{latency_evidence}} | {{delta_latency}} | {{budget_latency}} |
 
-## Top ncu metrics (from `ncu_top.json`)
+- **Analysis model / quality**: {{analysis_model}} / {{analysis_quality}}
+- **Primary bound, if evidenced**: {{bound}}
+- **Missing evidence**: {{missing_evidence}}
 
-### Compute
-{{compute_metrics_table}}
+## Method selection
 
-### Memory
-{{memory_metrics_table}}
+For every selected method, cite an observable trigger, compatibility rule,
+implementation delta, expected effect, and rejection criterion. List each
+higher-priority method that was scanned and skipped. Do not include hidden
+reasoning.
 
-### Latency / stalls
-{{latency_metrics_table}}
+| Method id | Priority | Trigger evidence | Implementation delta | Reject when |
+|---|---:|---|---|---|
+| {{method_1_id}} | {{method_1_priority}} | {{method_1_trigger}} | {{method_1_delta}} | {{method_1_reject}} |
+| {{method_2_id}} | {{method_2_priority}} | {{method_2_trigger}} | {{method_2_delta}} | {{method_2_reject}} |
 
----
+### Excluded candidates
 
-## Diagnosis
+| Method id | Priority | Exact skip reason |
+|---|---:|---|
+| {{excluded_method_id}} | {{excluded_priority}} | {{excluded_reason}} |
 
-_Which evidenced axis is the dominant bottleneck right now? Cite specific metric values, call out missing evidence, and explain how the budget reflects this diagnosis._
+### Orthogonality and compatibility
 
-> Example:
-> `sm__pipe_tensor_op_hmma_cycles_active...pct_of_peak = 8.4%` on a GEMM signals tensor cores barely used — compute Δ = 0.92. Simultaneously `smsp__warp_issue_stalled_long_scoreboard...pct = 61%` → latency Δ = 0.61. Memory bandwidth at 43% → Δ_m = 0.57. Budget: compute=2, memory=0, latency=1. Attack compute and latency; memory already near limit.
+- Architecture/public API compatibility: {{compatibility_check}}
+- Coupled or duplicate methods excluded: {{orthogonality_check}}
+- Previously ineffective/failed methods handled: {{history_check}}
 
-## Chosen methods
+## Branch plan
 
-For each, state: (a) **priority level** from catalog, (b) metric evidence, (c) the method, (d) the implementation delta vs. the current best, (e) expected ncu metric shift.
+All branches implement the selected method intent; vary only bounded
+hyperparameters or implementation details.
 
-### {{axis_1}} — `{{method_1_id}}` (Priority: {{P_level_1}})
-- **Budget for this axis**: {{budget_axis_1}}
-- **Priority scan**: _List all higher-priority methods that were scanned and why each was skipped_
-- **Trigger evidence**: _(cite specific ncu metric name = value)_
-- **Trigger strength**: _(continuous value 0-1 if b_axis ≥ 2)_
-- **Method**:
-- **Delta vs current best**:
-- **Expected ncu shift**:
-- **Risks / coupling**:
+| Branch | Tile/config | Stages | Warps | Other delta |
+|---|---|---:|---:|---|
+| b1 | {{b1_tile}} | {{b1_stages}} | {{b1_warps}} | {{b1_delta}} |
+| b2 | {{b2_tile}} | {{b2_stages}} | {{b2_warps}} | {{b2_delta}} |
 
-### {{axis_2}} — `{{method_2_id}}` (Priority: {{P_level_2}})
-- **Budget for this axis**: {{budget_axis_2}}
-- **Priority scan**: _List higher-priority methods scanned + skip reasons_
-- **Trigger evidence**:
-- **Method**:
-- **Delta vs current best**:
-- **Expected ncu shift**:
-- **Risks / coupling**:
+## Inner kernel evidence
 
-### {{axis_3}} — `{{method_3_id}}` (Priority: {{P_level_3}})
-_(only if B=3 methods; omit if axis budget is 0)_
-- **Budget for this axis**: {{budget_axis_3}}
-- **Priority scan**:
-- **Trigger evidence**:
-- **Method**:
-- **Delta vs current best**:
-- **Expected ncu shift**:
-- **Risks / coupling**:
+Fill this section from durable artifacts after `close-iter`.
 
-## Orthogonality check
+| Candidate | Correctness | Sanitizer | Estimate | Confidence interval | Valid/invalid pairs | Verdict |
+|---|---|---|---:|---|---:|---|
+| {{candidate_id}} | {{correctness}} | {{sanitizer_status}} | {{kernel_estimate_pct}}% | [{{kernel_ci_low_pct}}%, {{kernel_ci_high_pct}}%] | {{valid_pairs}} / {{invalid_pairs}} | {{kernel_verdict}} |
 
-_Verify: (1) no pair is the same optimization under two names, (2) coupled pairs (memory.P5 + latency.P3) not both selected, (3) all arch-compatible, (4) axis distribution matches the evidence budget._
+- **Kernel raw pairs**: `{{kernel_paired_samples_path}}`
+- **Compiler manifest**: `{{compiler_manifest_path}}`
+- **SASS result**: `{{sass_result_path}}`
 
-## Excluded candidates (higher-priority methods that were skipped)
+Only `confirmed_win` can enter the outer shortlist. `inconclusive` does not
+promote.
 
-_List every higher-priority method on each axis that was NOT selected, with the exact reason:_
+## Outer workload evidence
 
-- `compute.tensor_core` (P1) — skipped: kernel is pure elementwise, no matmul semantics
-- `memory.kernel_fusion` (P1) — skipped: already in `selected_methods` from iter 1
-- `latency.warp_shuffle_sync` (P1) — skipped: Triton compiler already handles via `tl.reduce`
+- **Status**: {{workload_status_or_not_supplied}}
+- **Primary metric**: {{primary_metric}} ({{primary_direction}})
+- **Estimate / confidence interval**: {{workload_estimate_pct}}% /
+  [{{workload_ci_low_pct}}%, {{workload_ci_high_pct}}%]
+- **Minimum effect**: {{workload_min_effect_pct}}%
+- **Constraint results**: {{constraint_results}}
+- **Workload raw pairs**: `{{workload_paired_samples_path_or_none}}`
 
-## Branch variants
+Without a user-provided workload, write “not supplied; end-to-end claim is not
+available.”
 
-_Describe the K hyperparameter variants generated for branch-and-select:_
+## Terminal decision
 
-| Branch | Tile (M×N×K) | Stages | Warps | Other diff |
-|--------|-------------|--------|-------|------------|
-| b1 | 128×128×32 | 3 | 4 | — |
-| b2 | 128×256×32 | 3 | 8 | — |
-| b3 | 256×128×32 | 4 | 4 | — |
-| b4 | 128×128×64 | 5 | 4 | — |
+- **Decision artifact**: `{{decision_path}}`
+- **Outcome**: {{terminal_outcome}}
+- **Promotion**: {{promoted_or_retained}}
+- **Reason**: {{decision_reason}}
+- **Next checkpoint stage**: {{next_stage}}
 
----
-
-## Result (filled after benchmarking)
-
-- **Champion branch**: b{{champion_idx}}
-- **New ms**: {{new_ms}}
-- **Speedup vs previous best**: {{speedup_vs_best_before}}
-- **Speedup vs reference**: {{speedup_vs_ref}}
-- **Validation**: {{validation_status}}
-- **Retries needed**: {{retries}}
-- **Outcome**: {{outcome}} (improved / regressed / failed_validation)
-
-### Attribution (from ablation)
-
-| Method | Ablated ms | Attribution ms | Contributed? | SASS verified? |
-|--------|-----------|---------------|-------------|----------------|
-| {{m1_id}} | {{m1_ablated_ms}} | {{m1_attr_ms}} | {{m1_contributed}} | {{m1_sass}} |
-| {{m2_id}} | {{m2_ablated_ms}} | {{m2_attr_ms}} | {{m2_contributed}} | {{m2_sass}} |
-| {{m3_id}} | {{m3_ablated_ms}} | {{m3_attr_ms}} | {{m3_contributed}} | {{m3_sass}} |
-
-### Post-hoc vs expected
-
-_Did the metric shift match the prediction? If not, why?_
-
-_Did attribution confirm the methods we expected to be effective?_
-
-_This note becomes part of the final retrospective._
+`kernel_only_win` is limited to kernel-only mode. `end_to_end_win` requires
+confirmed kernel and workload wins plus passing constraints.

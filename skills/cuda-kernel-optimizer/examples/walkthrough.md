@@ -1,213 +1,163 @@
-# Example Walkthrough (v2 — Roofline-Driven, Branch-and-Select)
+# V2.2 dual-loop walkthrough
 
-A hypothetical session optimizing `gemm.cu` against `ref.py` for 3 iterations on an H100, with 4 branches per iteration.
+This example optimizes `gemm.cu` against `ref.py` and then validates the
+shortlisted kernel on a user-provided inference workload. Values are illustrative;
+the verdict rules and artifact names match V2.2.
 
-## Layout before the run
+## 1. User-owned inputs
 
-```
+```text
 ~/work/
-├── gemm.cu          ← baseline (has `extern "C" void solve(float*, float*, float*, int, int, int)`)
-└── ref.py           ← defines `reference(A, B, C, M, N, K)` + `atol = 1e-3`
+├── gemm.cu
+├── ref.py
+└── workload.py
 ```
 
-## Command chain (agent-driven)
+`ref.py` exposes `reference(**kwargs)`. The user copies
+`templates/workload.py`, replaces every TODO, and declares the real objective:
 
-### Step 0–2 — Setup
+```python
+def metrics():
+    return {
+        "primary_metric": {"name": "p50_latency_ms", "direction": "lower"},
+        "min_effect_pct": 1.0,
+        "constraints": [
+            {"name": "p99_latency_ms", "max_regression_pct": 0.5},
+        ],
+    }
+```
+
+The adapter, its declared local dependencies, objective, and cases belong to the
+user. The skill does not discover or synthesize a workload.
+
+Equivalent workload entry points are:
 
 ```bash
-python cuda-kernel-optimizer/scripts/orchestrate.py setup \
+# Python adapter
+--workload ~/work/workload.py
+
+# Command adapter (objective is mandatory)
+--workload-cmd 'python3 ~/work/run_service_bench.py --json' \
+--objective ~/work/objective.json
+
+# Strict manifest
+--workload-manifest ~/work/workload.json
+```
+
+Choose only one form.
+
+## 2. Freeze a balanced run
+
+```bash
+python3 cuda-kernel-optimizer/scripts/orchestrate.py setup \
   --baseline ~/work/gemm.cu \
-  --ref      ~/work/ref.py \
-  --iterations 3 \
-  --ncu-num 5 \
-  --branches 4 \
-  --dims '{"M":4096,"N":4096,"K":4096}'
+  --ref ~/work/ref.py \
+  --dims '{"M":4096,"N":4096,"K":4096}' \
+  --backend cuda \
+  --budget balanced \
+  --workload ~/work/workload.py
 ```
 
-Output (abridged):
-```json
-{
-  "run_dir": "/home/user/work/run_20260420_143022",
-  "state":   "/home/user/work/run_20260420_143022/state.json",
-  "env":     "/home/user/work/env.json",
-  "early_stop": false,
-  "next_step": "The agent should now read iterv1/roofline.json ..."
-}
+`balanced` is the default and freezes a 10800-second limit, 8 branches, 4
+rounds, 20-100 paired blocks, 2 outer candidates, at most 10 workload cases,
+and targeted sanitizer coverage. Setup emits paths to `manifest.json`,
+`state.json`, and `checkpoint.json`, plus `next_stage: candidate_correctness`.
+
+At this point the baseline and reference have stable hashes, the baseline passed
+correctness, and the workload snapshot is frozen. Changing those inputs requires
+a new run.
+
+## 3. Inner kernel loop
+
+The agent reads the current best, available environment/profiler evidence, the
+optimization catalog, and the iteration report template. Suppose it records two
+methods and writes eight implementation variants:
+
+```text
+iterv1/
+├── analysis.md
+├── methods.json
+└── branches/
+    ├── b1/kernel.cu
+    ├── b2/kernel.cu
+    └── ... b8/kernel.cu
 ```
 
-This automatically:
-1. Probes the environment (`check_env.py`)
-2. Validates baseline + ref contract (`preflight.py`)
-3. Initializes `state.json` with branches=4
-4. Seeds baseline timing
-5. Profiles baseline with ncu (`--set full`) → `iterv1/best_input.ncu-rep`
-6. Computes roofline gaps → `iterv1/roofline.json`
-
-### Step 3b — Agent reads roofline (iter 1)
-
-The agent inspects `iterv1/roofline.json`:
-```json
-{
-  "delta_compute": 0.92,
-  "delta_memory": 0.57,
-  "delta_latency": 0.61,
-  "bound": "compute",
-  "near_peak": false,
-  "axis_budget": {"compute": 2, "memory": 0, "latency": 1}
-}
-```
-
-Interpretation: HMMA utilization at 8% → massive compute gap (Δ_c=0.92). Long scoreboard stalls at 61% → latency gap. Memory bandwidth at 43% → moderate but not dominant. Budget allocates **2 compute + 0 memory + 1 latency**.
-
-### Step 3c — Agent picks methods (iter 1)
-
-| Axis | Budget | Method id | Priority |
-|------|--------|-----------|----------|
-| compute | 2 | `compute.tensor_core` | P1 |
-| compute | — | `compute.overlap_compute_memory` | P2 |
-| latency | 1 | `latency.async_pipeline` | P3 |
-
-Note: memory budget = 0, so no memory methods this round (Δ_m = 0.57 > 0.10 but gets rounded out by proportional allocation dominated by compute+latency).
-
-### Step 3d — Agent writes 4 branch kernels
-
-All branches apply the same 3 methods, but with different hyperparameters:
-
-| Branch | Tile (M×N×K) | Stages | Warps | Notes |
-|--------|-------------|--------|-------|-------|
-| b1 | 128×128×32 | 3 | 4 | Conservative baseline |
-| b2 | 128×256×32 | 3 | 8 | Wider N tile |
-| b3 | 256×128×32 | 4 | 4 | Wider M tile + deeper pipeline |
-| b4 | 128×128×64 | 5 | 4 | Deeper K tile + max stages |
-
-The agent writes:
-- `iterv1/branches/b1/kernel.cu` through `b4/kernel.cu`
-- `iterv1/methods.json`
-- `iterv1/analysis.md`
-
-### Step 3e–3j — Close iteration
+Then it runs:
 
 ```bash
-python cuda-kernel-optimizer/scripts/orchestrate.py close-iter \
-  --run-dir ~/work/run_20260420_143022 \
-  --iter 1
+python3 cuda-kernel-optimizer/scripts/orchestrate.py close-iter \
+  --run-dir ~/work/run_20260717_101500 --iter 1
 ```
 
-This automatically:
-1. **Branch explore**: compiles + benchmarks all 4 branches
-   - b1: 3.21 ms (PASS)
-   - b2: 2.14 ms (PASS) ← champion
-   - b3: 2.89 ms (PASS)
-   - b4: FAIL (validation error — K tile too large caused register spill)
-2. **Selects b2** as champion → copies to `iterv1/kernel.cu`
-3. **NCU profiles champion** (`--set full`) → `iterv1/kernel.ncu-rep`
-4. **Ablation** (if the agent provided ablated kernels under `iterv1/ablations/`):
-   - Without `compute.tensor_core`: 4.82 ms → attribution = +2.68 ms ✓
-   - Without `compute.overlap`: 2.31 ms → attribution = +0.17 ms ✓
-   - Without `latency.async_pipeline`: 2.19 ms → attribution = +0.05 ms (below 2% noise threshold) ✗
-5. **SASS check**: greps for HMMA → found ✓; greps for LDGSTS/CP.ASYNC → found ✓
-6. **State update**:
-   - `compute.tensor_core` → effective (attributed + SASS verified)
-   - `compute.overlap_compute_memory` → effective (attributed + SASS verified)
-   - `latency.async_pipeline` → ineffective (attribution below noise threshold)
-   - b1, b3 saved to `state.frontier`
-7. **Opens iter 2**: profiles new best → `iterv2/best_input.ncu-rep` → roofline
+For every viable branch, the deterministic loop checks the Python reference,
+runs the sanitizer policy, captures compiler/SASS provenance, and measures
+randomized AB/BA baseline/candidate pairs. Telemetry-invalid blocks are retained
+but excluded from the valid pair count.
 
-Output:
-```json
-{
-  "iter": 1,
-  "status": "closed",
-  "best_ms": 2.14,
-  "next_iter": 2,
-  "early_stop": false
-}
+Illustrative inner results:
+
+| Candidate | Correct | Sanitizer | Estimate | 95% CI | Verdict |
+|---|---|---|---:|---:|---|
+| b2 | yes | passed | +1.7% | [+0.8%, +2.4%] | `confirmed_win` |
+| b5 | yes | passed | +0.4% | [-0.3%, +1.2%] | `inconclusive` |
+| b7 | no | not run | — | — | rejected |
+
+Only b2 may enter the outer shortlist. b5 is preserved for audit but cannot be
+promoted merely because its point estimate is positive.
+
+If NCU target profiling returns `ERR_NVGPUCTRPERM`, the log and return code are
+kept and profiler coverage is marked unavailable. The run does not request
+additional capabilities or change driver policy; paired timing continues.
+
+## 4. Outer real-workload loop
+
+Because this is full mode, the b2 inner win is not enough to update `best_file`.
+The orchestrator evaluates frozen baseline/candidate roles across the user cases
+and writes raw observations under:
+
+```text
+iterv1/workload/<candidate-hash>/paired_samples.jsonl
 ```
 
-### Step 3b — Agent reads roofline (iter 2)
+Illustrative workload result:
 
-```json
-{
-  "delta_compute": 0.35,
-  "delta_memory": 0.62,
-  "delta_latency": 0.48,
-  "bound": "bandwidth",
-  "near_peak": false,
-  "axis_budget": {"compute": 1, "memory": 1, "latency": 1}
-}
-```
+- p50 latency estimate: +1.3%, 95% CI [+1.1%, +1.6%]; required effect: 1.0%;
+- p99 regression: +0.2%; allowed regression: 0.5%;
+- verdict: `confirmed_win`, all constraints pass.
 
-The bound shifted from compute to bandwidth — tensor cores now running at 65% (from 8%), but memory is the new bottleneck. Budget is now 1:1:1 — balanced.
+`iterv1/decision.json` can therefore record `end_to_end_win`. State promotion
+occurs only after this decision is durably written and bound to the candidate
+hash. If the p50 interval had crossed 1.0%, or p99 had regressed more than 0.5%,
+the current best would remain unchanged.
 
-### Iter 2 & 3 — Same loop
+## 5. Kernel-only contrast
 
-Each iteration:
-1. The agent reads the roofline budget → picks methods accordingly
-2. The agent writes K=4 branch variants
-3. `close-iter` runs the full pipeline (branch → ncu → ablate → sass → update)
+If setup omitted every workload option, the same confirmed b2 kernel evidence
+could produce `kernel_only_win`. The summary would explicitly say that no
+user-provided workload was supplied and would not claim an end-to-end result.
 
-By iter 3, if roofline shows all Δ < 0.15, `early_stop: true` and the loop terminates.
+## 6. Resume without replay
 
-### Step 4 — Finalize
+After interruption:
 
 ```bash
-python cuda-kernel-optimizer/scripts/orchestrate.py finalize \
-  --run-dir ~/work/run_20260420_143022
+python3 cuda-kernel-optimizer/scripts/orchestrate.py resume --run-dir \
+  ~/work/run_20260717_101500
 ```
 
-Produces `summary.md` with:
-- Roofline history table (how Δ shifted across iterations)
-- Per-iteration timeline with methods + speedup + status
-- Effective methods (attribution-verified)
-- Ineffective and implementation-failed method lists
-- Frontier candidates (unexplored branches)
-- The agent appends a retrospective paragraph
+Resume verifies the manifest, state, checkpoint, candidate bytes, and frozen
+workload, then reports `next_stage` and `next_iteration`. Completed stages are
+not replayed. A drifted input or unsafe symlink fails closed.
 
-## Final layout
+## 7. Finalize and inspect evidence
 
-```
-run_20260420_143022/
-├── state.json
-├── env.json
-├── summary.md
-├── baseline/
-│   ├── gemm.cu
-│   └── bench.json
-├── iterv1/
-│   ├── kernel.cu               (champion = b2)
-│   ├── methods.json
-│   ├── analysis.md
-│   ├── roofline.json
-│   ├── best_input.ncu-rep      (profile of baseline)
-│   ├── ncu_top.json
-│   ├── kernel.ncu-rep          (profile of champion — ALWAYS present)
-│   ├── attribution.json
-│   ├── sass_check.json
-│   ├── bench.json
-│   ├── branch_results.json
-│   ├── branches/
-│   │   ├── b1/kernel.cu + bench.json
-│   │   ├── b2/kernel.cu + bench.json
-│   │   ├── b3/kernel.cu + bench.json
-│   │   └── b4/kernel.cu + bench.json
-│   └── ablations/
-│       ├── compute_tensor_core/kernel.cu + bench.json
-│       ├── compute_overlap_compute_memory/kernel.cu + bench.json
-│       └── latency_async_pipeline/kernel.cu + bench.json
-├── iterv2/
-│   └── ... (same pattern)
-└── iterv3/
-    └── ...
+```bash
+python3 cuda-kernel-optimizer/scripts/orchestrate.py finalize --run-dir \
+  ~/work/run_20260717_101500
 ```
 
-## Key differences from v1
-
-| Aspect | v1 | v2 |
-|--------|----|----|
-| Axis budget | Fixed 1:1:1 | Roofline-proportional, cap=2 |
-| Candidates per iter | 1 | K=4 (branch-and-select) |
-| Method validation | Priority compliance only | + attribution + SASS check |
-| Champion ncu report | Optional | Mandatory every iteration |
-| Effective classification | Overall improved → all 3 effective | Per-method attribution required |
-| Early stop | None | All Δ < 0.15 → near_peak |
-| Frontier / rollback | None | Non-champion branches saved |
+`summary.md` starts with the terminal result and budget, then reports frozen
+inputs, kernel evidence, real-workload evidence, profiler/sanitizer/compiler
+coverage, candidates, raw paths, and resume status. Recompute statistics from
+the linked `paired_samples.jsonl` files rather than trusting copied prose.
