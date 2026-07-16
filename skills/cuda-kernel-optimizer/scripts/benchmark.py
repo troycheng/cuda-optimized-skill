@@ -26,6 +26,7 @@ import json
 import math
 import copy
 import glob
+import hashlib
 import stat
 import tempfile
 import subprocess
@@ -289,13 +290,46 @@ def _note_cleanup_failure(active_error, cleanup_error, context: str) -> None:
         pass
 
 
-def compile_cu(
+def _write_private_source_snapshot(directory: Path, data: bytes, suffix: str) -> Path:
+    fd, name = tempfile.mkstemp(
+        prefix=".source-snapshot-",
+        suffix=suffix or ".cu",
+        dir=str(directory),
+    )
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(path, 0o400)
+        _fsync_regular_file(path)
+        _fsync_directory(directory)
+        identity = compiler_evidence.artifact_identity(path)
+        if (
+            identity is None
+            or identity["size_bytes"] != len(data)
+            or identity["sha256"] != hashlib.sha256(data).hexdigest()
+        ):
+            raise OSError(f"source snapshot could not be verified: {path}")
+        return path
+    except BaseException:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _compile_cu_with_owner(
     cu_file: str,
     output_so: str,
     arch: str,
     nvcc_bin: str,
     backend: str = "cuda",
     evidence_dir=None,
+    *,
+    attempt_owner,
 ):
     """Compile via a unique attempt file and atomically publish the final binary."""
     final_path = Path(output_so).expanduser().absolute()
@@ -322,54 +356,46 @@ def compile_cu(
         arch=arch,
     )
 
-    attempt_owner = tempfile.TemporaryDirectory(
-        prefix=f".{final_path.name}.compile-",
-        dir=str(final_path.parent),
-    )
     attempt_dir = Path(attempt_owner.name)
-    try:
-        os.chmod(attempt_dir, 0o700)
-        attempt_dir_stat = attempt_dir.lstat()
-        if (
-            stat.S_ISLNK(attempt_dir_stat.st_mode)
-            or not stat.S_ISDIR(attempt_dir_stat.st_mode)
-            or stat.S_IMODE(attempt_dir_stat.st_mode) != 0o700
-            or attempt_dir_stat.st_dev != final_path.parent.stat().st_dev
-        ):
-            raise OSError(f"compile attempt directory is not private: {attempt_dir}")
-        fd, attempt_name = tempfile.mkstemp(
-            prefix=f".{final_path.name}.attempt-",
-            suffix=final_path.suffix,
-            dir=str(attempt_dir),
-        )
-    except BaseException as error:
-        try:
-            attempt_owner.cleanup()
-        except BaseException as cleanup_error:
-            _note_cleanup_failure(error, cleanup_error, "compile attempt directory")
-        raise
+    os.chmod(attempt_dir, 0o700)
+    attempt_dir_stat = attempt_dir.lstat()
+    if (
+        stat.S_ISLNK(attempt_dir_stat.st_mode)
+        or not stat.S_ISDIR(attempt_dir_stat.st_mode)
+        or stat.S_IMODE(attempt_dir_stat.st_mode) != 0o700
+        or attempt_dir_stat.st_dev != final_path.parent.stat().st_dev
+    ):
+        raise OSError(f"compile attempt directory is not private: {attempt_dir}")
+    fd, attempt_name = tempfile.mkstemp(
+        prefix=f".{final_path.name}.attempt-",
+        suffix=final_path.suffix,
+        dir=str(attempt_dir),
+    )
     attempt_path = Path(attempt_name)
     try:
         os.utime(fd, ns=(0, 0))
         initial_attempt = os.fstat(fd)
     finally:
         os.close(fd)
-    clean_file = cu_file
+    canonical_path = Path(cu_file).expanduser().absolute()
+    canonical_path.lstat()
+    source_bytes, source_identity = compiler_evidence._read_stable_artifact(
+        canonical_path
+    )
+    source_snapshot = _write_private_source_snapshot(
+        attempt_dir, source_bytes, canonical_path.suffix
+    )
+    clean_file = source_snapshot
     cmd = list(cmd_prefix)
     try:
-        source = Path(cu_file).read_text(encoding="utf-8", errors="ignore")
+        source = source_bytes.decode("utf-8", errors="ignore")
         cleaned = _STRIP_INCLUDES.sub("", source)
         if cleaned != source:
-            clean_fd, clean_name = tempfile.mkstemp(
-                prefix=f".{Path(cu_file).name}.",
-                suffix=".nvcc_clean.cu",
-                dir=str(final_path.parent),
+            clean_file = _write_private_source_snapshot(
+                attempt_dir,
+                cleaned.encode("utf-8"),
+                ".nvcc_clean.cu",
             )
-            clean_file = clean_name
-            with os.fdopen(clean_fd, "w", encoding="utf-8") as stream:
-                stream.write(cleaned)
-                stream.flush()
-                os.fsync(stream.fileno())
 
         if backend == "cutlass":
             cutlass_include_dir = find_cutlass_include_dir()
@@ -388,7 +414,7 @@ def compile_cu(
 
         cmd.extend([
             "-shared", "-std=c++17", f"-arch={arch}", "-O3",
-            "-o", str(attempt_path), clean_file,
+            "-o", str(attempt_path), str(clean_file),
         ])
         evidence_status = _fresh_evidence_safely(
             evidence_path,
@@ -412,6 +438,21 @@ def compile_cu(
             sys.exit(1)
         if result.returncode != 0:
             print(f"Compilation failed:\n{result.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+        if compiler_evidence.artifact_identity(canonical_path) != source_identity:
+            _fresh_evidence_safely(
+                evidence_path,
+                source=canonical_path,
+                discovered=reset_outputs,
+                compile_command=cmd,
+                backend=backend,
+                arch=arch,
+            )
+            print(
+                "Compilation failed:\ncanonical source changed during compilation",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         before_publish = compiler_evidence.artifact_identity(attempt_path)
@@ -446,6 +487,20 @@ def compile_cu(
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            if compiler_evidence.artifact_identity(canonical_path) != source_identity:
+                _fresh_evidence_safely(
+                    evidence_path,
+                    source=canonical_path,
+                    discovered=reset_outputs,
+                    compile_command=cmd,
+                    backend=backend,
+                    arch=arch,
+                )
+                print(
+                    "Compilation failed:\ncanonical source changed before evidence commit",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         except BaseException:
             try:
                 _remove_output(final_path)
@@ -469,18 +524,55 @@ def compile_cu(
             backend=backend,
             arch=arch,
         )
+        if compiler_evidence.artifact_identity(canonical_path) != source_identity:
+            _remove_output(final_path)
+            _fresh_evidence_safely(
+                evidence_path,
+                source=canonical_path,
+                discovered=reset_outputs,
+                compile_command=cmd,
+                backend=backend,
+                arch=arch,
+            )
+            print(
+                "Compilation failed:\ncanonical source changed before evidence commit",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(f"[compile] -> {output_so}")
         return evidence_status
     finally:
-        if clean_file != cu_file:
-            try:
-                Path(clean_file).unlink()
-            except FileNotFoundError:
-                pass
         try:
             attempt_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def compile_cu(
+    cu_file: str,
+    output_so: str,
+    arch: str,
+    nvcc_bin: str,
+    backend: str = "cuda",
+    evidence_dir=None,
+):
+    """Compile from a private source snapshot and clean its owner deterministically."""
+    final_path = Path(output_so).expanduser().absolute()
+    attempt_owner = tempfile.TemporaryDirectory(
+        prefix=f".{final_path.name}.compile-",
+        dir=str(final_path.parent),
+    )
+    try:
+        return _compile_cu_with_owner(
+            cu_file,
+            output_so,
+            arch,
+            nvcc_bin,
+            backend=backend,
+            evidence_dir=evidence_dir,
+            attempt_owner=attempt_owner,
+        )
+    finally:
         active_error = sys.exc_info()[1]
         try:
             attempt_owner.cleanup()

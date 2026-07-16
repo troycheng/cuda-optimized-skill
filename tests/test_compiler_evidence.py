@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -412,6 +413,105 @@ class CompilerEvidenceTests(unittest.TestCase):
 
 
 class CompilerEvidenceIntegrationTests(unittest.TestCase):
+    def test_private_compile_owner_cleans_all_initialization_failures(self) -> None:
+        real_temporary_directory = tempfile.TemporaryDirectory
+        real_mkstemp = tempfile.mkstemp
+        real_fstat = os.fstat
+
+        class InjectedFailure(RuntimeError):
+            pass
+
+        for failure_point in ("mkstemp", "utime", "fstat"):
+            benchmark = _load("benchmark")
+            owners = []
+            armed_fstat = {"value": False}
+
+            class TrackedOwner:
+                def __init__(self, *args, **kwargs):
+                    self.inner = real_temporary_directory(*args, **kwargs)
+                    self.name = self.inner.name
+                    self.cleanup_calls = 0
+
+                def cleanup(self):
+                    self.cleanup_calls += 1
+                    self.inner.cleanup()
+                    if failure_point == "utime":
+                        raise OSError("cleanup also failed")
+
+            def owner_factory(*args, **kwargs):
+                owner = TrackedOwner(*args, **kwargs)
+                owners.append(owner)
+                return owner
+
+            def controlled_mkstemp(*args, **kwargs):
+                fd, name = real_mkstemp(*args, **kwargs)
+                directory = Path(kwargs.get("dir") or Path(name).parent)
+                if ".compile-" in directory.name:
+                    if failure_point == "mkstemp":
+                        os.close(fd)
+                        raise InjectedFailure("mkstemp injected")
+                    armed_fstat["value"] = failure_point == "fstat"
+                return fd, name
+
+            def controlled_fstat(fd):
+                if armed_fstat["value"]:
+                    armed_fstat["value"] = False
+                    raise InjectedFailure("fstat injected")
+                return real_fstat(fd)
+
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "kernel.cu"
+                binary = root / "kernel.so"
+                source.write_text('extern "C" void solve(float *out) {}', encoding="utf-8")
+                try:
+                    patches = [
+                        mock.patch.object(
+                            benchmark.tempfile,
+                            "TemporaryDirectory",
+                            side_effect=owner_factory,
+                        ),
+                        mock.patch.object(
+                            benchmark.tempfile,
+                            "mkstemp",
+                            side_effect=controlled_mkstemp,
+                        ),
+                        mock.patch.object(
+                            benchmark.os, "fstat", side_effect=controlled_fstat
+                        ),
+                    ]
+                    if failure_point == "utime":
+                        patches.append(
+                            mock.patch.object(
+                                benchmark.os,
+                                "utime",
+                                side_effect=InjectedFailure("utime injected"),
+                            )
+                        )
+                    with patches[0], patches[1], patches[2]:
+                        if failure_point == "utime":
+                            with patches[3]:
+                                with self.assertRaisesRegex(
+                                    InjectedFailure, "utime injected"
+                                ):
+                                    benchmark.compile_cu(
+                                        str(source), str(binary), "sm_120", "nvcc"
+                                    )
+                        else:
+                            with self.assertRaisesRegex(
+                                InjectedFailure, f"{failure_point} injected"
+                            ):
+                                benchmark.compile_cu(
+                                    str(source), str(binary), "sm_120", "nvcc"
+                                )
+
+                    self.assertEqual(owners[0].cleanup_calls, 1)
+                    self.assertFalse(Path(owners[0].name).exists())
+                    self.assertEqual(list(root.glob(".kernel.so.compile-*")), [])
+                finally:
+                    for owner in owners:
+                        owner.inner.cleanup()
+
     def test_compile_cu_records_exact_command_backend_arch_and_binary(self) -> None:
         benchmark = _load("benchmark")
         with tempfile.TemporaryDirectory() as tmp:
@@ -436,6 +536,14 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
                 self.assertNotEqual(attempt, binary)
                 self.assertTrue(attempt.is_file())
                 self.assertEqual(attempt.stat().st_size, 0)
+                source_snapshot = Path(command[-1])
+                self.assertEqual(source_snapshot.parent, attempt.parent)
+                self.assertNotEqual(source_snapshot, source)
+                self.assertEqual(stat.S_IMODE(source_snapshot.stat().st_mode), 0o400)
+                self.assertEqual(
+                    source_snapshot.read_text(encoding="utf-8"),
+                    source.read_text(encoding="utf-8"),
+                )
                 attempt_identity.append((attempt.stat().st_dev, attempt.stat().st_ino))
                 with attempt.open("r+b") as stream:
                     stream.write(b"elf")
@@ -458,6 +566,9 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
             )
             binary_bytes = binary.read_bytes()
             private_dirs_removed = [not path.exists() for path in private_dirs]
+            source_snapshot_removed = not Path(commands[0][-1]).exists()
+            canonical_source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+            canonical_source_path = str(source.resolve())
 
         self.assertEqual(manifest["backend"], "cuda")
         self.assertEqual(manifest["arch"], "sm_120")
@@ -466,6 +577,81 @@ class CompilerEvidenceIntegrationTests(unittest.TestCase):
         self.assertNotIn("-lineinfo", manifest["compile_command"])
         self.assertEqual(binary_bytes, b"elf")
         self.assertEqual(private_dirs_removed, [True])
+        self.assertTrue(source_snapshot_removed)
+        self.assertEqual(manifest["source"]["path"], canonical_source_path)
+        self.assertEqual(
+            manifest["source"]["sha256"],
+            canonical_source_sha256,
+        )
+
+    def test_compile_fails_closed_if_canonical_source_changes_during_nvcc(self) -> None:
+        benchmark = _load("benchmark")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            source.write_text("OLD source", encoding="utf-8")
+
+            def fake_run(command, **_kwargs):
+                snapshot = Path(command[-1])
+                self.assertEqual(snapshot.read_text(encoding="utf-8"), "OLD source")
+                Path(command[command.index("-o") + 1]).write_bytes(b"elf-for-old")
+                source.write_text("NEW source", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(benchmark.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(SystemExit):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertFalse(binary.exists())
+            for stage in ("binary", "sass", "ptx", "ttir", "ttgir", "llvm_ir"):
+                self.assertEqual(manifest[stage]["status"], "unavailable")
+
+    def test_preprocessed_compile_fails_if_canonical_source_changes(self) -> None:
+        benchmark = _load("benchmark")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "kernel.cu"
+            binary = root / "kernel.so"
+            source.write_text(
+                "#include <__clang_cuda_runtime_wrapper.h>\nOLD source",
+                encoding="utf-8",
+            )
+
+            def fake_run(command, **_kwargs):
+                attempt = Path(command[command.index("-o") + 1])
+                cleaned_snapshot = Path(command[-1])
+                self.assertEqual(stat.S_IMODE(cleaned_snapshot.stat().st_mode), 0o400)
+                self.assertEqual(
+                    cleaned_snapshot.read_text(encoding="utf-8").strip(), "OLD source"
+                )
+                attempt.write_bytes(b"elf-for-old")
+                source.write_text("NEW source", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(benchmark.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(SystemExit):
+                    benchmark.compile_cu(
+                        str(source), str(binary), "sm_120", "nvcc", backend="cuda"
+                    )
+
+            manifest = json.loads(
+                (root / "compiler_evidence" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertFalse(binary.exists())
+            self.assertEqual(manifest["binary"]["status"], "unavailable")
+            self.assertEqual(manifest["sass"]["status"], "unavailable")
 
     def test_private_compile_directory_blocks_shared_parent_symlink_attack(self) -> None:
         benchmark = _load("benchmark")
