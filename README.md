@@ -1,4 +1,4 @@
-# cuda-kernel-optimizer
+# cuda-kernel-optimizer v2.1
 
 **English** | [简体中文](README.zh-CN.md)
 
@@ -11,16 +11,34 @@ This is a **skill package**, not a standalone tool. An agent reads `SKILL.md` an
 ![alt text](asset/v2_en_arch.png)
 
 ## Usage
+
 ```text
 Use this prompt in the agent:
 @cuda-kernel-optimizer use this skill to optimize "the operator you want to optimize" for N iterations.
 ```
 
-## What's new in V2
+## Install in Codex
 
-V2 upgrades the loop from "try-and-log" into "try–attribute–verify–learn". Four mechanisms are added on top of V1; everything below reflects V2 behavior:
+For a new installation from the maintained fork `main`:
 
-- **Roofline-driven axis budget** — instead of V1's fixed 1-method-per-axis, V2 computes per-iteration compute/memory/latency gaps (Δc, Δm, Δl) and splits the 3-method budget proportionally (per-axis cap = 2). When all three gaps fall below 0.15 the loop early-stops with `near_peak: true`.
+```bash
+python "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/install-skill-from-github.py" \
+  --repo troycheng/cuda-optimized-skill \
+  --ref main \
+  --path skills/cuda-kernel-optimizer
+```
+
+The installer refuses to overwrite an existing skill. Back up or remove an
+older `cuda-kernel-optimizer` installation before using this command for an
+upgrade, then restart the Codex session so the new skill is discovered.
+
+## What's new in V2.1
+
+V2.1 upgrades the loop from "try-and-log" into "try–attribute–verify–learn".
+Five mechanisms are added on top of V1; everything below reflects V2.1
+behavior:
+
+- **Roofline-driven axis budget** — instead of V1's fixed 1-method-per-axis, V2.1 computes per-iteration compute/memory/latency gaps (Δc, Δm, Δl) and splits the 3-method budget proportionally (per-axis cap = 2). When all three evidenced gaps fall below 0.15 the loop early-stops with `near_peak: true`.
 - **Branch-and-Select exploration** — each iteration generates K branch candidates (default K=4) sharing the same methods but varying tile size, pipeline stages, warp count, and implementation variants. The fastest correct branch wins as champion; the rest are archived in `frontier`.
 - **Ablation-based attribution** — after the champion is picked, each method is ablated one at a time. `attribution(m) = ms_without_m − ms_champion` gives a per-method causal contribution instead of a single packed verdict.
 - **SASS instruction-level verification** — `cuobjdump --dump-sass` is grepped against a signature table (`sass_signatures.json`) to confirm each claimed optimization actually appears in the compiled machine code.
@@ -42,6 +60,8 @@ The host blocked hardware-counter access with `ERR_NVGPUCTRPERM` in both
 lanes. The skill correctly records `can_read_counters: false` and retains the
 failure log; no privileged capability or driver policy change was used. See
 [`tests/gpu/sm120/README.md`](tests/gpu/sm120/README.md) for the opt-in command.
+Version targets and exact architecture routing are maintained in
+[`skills/cuda-kernel-optimizer/references/compatibility.md`](skills/cuda-kernel-optimizer/references/compatibility.md).
 
 An additional isolated vLLM SM120 blockwise-FP8 `down_proj`
 (`m=1,n=8704,k=5120`) binary A/B used five fresh processes per candidate and
@@ -58,7 +78,7 @@ On the host where the agent runs:
 - A CUDA GPU with working drivers (`nvidia-smi` works)
 - `nvcc` in `$PATH` (for CUDA / CUTLASS backends)
 - `ncu` in `$PATH` if profiler metrics are required. Without counter access, the skill records the concrete failure and continues with correctness, timing, source, and SASS evidence.
-- `cuobjdump` in `$PATH` (ships with the CUDA toolkit) — needed for V2's SASS verification step
+- `cuobjdump` in `$PATH` (ships with the CUDA toolkit) — needed for V2.1's SASS verification step
 - Python 3.10+ with `torch` (CUDA build), `triton` if you want the Triton backend
 - For CUTLASS kernels: `$CUTLASS_PATH` or `$CUTLASS_INCLUDE_DIR` pointing at a tree with both `cutlass/` and `cute/` headers
 
@@ -87,7 +107,7 @@ A sibling directory of your baseline, `run_YYYYMMDD_HHMMSS/`, containing:
 ```text
 run_YYYYMMDD_HHMMSS/
 ├── state.json                   # global state, re-readable across sessions
-│                                #   V2 adds: branches, implementation_failed_methods,
+│                                #   V2.1 adds: branches, implementation_failed_methods,
 │                                #            roofline_history, frontier
 ├── env.json                     # GPU / nvcc / ncu / CUTLASS snapshot
 ├── baseline/
@@ -122,6 +142,8 @@ run_YYYYMMDD_HHMMSS/
 You do not need to drive the loop by hand, but these commands are useful when debugging the skill itself:
 
 ```bash
+cd skills/cuda-kernel-optimizer
+
 # 0 + 0b + 1 + 2 + 3a-for-iter1
 python scripts/orchestrate.py setup \
   --baseline   ./gemm.cu \
@@ -150,36 +172,38 @@ python scripts/orchestrate.py finalize --run-dir run_20260418_143022
 
 Each script is independently invocable (`--help` on any of them); `orchestrate.py` is just a convenience wrapper.
 
-## Repo layout
+## Skill layout
 
 ```text
-cuda-kernel-optimizer/
-├── SKILL.md                         # skill entry point
-├── README.md                        # you are here
-├── scripts/
-│   ├── benchmark.py                 # bundled benchmark driver (from project)
-│   ├── check_env.py                 # detect GPU / nvcc / ncu / cuobjdump / CUTLASS / libs
-│   ├── preflight.py                 # validate baseline + ref contract
-│   ├── state.py                     # the ONLY writer of state.json
-│   ├── validate_methods.py          # priority-compliance gate (called by state.py)
-│   ├── run_iteration.py             # calls benchmark.py, captures results
-│   ├── profile_ncu.py               # runs ncu, extracts top-K per axis
-│   ├── roofline.py                  # [V2] compute Δc/Δm/Δl, allocate axis budget, near_peak check
-│   ├── branch_explore.py            # [V2] compile + benchmark K branches, elect champion, update frontier
-│   ├── ablate.py                    # [V2] leave-one-out ablation, emit per-method attribution
-│   ├── sass_check.py                # [V2] cuobjdump → grep signatures → per-method SASS verdict
-│   ├── summarize.py                 # renders summary.md (V2: includes bottleneck drift table)
-│   └── orchestrate.py               # end-to-end CLI (setup/close-iter/finalize)
-├── references/
-│   ├── ncu_metrics_guide.md         # bottleneck → optimization mapping
-│   ├── optimization_catalog.md      # priority-ordered catalog
-│   ├── method_registry.json         # machine-readable mirror (validator reads)
-│   └── sass_signatures.json         # [V2] method → expected SASS instruction signatures
-├── templates/
-│   ├── iteration_report.md          # analysis.md skeleton
-│   └── methods.schema.json          # schema for methods.json (V2: adds trigger_strength)
-└── examples/
-    └── walkthrough.md               # annotated example session
+cuda-optimized-skill/
+├── README.md
+├── README.zh-CN.md
+└── skills/cuda-kernel-optimizer/
+    ├── SKILL.md                     # skill entry point
+    ├── scripts/
+    │   ├── benchmark.py             # bundled benchmark driver
+    │   ├── check_env.py             # GPU/toolchain environment probe
+    │   ├── preflight.py             # baseline + reference contract validation
+    │   ├── state.py                 # state.json writer
+    │   ├── validate_methods.py      # priority-compliance gate
+    │   ├── run_iteration.py         # benchmark execution and capture
+    │   ├── profile_ncu.py           # target-bounded ncu profiling
+    │   ├── roofline.py              # evidenced gaps and method budgets
+    │   ├── branch_explore.py        # median/noise-aware branch selection
+    │   ├── ablate.py                # leave-one-out attribution
+    │   ├── sass_check.py            # per-method SASS verification
+    │   ├── summarize.py             # summary and bottleneck drift
+    │   └── orchestrate.py           # setup/close-iter/finalize CLI
+    ├── references/
+    │   ├── compatibility.md         # versions and exact architecture routing
+    │   ├── ncu_metrics_guide.md     # bottleneck → optimization mapping
+    │   ├── optimization_catalog.md  # priority-ordered catalog
+    │   ├── method_registry.json     # machine-readable method registry
+    │   └── sass_signatures.json     # expected SASS signatures
+    ├── templates/
+    │   ├── iteration_report.md      # analysis.md skeleton
+    │   └── methods.schema.json      # methods.json schema
+    └── examples/walkthrough.md      # annotated walkthrough
 ```
 
 ## How an agent uses this
@@ -187,15 +211,15 @@ cuda-kernel-optimizer/
 When a user says "optimize `gemm.cu`", the agent:
 
 1. reads `SKILL.md`
-2. calls `orchestrate.py setup` (which runs env check → preflight → init → seed baseline → first profile)
-3. reads `iterv1/ncu_top.json` and the current best kernel source
-4. **runs `roofline.py` to get Δc / Δm / Δl and the per-axis method budget (total = 3, per-axis cap = 2); if `near_peak: true`, the loop ends here**
+2. calls `orchestrate.py setup` (env check → preflight → init → seed baseline → target-bounded profile attempt)
+3. reads the current best kernel plus available profiler evidence or the exact profiler failure
+4. when counter access is available, runs `roofline.py` to compute evidenced Δc / Δm / Δl and the per-axis method budget; missing metrics cannot trigger a `near_peak` conclusion
 5. consults `references/optimization_catalog.md` + `references/ncu_metrics_guide.md`
-6. picks methods **under the axis budget** (budget-aware scan: skip axis if budget=0, pick top-N by `trigger_strength` if budget=2), writes them + reasoning to `iterv1/methods.json` and `iterv1/analysis.md`
+6. picks methods under the available evidence budget and writes the decision record to `iterv1/methods.json` and `iterv1/analysis.md`; without counters, it limits claims to correctness, timing, source, and SASS evidence
 7. writes **K branch candidates** to `iterv1/branches/b{0..K-1}/kernel.<ext>` — same methods, different hyperparameters (tile / stages / warps / impl variants)
 8. calls `orchestrate.py close-iter --iter 1`, which internally:
    - runs `branch_explore.py` → compiles + benchmarks all branches, elects the fastest correct one as champion (copied to `iterv1/kernel.<ext>`), archives the rest in `frontier`
-   - profiles the champion with `ncu` → `iterv1/kernel.ncu-rep`
+   - profiles the champion with `ncu` when counter access is available; otherwise preserves the exact command, return code, and failure log
    - runs `sass_check.py` → `iterv1/sass_check.json`
    - runs `ablate.py` → `iterv1/attribution.json`
    - updates state: each method lands in one of `effective_methods` / `ineffective_methods` / `implementation_failed_methods` based on SASS ✓/✗ × attribution > noise
