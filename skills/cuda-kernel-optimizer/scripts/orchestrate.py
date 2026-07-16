@@ -37,6 +37,7 @@ from artifact_store import (  # noqa: E402
     ArtifactStore,
     CURRENT_SCHEMA_VERSION,
     atomic_write_json,
+    read_regular_bytes,
     sha256_file,
     write_paired_samples,
 )
@@ -705,9 +706,8 @@ def _candidate_file(candidate: Mapping) -> str:
     value = candidate.get("candidate_file") or candidate.get("kernel")
     if not isinstance(value, str) or not value.strip():
         raise ValueError("candidate must provide candidate_file or kernel")
-    path = Path(value).expanduser()
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("candidate artifact must be a non-symlink regular file")
+    path = Path(os.path.abspath(os.path.expanduser(value)))
+    read_regular_bytes(path)
     return str(path.resolve(strict=True))
 
 
@@ -1153,9 +1153,11 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return result
 
 
-def _read(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _read(path: str | os.PathLike) -> dict:
+    try:
+        return json.loads(read_regular_bytes(path).decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError(f"JSON artifact is not UTF-8: {path}") from error
 
 
 def _read_branch_results(path: str) -> dict:
@@ -3567,6 +3569,17 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 continue
             terminal_decision = source_decision
             kernel = workload_result["candidate_file"]
+            checkpoint = transition_checkpoint(
+                checkpoint,
+                next_stage,
+                status="in_progress",
+                candidate_id=workload_result.get("candidate_id"),
+                candidate_status=terminal_decision["status"],
+                updated_at=time.monotonic(),
+            )
+            checkpoint = _persist_checkpoint(
+                store, checkpoint, input_hash=state["input_hash"]
+            )
             current_state = _read(state_path)
             if not _decision_already_applied(
                 current_state, args.iter, terminal_decision

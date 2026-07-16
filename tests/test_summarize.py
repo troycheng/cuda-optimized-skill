@@ -465,6 +465,8 @@ class SummarizeTests(unittest.TestCase):
                         "iteration": 1,
                         "stage": "decision",
                         "status": "in_progress",
+                        "candidate_id": "b1",
+                        "candidate_status": "end_to_end_win",
                         "budget": {"remaining_seconds": 400.0},
                         "stage_evidence": {
                             "candidate_sanitizer": {

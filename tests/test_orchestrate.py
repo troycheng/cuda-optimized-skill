@@ -910,6 +910,22 @@ class BudgetedParserTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink"):
                 self.orchestrate.validate_output_root(alias, baseline=root / "kernel.py")
 
+    def test_generic_json_reader_rejects_symlinked_parent_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real = root / "real"
+            real.mkdir()
+            payload = real / "payload.json"
+            payload.write_text('{"ok":true}', encoding="utf-8")
+            linked = root / "linked"
+            try:
+                linked.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self.orchestrate._read(linked / "payload.json")
+
 
 class LifecycleIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -2190,6 +2206,24 @@ class OuterLoopTests(unittest.TestCase):
         malformed = [{"status": "confirmed_win", "statistics": {"estimate_pct": math.nan}}]
         with self.assertRaisesRegex(ValueError, "estimate_pct"):
             self.orchestrate.select_outer_candidates(malformed, 1)
+
+    def test_candidate_file_rejects_symlinked_parent_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real = root / "real"
+            real.mkdir()
+            candidate = real / "kernel.py"
+            candidate.write_text("# candidate\n", encoding="utf-8")
+            linked = root / "linked"
+            try:
+                linked.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self.orchestrate._candidate_file(
+                    {"candidate_file": str(linked / "kernel.py")}
+                )
 
     def test_kernel_only_terminal_never_calls_workload_and_can_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

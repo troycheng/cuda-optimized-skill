@@ -98,6 +98,22 @@ class ArtifactStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, str(root)):
                 self.artifacts.sha256_file(root)
 
+    def test_sha256_file_rejects_symlinked_parent_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real = root / "real"
+            real.mkdir()
+            source = real / "value.bin"
+            source.write_bytes(b"value")
+            linked = root / "linked"
+            try:
+                linked.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self.artifacts.sha256_file(linked / "value.bin")
+
     def test_atomic_json_fsyncs_parent_directory_after_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp).resolve() / "result.json"

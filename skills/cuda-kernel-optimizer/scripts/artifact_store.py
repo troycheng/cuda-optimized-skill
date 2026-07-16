@@ -21,16 +21,8 @@ _PathLike = Union[str, os.PathLike]
 
 
 def sha256_file(path: _PathLike) -> str:
-    """Return the SHA-256 digest of a regular file."""
-    source = Path(path).expanduser()
-    if not source.is_file():
-        raise ValueError(f"input file does not exist or is not a file: {source}")
-
-    digest = hashlib.sha256()
-    with source.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    """Return a stable SHA-256 digest without following path symlinks."""
+    return hashlib.sha256(read_regular_bytes(path)).hexdigest()
 
 
 def _open_parent_directory(
@@ -44,17 +36,21 @@ def _open_parent_directory(
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_fd = os.open(target.anchor, flags)
     try:
-        for component in target.parts[1:-1]:
+        for index, component in enumerate(target.parts[1:-1]):
+            # macOS exposes root-owned compatibility aliases such as /var ->
+            # /private/var.  Permit only that filesystem-root boundary; every
+            # user-controlled descendant remains no-follow.
+            component_flags = flags if index == 0 else flags | nofollow
             try:
                 child_fd = os.open(
-                    component, flags | nofollow, dir_fd=directory_fd
+                    component, component_flags, dir_fd=directory_fd
                 )
             except FileNotFoundError:
                 if not create:
                     raise
                 os.mkdir(component, 0o755, dir_fd=directory_fd)
                 child_fd = os.open(
-                    component, flags | nofollow, dir_fd=directory_fd
+                    component, component_flags, dir_fd=directory_fd
                 )
             except OSError as error:
                 if error.errno in {errno.ELOOP, errno.ENOTDIR}:
@@ -374,20 +370,20 @@ class ArtifactStore:
         target = self._resolve_relative(relative_path)
         if not target.exists():
             return []
-        if not target.is_file():
-            raise ValueError(f"JSONL artifact is not a file: {target}")
-
         records = []
-        with target.open("r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError as error:
-                    raise ValueError(
-                        f"invalid JSON in {target} at line {line_number}: {error.msg}"
-                    ) from error
+        try:
+            text = read_regular_bytes(target).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"JSONL artifact is not UTF-8: {target}") from error
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid JSON in {target} at line {line_number}: {error.msg}"
+                ) from error
         return records
 
     def write_checkpoint(self, payload: dict) -> Path:
@@ -401,10 +397,14 @@ class ArtifactStore:
 
     def load_checkpoint(self, *, expected_input_hash: str) -> dict:
         path = self._resolve_relative("checkpoint.json")
-        if not path.is_file():
-            raise ValueError(f"checkpoint not found: {path}")
-        with path.open("r", encoding="utf-8") as stream:
-            checkpoint = json.load(stream)
+        try:
+            checkpoint = json.loads(read_regular_bytes(path).decode("utf-8"))
+        except ValueError as error:
+            if "artifact file does not exist" in str(error):
+                raise ValueError(f"checkpoint not found: {path}") from error
+            raise
+        except UnicodeDecodeError as error:
+            raise ValueError(f"checkpoint is not UTF-8: {path}") from error
         if not isinstance(checkpoint, dict):
             raise ValueError(f"checkpoint must contain a JSON object: {path}")
         if type(checkpoint.get("schema_version")) is not int or checkpoint.get(

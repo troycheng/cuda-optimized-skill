@@ -799,6 +799,8 @@ class StateDecisionPromotionTests(unittest.TestCase):
                         "iteration": 1,
                         "stage": "decision",
                         "status": "in_progress",
+                        "candidate_id": "b1",
+                        "candidate_status": "end_to_end_win",
                         "stage_evidence": {
                             "candidate_sanitizer": {
                                 "status": "passed",
@@ -825,6 +827,50 @@ class StateDecisionPromotionTests(unittest.TestCase):
         self.assertEqual(terminal["sass"]["status"], "passed")
         self.assertEqual(terminal["sanitizer"]["coverage"], "complete")
         self.assertEqual(terminal["resume"]["stage"], "decision")
+
+    def test_candidate_terminal_requires_exact_checkpoint_candidate_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, _before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            self._run_update(args)
+            run_dir = state_path.parent
+            checkpoint_path = run_dir / "checkpoint.json"
+            base = {
+                "schema_version": 2,
+                "input_hash": "abc",
+                "iteration": 1,
+                "stage": "complete",
+                "status": "complete",
+                "budget": {},
+                "candidate_id": None,
+                "candidate_status": None,
+            }
+            checkpoint_path.write_text(json.dumps(base), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "resume.*candidate_id"):
+                self.state.persist_checkpoint_snapshot(
+                    state_path, base, checkpoint_path
+                )
+
+            wrong = {**base, "candidate_id": "b1", "candidate_status": "confirmed_loss"}
+            checkpoint_path.write_text(json.dumps(wrong), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "candidate_status.*terminal"):
+                self.state.persist_checkpoint_snapshot(
+                    state_path, wrong, checkpoint_path
+                )
+
+            stale = {
+                **base,
+                "iteration": 2,
+                "candidate_id": "b1",
+                "candidate_status": "kernel_only_win",
+            }
+            checkpoint_path.write_text(json.dumps(stale), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "iteration.*terminal"):
+                self.state.persist_checkpoint_snapshot(
+                    state_path, stale, checkpoint_path
+                )
 
     def test_faster_average_with_non_win_decision_never_promotes(self) -> None:
         for status in (

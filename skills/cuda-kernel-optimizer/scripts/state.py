@@ -710,6 +710,27 @@ def _validate_terminal_snapshot(
             raise ValueError(
                 "terminal_decision.resume.candidate_status must be null or non-empty"
             )
+        if candidate_id is not None:
+            if resume_iteration != iteration:
+                raise ValueError(
+                    "terminal_decision.resume.iteration must match terminal iteration"
+                )
+            if resume_candidate_id is None:
+                raise ValueError(
+                    "terminal_decision.resume.candidate_id is required for candidate terminal"
+                )
+            if resume_candidate_id != candidate_id:
+                raise ValueError(
+                    "terminal_decision.resume.candidate_id does not match terminal"
+                )
+            if resume_candidate_status is None:
+                raise ValueError(
+                    "terminal_decision.resume.candidate_status is required for candidate terminal"
+                )
+            if resume_candidate_status != status:
+                raise ValueError(
+                    "terminal_decision.resume.candidate_status does not match terminal"
+                )
     clean["resume"] = resume
     for kind, stats in (("kernel", statistics), ("workload", workload_statistics)):
         field = f"{kind}_paired_samples"
