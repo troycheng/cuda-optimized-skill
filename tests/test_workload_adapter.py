@@ -4,10 +4,15 @@ import copy
 import importlib.util
 import json
 import math
+import os
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
+import types
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -80,6 +85,15 @@ def _write_python_adapter(path: Path, *, objective: dict | None = None) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _write_executable(path: Path, body: str) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n" + textwrap.dedent(body),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
 
 
 class NormalizeWorkloadTests(unittest.TestCase):
@@ -174,15 +188,17 @@ class NormalizeWorkloadTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as tmp:
-            objective_path = Path(tmp) / "objective.json"
+            root = Path(tmp)
+            runner = _write_executable(root / "runner", "pass\n")
+            objective_path = root / "objective.json"
             objective_path.write_text(json.dumps(_objective()), "utf-8")
             spec = self.workloads.normalize_workload(
-                workload_cmd='./runner --label "two words"',
+                workload_cmd=f'{shlex.quote(str(runner))} --label "two words"',
                 objective=objective_path,
             )
 
         self.assertEqual(spec.kind, "command")
-        self.assertEqual(spec.source, ["./runner", "--label", "two words"])
+        self.assertEqual(spec.source, [str(runner.resolve()), "--label", "two words"])
         self.assertEqual(spec.objective, _objective())
 
     def test_command_sequence_rejects_non_string_and_empty_arguments(self) -> None:
@@ -560,11 +576,22 @@ class CommandWorkloadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.workloads = _load_workload_adapter()
 
-    def _spec(self, root: Path):
+    def _spec(self, root: Path, body: str | None = None):
+        if body is None:
+            body = """
+                import json, os
+                from pathlib import Path
+                Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text(json.dumps({
+                    "validation": {"valid": True},
+                    "benchmark": {"latency_ms": 3.5}
+                }))
+            """
+        runner = _write_executable(root / "runner", body)
         objective_path = root / "objective.json"
         objective_path.write_text(json.dumps(_objective()), "utf-8")
         return self.workloads.normalize_workload(
-            workload_cmd='./runner --label "two words"', objective=objective_path
+            workload_cmd=[str(runner), "--label", "two words"],
+            objective=objective_path,
         )
 
     def test_command_uses_argv_shell_false_environment_and_only_output_file(self) -> None:
@@ -573,33 +600,10 @@ class CommandWorkloadTests(unittest.TestCase):
             case = {"batch": 8}
             original_case = copy.deepcopy(case)
 
-            def completed(argv, **kwargs):
-                self.assertEqual(argv, ["./runner", "--label", "two words"])
-                self.assertIs(kwargs["shell"], False)
-                self.assertTrue(kwargs["capture_output"])
-                self.assertTrue(kwargs["text"])
-                env = kwargs["env"]
-                self.assertEqual(env["CUDA_OPTIMIZER_CANDIDATE"], "/tmp/candidate.py")
-                self.assertEqual(env["CUDA_OPTIMIZER_ROLE"], "baseline")
-                self.assertEqual(json.loads(env["CUDA_OPTIMIZER_CASE"]), case)
-                output = Path(env["CUDA_OPTIMIZER_OUTPUT"])
-                self.assertFalse(output.exists())
-                output.write_text(
-                    json.dumps(
-                        {
-                            "validation": {"valid": True},
-                            "benchmark": {"latency_ms": 3.5},
-                        }
-                    ),
-                    "utf-8",
-                )
-                return subprocess.CompletedProcess(
-                    argv, 0, stdout='{"forged": true}', stderr="diagnostic"
-                )
-
+            real_popen = subprocess.Popen
             with mock.patch.object(
-                self.workloads.subprocess, "run", side_effect=completed
-            ) as run:
+                self.workloads.subprocess, "Popen", wraps=real_popen
+            ) as popen:
                 result = self.workloads.run_command_once(
                     spec,
                     candidate="/tmp/candidate.py",
@@ -615,56 +619,42 @@ class CommandWorkloadTests(unittest.TestCase):
                     "benchmark": {"latency_ms": 3.5},
                 },
             )
-            self.assertEqual(run.call_args.kwargs["timeout"], 12.5)
+            self.assertEqual(popen.call_args.args[0], list(spec.source))
+            self.assertIs(popen.call_args.kwargs["shell"], False)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(env["CUDA_OPTIMIZER_CANDIDATE"], "/tmp/candidate.py")
+            self.assertEqual(env["CUDA_OPTIMIZER_ROLE"], "baseline")
+            self.assertEqual(json.loads(env["CUDA_OPTIMIZER_CASE"]), case)
             self.assertEqual(case, original_case)
 
     def test_command_failures_have_clear_bounded_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            spec = self._spec(Path(tmp))
+            root = Path(tmp)
             cases = (
-                (FileNotFoundError("missing runner"), "not found"),
-                (subprocess.TimeoutExpired(spec.source, 3), "timed out"),
-                (
-                    subprocess.CompletedProcess(
-                        spec.source, 9, stdout="x" * 20000, stderr="failure"
-                    ),
-                    "exit 9",
-                ),
+                ("import time; time.sleep(30)\n", "timed out", 0.1),
+                ('import sys; print("x" * 20000); print("failure", file=sys.stderr); raise SystemExit(9)\n', "exit 9", None),
             )
-            for side_effect, message in cases:
-                with self.subTest(message=message), mock.patch.object(
-                    self.workloads.subprocess,
-                    "run",
-                    side_effect=side_effect
-                    if isinstance(side_effect, BaseException)
-                    else None,
-                    return_value=side_effect
-                    if isinstance(side_effect, subprocess.CompletedProcess)
-                    else mock.DEFAULT,
-                ), self.assertRaisesRegex(RuntimeError, message) as raised:
+            for index, (body, message, timeout) in enumerate(cases):
+                case_root = root / str(index)
+                case_root.mkdir()
+                spec = self._spec(case_root, body)
+                with self.subTest(message=message), self.assertRaisesRegex(
+                    RuntimeError, message
+                ) as raised:
                     self.workloads.run_command_once(
                         spec,
                         candidate="candidate.py",
                         role="candidate",
                         case={},
+                        timeout=timeout,
                     )
                 self.assertLess(len(str(raised.exception)), 9000)
 
     def test_command_rejects_missing_bad_and_non_object_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            spec = self._spec(Path(tmp))
-
-            def result_with(payload):
-                def run(argv, **kwargs):
-                    if payload is not None:
-                        Path(kwargs["env"]["CUDA_OPTIMIZER_OUTPUT"]).write_text(
-                            payload, "utf-8"
-                        )
-                    return subprocess.CompletedProcess(argv, 0, "ignored", "")
-
-                return run
-
-            for payload, message in (
+            root = Path(tmp)
+            for index, (payload, message) in enumerate((
                 (None, "output"),
                 ("not json", "JSON"),
                 ("[]", "object"),
@@ -683,12 +673,17 @@ class CommandWorkloadTests(unittest.TestCase):
                     '{"validation": true, "benchmark": 1}',
                     "benchmark",
                 ),
-            ):
-                with self.subTest(payload=payload), mock.patch.object(
-                    self.workloads.subprocess,
-                    "run",
-                    side_effect=result_with(payload),
-                ), self.assertRaisesRegex(RuntimeError, message):
+            )):
+                case_root = root / str(index)
+                case_root.mkdir()
+                if payload is None:
+                    body = "pass\n"
+                else:
+                    body = f'''\nfrom pathlib import Path\nimport os\nPath(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text({payload!r})\n'''
+                spec = self._spec(case_root, body)
+                with self.subTest(payload=payload), self.assertRaisesRegex(
+                    RuntimeError, message
+                ):
                     self.workloads.run_command_once(
                         spec,
                         candidate="candidate.py",
@@ -865,6 +860,7 @@ class ManifestTests(unittest.TestCase):
             root = Path(tmp)
             runner = root / "run benchmark.sh"
             runner.write_text("#!/bin/sh\n", "utf-8")
+            runner.chmod(0o755)
             manifest = root / "workload.json"
             manifest.write_text(
                 json.dumps(
@@ -943,16 +939,10 @@ class UnifiedExecutionTests(unittest.TestCase):
         self.workloads = _load_workload_adapter()
 
     @staticmethod
-    def _command_result(argv, **kwargs):
-        Path(kwargs["env"]["CUDA_OPTIMIZER_OUTPUT"]).write_text(
-            json.dumps(
-                {
-                    "validation": {"valid": True, "checks": 4},
-                    "benchmark": {"latency_ms": 2.5},
-                    "diagnostics": {"source": "user-workload"},
-                }
-            ),
-            "utf-8",
+    def _command_runner(path: Path, payload: dict) -> Path:
+        return _write_executable(
+            path,
+            f'''\nimport os\nfrom pathlib import Path\nPath(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text({json.dumps(payload)!r})\n''',
         )
         return subprocess.CompletedProcess(argv, 0, "ignored", "")
 
@@ -971,8 +961,16 @@ class UnifiedExecutionTests(unittest.TestCase):
             python_spec = self.workloads.normalize_workload(workload=adapter)
             objective_path = root / "objective.json"
             objective_path.write_text(json.dumps(_objective()), "utf-8")
+            runner = self._command_runner(
+                root / "user-runner",
+                {
+                    "validation": {"valid": True, "checks": 4},
+                    "benchmark": {"latency_ms": 2.5},
+                    "diagnostics": {"source": "user-workload"},
+                },
+            )
             command_spec = self.workloads.normalize_workload(
-                workload_cmd=["./user-runner", "--once"],
+                workload_cmd=[str(runner), "--once"],
                 objective=objective_path,
             )
             case = {"batch": 4}
@@ -983,18 +981,13 @@ class UnifiedExecutionTests(unittest.TestCase):
                 role="candidate",
                 case=case,
             )
-            with mock.patch.object(
-                self.workloads.subprocess,
-                "run",
-                side_effect=self._command_result,
-            ):
-                command_result = self.workloads.run_spec_once(
-                    command_spec,
-                    candidate="candidate.py",
-                    role="candidate",
-                    case=case,
-                    timeout=10,
-                )
+            command_result = self.workloads.run_spec_once(
+                command_spec,
+                candidate="candidate.py",
+                role="candidate",
+                case=case,
+                timeout=10,
+            )
 
             self._assert_unified(python_result, case=case)
             self._assert_unified(command_result, case=case)
@@ -1019,8 +1012,14 @@ class UnifiedExecutionTests(unittest.TestCase):
             root = Path(tmp)
             adapter = root / "adapter.py"
             _write_python_adapter(adapter)
-            runner = root / "runner.sh"
-            runner.write_text("#!/bin/sh\n", "utf-8")
+            runner = self._command_runner(
+                root / "runner.sh",
+                {
+                    "validation": {"valid": True, "checks": 4},
+                    "benchmark": {"latency_ms": 2.5},
+                    "diagnostics": {"source": "user-workload"},
+                },
+            )
             cases = [{"batch": 8}]
             python_manifest = root / "python.json"
             python_manifest.write_text(
@@ -1061,17 +1060,12 @@ class UnifiedExecutionTests(unittest.TestCase):
                 role="candidate",
                 case=cases[0],
             )
-            with mock.patch.object(
-                self.workloads.subprocess,
-                "run",
-                side_effect=self._command_result,
-            ):
-                command_result = self.workloads.run_spec_once(
-                    command_spec,
-                    candidate="candidate.py",
-                    role="candidate",
-                    case=cases[0],
-                )
+            command_result = self.workloads.run_spec_once(
+                command_spec,
+                candidate="candidate.py",
+                role="candidate",
+                case=cases[0],
+            )
 
             self._assert_unified(python_result, case=cases[0])
             self._assert_unified(command_result, case=cases[0])
@@ -1130,25 +1124,18 @@ class UnifiedExecutionTests(unittest.TestCase):
             root = Path(tmp)
             objective_path = root / "objective.json"
             objective_path.write_text(json.dumps(_objective()), "utf-8")
+            runner = self._command_runner(
+                root / "runner",
+                {
+                    "validation": {"valid": False, "reason": "wrong"},
+                    "benchmark": {"latency_ms": 0.1},
+                },
+            )
             spec = self.workloads.normalize_workload(
-                workload_cmd=["./runner"], objective=objective_path
+                workload_cmd=[str(runner)], objective=objective_path
             )
 
-            def invalid(argv, **kwargs):
-                Path(kwargs["env"]["CUDA_OPTIMIZER_OUTPUT"]).write_text(
-                    json.dumps(
-                        {
-                            "validation": {"valid": False, "reason": "wrong"},
-                            "benchmark": {"latency_ms": 0.1},
-                        }
-                    ),
-                    "utf-8",
-                )
-                return subprocess.CompletedProcess(argv, 0, "", "")
-
-            with mock.patch.object(
-                self.workloads.subprocess, "run", side_effect=invalid
-            ), self.assertRaisesRegex(ValueError, "validation failed"):
+            with self.assertRaisesRegex(ValueError, "validation failed"):
                 self.workloads.run_spec_once(
                     spec,
                     candidate="candidate.py",
@@ -1337,6 +1324,342 @@ class TemplateAndPreflightTests(unittest.TestCase):
             self.assertNotEqual(without_objective.returncode, 0)
             report = json.loads(without_objective.stdout)
             self.assertIn("--objective", " ".join(report["errors"]))
+
+
+class SourceIdentityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workloads = _load_workload_adapter()
+
+    def test_same_mtime_same_size_source_change_never_reuses_pyc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = Path(tmp) / "workload.py"
+            _write_python_adapter(adapter, objective=_objective(name="p50_latency_ms"))
+            first = self.workloads.normalize_workload(workload=adapter)
+            original_stat = adapter.stat()
+            original = adapter.read_text("utf-8")
+            changed = original.replace("p50_latency_ms", "q50_latency_ms")
+            self.assertEqual(len(original.encode()), len(changed.encode()))
+            adapter.write_text(changed, "utf-8")
+            os.utime(
+                adapter,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+
+            second = self.workloads.normalize_workload(workload=adapter)
+
+            self.assertEqual(first.objective["primary_metric"]["name"], "p50_latency_ms")
+            self.assertEqual(second.objective["primary_metric"]["name"], "q50_latency_ms")
+            self.assertNotEqual(first.source_hash, second.source_hash)
+
+    def test_declared_dependency_bytes_are_frozen_and_ignore_old_module_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            module_name = "cuda_optimizer_declared_helper"
+            helper = root / f"{module_name}.py"
+            helper.write_text(f"OBJECTIVE = {_objective(name='p50_latency_ms')!r}\n", "utf-8")
+            adapter = root / "workload.py"
+            adapter.write_text(
+                textwrap.dedent(
+                    f"""
+                    import {module_name} as helper
+                    WORKLOAD_DEPENDENCIES = ["{module_name}.py"]
+                    def prepare(candidate): return None
+                    def validate(candidate): return True
+                    def benchmark(candidate): return {{"latency_ms": 1.0}}
+                    def metrics(): return helper.OBJECTIVE
+                    def cleanup(): return None
+                    """
+                ),
+                "utf-8",
+            )
+            stale = types.ModuleType(module_name)
+            stale.OBJECTIVE = _objective(name="stale_metric")
+            previous = sys.modules.get(module_name)
+            sys.modules[module_name] = stale
+            try:
+                first = self.workloads.normalize_workload(workload=adapter)
+                helper_stat = helper.stat()
+                changed = helper.read_text("utf-8").replace(
+                    "p50_latency_ms", "q50_latency_ms"
+                )
+                helper.write_text(changed, "utf-8")
+                os.utime(
+                    helper,
+                    ns=(helper_stat.st_atime_ns, helper_stat.st_mtime_ns),
+                )
+                second = self.workloads.normalize_workload(workload=adapter)
+            finally:
+                if previous is None:
+                    sys.modules.pop(module_name, None)
+                else:
+                    sys.modules[module_name] = previous
+
+            self.assertEqual(first.objective["primary_metric"]["name"], "p50_latency_ms")
+            self.assertEqual(second.objective["primary_metric"]["name"], "q50_latency_ms")
+            self.assertNotEqual(first.source_hash, second.source_hash)
+
+    def test_source_and_dependencies_must_be_local_regular_non_symlink_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real.py"
+            _write_python_adapter(real)
+            linked = root / "linked.py"
+            linked.symlink_to(real)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                self.workloads.normalize_workload(workload=linked)
+
+            outside = root.parent / f"{root.name}-outside.py"
+            outside.write_text("VALUE = 1\n", "utf-8")
+            try:
+                for dependency in ("../" + outside.name, "linked-helper.py"):
+                    helper_link = root / "linked-helper.py"
+                    if dependency == "linked-helper.py" and not helper_link.exists():
+                        helper_link.symlink_to(outside)
+                    adapter = root / "adapter.py"
+                    _write_python_adapter(adapter)
+                    adapter.write_text(
+                        f'WORKLOAD_DEPENDENCIES = ["{dependency}"]\n'
+                        + adapter.read_text("utf-8"),
+                        "utf-8",
+                    )
+                    with self.subTest(dependency=dependency), self.assertRaisesRegex(
+                        ValueError, "dependency|symlink|escape"
+                    ):
+                        self.workloads.normalize_workload(workload=adapter)
+            finally:
+                outside.unlink(missing_ok=True)
+
+
+class CommandSecurityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workloads = _load_workload_adapter()
+
+    @staticmethod
+    def _objective_file(root: Path) -> Path:
+        path = root / "objective.json"
+        path.write_text(json.dumps(_objective()), "utf-8")
+        return path
+
+    def test_path_executable_is_absolute_frozen_and_drift_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = _write_executable(
+                root / "cuda-user-runner",
+                """
+                import json, os
+                from pathlib import Path
+                Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text(json.dumps({
+                    "validation": True,
+                    "benchmark": {"latency_ms": 1.0}
+                }))
+                """,
+            )
+            with mock.patch.dict(os.environ, {"PATH": str(root)}):
+                spec = self.workloads.normalize_workload(
+                    workload_cmd=["cuda-user-runner"],
+                    objective=self._objective_file(root),
+                )
+                self.assertEqual(spec.source[0], str(runner.resolve()))
+                runner.write_text(
+                    runner.read_text("utf-8").replace("1.0", "2.0"), "utf-8"
+                )
+                runner.chmod(0o755)
+                with self.assertRaisesRegex(ValueError, "source_hash"):
+                    self.workloads.run_spec_once(
+                        spec, candidate="candidate.py", role="candidate"
+                    )
+
+    def test_path_symlink_executable_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = _write_executable(root / "real-runner", "pass\n")
+            (root / "linked-runner").symlink_to(real)
+            with mock.patch.dict(os.environ, {"PATH": str(root)}), self.assertRaisesRegex(
+                ValueError, "symlink"
+            ):
+                self.workloads.normalize_workload(
+                    workload_cmd="linked-runner",
+                    objective=self._objective_file(root),
+                )
+
+    def test_output_is_bounded_redacted_and_secret_env_requires_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = _write_executable(
+                root / "noisy-runner",
+                """
+                import os, sys
+                sys.stdout.write("x" * 2_000_000)
+                sys.stderr.write(" API_TOKEN=" + str(os.getenv("API_TOKEN")))
+                raise SystemExit(9)
+                """,
+            )
+            env = {
+                "API_TOKEN": "top-secret-token",
+                "CUDA_OPTIMIZER_PASS_ENV": "API_TOKEN",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                spec = self.workloads.normalize_workload(
+                    workload_cmd=[str(runner)],
+                    objective=self._objective_file(root),
+                )
+                with self.assertRaises(RuntimeError) as raised:
+                    self.workloads.run_command_once(
+                        spec,
+                        candidate="candidate.py",
+                        role="candidate",
+                        case={},
+                    )
+            message = str(raised.exception)
+            self.assertLess(len(message), 12000)
+            self.assertNotIn("top-secret-token", message)
+            self.assertIn("REDACTED", message)
+
+    def test_timeout_terminates_grandchild_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pid_file = root / "child.pid"
+            runner = _write_executable(
+                root / "tree-runner",
+                """
+                import subprocess, sys, time
+                from pathlib import Path
+                child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                Path(sys.argv[1]).write_text(str(child.pid))
+                time.sleep(30)
+                """,
+            )
+            spec = self.workloads.normalize_workload(
+                workload_cmd=[str(runner), str(pid_file)],
+                objective=self._objective_file(root),
+            )
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                self.workloads.run_command_once(
+                    spec,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case={},
+                    timeout=0.5,
+                )
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text("utf-8"))
+            alive = True
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+            if alive:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    alive = False
+            self.assertFalse(alive, "grandchild survived workload timeout")
+
+
+class ContextAndStrictJsonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workloads = _load_workload_adapter()
+
+    def test_python_lifecycle_receives_detached_normalized_context(self) -> None:
+        events = []
+
+        class Adapter:
+            def prepare(self, candidate):
+                events.append(("prepare", copy.deepcopy(self.CUDA_OPTIMIZER_CONTEXT)))
+                self.CUDA_OPTIMIZER_CONTEXT["case"]["batch"] = 99
+
+            def validate(self, candidate):
+                events.append(("validate", copy.deepcopy(self.CUDA_OPTIMIZER_CONTEXT)))
+                return True
+
+            def benchmark(self, candidate):
+                events.append(("benchmark", copy.deepcopy(self.CUDA_OPTIMIZER_CONTEXT)))
+                return {"latency_ms": 1.0}
+
+            def metrics(self):
+                return _objective()
+
+            def cleanup(self):
+                events.append(("cleanup", copy.deepcopy(self.CUDA_OPTIMIZER_CONTEXT)))
+
+        adapter = Adapter()
+        case = {"batch": 4, "shape": [2, 8]}
+        result = self.workloads.run_once(
+            adapter,
+            candidate="candidate.py",
+            role="  candidate  ",
+            case=case,
+        )
+
+        self.assertEqual(result["role"], "candidate")
+        self.assertEqual(result["case"], case)
+        self.assertEqual(case["batch"], 4)
+        self.assertEqual([name for name, _ in events], ["prepare", "validate", "benchmark", "cleanup"])
+        self.assertEqual(events[0][1]["case"]["batch"], 4)
+        self.assertEqual(events[-1][1]["case"]["batch"], 99)
+        self.assertFalse(hasattr(adapter, "CUDA_OPTIMIZER_CONTEXT"))
+
+    def test_case_must_be_json_safe_mapping(self) -> None:
+        adapter, _ = PythonLifecycleTests()._adapter()
+        for invalid, message in (
+            ([], "case"),
+            ({1: "bad"}, "string keys"),
+            ({"value": math.nan}, "finite"),
+            ({"value": object()}, "JSON"),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                self.workloads.run_once(
+                    adapter,
+                    candidate="candidate.py",
+                    role="candidate",
+                    case=invalid,
+                )
+
+    def test_template_documents_exact_runtime_contract(self) -> None:
+        template = (TEMPLATE_DIR / "workload.py").read_text("utf-8")
+        for text in (
+            "WORKLOAD_DEPENDENCIES",
+            "CUDA_OPTIMIZER_CONTEXT",
+            "literal bool",
+            "finite JSON",
+            "environment",
+            "cleanup",
+        ):
+            self.assertIn(text, template)
+
+    def test_objective_and_manifest_reject_duplicate_and_nonfinite_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, payload, call, message in (
+                (
+                    "duplicate-objective.json",
+                    '{"primary_metric":{"name":"a","name":"b","direction":"lower"},"min_effect_pct":1,"constraints":[]}',
+                    lambda path: self.workloads.load_objective(path),
+                    "duplicate",
+                ),
+                (
+                    "nan-objective.json",
+                    '{"primary_metric":{"name":"a","direction":"lower"},"min_effect_pct":NaN,"constraints":[]}',
+                    lambda path: self.workloads.load_objective(path),
+                    "strict JSON|non-finite JSON",
+                ),
+                (
+                    "duplicate-manifest.json",
+                    '{"kind":"command","kind":"python","source":"x","cases":[],"objective":{}}',
+                    lambda path: self.workloads.normalize_workload(workload_manifest=path),
+                    "duplicate",
+                ),
+            ):
+                path = root / name
+                path.write_text(payload, "utf-8")
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                    call(path)
 
 
 if __name__ == "__main__":

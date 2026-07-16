@@ -5,19 +5,29 @@ end-to-end workload.  This template intentionally raises until the user has
 connected all five lifecycle functions to their own system.
 """
 
+# Optional local Python files whose exact bytes are part of the frozen workload
+# identity. Keep this a literal list/tuple of non-symlink relative paths.
+# External packages, services, and environment state remain user-owned runtime
+# dependencies and must be held stable by the experiment procedure.
+WORKLOAD_DEPENDENCIES = []
+
 
 def prepare(candidate):
-    """TODO: deploy/load ``candidate`` into the user's real test target."""
+    """TODO: deploy/load ``candidate`` using CUDA_OPTIMIZER_CONTEXT.
+
+    During every lifecycle call, CUDA_OPTIMIZER_CONTEXT is exactly
+    ``{"role": <trimmed role>, "case": <detached finite JSON object>}``.
+    """
     raise NotImplementedError("TODO: prepare the real workload target")
 
 
 def validate(candidate):
-    """TODO: validate correctness before collecting performance evidence."""
+    """TODO: return a literal bool or ``{"valid": <literal bool>, ...}``."""
     raise NotImplementedError("TODO: validate the real workload result")
 
 
 def benchmark(candidate):
-    """TODO: run one observation and return the raw user-owned result."""
+    """TODO: return one finite JSON object from the real user-owned workload."""
     raise NotImplementedError("TODO: benchmark the real workload")
 
 
