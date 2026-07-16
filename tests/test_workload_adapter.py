@@ -947,6 +947,10 @@ class UnifiedExecutionTests(unittest.TestCase):
         return subprocess.CompletedProcess(argv, 0, "ignored", "")
 
     def _assert_unified(self, result: dict, *, case: dict) -> None:
+        self.assertEqual(
+            set(result),
+            {"role", "case", "validation", "benchmark", "objective"},
+        )
         self.assertEqual(result["role"], "candidate")
         self.assertEqual(result["case"], case)
         self.assertIn("validation", result)
@@ -1003,7 +1007,6 @@ class UnifiedExecutionTests(unittest.TestCase):
                     "validation",
                     "benchmark",
                     "objective",
-                    "diagnostics",
                 },
             )
 

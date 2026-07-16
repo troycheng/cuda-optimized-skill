@@ -1393,8 +1393,6 @@ def run_spec_once(
             "benchmark": command_result["benchmark"],
             "objective": frozen_objective,
         }
-        if "diagnostics" in command_result:
-            result["diagnostics"] = command_result["diagnostics"]
         return result
 
     raise ValueError(f"unknown workload kind: {spec.kind}")
