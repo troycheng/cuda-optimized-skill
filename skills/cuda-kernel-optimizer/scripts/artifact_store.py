@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Mapping
 from pathlib import Path, PureWindowsPath
 from typing import Any, Optional, Union
 
@@ -147,35 +148,26 @@ def read_regular_with_optional_sibling(
         os.close(directory_fd)
 
 
-def remove_regular_file(path: _PathLike, *, missing_ok: bool = True) -> bool:
-    """Remove one regular file relative to a stable, no-follow parent dirfd."""
-    try:
-        directory_fd, leaf, target = _open_parent_directory(path, create=False)
-    except FileNotFoundError as error:
-        if missing_ok:
-            return False
-        raise ValueError(f"artifact file does not exist: {path}") from error
-    try:
-        try:
-            metadata = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError as error:
-            if missing_ok:
-                return False
-            raise ValueError(f"artifact file does not exist: {target}") from error
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"artifact path is not a regular file: {target}")
-        os.unlink(leaf, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-        return True
-    finally:
-        os.close(directory_fd)
+def _validate_leaf_name(value: str) -> str:
+    if type(value) is not str or not value or value in {".", ".."}:
+        raise ValueError("artifact bundle names must be non-empty file names")
+    path = Path(value)
+    windows_path = PureWindowsPath(value)
+    if (
+        path.is_absolute()
+        or windows_path.is_absolute()
+        or len(path.parts) != 1
+        or len(windows_path.parts) != 1
+    ):
+        raise ValueError("artifact bundle names must contain one relative component")
+    return value
 
 
-def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
-    """Atomically replace a file relative to one stable, no-follow parent dirfd."""
+def _atomic_write_leaf(
+    directory_fd: int, leaf: str, target: Path, payload: bytes
+) -> None:
     if not isinstance(payload, bytes):
         raise TypeError("atomic payload must be bytes")
-    directory_fd, leaf, target = _open_parent_directory(path, create=True)
     temporary_leaf = f".{leaf}.{secrets.token_hex(8)}.tmp"
     fd = None
     try:
@@ -195,7 +187,10 @@ def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
         )
         offset = 0
         while offset < len(payload):
-            offset += os.write(fd, payload[offset:])
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise OSError("atomic artifact write made no progress")
+            offset += written
         os.fsync(fd)
         os.close(fd)
         fd = None
@@ -205,7 +200,6 @@ def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
         )
-        os.fsync(directory_fd)
     except BaseException:
         if fd is not None:
             os.close(fd)
@@ -214,6 +208,132 @@ def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _remove_regular_leaf(
+    directory_fd: int, leaf: str, target: Path, *, missing_ok: bool
+) -> bool:
+    try:
+        metadata = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        if missing_ok:
+            return False
+        raise ValueError(f"artifact file does not exist: {target}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"artifact path is not a regular file: {target}")
+    os.unlink(leaf, dir_fd=directory_fd)
+    return True
+
+
+def remove_regular_file(path: _PathLike, *, missing_ok: bool = True) -> bool:
+    """Remove one regular file relative to a stable, no-follow parent dirfd."""
+    try:
+        directory_fd, leaf, target = _open_parent_directory(path, create=False)
+    except FileNotFoundError as error:
+        if missing_ok:
+            return False
+        raise ValueError(f"artifact file does not exist: {path}") from error
+    try:
+        removed = _remove_regular_leaf(
+            directory_fd, leaf, target, missing_ok=missing_ok
+        )
+        os.fsync(directory_fd)
+        return removed
+    finally:
+        os.close(directory_fd)
+
+
+def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
+    """Atomically replace a file relative to one stable, no-follow parent dirfd."""
+    if not isinstance(payload, bytes):
+        raise TypeError("atomic payload must be bytes")
+    directory_fd, leaf, target = _open_parent_directory(path, create=True)
+    try:
+        _atomic_write_leaf(directory_fd, leaf, target, payload)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def publish_regular_bundle(directory: _PathLike, writes, removals=()) -> dict:
+    """Publish regular-file writes/removals through one stable directory fd."""
+    if not isinstance(writes, Mapping):
+        raise ValueError("artifact bundle writes must be a mapping")
+    if isinstance(removals, (str, bytes, bytearray, Mapping)):
+        raise ValueError("artifact bundle removals must be a sequence")
+    try:
+        removal_names = list(removals)
+    except TypeError as error:
+        raise ValueError("artifact bundle removals must be a sequence") from error
+    clean_writes = []
+    expected_hashes = {}
+    for name, payload in writes.items():
+        leaf = _validate_leaf_name(name)
+        if not isinstance(payload, bytes):
+            raise TypeError("artifact bundle payloads must be bytes")
+        clean_writes.append((leaf, payload))
+        expected_hashes[leaf] = hashlib.sha256(payload).hexdigest()
+    clean_removals = [_validate_leaf_name(name) for name in removal_names]
+    if len(set(clean_removals)) != len(clean_removals):
+        raise ValueError("artifact bundle removals must be unique")
+    if set(expected_hashes).intersection(clean_removals):
+        raise ValueError("artifact bundle cannot write and remove the same file")
+
+    directory_path = Path(
+        os.path.abspath(os.path.expanduser(os.fspath(directory)))
+    )
+    marker = directory_path / ".publish-bundle"
+    try:
+        directory_fd, _leaf, _target = _open_parent_directory(
+            marker, create=False
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"artifact publish directory is missing, a symlink, or unsafe: {directory_path}"
+        ) from error
+    original = os.fstat(directory_fd)
+    if not stat.S_ISDIR(original.st_mode):
+        os.close(directory_fd)
+        raise ValueError(f"artifact publish path is not a directory: {directory_path}")
+    try:
+        for leaf, payload in clean_writes:
+            target = directory_path / leaf
+            _atomic_write_leaf(directory_fd, leaf, target, payload)
+            published = _read_regular_leaf(
+                directory_fd, leaf, target, missing_ok=False
+            )
+            if hashlib.sha256(published).hexdigest() != expected_hashes[leaf]:
+                raise ValueError(
+                    f"published artifact does not match captured payload: {target}"
+                )
+        for leaf in clean_removals:
+            _remove_regular_leaf(
+                directory_fd,
+                leaf,
+                directory_path / leaf,
+                missing_ok=True,
+            )
+        os.fsync(directory_fd)
+
+        identity_fd = None
+        try:
+            identity_fd, _leaf, _target = _open_parent_directory(
+                marker, create=False
+            )
+            current = os.fstat(identity_fd)
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                "artifact publish directory was replaced, is a symlink, or unsafe: "
+                f"{directory_path}"
+            ) from error
+        finally:
+            if identity_fd is not None:
+                os.close(identity_fd)
+        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+            raise ValueError(
+                f"artifact publish directory was replaced: {directory_path}"
+            )
+        return expected_hashes
     finally:
         os.close(directory_fd)
 

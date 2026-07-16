@@ -2393,20 +2393,23 @@ class OuterLoopTests(unittest.TestCase):
             outside = root / "outside"
             outside.mkdir()
             (outside / "kernel.py").write_bytes(b"# attacker\n")
-            original_writer = self.orchestrate.atomic_write_bytes
+            artifact_store = sys.modules["artifact_store"]
+            original_writer = artifact_store._atomic_write_leaf
             swapped = False
 
-            def replace_parent_after_write(path, payload):
+            def replace_parent_after_write(
+                directory_fd, leaf, target, payload
+            ):
                 nonlocal swapped
-                original_writer(path, payload)
-                if not swapped and Path(path).name == "kernel.py":
+                original_writer(directory_fd, leaf, target, payload)
+                if not swapped and leaf == "kernel.py":
                     swapped = True
                     iter_dir.rename(displaced)
                     iter_dir.symlink_to(outside, target_is_directory=True)
 
             with mock.patch.object(
-                self.orchestrate,
-                "atomic_write_bytes",
+                artifact_store,
+                "_atomic_write_leaf",
                 side_effect=replace_parent_after_write,
             ):
                 with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
@@ -2414,6 +2417,66 @@ class OuterLoopTests(unittest.TestCase):
                         {"candidate_file": str(candidate_file)},
                         iter_dir=iter_dir,
                     )
+
+    def test_publish_keeps_using_original_directory_after_kernel_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            candidate_dir = root / "candidate"
+            candidate_dir.mkdir()
+            candidate_file = candidate_dir / "kernel.py"
+            original_kernel = b"# candidate\n"
+            original_bench = b'{"correctness":{"passed":true}}\n'
+            candidate_file.write_bytes(original_kernel)
+            (candidate_dir / "bench.json").write_bytes(original_bench)
+            iter_dir = root / "iterv1"
+            iter_dir.mkdir()
+            (iter_dir / "kernel.cu").write_bytes(b"// stale\n")
+            (iter_dir / "bench.json").write_bytes(b'{"stale":true}\n')
+            displaced = root / "iterv1-displaced"
+            outside = root / "outside"
+            outside.mkdir()
+            outside_payloads = {
+                "kernel.py": b"# outside python\n",
+                "kernel.cu": b"// outside cuda\n",
+                "bench.json": b'{"outside":true}\n',
+            }
+            for name, payload in outside_payloads.items():
+                (outside / name).write_bytes(payload)
+            artifact_store = sys.modules["artifact_store"]
+            original_reader = artifact_store._read_regular_leaf
+            swapped = False
+
+            def replace_parent_after_kernel_verification(
+                directory_fd, leaf, target, *, missing_ok
+            ):
+                nonlocal swapped
+                payload = original_reader(
+                    directory_fd, leaf, target, missing_ok=missing_ok
+                )
+                if not swapped and target == iter_dir / "kernel.py":
+                    swapped = True
+                    iter_dir.rename(displaced)
+                    iter_dir.symlink_to(outside, target_is_directory=True)
+                return payload
+
+            with mock.patch.object(
+                artifact_store,
+                "_read_regular_leaf",
+                side_effect=replace_parent_after_kernel_verification,
+            ):
+                with self.assertRaisesRegex(ValueError, "replaced|symlink|unsafe"):
+                    self.orchestrate._publish_outer_candidate(
+                        {"candidate_file": str(candidate_file)},
+                        iter_dir=iter_dir,
+                    )
+
+            for name, payload in outside_payloads.items():
+                outside_file = outside / name
+                self.assertTrue(outside_file.is_file(), name)
+                self.assertEqual(outside_file.read_bytes(), payload)
+            self.assertEqual((displaced / "kernel.py").read_bytes(), original_kernel)
+            self.assertEqual((displaced / "bench.json").read_bytes(), original_bench)
+            self.assertFalse((displaced / "kernel.cu").exists())
 
     def test_kernel_only_terminal_never_calls_workload_and_can_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

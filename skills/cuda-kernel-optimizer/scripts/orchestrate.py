@@ -36,11 +36,10 @@ if str(SCRIPT_DIR) not in sys.path:
 from artifact_store import (  # noqa: E402
     ArtifactStore,
     CURRENT_SCHEMA_VERSION,
-    atomic_write_bytes,
     atomic_write_json,
+    publish_regular_bundle,
     read_regular_bytes,
     read_regular_with_optional_sibling,
-    remove_regular_file,
     sha256_file,
     write_paired_samples,
 )
@@ -1315,16 +1314,11 @@ def _publish_outer_candidate(
     destination = iter_dir / f"kernel{suffix}"
     if hashlib.sha256(snapshot["payload"]).hexdigest() != snapshot["sha256"]:
         raise ValueError("candidate snapshot payload does not match sha256")
-    atomic_write_bytes(destination, snapshot["payload"])
-    if sha256_file(destination) != snapshot["sha256"]:
-        raise ValueError("published candidate does not match captured snapshot")
-    for stale_suffix in {".cu", ".py"} - {suffix}:
-        stale = iter_dir / f"kernel{stale_suffix}"
-        if stale.is_symlink() or stale.is_file():
-            stale.unlink()
-        elif stale.exists():
-            raise ValueError("stale iteration kernel is not a regular file")
-    destination_bench = iter_dir / "bench.json"
+    writes = {destination.name: snapshot["payload"]}
+    removals = [
+        f"kernel{stale_suffix}"
+        for stale_suffix in {".cu", ".py"} - {suffix}
+    ]
     bench_snapshot = snapshot.get("bench")
     if bench_snapshot is not None:
         if (
@@ -1332,11 +1326,17 @@ def _publish_outer_candidate(
             != bench_snapshot["sha256"]
         ):
             raise ValueError("bench snapshot payload does not match sha256")
-        atomic_write_bytes(destination_bench, bench_snapshot["payload"])
-        if sha256_file(destination_bench) != bench_snapshot["sha256"]:
-            raise ValueError("published bench does not match captured snapshot")
+        writes["bench.json"] = bench_snapshot["payload"]
     else:
-        remove_regular_file(destination_bench, missing_ok=True)
+        removals.append("bench.json")
+    published_hashes = publish_regular_bundle(iter_dir, writes, removals)
+    if published_hashes[destination.name] != snapshot["sha256"]:
+        raise ValueError("published candidate does not match captured snapshot")
+    if (
+        bench_snapshot is not None
+        and published_hashes["bench.json"] != bench_snapshot["sha256"]
+    ):
+        raise ValueError("published bench does not match captured snapshot")
     return str(Path(os.path.abspath(destination)))
 
 
