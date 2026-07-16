@@ -799,13 +799,13 @@ def measure_once(state, *, cuda=None):
         state["callable"], warmup=0, repeat=1, cuda=cuda
     )[0]
     if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError("timing must be a finite non-negative real number")
+        raise ValueError("timing must be a finite positive real number")
     try:
         timing = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError("timing must be a finite non-negative real number") from exc
-    if not math.isfinite(timing) or timing < 0:
-        raise ValueError("timing must be a finite non-negative real number")
+        raise ValueError("timing must be a finite positive real number") from exc
+    if not math.isfinite(timing) or timing <= 0:
+        raise ValueError("timing must be a finite positive real number")
     return timing
 
 

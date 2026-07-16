@@ -172,7 +172,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_measure_once_rejects_invalid_elapsed_time(self) -> None:
         benchmark = _load_benchmark()
         benchmark._reset_tensor_inputs = lambda _state: None
-        for value in (-1, True, "1", math.nan, math.inf, -math.inf):
+        for value in (0, 0.0, -1, True, "1", math.nan, math.inf, -math.inf):
             benchmark._time_iterations = lambda *_args, **_kwargs: [value]
             with self.subTest(value=value), self.assertRaisesRegex(
                 ValueError, "timing"
