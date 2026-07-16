@@ -127,6 +127,28 @@ def _resolved_path(path: str) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
 
+def _validate_candidate_contract(
+    *, status: str, declared_candidate, candidate_file
+) -> None:
+    if status in _WIN_STATUSES:
+        if _resolved_path(declared_candidate) != _resolved_path(candidate_file):
+            raise ValueError(
+                "decision.json candidate_file does not match the update kernel"
+            )
+        return
+
+    if declared_candidate is None and candidate_file is None:
+        return
+    if declared_candidate is None or candidate_file is None:
+        raise ValueError(
+            "decision.json candidate_file conflicts with the supplied kernel"
+        )
+    if _resolved_path(declared_candidate) != _resolved_path(candidate_file):
+        raise ValueError(
+            "decision.json candidate_file does not match the update kernel"
+        )
+
+
 def _validate_decision_statistics(
     payload, *, required: bool, field_name: str = "statistics"
 ) -> dict | None:
@@ -168,7 +190,7 @@ def _validate_decision_statistics(
 
 
 def _load_decision(
-    path: str, *, candidate_file: str
+    path: str, *, candidate_file: str | None
 ) -> tuple[dict, str, dict | None, dict | None]:
     if not os.path.isfile(path):
         raise ValueError(f"decision.json missing: {path}")
@@ -184,10 +206,11 @@ def _load_decision(
             "decision.json status must be a recognized terminal status"
         )
     declared_candidate = decision.get("candidate_file")
-    if _resolved_path(declared_candidate) != _resolved_path(candidate_file):
-        raise ValueError(
-            "decision.json candidate_file does not match the update kernel"
-        )
+    _validate_candidate_contract(
+        status=status,
+        declared_candidate=declared_candidate,
+        candidate_file=candidate_file,
+    )
     statistics = _validate_decision_statistics(
         decision.get("statistics"), required=status in _WIN_STATUSES
     )

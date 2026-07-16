@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "cuda-kernel-optimizer" / "scripts"
 BRANCH_EXPLORE_PATH = SCRIPTS / "branch_explore.py"
 RUN_ITERATION_PATH = SCRIPTS / "run_iteration.py"
+STATE_PATH = SCRIPTS / "state.py"
 
 
 def _load(path: Path, name: str):
@@ -146,6 +147,21 @@ class BranchExploreTests(unittest.TestCase):
             self.assertFalse((root / "run" / "iterv1" / "kernel.py").exists())
             self.assertEqual(Path(payload["best_file"]).read_bytes(), before_best)
             self.assertEqual(state_path.read_bytes(), before_state)
+            decision_path = root / "run" / "iterv1" / "decision.json"
+            state_module = _load(STATE_PATH, "cuda_optimizer_state_consumer")
+            decision, status, statistics, workload_statistics = (
+                state_module._load_decision(
+                    str(decision_path), candidate_file=None
+                )
+            )
+            self.assertEqual(status, "no_confirmed_kernel_win")
+            self.assertIsNone(decision["candidate_file"])
+            self.assertIsNone(statistics)
+            self.assertIsNone(workload_statistics)
+            self.assertEqual(
+                state_module._promotion_for(status, "kernel-only"),
+                ("no_confirmed_kernel_win", False),
+            )
 
     def test_confirmed_winners_are_stably_sorted_by_estimate(self) -> None:
         branch_explore = _load_branch_explore()

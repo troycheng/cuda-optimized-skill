@@ -369,6 +369,42 @@ class StateDecisionPromotionTests(unittest.TestCase):
 
         self.assertEqual(unchanged["best_file"], before["best_file"])
 
+    def test_no_win_candidate_contract_accepts_null_but_rejects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            decision_path = root / "decision.json"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "candidate_file": None,
+                        "statistics": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            decision, status, statistics, workload = self.state._load_decision(
+                str(decision_path), candidate_file=None
+            )
+            self.assertEqual(decision["status"], "no_confirmed_kernel_win")
+            self.assertEqual(status, "no_confirmed_kernel_win")
+            self.assertIsNone(statistics)
+            self.assertIsNone(workload)
+
+            conflicting = root / "kernel.py"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "candidate_file": str(conflicting),
+                        "statistics": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "candidate_file"):
+                self.state._load_decision(str(decision_path), candidate_file=None)
+
     def test_confirmed_win_with_conflicting_statistics_status_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args, state_path, _candidate, before = self._fixture(

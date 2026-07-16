@@ -235,6 +235,26 @@ def cmd_close_iter(args):
     if branch_result.returncode != 0:
         sys.exit(f"branch_explore failed rc={branch_result.returncode}")
 
+    try:
+        branch_payload = json.loads(branch_result.stdout or "")
+    except json.JSONDecodeError as error:
+        sys.exit(f"branch_explore returned malformed JSON: {error}")
+    if not isinstance(branch_payload, dict):
+        sys.exit("branch_explore output must be a JSON object")
+    if branch_payload.get("status") == "no_confirmed_kernel_win":
+        decision_path = os.path.join(iter_dir, "decision.json")
+        print(json.dumps({
+            "iter": args.iter,
+            "status": "no_confirmed_kernel_win",
+            "decision": decision_path,
+            "state": state_path,
+            "next_step": (
+                "No candidate was promoted. Continue with another iteration "
+                "or finalize the run with the current best."
+            ),
+        }, indent=2))
+        return
+
     # Find champion kernel
     kernel = None
     for ext in (".cu", ".py"):
