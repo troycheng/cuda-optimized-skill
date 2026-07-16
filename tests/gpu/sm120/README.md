@@ -18,3 +18,9 @@ docker run --rm --gpus device=1 \
 Re-check GPU utilization immediately before the command. Do not point the
 working directory at `/data/vllm-opt` or install into a running service
 container.
+
+The acceptance runner requires each backend to pass reference correctness and
+to emit `samples_ms`, `median_ms`, `p95_ms`, `stddev_ms`, and `cv_pct`. Set a
+different `CUDA_E2E_ARTIFACTS` directory for every toolchain lane so results are
+never overwritten. Nsight Compute counter access is validated separately with
+a real target-bounded profile; `ncu --query-metrics` alone is insufficient.

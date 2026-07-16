@@ -2,9 +2,9 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Claude skill that iteratively optimizes a CUDA / CUTLASS / Triton kernel against a Python reference, using `nsight-compute` (`ncu`) as the source of evidence for each optimization decision.
+A Codex-compatible skill that iteratively optimizes a CUDA / CUTLASS / Triton kernel against a Python reference. It combines correctness checks, robust timing distributions, optional `nsight-compute` (`ncu`) profiling, branch selection, ablation, and SASS verification.
 
-This is a **skill package**, not a standalone tool. Claude reads `SKILL.md` and drives the loop. The scripts under `scripts/` handle the deterministic parts (environment detection, profiling, benchmarking, state).
+This is a **skill package**, not a standalone tool. An agent reads `SKILL.md` and drives the loop. The scripts under `scripts/` handle the deterministic parts (environment detection, profiling, benchmarking, and state).
 
 ---
 
@@ -24,16 +24,40 @@ V2 upgrades the loop from "try-and-log" into "try–attribute–verify–learn".
 - **Branch-and-Select exploration** — each iteration generates K branch candidates (default K=4) sharing the same methods but varying tile size, pipeline stages, warp count, and implementation variants. The fastest correct branch wins as champion; the rest are archived in `frontier`.
 - **Ablation-based attribution** — after the champion is picked, each method is ablated one at a time. `attribution(m) = ms_without_m − ms_champion` gives a per-method causal contribution instead of a single packed verdict.
 - **SASS instruction-level verification** — `cuobjdump --dump-sass` is grepped against a signature table (`sass_signatures.json`) to confirm each claimed optimization actually appears in the compiled machine code.
+- **Noise-aware measurements** — benchmark JSON preserves independent samples, median, nearest-rank p95, population standard deviation, and median-normalized CV. Branches are ranked by median and annotated when their difference is inside the configured noise band.
 
 These together change method classification from two buckets (effective / ineffective) to three: `effective_methods` (SASS ✓ and attribution > noise), `ineffective_methods` (SASS ✓ but attribution ≤ noise), and `implementation_failed_methods` (SASS ✗).
 
+## RTX 5090 validation
+
+The opt-in SM120 matrix passed on a physical RTX 5090 on 2026-07-16 for
+Triton, native CUDA, and CUTLASS correctness plus timing artifacts.
+
+| Lane | CUDA compiler | Triton | CUTLASS | Nsight Compute | Result |
+|---|---:|---:|---:|---:|---|
+| Compatibility | 13.0.1 | 3.6.0 | 4.6.1 | 2025.3.1 | 3/3 backends passed |
+| Current | 13.3.73 | 3.7.1 | 4.6.1 | 2026.2.1 | 3/3 backends passed |
+
+The host blocked hardware-counter access with `ERR_NVGPUCTRPERM` in both
+lanes. The skill correctly records `can_read_counters: false` and retains the
+failure log; no privileged capability or driver policy change was used. See
+[`tests/gpu/sm120/README.md`](tests/gpu/sm120/README.md) for the opt-in command.
+
+An additional isolated vLLM SM120 blockwise-FP8 `down_proj`
+(`m=1,n=8704,k=5120`) binary A/B used five fresh processes per candidate and
+200 timed launches per process. Both candidates passed correctness; medians
+were 20.482 us and 20.483 us, so the run stopped inside the 2% noise band. The
+captured source headers were byte-identical despite distinct extension hashes,
+so this is intentionally reported as binary evidence rather than a new
+source-patch validation.
+
 ## What you need
 
-On the host where Claude runs:
+On the host where the agent runs:
 
 - A CUDA GPU with working drivers (`nvidia-smi` works)
 - `nvcc` in `$PATH` (for CUDA / CUTLASS backends)
-- `ncu` in `$PATH` with permission to read perf counters — without it, the skill degrades to code-static reasoning only, which is significantly weaker
+- `ncu` in `$PATH` if profiler metrics are required. Without counter access, the skill records the concrete failure and continues with correctness, timing, source, and SASS evidence.
 - `cuobjdump` in `$PATH` (ships with the CUDA toolkit) — needed for V2's SASS verification step
 - Python 3.10+ with `torch` (CUDA build), `triton` if you want the Triton backend
 - For CUTLASS kernels: `$CUTLASS_PATH` or `$CUTLASS_INCLUDE_DIR` pointing at a tree with both `cutlass/` and `cute/` headers
@@ -42,13 +66,13 @@ On the host where Claude runs:
 
 ### `ncu` permission gotcha
 
-On most cloud and container setups, profiling-counter access is disabled. You'll see it as `can_read_counters: false` in `env.json`. Fixes (pick one):
+On many cloud and container setups, profiling-counter access is disabled. You'll see it as `can_read_counters: false` in `env.json`. Do not change host policy or add container capabilities automatically. With explicit operator authorization, possible remedies include:
 
 - Run the host as root, or
 - Add `options nvidia NVreg_RestrictProfilingToAdminUsers=0` to `/etc/modprobe.d/nvidia.conf` and reboot, or
 - For docker: `--cap-add=SYS_ADMIN` (Nsight docs recommend this)
 
-## What you give Claude
+## What you provide
 
 1. **Baseline kernel file** — `gemm.cu` (CUDA/CUTLASS) or `gemm.py` (Triton)
 2. **Reference file** — `ref.py` exposing `reference(**kwargs)` and optional `atol` / `rtol`
@@ -72,15 +96,16 @@ run_YYYYMMDD_HHMMSS/
 ├── iterv1/
 │   ├── roofline.json            # Δc / Δm / Δl + per-axis budget allocation
 │   ├── methods.json             # methods picked under the budget (trigger_strength included)
-│   ├── analysis.md              # ncu metrics + CoT + risk notes
-│   ├── best_input.ncu-rep       # profile of what went IN
+│   ├── analysis.md              # evidence, decisions, validation, and risks
+│   ├── best_input.ncu-rep       # present when target profiling succeeds
 │   ├── branches/                # K branch candidates (same methods, different hyperparams)
 │   │   ├── b0/kernel.{cu,py} + bench.json
 │   │   ├── b1/…
 │   │   └── …
 │   ├── kernel.{cu,py}           # champion kernel (fastest correct branch)
-│   ├── kernel.ncu-rep           # profile of the champion
-│   ├── ncu_top.json             # top-K metrics per axis (what Claude sees)
+│   ├── kernel.ncu-rep           # present when champion profiling succeeds
+│   ├── ncu_top.json             # available top-K metrics per axis
+│   ├── *.ncu.log                # preserved success or failure logs
 │   ├── sass_check.json          # per-method SASS signature verification
 │   ├── ablations/               # leave-one-out ablation runs
 │   │   ├── no_<method_a>/kernel.{cu,py} + bench.json
@@ -94,7 +119,7 @@ run_YYYYMMDD_HHMMSS/
 
 ## Manual invocation
 
-You don't need to drive the loop by hand — that's Claude's job — but for debugging the skill itself:
+You do not need to drive the loop by hand, but these commands are useful when debugging the skill itself:
 
 ```bash
 # 0 + 0b + 1 + 2 + 3a-for-iter1
@@ -107,7 +132,7 @@ python scripts/orchestrate.py setup \
   --dims       '{"M":4096,"N":4096,"K":4096}'
   # --benchmark defaults to scripts/benchmark.py (bundled)
 
-# --- (Claude writes iterv1/kernel.cu + iterv1/methods.json + iterv1/analysis.md
+# --- (The agent writes iterv1/kernel.cu + iterv1/methods.json + iterv1/analysis.md
 #      + K branch candidates under iterv1/branches/) ---
 
 # 3d + 3f + 3a-for-iter2 for iter 1
@@ -129,7 +154,7 @@ Each script is independently invocable (`--help` on any of them); `orchestrate.p
 
 ```text
 cuda-kernel-optimizer/
-├── SKILL.md                         # the skill — Claude reads this
+├── SKILL.md                         # skill entry point
 ├── README.md                        # you are here
 ├── scripts/
 │   ├── benchmark.py                 # bundled benchmark driver (from project)
@@ -147,19 +172,19 @@ cuda-kernel-optimizer/
 │   └── orchestrate.py               # end-to-end CLI (setup/close-iter/finalize)
 ├── references/
 │   ├── ncu_metrics_guide.md         # bottleneck → optimization mapping
-│   ├── optimization_catalog.md      # priority-ordered catalog (Claude reads)
+│   ├── optimization_catalog.md      # priority-ordered catalog
 │   ├── method_registry.json         # machine-readable mirror (validator reads)
 │   └── sass_signatures.json         # [V2] method → expected SASS instruction signatures
 ├── templates/
-│   ├── iteration_report.md          # analysis.md skeleton Claude fills in
+│   ├── iteration_report.md          # analysis.md skeleton
 │   └── methods.schema.json          # schema for methods.json (V2: adds trigger_strength)
 └── examples/
     └── walkthrough.md               # annotated example session
 ```
 
-## How Claude uses this
+## How an agent uses this
 
-When a user says "optimize `gemm.cu`", Claude:
+When a user says "optimize `gemm.cu`", the agent:
 
 1. reads `SKILL.md`
 2. calls `orchestrate.py setup` (which runs env check → preflight → init → seed baseline → first profile)
@@ -183,7 +208,7 @@ See `examples/walkthrough.md` for a full example and `SKILL.md` for the formal p
 
 ## Limits and honest caveats
 
-- **Ceiling**: if your reference is already cuBLAS / cuDNN / cuBLASLt, meaningful wins require algorithmic changes (split-K, stream-K, fused epilogues, mixed precision) that Claude may or may not find in a 3-iteration budget. Large speedups are easier when the baseline is hand-rolled.
+- **Ceiling**: if your reference is already cuBLAS / cuDNN / cuBLASLt, meaningful wins require algorithmic changes (split-K, stream-K, fused epilogues, mixed precision) that may not fit a 3-iteration budget. Large speedups are easier when the baseline is hand-rolled.
 - **Noise**: kernels running under ~50 μs are dominated by launch overhead. The skill's default 2% noise threshold helps, but if your dims are tiny, raise `--repeat` or the dimensions. Ablation attribution uses the same threshold — sub-noise contributions are classified as `ineffective_methods`.
 - **Triton + `@triton.autotune`**: autotuning under `ncu` is slow and can time out. Either pre-bake a single config before profiling, or set `--launch-count 1` and increase warmup.
 - **ncu CSV column names**: older `ncu` (< 2022.1) emits `"Metric Value"` with different capitalization/units; `profile_ncu.py` is tolerant but if you see all zeros check the `.ncu.log` file in the iteration directory.
@@ -213,4 +238,3 @@ This skill is independent of and does not redistribute CUTLASS, Triton, or Nsigh
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=KernelFlow-ops/cuda-optimized-skill&type=date&legend=top-left" />
  </picture>
 </a>
-

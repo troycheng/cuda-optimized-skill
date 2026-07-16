@@ -1,14 +1,28 @@
 # CUDA Ecosystem Compatibility
 
-Validated on **2026-07-15**. These are validation targets, not hard minimums.
+Validated on **2026-07-16**. These are validation targets, not hard minimums.
 Probe the installed environment before selecting an optimization path.
 
 | Component | Validation target | Runtime rule |
 |---|---|---|
-| CUDA Toolkit | CUDA Toolkit 13.3 | Use `nvcc --version` and compile a minimal target-specific kernel. |
+| CUDA Toolkit | CUDA Toolkit 13.3 Update 1 | Use `nvcc --version` and compile a minimal target-specific kernel. |
 | Nsight Compute | Nsight Compute 2026.2.1 | This release line supports CUDA 13.3. Query metric metadata, then run a real target profile to establish counter access. |
 | Triton | Triton 3.7.1 | Inspect callable signatures before using optional or experimental arguments. |
 | CUTLASS | CUTLASS 4.6.1 | Read `cutlass/version.h` or `cutlass.version`; compile the selected C++ or CuTe DSL example for the exact target. |
+
+## Observed RTX 5090 lanes
+
+Both isolated lanes passed the same opt-in SM120 correctness and timing matrix
+for Triton, native CUDA, and CUTLASS:
+
+| Lane | nvcc | PyTorch | Triton | CUTLASS | ncu | Counter verdict |
+|---|---:|---:|---:|---:|---:|---|
+| Compatibility | 13.0.1 | 2.11.0+cu130 | 3.6.0 | 4.6.1 | 2025.3.1 | `ERR_NVGPUCTRPERM` |
+| Current | 13.3.73 | 2.11.0+cu130 | 3.7.1 | 4.6.1 | 2026.2.1 | `ERR_NVGPUCTRPERM` |
+
+The counter verdict is a host-policy result, not a toolchain compatibility
+failure. A successful `ncu --query-metrics` is not counter-access proof. These
+runs did not add `SYS_ADMIN`, run privileged containers, or change the driver.
 
 ## Architecture capability rules
 

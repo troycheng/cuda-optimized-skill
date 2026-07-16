@@ -21,7 +21,11 @@ the skill runs an **evidence-guided, branch-and-select iterative optimization lo
 2. **Branch-and-Select**: each iteration generates K candidate kernels (hyperparameter/implementation variants), benchmarks all, selects champion. 
 3. **Ablation attribution**: after selecting champion, each method is individually ablated to determine its actual contribution.
 4. **SASS verification**: `cuobjdump --dump-sass` confirms claimed optimizations actually appear in generated code.
-5. **Every iteration produces a full ncu report** on the champion kernel.
+5. **Profiler-aware evidence**: when performance counters are accessible, every
+   iteration profiles the input and champion. When they are unavailable, the
+   run records the exact failure and continues with correctness, timing
+   distributions, source inspection, and SASS evidence without inventing
+   profiler conclusions.
 
 ## Inputs the skill expects from the user
 
@@ -45,15 +49,17 @@ If any of these are missing, ask the user once — briefly — then proceed.
 1. init run folder    → run_YYYYMMDD_HHMMSS/
 2. copy baseline      → baseline/ + bench once to seed `best`
 3. for i in 1..N:
-     a. profile best_kernel with ncu (--set full)  → iterv{i}/best_input.ncu-rep
-     b. extract top compute/mem/latency            → ncu_top.json
-     c. roofline.py: compute Δ_c, Δ_m, Δ_l        → roofline.json + axis_budget
-        if near_peak (all Δ < 0.15) → early stop
+     a. profile best_kernel with ncu when permitted → best_input.ncu-rep
+        otherwise record the exact profiler failure
+     b. extract available compute/mem/latency evidence → ncu_top.json
+     c. roofline.py: compute evidenced Δ_c, Δ_m, Δ_l → roofline.json + axis_budget
+        if all three gaps exist and are < 0.15 → early stop
      d. Agent selects methods (b_axis per axis, cap=2) → analysis.md (decision record)
      e. Agent writes K branch kernels (same methods, diff hyperparams)
      f. branch_explore.py: compile + bench all K   → select champion
      g. if champion FAIL: regenerate (max 3 retries)
-     h. ncu profile champion (--set full)          → iterv{i}/kernel.ncu-rep
+     h. profile champion when counters are accessible; otherwise preserve the
+        failed command, return code, and log
      i. ablate.py: single-method rollback bench    → attribution.json
      j. sass_check.py: verify SASS signatures      → sass_check.json
      k. update state with attribution + SASS results
@@ -133,7 +139,7 @@ python <skill>/scripts/run_iteration.py seed-baseline \
 
 ## Step 3 — Iteration loop (repeat for i = 1..N)
 
-### 3a. Profile the current `best` with ncu (FULL report — mandatory)
+### 3a. Profile the current `best` with ncu when available
 
 ```bash
 python <skill>/scripts/profile_ncu.py \
@@ -142,7 +148,11 @@ python <skill>/scripts/profile_ncu.py \
   --which best_input
 ```
 
-Writes `iterv{i}/best_input.ncu-rep` (full ncu report) and `iterv{i}/ncu_top.json`.
+On success, writes `iterv{i}/best_input.ncu-rep` and
+`iterv{i}/ncu_top.json`. On failure, preserve the command, return code, and log;
+update `env.json.ncu.can_read_counters` and state with the concrete verdict.
+Do not retry by adding container capabilities, changing driver settings, or
+running privileged commands unless the user explicitly authorizes that change.
 
 ### 3b. Compute bottleneck evidence and axis budgets
 
@@ -232,7 +242,7 @@ Compiles and benchmarks all K branches (no ncu). Selects champion = fastest vali
 
 If the champion fails correctness, the agent rewrites it and re-runs 3e.
 
-### 3g. Profile champion with ncu (FULL report — mandatory)
+### 3g. Profile the champion with ncu when available
 
 ```bash
 python <skill>/scripts/profile_ncu.py \
@@ -241,7 +251,10 @@ python <skill>/scripts/profile_ncu.py \
   --which kernel
 ```
 
-Writes `iterv{i}/kernel.ncu-rep` — **every iteration must have a full ncu report on the champion**.
+On success, writes `iterv{i}/kernel.ncu-rep`. If counter access or target
+profiling is unavailable, write the explicit unsupported/error evidence instead
+and continue in degraded mode. A missing report must never be represented as a
+successful profile.
 
 ### 3h. Ablation attribution
 
@@ -320,7 +333,8 @@ python <skill>/scripts/summarize.py \
 - **Champion chosen but all methods have near-zero attribution** → the speedup came from hyperparameter change, not methods. Record in analysis.md.
 - **SASS signature missing but kernel is faster** → nvcc took a different path. Mark method as `implementation_failed` but keep the kernel if it's faster.
 - **Branch explore: all K branches fail validation** → the agent must rewrite with a different approach.
-- **Early stop triggered** → all Δ < 0.15, kernel is near roofline. Report to user.
+- **Early stop triggered** → all three evidenced Δ values are below 0.15; report
+  the measured basis. Missing profiler metrics cannot trigger this conclusion.
 
 ---
 
@@ -338,9 +352,10 @@ python <skill>/scripts/summarize.py \
 │   ├── analysis.md           (roofline + evidence-backed method decisions)
 │   ├── methods.json
 │   ├── roofline.json
-│   ├── best_input.ncu-rep    (profile of best going INTO this iter)
+│   ├── best_input.ncu-rep    (when target profiling succeeds)
 │   ├── ncu_top.json
-│   ├── kernel.ncu-rep        (profile of champion — ALWAYS present)
+│   ├── kernel.ncu-rep        (when champion profiling succeeds)
+│   ├── *.ncu.log             (always preserve profiler success/failure logs)
 │   ├── attribution.json
 │   ├── sass_check.json
 │   ├── bench.json

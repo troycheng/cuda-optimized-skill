@@ -71,7 +71,7 @@ class CompatibilityTests(unittest.TestCase):
     def test_version_targets_and_capability_rules_are_documented(self) -> None:
         text = COMPATIBILITY.read_text(encoding="utf-8")
         for expected in (
-            "2026-07-15",
+            "2026-07-16",
             "CUDA Toolkit 13.3",
             "Nsight Compute 2026.2.1",
             "Triton 3.7.1",
