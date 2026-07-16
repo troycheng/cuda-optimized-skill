@@ -1827,7 +1827,9 @@ def _validate_sanitizer_report(
         raise ValueError("sanitizer report must contain a JSON object")
     clean = _strict_json_copy(report, "sanitizer report")
     status = clean.get("status")
-    if status not in {"passed", "failed", "unavailable", "not_applicable"}:
+    if status not in {
+        "passed", "failed", "unavailable", "not_applicable", "timed_out"
+    }:
         raise ValueError("sanitizer report status is invalid")
     expected_passed = status in {"passed", "not_applicable"}
     if clean.get("passed") is not expected_passed:
@@ -1837,6 +1839,7 @@ def _validate_sanitizer_report(
         "failed": clean.get("coverage"),
         "unavailable": "degraded",
         "not_applicable": "not_applicable",
+        "timed_out": "incomplete",
     }[status]
     if status == "failed":
         if clean.get("coverage") not in {"complete", "degraded"}:
@@ -1904,7 +1907,12 @@ def _aggregate_sanitizer_results(
             "coverage": clean["coverage"],
         }
         if clean.get("artifact") is not None:
-            record["artifact"] = clean["artifact"]
+            artifact = Path(clean["artifact"]).expanduser()
+            if artifact.is_symlink() or not artifact.is_file():
+                raise ValueError("sanitizer raw artifact must be a regular file")
+            resolved_artifact = artifact.resolve(strict=True)
+            record["artifact"] = str(resolved_artifact)
+            record["artifact_sha256"] = sha256_file(resolved_artifact)
         records.append(record)
 
     statuses = {record["status"] for record in records}
@@ -2071,18 +2079,20 @@ def _run_sanitizer_gate(
                 raise ValueError("sanitizer candidate artifact methods_sha256 drifted")
             if report.get("policy_sha256") != policy_sha256:
                 raise ValueError("sanitizer candidate artifact policy_sha256 drifted")
-            reports.append(
-                _validate_sanitizer_report(
-                    report,
-                    candidate=candidate,
-                    state=state,
-                    mode=policy.sanitizer_mode,
-                    expected_method_ids=method_ids,
-                    expected_tools=selected_tools,
-                    expected_command=benchmark_command,
-                )
+            validated = _validate_sanitizer_report(
+                report,
+                candidate=candidate,
+                state=state,
+                mode=policy.sanitizer_mode,
+                expected_method_ids=method_ids,
+                expected_tools=selected_tools,
+                expected_command=benchmark_command,
             )
-            continue
+            if validated["status"] == "timed_out":
+                output.unlink()
+            else:
+                reports.append(validated)
+                continue
         if output.exists():
             raise ValueError("sanitizer candidate artifact must be a regular file")
 
@@ -2142,7 +2152,9 @@ def _run_sanitizer_gate(
                 "timed_out": True,
                 "candidate_id": _candidate_checkpoint_id(candidate),
             }
-        if completed.returncode not in {0, sanitizer_engine.ERROR_EXITCODE}:
+        if completed.returncode not in {
+            0, sanitizer_engine.ERROR_EXITCODE, 124
+        }:
             diagnostic = (completed.stderr or completed.stdout or "").strip()
             raise SystemExit(
                 f"sanitize failed rc={completed.returncode}"
@@ -2168,17 +2180,25 @@ def _run_sanitizer_gate(
         )
         atomic_write_json(output, report)
         report["artifact"] = str(output.resolve(strict=True))
-        reports.append(
-            _validate_sanitizer_report(
-                report,
-                candidate=candidate,
-                state=state,
-                mode=policy.sanitizer_mode,
-                expected_method_ids=method_ids,
-                expected_tools=selected_tools,
-                expected_command=benchmark_command,
-            )
+        validated = _validate_sanitizer_report(
+            report,
+            candidate=candidate,
+            state=state,
+            mode=policy.sanitizer_mode,
+            expected_method_ids=method_ids,
+            expected_tools=selected_tools,
+            expected_command=benchmark_command,
         )
+        if completed.returncode == 124:
+            if validated["status"] != "timed_out":
+                raise ValueError("sanitize rc=124 requires a timed_out report")
+            return {
+                "timed_out": True,
+                "candidate_id": _candidate_checkpoint_id(candidate),
+            }
+        if validated["status"] == "timed_out":
+            raise ValueError("timed_out sanitizer report requires rc=124")
+        reports.append(validated)
 
     aggregate = _aggregate_sanitizer_results(
         state=state,
@@ -2259,6 +2279,42 @@ def _load_sanitizer_aggregate(
         candidate_file = _candidate_file(candidate)
         candidate_sha256 = sha256_file(candidate_file)
         status = record.get("status")
+        artifact_value = record.get("artifact")
+        artifact_digest = record.get("artifact_sha256")
+        if not isinstance(artifact_value, str) or not isinstance(
+            artifact_digest, str
+        ):
+            raise ValueError("sanitizer.json artifact binding is missing")
+        artifact_path = Path(artifact_value).expanduser()
+        if artifact_path.is_symlink() or not artifact_path.is_file():
+            raise ValueError("sanitizer.json raw artifact is missing or unsafe")
+        resolved_artifact = artifact_path.resolve(strict=True)
+        sanitizer_dir = (iter_dir / "sanitizer").resolve(strict=True)
+        if (
+            resolved_artifact.parent != sanitizer_dir
+            or str(resolved_artifact) != artifact_value
+            or sha256_file(resolved_artifact) != artifact_digest
+        ):
+            raise ValueError("sanitizer.json raw artifact binding drifted")
+        try:
+            raw_report = _read(str(resolved_artifact))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"sanitizer raw artifact is malformed: {error}"
+            ) from error
+        if raw_report.get("methods_sha256") != aggregate.get("methods_sha256"):
+            raise ValueError("sanitizer raw artifact methods_sha256 drifted")
+        if raw_report.get("policy_sha256") != aggregate.get("policy_sha256"):
+            raise ValueError("sanitizer raw artifact policy_sha256 drifted")
+        raw_report["artifact"] = artifact_value
+        validated_report = _validate_sanitizer_report(
+            raw_report,
+            candidate=candidate,
+            state=state,
+            mode=policy.sanitizer_mode,
+            expected_method_ids=method_ids,
+            expected_tools=selected_tools,
+        )
         if (
             record.get("candidate_id") != _candidate_checkpoint_id(candidate)
             or record.get("candidate_file") != candidate_file
@@ -2267,6 +2323,9 @@ def _load_sanitizer_aggregate(
             or record.get("candidate_status")
             != ("rejected_correctness" if status == "failed" else "eligible")
             or record.get("passed") != (status in {"passed", "not_applicable"})
+            or status != validated_report.get("status")
+            or record.get("coverage") != validated_report.get("coverage")
+            or record.get("passed") != validated_report.get("passed")
         ):
             raise ValueError("sanitizer.json candidates drifted")
     statuses = {record["status"] for record in records}
@@ -2417,18 +2476,17 @@ def _write_candidate_profile_binding(
     top_path = iter_dir / "ncu_top.json"
     if top_path.is_symlink():
         raise ValueError("ncu_top.json must not be a symlink")
-    if top_path.is_file():
-        top = _load_iteration_json(iter_dir, "ncu_top.json")
-        profiled_file = top.get("profiled_file")
-        if not isinstance(profiled_file, str):
-            raise ValueError("ncu_top.json profiled_file is missing")
-        profiled_path = Path(profiled_file).expanduser()
-        if profiled_path.is_symlink() or profiled_path.resolve(strict=True) != resolved:
-            raise ValueError("ncu_top.json is bound to a different candidate")
-        payload["ncu_top"] = str(top_path.resolve(strict=True))
-        payload["ncu_top_sha256"] = sha256_file(top_path)
-    elif top_path.exists():
-        raise ValueError("ncu_top.json must be a regular file")
+    if not top_path.is_file():
+        raise ValueError("profile_ncu did not write ncu_top.json")
+    top = _load_iteration_json(iter_dir, "ncu_top.json")
+    profiled_file = top.get("profiled_file")
+    if not isinstance(profiled_file, str):
+        raise ValueError("ncu_top.json profiled_file is missing")
+    profiled_path = Path(profiled_file).expanduser()
+    if profiled_path.is_symlink() or profiled_path.resolve(strict=True) != resolved:
+        raise ValueError("ncu_top.json is bound to a different candidate")
+    payload["ncu_top"] = str(top_path.resolve(strict=True))
+    payload["ncu_top_sha256"] = sha256_file(top_path)
     atomic_write_json(iter_dir / "candidate_profile_binding.json", payload)
     return payload
 
@@ -2447,14 +2505,45 @@ def _profile_binding_matches(
         binding = _load_iteration_json(iter_dir, "candidate_profile_binding.json")
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    resolved = str(Path(kernel).expanduser().resolve(strict=True))
-    return (
+    kernel_path = Path(kernel).expanduser()
+    if kernel_path.is_symlink() or not kernel_path.is_file():
+        return False
+    resolved_path = kernel_path.resolve(strict=True)
+    resolved = str(resolved_path)
+    if not (
         binding.get("schema_version") == CURRENT_SCHEMA_VERSION
         and binding.get("input_hash") == state.get("input_hash")
         and binding.get("candidate_id") == candidate_id
         and binding.get("candidate_file") == resolved
-        and binding.get("candidate_sha256") == sha256_file(resolved)
-    )
+        and binding.get("candidate_sha256") == sha256_file(resolved_path)
+    ):
+        return False
+    top_value = binding.get("ncu_top")
+    top_digest = binding.get("ncu_top_sha256")
+    if not isinstance(top_value, str) or not isinstance(top_digest, str):
+        return False
+    top_path = Path(top_value).expanduser()
+    if top_path.is_symlink() or not top_path.is_file():
+        return False
+    try:
+        resolved_top = top_path.resolve(strict=True)
+    except OSError:
+        return False
+    if (
+        resolved_top.parent != iter_dir
+        or resolved_top.name != "ncu_top.json"
+        or str(resolved_top) != top_value
+        or sha256_file(resolved_top) != top_digest
+    ):
+        return False
+    try:
+        top = _load_iteration_json(iter_dir, "ncu_top.json")
+        profiled_path = Path(top.get("profiled_file", "")).expanduser()
+        if profiled_path.is_symlink() or profiled_path.resolve(strict=True) != resolved_path:
+            return False
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
 
 
 def _run_candidate_profile(
@@ -3139,6 +3228,15 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
             kernel = _publish_outer_candidate(
                 selected_candidate, iter_dir=iteration_dir
             )
+            if eligible_candidates and not _profile_binding_matches(
+                iteration_dir,
+                state=state,
+                candidate_id=candidate_id,
+                kernel=kernel,
+            ):
+                raise ValueError(
+                    "candidate profile evidence is missing, unsafe, or drifted"
+                )
             if mode == "full" and eligible_candidates:
                 pair_estimate = _finite_real(
                     state.get("estimated_workload_pair_seconds", 0.0),

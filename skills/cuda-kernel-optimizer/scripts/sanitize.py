@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -24,6 +25,8 @@ DEFAULT_POLICY = (
     Path(__file__).resolve().parent.parent / "references" / "sanitizer_policy.json"
 )
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_ACTIVE_TOOL_PROCESS = None
+_ACTIVE_TOOL_PGID = None
 
 
 def _string_list(value, field: str, *, allow_empty: bool) -> list[str]:
@@ -213,7 +216,74 @@ def validate_result(result, *, selected_tools, command=None) -> dict:
     return dict(result)
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_process_group_gone(process_group_id: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group_id):
+            return True
+        time.sleep(0.01)
+    return not _process_group_exists(process_group_id)
+
+
+def _terminate_tool_group(process_group_id: int, grace_seconds: float = 0.2) -> None:
+    if not _process_group_exists(process_group_id):
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    if _wait_process_group_gone(process_group_id, grace_seconds):
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if not _wait_process_group_gone(process_group_id, 1.0):
+        raise RuntimeError("compute-sanitizer process group survived SIGKILL")
+
+
+def _terminate_active_tool(process, process_group_id: int):
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        stdout, stderr = process.communicate(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+    _terminate_tool_group(process_group_id, grace_seconds=0.05)
+    return stdout or "", stderr or ""
+
+
+def _forward_termination(signum, _frame) -> None:
+    process = _ACTIVE_TOOL_PROCESS
+    process_group_id = _ACTIVE_TOOL_PGID
+    if process_group_id is not None and process is not None:
+        _terminate_active_tool(process, process_group_id)
+    raise SystemExit(128 + signum)
+
+
+def _install_signal_forwarding() -> None:
+    signal.signal(signal.SIGTERM, _forward_termination)
+    signal.signal(signal.SIGINT, _forward_termination)
+
+
 def _run_tool_with_timeout(command: list[str], timeout_seconds: float):
+    global _ACTIVE_TOOL_PROCESS, _ACTIVE_TOOL_PGID
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -223,23 +293,19 @@ def _run_tool_with_timeout(command: list[str], timeout_seconds: float):
         errors="replace",
         start_new_session=True,
     )
+    _ACTIVE_TOOL_PROCESS = process
+    _ACTIVE_TOOL_PGID = process.pid
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-        return process.returncode, stdout or "", stderr or "", False
-    except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout, stderr = process.communicate(timeout=0.5)
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            _terminate_tool_group(process.pid)
+            return process.returncode, stdout or "", stderr or "", False
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = process.communicate()
-        return None, stdout or "", stderr or "", True
+            stdout, stderr = _terminate_active_tool(process, process.pid)
+            return None, stdout or "", stderr or "", True
+    finally:
+        _ACTIVE_TOOL_PROCESS = None
+        _ACTIVE_TOOL_PGID = None
 
 
 def run_tools(*, executable, tools, command, timeout_seconds: float = 300.0) -> dict:
@@ -253,9 +319,10 @@ def run_tools(*, executable, tools, command, timeout_seconds: float = 300.0) -> 
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
         or not float(timeout_seconds) > 0.0
     ):
-        raise ValueError("timeout_seconds must be positive")
+        raise ValueError("timeout_seconds must be a positive finite number")
     timeout_seconds = float(timeout_seconds)
     if not selected_tools:
         return validate_result({
@@ -444,6 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _install_signal_forwarding()
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]

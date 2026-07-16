@@ -968,6 +968,16 @@ class LifecycleIntegrationTests(unittest.TestCase):
             warmup=1, repeat=1, retries=0,
         )
 
+    def _write_mock_ncu_top(self, command, run_dir: Path) -> None:
+        if Path(command[1]).name != "profile_ncu.py":
+            return
+        iter_dir = run_dir / "iterv1"
+        kernel = next(iter(iter_dir.glob("kernel.*")))
+        (iter_dir / "ncu_top.json").write_text(
+            json.dumps({"profiled_file": str(kernel.resolve()), "axes": {}}),
+            encoding="utf-8",
+        )
+
     def _write_winner_artifacts(self, run_dir: Path) -> Path:
         iter_dir = run_dir / "iterv1"
         selected = iter_dir / "kernel.py"
@@ -1482,6 +1492,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
 
             def close_runner(command, **kwargs):
                 script = Path(command[1]).name
+                self._write_mock_ncu_top(command, run_dir)
                 if script == "state.py":
                     return subprocess.run(command, capture_output=True, text=True)
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1695,6 +1706,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
 
             def stop_after_profile(command, **_kwargs):
                 script = Path(command[1]).name
+                self._write_mock_ncu_top(command, run_dir)
                 if script == "sass_check.py":
                     raise RuntimeError("stop after profile")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1730,10 +1742,12 @@ class LifecycleIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir, _state_path = self._setup(Path(tmp))
             self._write_winner_artifacts(run_dir)
+            def first_runner(command, **_kwargs):
+                self._write_mock_ncu_top(command, run_dir)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
             with mock.patch.object(
-                self.orchestrate,
-                "_run",
-                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+                self.orchestrate, "_run", side_effect=first_runner
             ), mock.patch.object(
                 self.orchestrate,
                 "apply_decision",
@@ -1764,6 +1778,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
             self._write_winner_artifacts(run_dir)
 
             def first_runner(command, **_kwargs):
+                self._write_mock_ncu_top(command, run_dir)
                 if Path(command[1]).name == "state.py":
                     return subprocess.run(command, capture_output=True, text=True)
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1793,6 +1808,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
             self._write_winner_artifacts(run_dir)
 
             def stop_after_profile(command, **_kwargs):
+                self._write_mock_ncu_top(command, run_dir)
                 if Path(command[1]).name == "sass_check.py":
                     raise RuntimeError("stop after profile")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
