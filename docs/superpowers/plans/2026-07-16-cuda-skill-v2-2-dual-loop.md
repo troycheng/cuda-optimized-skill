@@ -1605,7 +1605,7 @@ git status --short
 
 预期：CPU 测试全部 PASS，GPU opt-in 本地 skipped，Skill is valid，diff check 无输出，status 只包含预期文档更新。
 
-- [ ] **步骤 3：提交 release evidence**
+- [x] **步骤 3：提交 release evidence**
 
 ~~~bash
 git add README.md README.zh-CN.md \
@@ -1616,7 +1616,7 @@ git add README.md README.zh-CN.md \
 git commit -m "docs: record v2.2 validation evidence"
 ~~~
 
-- [ ] **步骤 4：确认远端保护**
+- [x] **步骤 4：确认远端保护**
 
 运行：
 
@@ -1631,7 +1631,7 @@ git remote get-url --push upstream
 - origin push 指向 troycheng/cuda-optimized-skill。
 - upstream push 为 DISABLED 或其他不可推送地址。
 
-- [ ] **步骤 5：合并到 main**
+- [x] **步骤 5：合并到 main**
 
 在主 worktree：
 
@@ -1642,7 +1642,7 @@ git merge --ff-only agent/v2-2-dual-loop
 
 预期：fast-forward 成功，无 merge commit。
 
-- [ ] **步骤 6：重新验证 main**
+- [x] **步骤 6：重新验证 main**
 
 运行：
 
@@ -1656,7 +1656,7 @@ git status --short --branch
 
 预期：全部 PASS；main 工作区干净，只领先 origin/main。
 
-- [ ] **步骤 7：只推送 fork main**
+- [x] **步骤 7：只推送 fork main**
 
 运行：
 
@@ -1667,9 +1667,24 @@ git ls-remote origin refs/heads/main
 
 预期：origin/main 指向本地 HEAD。不得运行 git push upstream。
 
-- [ ] **步骤 8：最终同步本机已安装 skill**
+- [x] **步骤 8：最终同步本机已安装 skill**
 
 重复任务 13 的 staging、quick_validate、backup、atomic move 和 diff -qr。最终安装内容必须与已推送 main 的 skills/cuda-kernel-optimizer 完全一致。
+
+### 任务 15 执行记录（2026-07-17）
+
+- release evidence commit：`0f1748c docs: record v2.2 validation evidence`。
+- fork 保护：origin push 为
+  `https://github.com/troycheng/cuda-optimized-skill.git`；upstream push 为
+  `DISABLED`；GitHub active account 为 `troycheng`。
+- `agent/v2-2-dual-loop` 已以 `--ff-only` 合并到 main，无 merge commit。
+- main 完整回归：514 项通过，4 项 GPU opt-in 按预期 skipped；23 个脚本的
+  `--help` 全部返回 0；quick_validate、diff-check 均通过。
+- 首次 fork push 后，本地 main 与 origin/main 均指向
+  `0f1748c06e570365751ccf8569e2c1d575cf0876`；未向 upstream 推送。
+- 本机 skill 通过 staging quick_validate 后原子切换；旧副本保存在
+  `/Users/tcheng/.codex/skills/cuda-kernel-optimizer.backup-20260717-055051`，
+  `diff -qr` 证明安装内容与 main 中的 skill 目录一致。
 
 ## 总体验收命令
 
