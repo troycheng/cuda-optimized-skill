@@ -876,6 +876,7 @@ def apply_decision(
     attribution=None,
     sass_check=None,
     skip_validation: bool = False,
+    hard_timeout: float | None = None,
     runner=None,
 ) -> dict:
     """Atomically publish a decision, then invoke state update with its path."""
@@ -916,13 +917,22 @@ def apply_decision(
     if skip_validation:
         command.append("--skip-validation")
     selected_runner = _run if runner is None else runner
-    completed = selected_runner(command)
+    run_options = {}
+    if hard_timeout is not None:
+        run_options = {
+            "capture_output": True,
+            "hard_timeout": _finite_real(
+                hard_timeout, "hard_timeout", minimum=0.0
+            ),
+        }
+    completed = selected_runner(command, **run_options)
     return {
         "decision_path": str(decision_path),
         "command": command,
         "returncode": completed.returncode,
         "stdout": getattr(completed, "stdout", None),
         "stderr": getattr(completed, "stderr", None),
+        "timed_out": bool(getattr(completed, "timed_out", False)),
     }
 
 
@@ -960,20 +970,39 @@ def _redacted_argv(cmd: Sequence[str]) -> list[str]:
 
 
 def _terminate_process_group(
-    process: subprocess.Popen, *, grace_seconds: float
+    process: subprocess.Popen, *, process_group_id: int, grace_seconds: float
 ) -> tuple[str | None, str | None]:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return process.communicate()
-    try:
-        return process.communicate(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
+    def group_exists() -> bool:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace_seconds
+    while group_exists():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        process.poll()
+        time.sleep(min(0.02, remaining))
+    if group_exists():
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    try:
         return process.communicate()
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -1003,6 +1032,7 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
         start_new_session=True,
         **kw,
     )
+    process_group_id = process.pid
     timed_out = False
     try:
         stdout, stderr = process.communicate(
@@ -1011,10 +1041,16 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     except subprocess.TimeoutExpired:
         timed_out = True
         stdout, stderr = _terminate_process_group(
-            process, grace_seconds=grace_seconds
+            process,
+            process_group_id=process_group_id,
+            grace_seconds=grace_seconds,
         )
     except BaseException:
-        _terminate_process_group(process, grace_seconds=grace_seconds)
+        _terminate_process_group(
+            process,
+            process_group_id=process_group_id,
+            grace_seconds=grace_seconds,
+        )
         raise
     returncode = 124 if timed_out else process.returncode
     result = subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
@@ -1596,6 +1632,7 @@ _STAGE_ESTIMATES_SECONDS = {
     "ablation": 180.0,
     "candidate_sanitizer": 120.0,
     "workload_paired": 120.0,
+    "decision": 120.0,
 }
 
 
@@ -1643,6 +1680,67 @@ def _persist_hard_timeout(
     return _persist_checkpoint(
         store, stopped, input_hash=stopped["input_hash"]
     )
+
+
+def _inconclusive_decision(source: Mapping, *, reason: str) -> dict:
+    decision = _strict_json_copy(source, "source decision")
+    result = {
+        "status": "inconclusive",
+        "candidate_status": "inconclusive",
+        "budget_exhausted": True,
+        "reason": reason,
+        "statistics": None,
+        "kernel_evidence": decision.get("kernel_evidence") or {
+            "status": decision.get("status"),
+            "statistics": decision.get("statistics"),
+        },
+    }
+    for field in ("candidate_file", "candidate_sha256"):
+        if decision.get(field) is not None:
+            result[field] = decision[field]
+    workload_evidence = decision.get("workload_evidence")
+    if workload_evidence is None and decision.get("workload_statistics") is not None:
+        workload_evidence = {
+            "status": decision.get("status"),
+            "statistics": decision.get("workload_statistics"),
+        }
+    if workload_evidence is not None:
+        result["workload_evidence"] = workload_evidence
+    return _strict_json_copy(result, "inconclusive decision")
+
+
+def _persist_decision_budget_exhausted(
+    checkpoint: Mapping,
+    source_decision: Mapping,
+    *,
+    iteration_dir: Path,
+    store: ArtifactStore,
+    clock: BudgetClock,
+    reason: str,
+) -> tuple[dict, dict]:
+    decision = _inconclusive_decision(source_decision, reason=reason)
+    decision_path = iteration_dir / "decision.json"
+    atomic_write_json(decision_path, decision)
+    now = time.monotonic()
+    stopped = transition_checkpoint(
+        checkpoint,
+        "decision",
+        status="budget_exhausted",
+        candidate_id=checkpoint.get("candidate_id"),
+        candidate_status="inconclusive",
+        budget=_checkpoint_budget(clock, now),
+        evidence={
+            "status": "inconclusive",
+            "reason": reason,
+            "decision_path": str(decision_path.resolve(strict=True)),
+            "decision_sha256": sha256_file(decision_path),
+        },
+        updated_at=now,
+    )
+    persisted = _persist_checkpoint(
+        store, stopped, input_hash=stopped["input_hash"]
+    )
+    return decision, persisted
 
 
 def _candidate_checkpoint_id(candidate: Mapping | None) -> str | None:
@@ -1838,6 +1936,14 @@ def _decision_already_applied(state: Mapping, iteration: int, payload: Mapping) 
     expected_decision = str(
         (Path(state["run_dir"]) / f"iterv{iteration}" / "decision.json").resolve()
     )
+    try:
+        authoritative = _strict_json_copy(
+            _read(expected_decision), "authoritative decision"
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if authoritative != _strict_json_copy(payload, "expected decision"):
+        return False
     return any(
         isinstance(item, Mapping)
         and item.get("iter") == iteration
@@ -1845,6 +1951,38 @@ def _decision_already_applied(state: Mapping, iteration: int, payload: Mapping) 
         and item.get("status") == payload.get("status")
         for item in state.get("history", [])
     )
+
+
+def _decision_record_already_applied(
+    state: Mapping, iteration: int, payload: Mapping
+) -> bool:
+    decision_path = (
+        Path(state["run_dir"]) / f"iterv{iteration}" / "decision.json"
+    ).resolve()
+    try:
+        if _strict_json_copy(
+            _read(str(decision_path)), "authoritative decision"
+        ) != _strict_json_copy(payload, "expected decision"):
+            return False
+        digest = sha256_file(decision_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and item.get("event") == "decision_record"
+        and item.get("iter") == iteration
+        and item.get("status") == payload.get("status")
+        and item.get("decision_json") == str(decision_path)
+        and item.get("decision_sha256") == digest
+        for item in state.get("history", [])
+    )
+
+
+def _restore_state_after_producer_timeout(
+    state_path: str, snapshot: Mapping
+) -> None:
+    state_manager.validate_state(dict(snapshot))
+    atomic_write_json(state_path, _strict_json_copy(snapshot, "state snapshot"))
 
 
 def _closed_lifecycle_output(
@@ -2332,27 +2470,84 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
         if next_stage == "decision":
             branch_payload = _load_lifecycle_branch_results(iteration_dir)
             if branch_payload["status"] == "no_confirmed_kernel_win":
-                decision = _load_iteration_json(iteration_dir, "decision.json")
-                if decision.get("status") != "no_confirmed_kernel_win":
+                source_decision = _load_iteration_json(
+                    iteration_dir, "decision.json"
+                )
+                if source_decision.get("status") not in {
+                    "no_confirmed_kernel_win",
+                    "inconclusive",
+                }:
                     raise ValueError(
                         "decision.json conflicts with no-win branch results"
                     )
-                recorded = _run(
-                    [
-                        sys.executable,
-                        str(SCRIPT_DIR / "state.py"),
-                        "record-decision",
-                        "--state",
-                        state_path,
-                        "--iter",
-                        str(args.iter),
-                        "--decision",
-                        str(iteration_dir / "decision.json"),
-                    ],
-                    capture_output=True,
+                candidate_id = None
+                workload_result = None
+            else:
+                workload_result = _load_workload_result_artifact(
+                    iteration_dir, state=state
                 )
-                if recorded.returncode != 0:
-                    raise SystemExit("state decision record failed")
+                source_decision = workload_result["decision"]
+                candidate_id = workload_result.get("candidate_id")
+
+            admitted, checkpoint = _admit_checkpoint_stage(
+                checkpoint,
+                next_stage,
+                store=store,
+                clock=clock,
+                estimated_seconds=_STAGE_ESTIMATES_SECONDS[next_stage],
+                candidate_id=candidate_id,
+            )
+            if not admitted:
+                _decision, checkpoint = _persist_decision_budget_exhausted(
+                    checkpoint,
+                    source_decision,
+                    iteration_dir=iteration_dir,
+                    store=store,
+                    clock=clock,
+                    reason="decision_budget_exhausted",
+                )
+                _budget_stop_output(args, checkpoint)
+                return
+
+            if branch_payload["status"] == "no_confirmed_kernel_win":
+                current_state = _read(state_path)
+                if not _decision_record_already_applied(
+                    current_state, args.iter, source_decision
+                ):
+                    state_before_producer = copy.deepcopy(current_state)
+                    recorded = _run(
+                        [
+                            sys.executable,
+                            str(SCRIPT_DIR / "state.py"),
+                            "record-decision",
+                            "--state",
+                            state_path,
+                            "--iter",
+                            str(args.iter),
+                            "--decision",
+                            str(iteration_dir / "decision.json"),
+                        ],
+                        capture_output=True,
+                        hard_timeout=_hard_timeout_seconds(clock),
+                    )
+                    if getattr(recorded, "timed_out", False):
+                        _restore_state_after_producer_timeout(
+                            state_path, state_before_producer
+                        )
+                        _decision, checkpoint = (
+                            _persist_decision_budget_exhausted(
+                                checkpoint,
+                                source_decision,
+                                iteration_dir=iteration_dir,
+                                store=store,
+                                clock=clock,
+                                reason="decision_producer_timeout",
+                            )
+                        )
+                        _budget_stop_output(args, checkpoint)
+                        return
+                    if recorded.returncode != 0:
+                        raise SystemExit("state decision record failed")
                 checkpoint = _complete_checkpoint_stage(
                     checkpoint,
                     next_stage,
@@ -2362,15 +2557,13 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     candidate_status="no_confirmed_kernel_win",
                 )
                 continue
-            workload_result = _load_workload_result_artifact(
-                iteration_dir, state=state
-            )
-            terminal_decision = workload_result["decision"]
+            terminal_decision = source_decision
             kernel = workload_result["candidate_file"]
             current_state = _read(state_path)
             if not _decision_already_applied(
                 current_state, args.iter, terminal_decision
             ):
+                state_before_producer = copy.deepcopy(current_state)
                 applied = apply_decision(
                     terminal_decision,
                     run_dir=run_dir,
@@ -2385,7 +2578,22 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     attribution=attribution_path,
                     sass_check=sass_check_path,
                     skip_validation=True,
+                    hard_timeout=_hard_timeout_seconds(clock),
                 )
+                if applied.get("timed_out"):
+                    _restore_state_after_producer_timeout(
+                        state_path, state_before_producer
+                    )
+                    _decision, checkpoint = _persist_decision_budget_exhausted(
+                        checkpoint,
+                        terminal_decision,
+                        iteration_dir=iteration_dir,
+                        store=store,
+                        clock=clock,
+                        reason="decision_producer_timeout",
+                    )
+                    _budget_stop_output(args, checkpoint)
+                    return
                 if applied["returncode"] != 0:
                     diagnostic = (
                         applied.get("stderr") or applied.get("stdout") or ""

@@ -755,6 +755,55 @@ class BudgetedParserTests(unittest.TestCase):
                     pass
                 self.fail("timed-out grandchild process was left running")
 
+    def test_run_waits_for_group_when_term_exits_leader_but_not_grandchild(self) -> None:
+        survivors = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for attempt in range(3):
+                child_pid_path = root / f"child-{attempt}.pid"
+                script = root / f"leader-{attempt}.py"
+                script.write_text(
+                    "\n".join(
+                        [
+                            "import subprocess, sys, time",
+                            "child = subprocess.Popen([sys.executable, '-c', "
+                            "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], "
+                            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+                            f"open({str(child_pid_path)!r}, 'w').write(str(child.pid))",
+                            "time.sleep(60)",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+                result = self.orchestrate._run(
+                    [sys.executable, str(script)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    hard_timeout=0.2,
+                    term_grace=0.15,
+                )
+
+                self.assertTrue(result.timed_out)
+                child_pid = int(child_pid_path.read_text("utf-8"))
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    survivors.append(child_pid)
+
+        for pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.assertEqual(survivors, [], "TERM-ignoring grandchildren survived _run")
+
     def test_setup_rejects_bad_baseline_evidence_and_cleans_run(self) -> None:
         bad_payloads = (
             {"correctness": {"passed": False}, "kernel": {"average_ms": 1.0}},
@@ -966,6 +1015,28 @@ class LifecycleIntegrationTests(unittest.TestCase):
         )
         return selected
 
+    def _position_before_decision(
+        self, run_dir: Path, state_path: Path, *, exhausted: bool
+    ) -> dict:
+        state = json.loads(state_path.read_text("utf-8"))
+        checkpoint = json.loads(
+            (run_dir / "checkpoint.json").read_text("utf-8")
+        )
+        checkpoint.update(
+            iteration=1,
+            stage="workload_paired",
+            stage_index=self.orchestrate.STAGES.index("workload_paired"),
+            status="stage_complete",
+            candidate_status=None,
+        )
+        if exhausted:
+            checkpoint["budget"] = {
+                "elapsed_seconds": state["budget"]["max_seconds"],
+                "remaining_seconds": 0.0,
+            }
+        self.orchestrate.ArtifactStore(run_dir).write_checkpoint(checkpoint)
+        return state
+
     def test_real_setup_no_win_close_resume_and_finalize_records_all_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1032,6 +1103,250 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 )["next_stage"],
                 "complete",
             )
+
+    def test_no_win_decision_budget_denial_never_calls_state_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+            iter_dir = run_dir / "iterv1"
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": []}), encoding="utf-8"
+            )
+            (iter_dir / "branch_results.json").write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "champion": None,
+                        "shortlist": [],
+                        "completed_comparisons": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (iter_dir / "decision.json").write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "candidate_file": None,
+                        "statistics": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original_state = self._position_before_decision(
+                run_dir, state_path, exhausted=True
+            )
+            runner = mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            )
+
+            with mock.patch.object(
+                self.orchestrate, "_run", runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            runner.assert_not_called()
+            self.assertEqual(
+                json.loads(state_path.read_text("utf-8"))["history"],
+                original_state["history"],
+            )
+            decision = json.loads((iter_dir / "decision.json").read_text("utf-8"))
+            self.assertEqual(decision["status"], "inconclusive")
+            self.assertTrue(decision["budget_exhausted"])
+            checkpoint = json.loads(
+                (run_dir / "checkpoint.json").read_text("utf-8")
+            )
+            self.assertEqual(checkpoint["stage"], "decision")
+            self.assertEqual(checkpoint["status"], "budget_exhausted")
+            self.assertEqual(checkpoint["candidate_status"], "inconclusive")
+
+    def test_winning_decision_budget_denial_never_calls_apply_or_promotes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+            selected = self._write_winner_artifacts(run_dir)
+            state = json.loads(state_path.read_text("utf-8"))
+            terminal = {
+                "status": "kernel_only_win",
+                "candidate_file": str(selected.resolve()),
+                "candidate_sha256": self.orchestrate.sha256_file(selected),
+                "statistics": self._statistics(),
+            }
+            self.orchestrate._write_workload_result_artifact(
+                run_dir / "iterv1",
+                state=state,
+                terminal_decision=terminal,
+                candidate_id="1",
+            )
+            original_state = self._position_before_decision(
+                run_dir, state_path, exhausted=True
+            )
+            applied = mock.Mock(
+                return_value={"returncode": 0, "stdout": "", "stderr": ""}
+            )
+
+            with mock.patch.object(
+                self.orchestrate, "apply_decision", applied
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            applied.assert_not_called()
+            current_state = json.loads(state_path.read_text("utf-8"))
+            self.assertEqual(current_state["best_file"], original_state["best_file"])
+            self.assertEqual(current_state["history"], original_state["history"])
+            decision = json.loads(
+                (run_dir / "iterv1" / "decision.json").read_text("utf-8")
+            )
+            self.assertEqual(decision["status"], "inconclusive")
+            self.assertEqual(decision["candidate_file"], str(selected.resolve()))
+            self.assertEqual(
+                decision["candidate_sha256"],
+                self.orchestrate.sha256_file(selected),
+            )
+            self.assertEqual(decision["kernel_evidence"]["status"], "kernel_only_win")
+            checkpoint = json.loads(
+                (run_dir / "checkpoint.json").read_text("utf-8")
+            )
+            self.assertEqual(checkpoint["stage"], "decision")
+            self.assertEqual(checkpoint["status"], "budget_exhausted")
+            self.assertEqual(checkpoint["candidate_status"], "inconclusive")
+
+    def test_no_win_decision_producer_timeout_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir, state_path = self._setup(root)
+            iter_dir = run_dir / "iterv1"
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": []}), encoding="utf-8"
+            )
+            (iter_dir / "branch_results.json").write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "champion": None,
+                        "shortlist": [],
+                        "completed_comparisons": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (iter_dir / "decision.json").write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "candidate_file": None,
+                        "statistics": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original_state = self._position_before_decision(
+                run_dir, state_path, exhausted=False
+            )
+            fake_scripts = root / "fake-scripts"
+            fake_scripts.mkdir()
+            child_pid_path = root / "state-child.pid"
+            (fake_scripts / "state.py").write_text(
+                "\n".join(
+                    [
+                        "import json, signal, subprocess, sys, time",
+                        "from pathlib import Path",
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                        "child = subprocess.Popen([sys.executable, '-c', "
+                        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], "
+                        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+                        f"Path({str(child_pid_path)!r}).write_text(str(child.pid))",
+                        "state_path = Path(sys.argv[sys.argv.index('--state') + 1])",
+                        "state = json.loads(state_path.read_text())",
+                        "state['history'].append({'event': 'partial-timeout-write'})",
+                        "state_path.write_text(json.dumps(state))",
+                        "time.sleep(60)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                self.orchestrate, "SCRIPT_DIR", fake_scripts
+            ), mock.patch.object(
+                self.orchestrate, "_hard_timeout_seconds", return_value=0.2
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            self.assertEqual(
+                json.loads(state_path.read_text("utf-8"))["history"],
+                original_state["history"],
+            )
+            child_pid = int(child_pid_path.read_text("utf-8"))
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail("timed-out state producer descendant survived")
+            decision = json.loads((iter_dir / "decision.json").read_text("utf-8"))
+            self.assertEqual(decision["status"], "inconclusive")
+            checkpoint = json.loads(
+                (run_dir / "checkpoint.json").read_text("utf-8")
+            )
+            self.assertEqual(checkpoint["stage"], "decision")
+            self.assertEqual(checkpoint["status"], "budget_exhausted")
+            self.assertEqual(checkpoint["candidate_status"], "inconclusive")
+
+    def test_winning_decision_producer_timeout_is_inconclusive_not_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+            selected = self._write_winner_artifacts(run_dir)
+            state = json.loads(state_path.read_text("utf-8"))
+            terminal = {
+                "status": "kernel_only_win",
+                "candidate_file": str(selected.resolve()),
+                "candidate_sha256": self.orchestrate.sha256_file(selected),
+                "statistics": self._statistics(),
+            }
+            self.orchestrate._write_workload_result_artifact(
+                run_dir / "iterv1",
+                state=state,
+                terminal_decision=terminal,
+                candidate_id="1",
+            )
+            original_state = self._position_before_decision(
+                run_dir, state_path, exhausted=False
+            )
+            applied = mock.Mock(
+                return_value={
+                    "returncode": 124,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": True,
+                }
+            )
+
+            with mock.patch.object(
+                self.orchestrate, "apply_decision", applied
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            self.assertGreater(applied.call_args.kwargs["hard_timeout"], 0.0)
+            current_state = json.loads(state_path.read_text("utf-8"))
+            self.assertEqual(current_state["best_file"], original_state["best_file"])
+            self.assertEqual(current_state["history"], original_state["history"])
+            decision = json.loads(
+                (run_dir / "iterv1" / "decision.json").read_text("utf-8")
+            )
+            self.assertEqual(decision["status"], "inconclusive")
+            self.assertEqual(decision["candidate_file"], str(selected.resolve()))
+            checkpoint = json.loads(
+                (run_dir / "checkpoint.json").read_text("utf-8")
+            )
+            self.assertEqual(checkpoint["stage"], "decision")
+            self.assertEqual(checkpoint["status"], "budget_exhausted")
+            self.assertEqual(checkpoint["candidate_status"], "inconclusive")
 
     def test_no_win_round_one_resumes_and_runs_branch_for_round_two(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1426,8 +1741,8 @@ class LifecycleIntegrationTests(unittest.TestCase):
             ), self.assertRaisesRegex(RuntimeError, "stop before decision"):
                 self.orchestrate.cmd_close_iter(self._close_args(run_dir))
             interrupted = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
-            self.assertEqual(interrupted["stage"], "workload_paired")
-            self.assertEqual(interrupted["status"], "stage_complete")
+            self.assertEqual(interrupted["stage"], "decision")
+            self.assertEqual(interrupted["status"], "in_progress")
             self.assertTrue((run_dir / "iterv1" / "workload_result.json").is_file())
 
             workload = mock.Mock(side_effect=AssertionError("workload reran"))
