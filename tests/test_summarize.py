@@ -899,17 +899,15 @@ class SummarizeTests(unittest.TestCase):
             state_path.write_text(
                 json.dumps(_minimal_state(root)), encoding="utf-8"
             )
-            real_replace = os.replace
-            real_fsync = os.fsync
             with mock.patch.object(
-                self.summarize.os, "replace", wraps=real_replace
-            ) as replace, mock.patch.object(
-                self.summarize.os, "fsync", wraps=real_fsync
-            ) as fsync, contextlib.redirect_stdout(io.StringIO()):
+                self.summarize,
+                "atomic_write_bytes",
+                wraps=self.summarize.atomic_write_bytes,
+            ) as atomic_write, contextlib.redirect_stdout(io.StringIO()):
                 self.summarize.render(str(state_path), str(output_path))
 
-            replace.assert_called_once()
-            self.assertGreaterEqual(fsync.call_count, 2)
+            atomic_write.assert_called_once()
+            self.assertEqual(atomic_write.call_args.args[0], str(output_path))
             self.assertIn("# Result: inconclusive", output_path.read_text("utf-8"))
             self.assertEqual(list(root.glob(".summary.md.*.tmp")), [])
 

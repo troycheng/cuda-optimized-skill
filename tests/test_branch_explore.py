@@ -248,7 +248,7 @@ class BranchExploreTests(unittest.TestCase):
             state_module = _load(STATE_PATH, "cuda_optimizer_state_consumer")
             decision, status, statistics, workload_statistics = (
                 state_module._load_decision(
-                    str(decision_path), candidate_file=None
+                    str(decision_path.resolve()), candidate_file=None
                 )
             )
             self.assertEqual(status, "no_confirmed_kernel_win")

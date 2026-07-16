@@ -65,6 +65,7 @@ from artifact_store import (  # noqa: E402
     ArtifactStore,
     CURRENT_SCHEMA_VERSION,
     atomic_write_json,
+    read_regular_bytes,
     sha256_file,
 )
 from budget import BudgetPolicy, resolve_budget  # noqa: E402
@@ -78,8 +79,19 @@ import workload_evaluate  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _read(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return json.loads(
+            read_regular_bytes(path).decode("utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant: {token}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"artifact JSON is malformed: {error}") from error
+
+
+def _sha256_nofollow(path: str | os.PathLike) -> str:
+    return hashlib.sha256(read_regular_bytes(path)).hexdigest()
 
 
 def validate_state(payload: dict) -> dict:
@@ -203,11 +215,11 @@ def _validate_candidate_hash(
     if declared_hash is None:
         if status in _WIN_STATUSES:
             raise ValueError("winning decision requires candidate_sha256")
-        return sha256_file(candidate)
+        return _sha256_nofollow(candidate)
     if not isinstance(declared_hash, str) or not _SHA256.fullmatch(declared_hash):
         raise ValueError("decision candidate_sha256 must be 64 hexadecimal characters")
 
-    actual_hash = sha256_file(candidate)
+    actual_hash = _sha256_nofollow(candidate)
     if actual_hash != declared_hash.lower():
         raise ValueError("decision candidate_sha256 does not match candidate content")
     return actual_hash
@@ -282,7 +294,7 @@ def _verify_candidate_binding(binding: dict | None) -> None:
     )
     if identity != expected_identity:
         raise ValueError("candidate changed before state write")
-    if sha256_file(candidate) != binding.get("sha256"):
+    if _sha256_nofollow(candidate) != binding.get("sha256"):
         raise ValueError("candidate sha256 changed before state write")
 
 
@@ -384,31 +396,28 @@ def _validate_paired_artifact(
         return clean
 
     artifact = Path(clean["path"])
-    if artifact.is_symlink() or not artifact.is_file():
-        raise ValueError(f"{field}.path must be a regular non-symlink file")
-    if sha256_file(artifact) != clean["sha256"].lower():
+    artifact_bytes = read_regular_bytes(artifact)
+    if hashlib.sha256(artifact_bytes).hexdigest() != clean["sha256"].lower():
         raise ValueError(f"{field}.sha256 does not match artifact content")
     sample_candidate = Path(clean["candidate_file"])
-    if sample_candidate.is_symlink() or not sample_candidate.is_file():
-        raise ValueError(f"{field}.candidate_file is unsafe or missing")
-    if sha256_file(sample_candidate) != candidate_sha256:
+    if hashlib.sha256(read_regular_bytes(sample_candidate)).hexdigest() != candidate_sha256:
         raise ValueError(f"{field}.candidate_file does not match decision content")
 
     records = []
     try:
-        with artifact.open("r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, 1):
-                if not line.strip():
-                    raise ValueError(f"{field} contains blank line {line_number}")
-                records.append(
-                    json.loads(
-                        line,
-                        parse_constant=lambda token: (_ for _ in ()).throw(
-                            ValueError(f"non-finite JSON constant: {token}")
-                        ),
-                    )
+        text = artifact_bytes.decode("utf-8")
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                raise ValueError(f"{field} contains blank line {line_number}")
+            records.append(
+                json.loads(
+                    line,
+                    parse_constant=lambda token: (_ for _ in ()).throw(
+                        ValueError(f"non-finite JSON constant: {token}")
+                    ),
                 )
-    except (OSError, json.JSONDecodeError) as error:
+            )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{field} is malformed: {error}") from error
     if len(records) != clean["pairs"]:
         raise ValueError(f"{field}.pairs does not match JSONL record count")
@@ -550,6 +559,16 @@ def _validate_terminal_snapshot(
         not isinstance(candidate_sha256, str) or not _SHA256.fullmatch(candidate_sha256)
     ):
         raise ValueError("terminal_decision.candidate_sha256 is invalid")
+    candidate_file = clean.get("candidate_file")
+    if candidate_file is not None:
+        if type(candidate_file) is not str or not os.path.isabs(candidate_file):
+            raise ValueError("terminal_decision.candidate_file must be absolute")
+        if candidate_sha256 is None:
+            raise ValueError("terminal_decision.candidate_file requires candidate_sha256")
+        if verify_artifacts and _sha256_nofollow(candidate_file) != candidate_sha256:
+            raise ValueError("terminal_decision candidate file does not match sha256")
+    elif candidate_sha256 is not None:
+        raise ValueError("terminal_decision.candidate_sha256 requires candidate_file")
     candidate_id = clean.get("candidate_id")
     has_candidate_evidence = any(
         value is not None
@@ -575,12 +594,7 @@ def _validate_terminal_snapshot(
     if type(decision_json) is not str or not os.path.isabs(decision_json):
         raise ValueError("terminal_decision.decision_json must be an absolute path")
     if verify_artifacts:
-        decision_path = Path(decision_json)
-        if decision_path.is_symlink() or not decision_path.is_file():
-            raise ValueError(
-                "terminal_decision.decision_json must be a regular non-symlink file"
-            )
-        if sha256_file(decision_path) != decision_sha256:
+        if _sha256_nofollow(decision_json) != decision_sha256:
             raise ValueError("terminal_decision.decision_sha256 does not match file")
     resume = clean.get("resume", {"status": "not_recorded"})
     if not isinstance(resume, Mapping):
@@ -645,7 +659,7 @@ def _checkpoint_runtime_evidence(state: Mapping, *, iteration: int) -> tuple[dic
     path = Path(state["run_dir"]) / "checkpoint.json"
     if path.is_symlink() or not path.is_file():
         return {"status": "not_recorded"}, {"status": "not_recorded"}
-    payload = _read(str(path))
+    payload = _read(path)
     if not isinstance(payload, Mapping):
         raise ValueError("checkpoint.json must contain a mapping")
     if payload.get("input_hash") != state["input_hash"]:
@@ -1406,7 +1420,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         ),
         "candidate_id": decision.get("candidate_id"),
         "decision_json": os.path.abspath(decision_path),
-        "decision_sha256": sha256_file(decision_path),
+        "decision_sha256": _sha256_nofollow(decision_path),
         "statistics": decision_statistics,
         "workload_statistics": workload_statistics,
         "constraints": _strict_json_copy(constraints, "decision constraints"),
@@ -1518,7 +1532,7 @@ def cmd_record_decision(args: argparse.Namespace) -> None:
     resume_evidence, sanitizer_evidence = _checkpoint_runtime_evidence(
         state, iteration=iteration
     )
-    decision_digest = sha256_file(decision_path)
+    decision_digest = _sha256_nofollow(decision_path)
     record = {
         "event": "decision_record",
         "iter": iteration,

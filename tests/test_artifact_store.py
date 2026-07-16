@@ -100,13 +100,13 @@ class ArtifactStoreTests(unittest.TestCase):
 
     def test_atomic_json_fsyncs_parent_directory_after_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "result.json"
+            target = Path(tmp).resolve() / "result.json"
             events = []
             real_replace = self.artifacts.os.replace
             real_fsync = self.artifacts.os.fsync
 
-            def tracked_replace(source, destination):
-                real_replace(source, destination)
+            def tracked_replace(source, destination, **kwargs):
+                real_replace(source, destination, **kwargs)
                 events.append("replace")
 
             def tracked_fsync(fd):
@@ -132,8 +132,8 @@ class ArtifactStoreTests(unittest.TestCase):
             real_replace = self.artifacts.os.replace
             real_fsync = self.artifacts.os.fsync
 
-            def tracked_replace(source, destination):
-                real_replace(source, destination)
+            def tracked_replace(source, destination, **kwargs):
+                real_replace(source, destination, **kwargs)
                 events.append("replace")
 
             def tracked_fsync(fd):
@@ -156,6 +156,32 @@ class ArtifactStoreTests(unittest.TestCase):
                 [json.loads(line) for line in target.read_text("utf-8").splitlines()],
                 [{"index": 1}, {"index": 2}],
             )
+
+    def test_atomic_jsonl_replace_is_bound_to_the_open_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp).resolve() / "paired_samples.jsonl"
+            real_replace = self.artifacts.os.replace
+            calls = []
+
+            def tracked_replace(*args, **kwargs):
+                calls.append((args, kwargs))
+                return real_replace(*args, **kwargs)
+
+            with mock.patch.object(
+                self.artifacts.os, "replace", side_effect=tracked_replace
+            ):
+                self.artifacts.atomic_write_jsonl(target, [{"index": 1}])
+
+            self.assertEqual(len(calls), 1)
+            _args, kwargs = calls[0]
+            self.assertIsInstance(kwargs.get("src_dir_fd"), int)
+            self.assertEqual(kwargs.get("src_dir_fd"), kwargs.get("dst_dir_fd"))
+
+    def test_atomic_jsonl_empty_sequence_writes_zero_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp).resolve() / "empty.jsonl"
+            self.artifacts.atomic_write_jsonl(target, [])
+            self.assertEqual(target.read_bytes(), b"")
 
     def test_atomic_jsonl_rejects_symlink_in_parent_component(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -396,7 +422,7 @@ class ArtifactStoreTests(unittest.TestCase):
 
     def test_atomic_json_replaces_and_serialization_failure_preserves_old_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "nested" / "value.json"
+            path = Path(tmp).resolve() / "nested" / "value.json"
             self.artifacts.atomic_write_json(path, {"value": "old"})
             self.artifacts.atomic_write_json(path, {"value": "new"})
             self.assertEqual(json.loads(path.read_text("utf-8")), {"value": "new"})

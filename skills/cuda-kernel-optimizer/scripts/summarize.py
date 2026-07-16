@@ -8,9 +8,7 @@ import html
 import json
 import math
 import os
-import stat
 import sys
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import quote
@@ -22,6 +20,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 import decision as decision_engine  # noqa: E402
 import state as state_manager  # noqa: E402
+from artifact_store import atomic_write_bytes, read_regular_bytes  # noqa: E402
 
 
 _TERMINAL_STATUSES = {
@@ -42,85 +41,23 @@ _STATUS_ALIASES = {
 }
 
 
-def _reject_symlink_components(path, *, field: str, include_leaf: bool) -> Path:
-    candidate = Path(path).expanduser().absolute()
-    limit = candidate if include_leaf else candidate.parent
-    current = Path(candidate.anchor)
-    for part in limit.parts[1:]:
-        current = current / part
-        try:
-            mode = os.lstat(current).st_mode
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(mode):
-            raise ValueError(f"{field} parent path must not contain a symlink: {current}")
-    return candidate
-
-
 def _read(path: str) -> dict:
-    source = _reject_symlink_components(path, field="state", include_leaf=True)
-    if source.is_symlink():
-        raise ValueError(f"state path must not be a symlink: {source}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(source, flags)
-    except OSError as error:
-        raise ValueError(f"state path could not be opened safely: {source}") from error
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"state path must be a regular file: {source}")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-            descriptor = -1
-            payload = json.load(stream)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        payload = json.loads(read_regular_bytes(path).decode("utf-8"))
+    except ValueError as error:
+        raise ValueError(f"state path is unsafe or malformed: {error}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"state path is malformed: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("state must contain a JSON object")
     return payload
 
 
-def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(directory, flags)
-    except OSError:
-        descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _atomic_write_text(path: str, text: str) -> None:
-    target = _reject_symlink_components(path, field="output", include_leaf=True)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink_components(target, field="output", include_leaf=True)
-    if target.is_symlink():
-        raise ValueError(f"summary output must not be a symlink: {target}")
-    if target.exists() and not target.is_file():
-        raise ValueError(f"summary output must be a regular file: {target}")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        # A late symlink is safe to replace, but refusing it keeps the output
-        # contract explicit and avoids silently changing caller-owned paths.
-        if target.is_symlink():
-            raise ValueError(f"summary output became a symlink: {target}")
-        os.replace(temporary, target)
-        _fsync_directory(target.parent)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+        atomic_write_bytes(path, text.encode("utf-8"))
+    except ValueError as error:
+        raise ValueError(f"summary output path is unsafe: {error}") from error
 
 
 def _mapping(value) -> Mapping:

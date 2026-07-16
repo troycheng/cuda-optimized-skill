@@ -64,7 +64,7 @@ class StateSchemaTests(unittest.TestCase):
 
     def test_state_command_reader_rejects_legacy_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
+            path = Path(tmp).resolve() / "state.json"
             path.write_text(json.dumps({"run_dir": tmp}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, r"start a new v2\.2 run"):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -72,7 +72,7 @@ class StateSchemaTests(unittest.TestCase):
 
     def test_cmd_init_creates_v2_state_manifest_and_preserves_legacy_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             baseline = root / "baseline.py"
             ref = root / "ref.py"
             env_path = root / "env.json"
@@ -143,7 +143,7 @@ class StateSchemaTests(unittest.TestCase):
 
     def test_record_decision_is_idempotent_and_does_not_promote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp) / "run"
+            run_dir = Path(tmp).resolve() / "run"
             iter_dir = run_dir / "iterv1"
             iter_dir.mkdir(parents=True)
             best = run_dir / "best.py"
@@ -323,6 +323,7 @@ class StateDecisionPromotionTests(unittest.TestCase):
         write_decision: bool = True,
         average_ms: float = 0.1,
     ) -> tuple[argparse.Namespace, Path, Path, dict]:
+        root = root.resolve()
         run_dir = root / "run"
         iter_dir = run_dir / "iterv1"
         iter_dir.mkdir(parents=True)
@@ -684,6 +685,28 @@ class StateDecisionPromotionTests(unittest.TestCase):
         self.assertEqual(unchanged["best_file"], before["best_file"])
         self.assertNotIn("terminal_decision", unchanged)
 
+    def test_raw_evidence_read_rejects_a_symlinked_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            decision_path = Path(args.state).parent / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            artifact = Path(decision["kernel_paired_samples"]["path"])
+            real_parent = artifact.parent.with_name("kernel-real")
+            artifact.parent.rename(real_parent)
+            try:
+                artifact.parent.symlink_to(real_parent, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+        self.assertNotIn("terminal_decision", unchanged)
+
     def test_full_mode_end_to_end_win_is_the_only_global_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args, state_path, candidate, _before = self._fixture(
@@ -705,7 +728,7 @@ class StateDecisionPromotionTests(unittest.TestCase):
             args, state_path, candidate, _before = self._fixture(
                 Path(tmp), mode="full", decision_status="end_to_end_win"
             )
-            run_dir = Path(tmp) / "run"
+            run_dir = state_path.parent
             iter_dir = run_dir / "iterv1"
             candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
 
@@ -827,7 +850,7 @@ class StateDecisionPromotionTests(unittest.TestCase):
 
     def test_no_win_candidate_contract_accepts_null_but_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             decision_path = root / "decision.json"
             decision_path.write_text(
                 json.dumps(

@@ -834,7 +834,7 @@ class BudgetedParserTests(unittest.TestCase):
                 ref = root / "ref.py"
                 baseline.write_text("# kernel\n", encoding="utf-8")
                 ref.write_text("# ref\n", encoding="utf-8")
-                allocated = root / "allocated-run"
+                allocated = root.resolve() / "allocated-run"
                 allocated.mkdir()
                 args = self.orchestrate.build_parser().parse_args(
                     [

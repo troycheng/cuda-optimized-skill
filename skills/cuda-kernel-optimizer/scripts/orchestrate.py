@@ -739,6 +739,11 @@ def build_terminal_decision(
         workload=workload_result,
         constraints=None,
     )
+    if isinstance(kernel.get("statistics"), Mapping):
+        result.setdefault(
+            "statistics",
+            _strict_json_copy(kernel["statistics"], "kernel statistics"),
+        )
     candidate_file = _candidate_file(candidate)
     result["candidate_file"] = candidate_file
     result["candidate_sha256"] = sha256_file(candidate_file)

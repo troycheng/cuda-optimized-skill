@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from pathlib import Path, PureWindowsPath
 from typing import Any, Optional, Union
 
@@ -32,59 +33,132 @@ def sha256_file(path: _PathLike) -> str:
     return digest.hexdigest()
 
 
-def _fsync_directory(path: Path) -> None:
-    """Persist a directory entry update, with a portable open fallback."""
-    flags = os.O_RDONLY
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
+def _open_parent_directory(
+    path: _PathLike, *, create: bool
+) -> tuple[int, str, Path]:
+    """Open a stable parent dirfd without following any path component."""
+    target = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    if not target.name:
+        raise ValueError("artifact path must name a file")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(target.anchor, flags)
     try:
-        fd = os.open(path, flags | directory_flag)
-    except OSError:
-        if not directory_flag:
-            raise
-        fd = os.open(path, flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        for component in target.parts[1:-1]:
+            try:
+                child_fd = os.open(
+                    component, flags | nofollow, dir_fd=directory_fd
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, 0o755, dir_fd=directory_fd)
+                child_fd = os.open(
+                    component, flags | nofollow, dir_fd=directory_fd
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"artifact parent path contains a symlink or non-directory: {target}"
+                    ) from error
+                raise
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd, target.name, target
+    except BaseException:
+        os.close(directory_fd)
+        raise
 
 
-def _reject_symlink_components(path: _PathLike) -> Path:
-    """Return an absolute path only when no existing component is a symlink."""
-    target = Path(path).expanduser().absolute()
-    current = Path(target.anchor)
-    for component in target.parts[1:]:
-        current /= component
+def read_regular_bytes(path: _PathLike) -> bytes:
+    """Read regular-file bytes through no-follow parent and leaf descriptors."""
+    try:
+        directory_fd, leaf, target = _open_parent_directory(path, create=False)
+    except FileNotFoundError as error:
+        raise ValueError(f"artifact file does not exist: {path}") from error
+    fd = None
+    try:
         try:
-            mode = os.lstat(current).st_mode
+            fd = os.open(
+                leaf,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+                raise ValueError(
+                    f"artifact file is missing, a symlink, or unsafe: {target}"
+                ) from error
+            raise
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"artifact path is not a regular file: {target}")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory_fd)
+
+
+def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
+    """Atomically replace a file relative to one stable, no-follow parent dirfd."""
+    if not isinstance(payload, bytes):
+        raise TypeError("atomic payload must be bytes")
+    directory_fd, leaf, target = _open_parent_directory(path, create=True)
+    temporary_leaf = f".{leaf}.{secrets.token_hex(8)}.tmp"
+    fd = None
+    try:
+        try:
+            existing = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(mode):
-            role = "target" if current == target else "parent"
-            raise ValueError(f"JSONL {role} path contains a symlink: {current}")
-    return target
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise ValueError(f"artifact target path contains a symlink: {target}")
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise ValueError(f"artifact target must be a regular file: {target}")
+        fd = os.open(
+            temporary_leaf,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(
+            temporary_leaf,
+            leaf,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary_leaf, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
 
 
 def atomic_write_json(path: _PathLike, payload: Any) -> None:
     """Atomically replace *path* with a formatted UTF-8 JSON document."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, ensure_ascii=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        _fsync_directory(target.parent)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+        encoded = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    except (ValueError, OverflowError) as error:
+        raise ValueError("JSON document is not serializable") from error
+    atomic_write_bytes(path, encoded)
 
 
 def atomic_write_jsonl(path: _PathLike, records) -> None:
@@ -109,28 +183,8 @@ def atomic_write_jsonl(path: _PathLike, records) -> None:
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(f"JSONL record {index} is not strict JSON") from error
 
-    target = _reject_symlink_components(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink_components(target.parent)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            for line in encoded:
-                stream.write(line)
-                stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        _fsync_directory(target.parent)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    document = ("\n".join(encoded) + ("\n" if encoded else "")).encode("utf-8")
+    atomic_write_bytes(path, document)
 
 
 def write_paired_samples(
@@ -197,7 +251,7 @@ def write_paired_samples(
         "schema_version": CURRENT_SCHEMA_VERSION,
         "kind": kind,
         "path": str(target),
-        "sha256": sha256_file(target),
+        "sha256": hashlib.sha256(read_regular_bytes(target)).hexdigest(),
         "pairs": len(records),
         "input_hash": input_hash,
         "iteration": iteration,
