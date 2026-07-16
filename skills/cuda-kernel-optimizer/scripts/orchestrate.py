@@ -711,6 +711,15 @@ def _candidate_file(candidate: Mapping) -> str:
     return str(path.resolve(strict=True))
 
 
+def _candidate_identifier(candidate: Mapping, fallback: str | None = None):
+    candidate_id = candidate.get("id")
+    if candidate_id is None:
+        candidate_id = candidate.get("branch_index")
+    if candidate_id is None:
+        candidate_id = fallback
+    return candidate_id
+
+
 def build_terminal_decision(
     *,
     mode: str,
@@ -740,7 +749,7 @@ def build_terminal_decision(
         result["kernel_paired_samples"] = _strict_json_copy(
             kernel_samples, "kernel paired samples"
         )
-    candidate_id = candidate.get("id") or candidate.get("branch_index")
+    candidate_id = _candidate_identifier(candidate)
     if candidate_id is None and isinstance(kernel_samples, Mapping):
         candidate_id = kernel_samples.get("candidate_id")
     if candidate_id is None:
@@ -891,9 +900,9 @@ def evaluate_outer_candidate(
             if candidate_root is None or input_hash is None or iteration is None:
                 raise ValueError("workload pair persistence binding is incomplete")
             candidate_digest = sha256_file(candidate_path)
-            candidate_id = normalized_candidate.get("id") or normalized_candidate.get(
-                "branch_index"
-            ) or candidate_digest[:16]
+            candidate_id = _candidate_identifier(
+                normalized_candidate, candidate_digest[:16]
+            )
             evidence_path = (
                 iteration_root
                 / "workload"
@@ -3545,6 +3554,11 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     clock=clock,
                     candidate_status="no_confirmed_kernel_win",
                 )
+                state_manager.persist_checkpoint_snapshot(
+                    state_path,
+                    checkpoint,
+                    Path(run_dir) / "checkpoint.json",
+                )
                 continue
             terminal_decision = source_decision
             kernel = workload_result["candidate_file"]
@@ -3599,6 +3613,11 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 clock=clock,
                 candidate_id=workload_result.get("candidate_id"),
                 candidate_status=terminal_decision["status"],
+            )
+            state_manager.persist_checkpoint_snapshot(
+                state_path,
+                checkpoint,
+                Path(run_dir) / "checkpoint.json",
             )
             continue
 

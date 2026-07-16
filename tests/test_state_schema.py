@@ -189,6 +189,122 @@ class StateSchemaTests(unittest.TestCase):
             ]
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["status"], "no_confirmed_kernel_win")
+            terminal = updated["terminal_decision"]
+            self.assertEqual(terminal["iteration"], 1)
+            self.assertEqual(terminal["input_hash"], "abc")
+            self.assertEqual(terminal["mode"], "kernel-only")
+            self.assertEqual(terminal["status"], "no_confirmed_kernel_win")
+            self.assertIsNone(terminal["candidate_id"])
+            self.assertIsNone(terminal["candidate_sha256"])
+            self.assertEqual(terminal["decision_json"], str(decision.absolute()))
+            self.assertEqual(terminal["resume"]["status"], "not_recorded")
+
+    def test_record_loss_preserves_and_requires_candidate_evidence_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            run_dir = root / "run"
+            iter_dir = run_dir / "iterv1"
+            iter_dir.mkdir(parents=True)
+            candidate = iter_dir / "kernel.py"
+            candidate.write_text("# loss\n", encoding="utf-8")
+            candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            state_path = run_dir / "state.json"
+            initial_state = {
+                "schema_version": 2,
+                "run_dir": str(run_dir),
+                "input_hash": "a" * 64,
+                "budget": {},
+                "candidates": {},
+                "mode": "kernel-only",
+                "history": [],
+            }
+            state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+            statistics = {
+                "status": "confirmed_loss",
+                "statistic": "median_paired_improvement_pct",
+                "direction": "lower",
+                "min_effect_pct": 1.0,
+                "confidence": 0.95,
+                "estimate_pct": -2.0,
+                "ci_low_pct": -2.0,
+                "ci_high_pct": -2.0,
+                "valid_pairs": 3,
+                "invalid_pairs": 0,
+                "improvements_pct": [-2.0] * 3,
+            }
+            classifier = {
+                "direction": "lower",
+                "min_effect_pct": 1.0,
+                "confidence": 0.95,
+                "bootstrap_samples": 20,
+                "seed": 0,
+            }
+            raw_path = iter_dir / "kernel-pairs.jsonl"
+            records = [
+                {
+                    "schema_version": 2,
+                    "kind": "kernel",
+                    "input_hash": "a" * 64,
+                    "iteration": 1,
+                    "candidate_id": "loss-1",
+                    "candidate_file": str(candidate),
+                    "candidate_sha256": candidate_sha,
+                    "classifier": classifier,
+                    "pair_index": index,
+                    "pair": {
+                        "baseline": 100.0,
+                        "candidate": 102.0,
+                        "valid": True,
+                    },
+                }
+                for index in range(3)
+            ]
+            raw_path.write_text(
+                "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in records),
+                encoding="utf-8",
+            )
+            paired = {
+                "schema_version": 2,
+                "kind": "kernel",
+                "path": str(raw_path),
+                "sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+                "pairs": 3,
+                "input_hash": "a" * 64,
+                "iteration": 1,
+                "candidate_id": "loss-1",
+                "candidate_file": str(candidate),
+                "candidate_sha256": candidate_sha,
+                "classifier": classifier,
+            }
+            decision_path = iter_dir / "decision.json"
+            decision = {
+                "status": "confirmed_loss",
+                "candidate_id": "loss-1",
+                "candidate_file": str(candidate),
+                "candidate_sha256": candidate_sha,
+                "statistics": statistics,
+                "kernel_paired_samples": paired,
+            }
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+            args = argparse.Namespace(
+                state=str(state_path), iter=1, decision=str(decision_path)
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.state.cmd_record_decision(args)
+
+            terminal = json.loads(state_path.read_text("utf-8"))["terminal_decision"]
+            self.assertEqual(terminal["status"], "confirmed_loss")
+            self.assertEqual(terminal["candidate_id"], "loss-1")
+            self.assertEqual(terminal["candidate_sha256"], candidate_sha)
+            self.assertEqual(terminal["statistics"], statistics)
+            self.assertEqual(terminal["kernel_paired_samples"], paired)
+
+            decision.pop("candidate_id")
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+            state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "candidate_id"):
+                self.state.cmd_record_decision(args)
 
 
 class StateDecisionPromotionTests(unittest.TestCase):

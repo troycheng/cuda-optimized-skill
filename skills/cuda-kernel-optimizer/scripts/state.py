@@ -499,6 +499,20 @@ def _paired_count(statistics: Mapping | None) -> int | None:
     return None
 
 
+def _checkpoint_candidate_binding(checkpoint: Mapping) -> tuple[str | None, str | None]:
+    candidate_id = checkpoint.get("candidate_id")
+    if candidate_id is not None and (
+        type(candidate_id) is not str or not candidate_id.strip()
+    ):
+        raise ValueError("checkpoint candidate_id must be null or non-empty")
+    candidate_status = checkpoint.get("candidate_status")
+    if candidate_status is not None and (
+        type(candidate_status) is not str or not candidate_status.strip()
+    ):
+        raise ValueError("checkpoint candidate_status must be null or non-empty")
+    return candidate_id, candidate_status
+
+
 def _validate_terminal_snapshot(
     terminal, *, state: Mapping, verify_artifacts: bool
 ) -> dict:
@@ -537,10 +551,23 @@ def _validate_terminal_snapshot(
     ):
         raise ValueError("terminal_decision.candidate_sha256 is invalid")
     candidate_id = clean.get("candidate_id")
-    if status in _WIN_STATUSES and (
+    has_candidate_evidence = any(
+        value is not None
+        for value in (
+            clean.get("candidate_file"),
+            candidate_sha256,
+            statistics,
+            workload_statistics,
+            clean.get("kernel_paired_samples"),
+            clean.get("workload_paired_samples"),
+        )
+    )
+    if candidate_id is not None and (
         type(candidate_id) is not str or not candidate_id.strip()
     ):
-        raise ValueError("terminal_decision win requires candidate_id")
+        raise ValueError("terminal_decision.candidate_id must be non-empty")
+    if has_candidate_evidence and candidate_id is None:
+        raise ValueError("terminal_decision candidate evidence requires candidate_id")
     decision_sha256 = clean.get("decision_sha256")
     if not isinstance(decision_sha256, str) or not _SHA256.fullmatch(decision_sha256):
         raise ValueError("terminal_decision.decision_sha256 is invalid")
@@ -555,6 +582,32 @@ def _validate_terminal_snapshot(
             )
         if sha256_file(decision_path) != decision_sha256:
             raise ValueError("terminal_decision.decision_sha256 does not match file")
+    resume = clean.get("resume", {"status": "not_recorded"})
+    if not isinstance(resume, Mapping):
+        raise ValueError("terminal_decision.resume must be a mapping")
+    resume = _strict_json_copy(dict(resume), "terminal_decision.resume")
+    if resume.get("status") != "not_recorded":
+        resume_iteration = resume.get("iteration")
+        if type(resume_iteration) is not int or resume_iteration < 0:
+            raise ValueError("terminal_decision.resume.iteration must be non-negative")
+        if resume.get("input_hash") != state.get("input_hash"):
+            raise ValueError("terminal_decision.resume.input_hash does not match state")
+        resume_candidate_id = resume.get("candidate_id")
+        if resume_candidate_id is not None and (
+            type(resume_candidate_id) is not str or not resume_candidate_id.strip()
+        ):
+            raise ValueError(
+                "terminal_decision.resume.candidate_id must be null or non-empty"
+            )
+        resume_candidate_status = resume.get("candidate_status")
+        if resume_candidate_status is not None and (
+            type(resume_candidate_status) is not str
+            or not resume_candidate_status.strip()
+        ):
+            raise ValueError(
+                "terminal_decision.resume.candidate_status must be null or non-empty"
+            )
+    clean["resume"] = resume
     for kind, stats in (("kernel", statistics), ("workload", workload_statistics)):
         field = f"{kind}_paired_samples"
         evidence = clean.get(field)
@@ -591,7 +644,7 @@ def _validate_terminal_snapshot(
 def _checkpoint_runtime_evidence(state: Mapping, *, iteration: int) -> tuple[dict, dict]:
     path = Path(state["run_dir"]) / "checkpoint.json"
     if path.is_symlink() or not path.is_file():
-        return {}, {"status": "not_recorded"}
+        return {"status": "not_recorded"}, {"status": "not_recorded"}
     payload = _read(str(path))
     if not isinstance(payload, Mapping):
         raise ValueError("checkpoint.json must contain a mapping")
@@ -604,6 +657,7 @@ def _checkpoint_runtime_evidence(state: Mapping, *, iteration: int) -> tuple[dic
     status = payload.get("status")
     if type(stage) is not str or type(status) is not str:
         raise ValueError("checkpoint.json stage and status must be strings")
+    candidate_id, candidate_status = _checkpoint_candidate_binding(payload)
     resume = {
         "status": status,
         "stage": stage,
@@ -611,6 +665,8 @@ def _checkpoint_runtime_evidence(state: Mapping, *, iteration: int) -> tuple[dic
         "checkpoint": str(path.resolve(strict=True)),
         "input_hash": state["input_hash"],
         "budget": _strict_json_copy(payload.get("budget", {}), "checkpoint budget"),
+        "candidate_id": candidate_id,
+        "candidate_status": candidate_status,
     }
     stage_evidence = payload.get("stage_evidence", {})
     if not isinstance(stage_evidence, Mapping):
@@ -645,6 +701,7 @@ def persist_checkpoint_snapshot(
         raise ValueError("checkpoint stage and status must be strings")
     if type(iteration) is not int or iteration < 0:
         raise ValueError("checkpoint iteration must be non-negative")
+    candidate_id, candidate_status = _checkpoint_candidate_binding(checkpoint)
     path = Path(checkpoint_path).expanduser()
     if path.is_symlink() or not path.is_file():
         raise ValueError("checkpoint path must be a regular non-symlink file")
@@ -655,6 +712,8 @@ def persist_checkpoint_snapshot(
         "checkpoint": str(path.resolve(strict=True)),
         "input_hash": state["input_hash"],
         "budget": _strict_json_copy(checkpoint.get("budget", {}), "checkpoint budget"),
+        "candidate_id": candidate_id,
+        "candidate_status": candidate_status,
     }
     state["resume"] = resume
     terminal = state.get("terminal_decision")
@@ -1437,13 +1496,36 @@ def cmd_record_decision(args: argparse.Namespace) -> None:
     status = decision.get("status")
     if type(status) is not str or status not in _DECISION_STATUSES:
         raise ValueError("decision.json status must be recognized")
+    if status in _WIN_STATUSES:
+        raise ValueError("winning decisions must be recorded through state update")
+    decision, status, statistics, workload_statistics = _load_decision(
+        decision_path,
+        candidate_file=decision.get("candidate_file"),
+    )
+    candidate_binding = _capture_candidate_binding(
+        decision,
+        status=status,
+        candidate_file=decision.get("candidate_file"),
+        iter_dir=iter_dir,
+    )
+    constraints = decision.get("constraints", [])
+    if (
+        isinstance(constraints, (str, bytes, bytearray, Mapping))
+        or not isinstance(constraints, list)
+        or not all(isinstance(item, Mapping) for item in constraints)
+    ):
+        raise ValueError("decision constraints must be a sequence of mappings")
+    resume_evidence, sanitizer_evidence = _checkpoint_runtime_evidence(
+        state, iteration=iteration
+    )
+    decision_digest = sha256_file(decision_path)
     record = {
         "event": "decision_record",
         "iter": iteration,
         "status": status,
         "decision_json": decision_path,
-        "decision_sha256": sha256_file(decision_path),
-        "statistics": decision.get("statistics"),
+        "decision_sha256": decision_digest,
+        "statistics": statistics,
     }
     history = state.setdefault("history", [])
     if not any(
@@ -1454,7 +1536,39 @@ def cmd_record_decision(args: argparse.Namespace) -> None:
         for item in history
     ):
         history.append(record)
-        _write(args.state, state)
+    terminal = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "iteration": iteration,
+        "input_hash": state["input_hash"],
+        "mode": _state_mode(state),
+        "status": status,
+        "decision_status": status,
+        "candidate_file": (
+            candidate_binding["path"] if candidate_binding is not None else None
+        ),
+        "candidate_sha256": (
+            candidate_binding["sha256"] if candidate_binding is not None else None
+        ),
+        "candidate_id": decision.get("candidate_id"),
+        "decision_json": decision_path,
+        "decision_sha256": decision_digest,
+        "statistics": statistics,
+        "workload_statistics": workload_statistics,
+        "constraints": _strict_json_copy(constraints, "decision constraints"),
+        "correctness": {"status": "not_recorded"},
+        "compiler_evidence": {"status": "not_recorded"},
+        "sass": {"status": "not_recorded"},
+        "sanitizer": sanitizer_evidence,
+        "resume": resume_evidence,
+    }
+    for field in ("kernel_paired_samples", "workload_paired_samples"):
+        if field in decision:
+            terminal[field] = _strict_json_copy(decision[field], field)
+    state["terminal_decision"] = _validate_terminal_snapshot(
+        terminal, state=state, verify_artifacts=True
+    )
+    state["resume"] = terminal["resume"]
+    _write(args.state, state)
     print(json.dumps(record, indent=2))
 
 

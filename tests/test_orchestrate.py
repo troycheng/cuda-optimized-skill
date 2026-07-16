@@ -1129,10 +1129,16 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 run_dir=str(run_dir), iter=1, benchmark="benchmark.py",
                 warmup=1, repeat=1, retries=0,
             )
+
+            def lifecycle_runner(command, **_kwargs):
+                if Path(command[1]).name in {"state.py", "summarize.py"}:
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
             with mock.patch.object(
                 self.orchestrate,
                 "_run",
-                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+                side_effect=lifecycle_runner,
             ), contextlib.redirect_stdout(io.StringIO()):
                 self.orchestrate.cmd_close_iter(close_args)
 
@@ -1149,11 +1155,26 @@ class LifecycleIntegrationTests(unittest.TestCase):
             self.assertEqual(evidence["candidate_sanitizer"]["status"], "deferred")
             self.assertEqual(evidence["workload_paired"]["status"], "not_applicable")
             self.assertEqual(evidence["decision"]["status"], "no_confirmed_kernel_win")
+            state_after_close = json.loads(state_path.read_text("utf-8"))
+            self.assertEqual(
+                state_after_close["terminal_decision"]["status"],
+                "no_confirmed_kernel_win",
+            )
+            self.assertEqual(
+                state_after_close["terminal_decision"]["resume"]["iteration"], 1
+            )
+            self.assertIsNone(
+                state_after_close["terminal_decision"]["resume"]["candidate_id"]
+            )
+            self.assertEqual(
+                state_after_close["terminal_decision"]["resume"]["candidate_status"],
+                "no_confirmed_kernel_win",
+            )
 
             with mock.patch.object(
                 self.orchestrate,
                 "_run",
-                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+                side_effect=lifecycle_runner,
             ), contextlib.redirect_stdout(io.StringIO()):
                 self.orchestrate.cmd_finalize(SimpleNamespace(run_dir=str(run_dir)))
             complete = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
@@ -1163,6 +1184,12 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 )["next_stage"],
                 "complete",
             )
+            final_state = json.loads(state_path.read_text("utf-8"))
+            self.assertEqual(final_state["terminal_decision"]["status"], "no_confirmed_kernel_win")
+            self.assertEqual(final_state["terminal_decision"]["resume"]["stage"], "complete")
+            self.assertEqual(final_state["terminal_decision"]["resume"]["iteration"], 1)
+            self.assertEqual(final_state["terminal_decision"]["resume"]["candidate_status"], "no_confirmed_kernel_win")
+            self.assertTrue((run_dir / "summary.md").is_file())
 
     def test_no_win_decision_budget_denial_never_calls_state_producer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2186,6 +2213,25 @@ class OuterLoopTests(unittest.TestCase):
         evaluator.assert_not_called()
         self.assertEqual(result["status"], "kernel_only_win")
 
+    def test_branch_index_zero_is_a_stable_candidate_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_file = Path(tmp) / "kernel.py"
+            candidate_file.write_text("# candidate\n", encoding="utf-8")
+            candidate = {
+                "branch_index": 0,
+                "status": "confirmed_win",
+                "candidate_file": str(candidate_file),
+                "statistics": self.orchestrate_test_statistics(),
+            }
+
+            decision = self.orchestrate.build_terminal_decision(
+                mode="kernel-only",
+                candidate=candidate,
+                decide_fn=lambda **_kwargs: {"status": "kernel_only_win"},
+            )
+
+            self.assertEqual(decision["candidate_id"], "0")
+
     def test_full_outer_evaluation_uses_the_frozen_spec_and_can_end_to_end_win(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             candidate_file = Path(tmp) / "kernel.py"
@@ -2237,7 +2283,7 @@ class OuterLoopTests(unittest.TestCase):
             candidate_file = iter_dir / "candidate.py"
             candidate_file.write_text("# candidate\n", encoding="utf-8")
             candidate = {
-                "id": "b1",
+                "branch_index": 0,
                 "status": "confirmed_win",
                 "candidate_file": str(candidate_file),
                 "statistics": self.orchestrate_test_statistics(),
@@ -2292,7 +2338,8 @@ class OuterLoopTests(unittest.TestCase):
 
         self.assertEqual(evidence["input_hash"], "a" * 64)
         self.assertEqual(evidence["iteration"], 2)
-        self.assertEqual(evidence["candidate_id"], "b1")
+        self.assertEqual(evidence["candidate_id"], "0")
+        self.assertEqual(result["candidate_id"], "0")
         self.assertEqual(evidence["pairs"], 1)
         self.assertEqual(records[0]["pair"], raw_pairs[0])
 
