@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +97,33 @@ class ArtifactStoreTests(unittest.TestCase):
                 self.artifacts.sha256_file(missing)
             with self.assertRaisesRegex(ValueError, str(root)):
                 self.artifacts.sha256_file(root)
+
+    def test_atomic_json_fsyncs_parent_directory_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "result.json"
+            events = []
+            real_replace = self.artifacts.os.replace
+            real_fsync = self.artifacts.os.fsync
+
+            def tracked_replace(source, destination):
+                real_replace(source, destination)
+                events.append("replace")
+
+            def tracked_fsync(fd):
+                mode = os.fstat(fd).st_mode
+                events.append("dir_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+                return real_fsync(fd)
+
+            with mock.patch.object(
+                self.artifacts.os, "replace", side_effect=tracked_replace
+            ), mock.patch.object(
+                self.artifacts.os, "fsync", side_effect=tracked_fsync
+            ):
+                self.artifacts.atomic_write_json(target, {"ok": True})
+
+            self.assertLess(events.index("file_fsync"), events.index("replace"))
+            self.assertLess(events.index("replace"), events.index("dir_fsync"))
+            self.assertEqual(json.loads(target.read_text("utf-8")), {"ok": True})
 
     def test_append_jsonl_preserves_order_and_read_ignores_blank_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1319,6 +1319,27 @@ def _verify_command_source(spec: WorkloadSpec) -> None:
     _verify_source_hash(spec, snapshots)
 
 
+def verify_frozen_spec(spec: WorkloadSpec) -> None:
+    """Verify frozen source bytes and contract without executing user code."""
+    if not isinstance(spec, WorkloadSpec):
+        raise ValueError("spec must be a WorkloadSpec")
+    if spec.kind == "command":
+        _verify_command_source(spec)
+        return
+    if spec.kind != "python" or not isinstance(spec.source, str):
+        raise ValueError("frozen workload kind or source is invalid")
+    try:
+        bundle = _read_python_bundle(spec.source)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"workload source_hash verification failed: {error}"
+        ) from error
+    snapshots = (bundle.source,) + tuple(
+        snapshot for _, snapshot in bundle.dependencies
+    )
+    _verify_source_hash(spec, snapshots)
+
+
 def run_spec_once(
     spec: WorkloadSpec,
     *,

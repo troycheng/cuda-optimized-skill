@@ -234,6 +234,31 @@ class BudgetClockTests(unittest.TestCase):
         self.assertEqual(clock.remaining_seconds(now=200), 2600)
         self.assertEqual(clock.remaining_seconds(now=3000), 0)
 
+    def test_persisted_elapsed_time_survives_clock_rollback(self) -> None:
+        clock = budget.BudgetClock(
+            policy=budget.resolve_budget("quick"),
+            started_at=100,
+            elapsed_seconds=50,
+        )
+
+        self.assertEqual(clock.elapsed(now=90), 50)
+        self.assertEqual(clock.remaining_seconds(now=90), 2650)
+        self.assertEqual(clock.elapsed(now=110), 60)
+        self.assertEqual(clock.execution_seconds_available(now=110), 2340)
+
+    def test_constructor_rejects_invalid_persisted_elapsed_time(self) -> None:
+        policy = budget.resolve_budget("quick")
+        for value in (*INVALID_TIME_VALUES, -1):
+            with self.subTest(value=repr(value)):
+                self._assert_invalid_time(
+                    "elapsed_seconds",
+                    lambda value=value: budget.BudgetClock(
+                        policy=policy,
+                        started_at=100,
+                        elapsed_seconds=value,
+                    ),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

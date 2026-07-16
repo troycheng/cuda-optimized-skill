@@ -647,9 +647,6 @@ def cmd_init(args: argparse.Namespace) -> None:
             "branches": int(getattr(args, "branches", 4)),
         }
     workload = getattr(args, "workload", None)
-    workload_json = getattr(args, "workload_json", None)
-    if workload_json is not None:
-        workload = _strict_json_value(workload_json, "--workload-json")
     mode = getattr(args, "mode", "kernel-only")
     started_at = getattr(args, "started_at", None) or time.time()
     backend = getattr(args, "backend", "auto")
@@ -707,6 +704,19 @@ def cmd_init(args: argparse.Namespace) -> None:
         if manifest_path != run_dir / "manifest.json" or not manifest_path.is_file():
             raise ValueError("manifest must be run_dir/manifest.json")
         manifest = _read(str(manifest_path))
+
+    workload_file_arg = getattr(args, "workload_file", None)
+    if workload_file_arg is not None:
+        workload_path = Path(workload_file_arg).expanduser()
+        if workload_path.is_symlink():
+            raise ValueError("workload file must not be a symlink")
+        workload_path = workload_path.resolve(strict=True)
+        expected_workload_path = run_dir / "workload" / "spec.json"
+        if workload_path != expected_workload_path or not workload_path.is_file():
+            raise ValueError("workload file must be run_dir/workload/spec.json")
+        workload = _strict_json_value(
+            workload_path.read_text("utf-8"), "--workload-file"
+        )
 
     state, state_path = initialize_state(
         run_dir=run_dir,
@@ -1010,6 +1020,40 @@ def cmd_show(args: argparse.Namespace) -> None:
     print(json.dumps(state, indent=2))
 
 
+def cmd_record_decision(args: argparse.Namespace) -> None:
+    state = _read_state(args.state)
+    iteration = int(args.iter)
+    if iteration <= 0:
+        raise ValueError("iter must be a positive integer")
+    iter_dir = os.path.join(state["run_dir"], f"iterv{iteration}")
+    decision_path = _validate_decision_path(args.decision, iter_dir=iter_dir)
+    decision = _read(decision_path)
+    if not isinstance(decision, Mapping):
+        raise ValueError("decision.json must contain a JSON object")
+    status = decision.get("status")
+    if type(status) is not str or status not in _DECISION_STATUSES:
+        raise ValueError("decision.json status must be recognized")
+    record = {
+        "event": "decision_record",
+        "iter": iteration,
+        "status": status,
+        "decision_json": decision_path,
+        "decision_sha256": sha256_file(decision_path),
+        "statistics": decision.get("statistics"),
+    }
+    history = state.setdefault("history", [])
+    if not any(
+        isinstance(item, Mapping)
+        and item.get("event") == "decision_record"
+        and item.get("iter") == iteration
+        and item.get("decision_sha256") == record["decision_sha256"]
+        for item in history
+    ):
+        history.append(record)
+        _write(args.state, state)
+    print(json.dumps(record, indent=2))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1038,7 +1082,7 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--run-dir", default=None, help=argparse.SUPPRESS)
     pi.add_argument("--manifest", default=None, help=argparse.SUPPRESS)
     pi.add_argument("--mode", choices=("full", "kernel-only"), default="kernel-only", help=argparse.SUPPRESS)
-    pi.add_argument("--workload-json", default=None, help=argparse.SUPPRESS)
+    pi.add_argument("--workload-file", default=None, help=argparse.SUPPRESS)
     pi.add_argument("--started-at", type=float, default=None, help=argparse.SUPPRESS)
     pi.add_argument("--backend", default="auto", help=argparse.SUPPRESS)
     pi.add_argument("--confidence", type=float, default=0.95, help=argparse.SUPPRESS)
@@ -1078,6 +1122,12 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("show")
     ps.add_argument("--state", required=True)
     ps.set_defaults(func=cmd_show)
+
+    pr = sub.add_parser("record-decision")
+    pr.add_argument("--state", required=True)
+    pr.add_argument("--iter", required=True, type=int)
+    pr.add_argument("--decision", required=True)
+    pr.set_defaults(func=cmd_record_decision)
 
     return p
 

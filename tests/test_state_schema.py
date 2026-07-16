@@ -141,6 +141,55 @@ class StateSchemaTests(unittest.TestCase):
             for iteration in range(1, 4):
                 self.assertTrue((run_dir / f"iterv{iteration}").is_dir())
 
+    def test_record_decision_is_idempotent_and_does_not_promote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            iter_dir = run_dir / "iterv1"
+            iter_dir.mkdir(parents=True)
+            best = run_dir / "best.py"
+            best.write_text("# best\n", encoding="utf-8")
+            state_path = run_dir / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "run_dir": str(run_dir),
+                        "input_hash": "abc",
+                        "budget": {},
+                        "candidates": {},
+                        "best_file": str(best),
+                        "history": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            decision = iter_dir / "decision.json"
+            decision.write_text(
+                json.dumps(
+                    {
+                        "status": "no_confirmed_kernel_win",
+                        "candidate_file": None,
+                        "statistics": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                state=str(state_path), iter=1, decision=str(decision)
+            )
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.state.cmd_record_decision(args)
+            updated = json.loads(state_path.read_text("utf-8"))
+            self.assertEqual(updated["best_file"], str(best))
+            records = [
+                item
+                for item in updated["history"]
+                if item.get("event") == "decision_record"
+            ]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "no_confirmed_kernel_win")
+
 
 class StateDecisionPromotionTests(unittest.TestCase):
     def setUp(self) -> None:

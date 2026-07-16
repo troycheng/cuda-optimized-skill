@@ -1122,6 +1122,18 @@ class UnifiedExecutionTests(unittest.TestCase):
                     role="candidate",
                 )
 
+    def test_verify_frozen_spec_detects_source_drift_without_running_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = Path(tmp) / "adapter.py"
+            _write_python_adapter(adapter)
+            spec = self.workloads.normalize_workload(workload=adapter)
+            adapter.write_text(
+                adapter.read_text("utf-8") + "\n# drifted\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "source_hash"):
+                self.workloads.verify_frozen_spec(spec)
+
     def test_run_spec_metrics_dynamic_import_uses_frozen_dependency_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

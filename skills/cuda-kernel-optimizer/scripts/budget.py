@@ -117,21 +117,31 @@ def resolve_budget(name: str, **overrides: object) -> BudgetPolicy:
 class BudgetClock:
     policy: BudgetPolicy
     started_at: float
+    elapsed_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         _validate_time(self.started_at, "started_at")
+        elapsed = _validate_time(self.elapsed_seconds, "elapsed_seconds")
+        if elapsed < 0.0:
+            raise ValueError("elapsed_seconds must be a non-negative finite number")
+
+    def elapsed(self, *, now: float) -> float:
+        current = _validate_time(now, "now")
+        return self.elapsed_seconds + max(0.0, current - self.started_at)
 
     def can_start(self, *, now: float, estimated_seconds: float) -> bool:
-        current = _validate_time(now, "now")
-        execution_deadline = (
-            self.started_at + self.policy.max_seconds - self.policy.reserve_seconds
-        )
         estimate = max(
             0.0, _validate_time(estimated_seconds, "estimated_seconds")
         )
-        return current + estimate <= execution_deadline
+        return estimate <= self.execution_seconds_available(now=now)
+
+    def execution_seconds_available(self, *, now: float) -> float:
+        return max(
+            0.0,
+            self.policy.max_seconds
+            - self.policy.reserve_seconds
+            - self.elapsed(now=now),
+        )
 
     def remaining_seconds(self, *, now: float) -> float:
-        current = _validate_time(now, "now")
-        deadline = self.started_at + self.policy.max_seconds
-        return max(0.0, deadline - current)
+        return max(0.0, self.policy.max_seconds - self.elapsed(now=now))

@@ -6,8 +6,12 @@ import io
 import json
 import math
 import os
+import signal
+import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -549,6 +553,22 @@ class BudgetedParserTests(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
                 if Path(command[1]).name == "state.py":
                     return subprocess.run(command, capture_output=True, text=True)
+                if Path(command[1]).name == "run_iteration.py":
+                    state_path = Path(command[command.index("--state") + 1])
+                    state = json.loads(state_path.read_text("utf-8"))
+                    bench = Path(state["run_dir"]) / "baseline" / "bench.json"
+                    bench.write_text(
+                        json.dumps(
+                            {
+                                "correctness": {"passed": True},
+                                "kernel": {"average_ms": 1.25},
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    state["best_metric_ms"] = 1.25
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
                 raise AssertionError(f"unexpected setup command: {command}")
 
             with mock.patch.object(self.orchestrate, "normalize_workload", normalized), \
@@ -562,6 +582,12 @@ class BudgetedParserTests(unittest.TestCase):
             manifest = json.loads((run_dir / "manifest.json").read_text("utf-8"))
             state = json.loads((run_dir / "state.json").read_text("utf-8"))
             checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            baseline_bench_hash = self.orchestrate.sha256_file(
+                run_dir / "baseline" / "bench.json"
+            )
+            workload_spec_mode = stat.S_IMODE(
+                (run_dir / "workload" / "spec.json").stat().st_mode
+            ) if (run_dir / "workload" / "spec.json").exists() else None
             env_in_run = (run_dir / "env.json").is_file()
             env_at_source = (sources / "env.json").exists()
 
@@ -573,10 +599,13 @@ class BudgetedParserTests(unittest.TestCase):
         )
         preflight_run.assert_called_once()
         self.assertIs(preflight_run.call_args.args[4], spec)
-        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_count, 3)
         state_command = runner.call_args_list[1].args[0]
         self.assertIn("--output-root", state_command)
         self.assertIn("--budget-json", state_command)
+        self.assertIn("--workload-file", state_command)
+        self.assertNotIn("--workload-json", state_command)
+        self.assertEqual(workload_spec_mode, 0o600)
         self.assertEqual(run_dir.parent, output_root.resolve())
         self.assertEqual(output["mode"], "full")
         self.assertEqual(manifest["workload"]["source_hash"], "a" * 64)
@@ -594,10 +623,216 @@ class BudgetedParserTests(unittest.TestCase):
         self.assertEqual(
             checkpoint["stage_evidence"]["baseline"]["status"], "passed"
         )
+        baseline_evidence = checkpoint["stage_evidence"]["baseline"]
+        self.assertEqual(baseline_evidence["metric_ms"], 1.25)
+        self.assertTrue(baseline_evidence["correctness_passed"])
+        self.assertEqual(
+            baseline_evidence["bench_sha256"],
+            baseline_bench_hash,
+        )
         self.assertEqual(state["iterations_total"], 4)
         self.assertEqual(state["branches"], 8)
         self.assertTrue(env_in_run)
         self.assertFalse(env_at_source)
+
+    def test_setup_keeps_secret_workload_snapshot_out_of_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "kernel.py"
+            ref = root / "ref.py"
+            baseline.write_text("# kernel\n", encoding="utf-8")
+            ref.write_text("# ref\n", encoding="utf-8")
+            secret = "API_TOKEN=super-secret-value"
+            spec = self.orchestrate.WorkloadSpec(
+                kind="command",
+                source=["/bin/echo", secret],
+                objective={
+                    "primary_metric": {"name": "latency", "direction": "lower"},
+                    "min_effect_pct": 0.5,
+                    "constraints": [],
+                },
+                cases=(),
+                source_hash="a" * 64,
+            )
+            args = self.orchestrate.build_parser().parse_args(
+                [
+                    "setup", "--baseline", str(baseline), "--ref", str(ref),
+                    "--dims", "{}", "--output-root", str(root),
+                    "--workload-cmd", "ignored", "--objective", "ignored.json",
+                ]
+            )
+            commands = []
+
+            def runner(command, **_kwargs):
+                commands.append(list(command))
+                script = Path(command[1]).name
+                if script == "check_env.py":
+                    Path(command[command.index("--out") + 1]).write_text("{}")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if script == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                if script == "run_iteration.py":
+                    state_path = Path(command[command.index("--state") + 1])
+                    state = json.loads(state_path.read_text("utf-8"))
+                    bench = Path(state["run_dir"]) / "baseline" / "bench.json"
+                    bench.write_text(json.dumps({"correctness": {"passed": True}, "kernel": {"average_ms": 1.0}}))
+                    state["best_metric_ms"] = 1.0
+                    state_path.write_text(json.dumps(state))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                raise AssertionError(script)
+
+            with mock.patch.object(
+                self.orchestrate, "normalize_workload", return_value=spec
+            ), mock.patch.object(
+                self.orchestrate.preflight,
+                "run",
+                return_value={"ok": True, "errors": []},
+            ), mock.patch.object(
+                self.orchestrate, "_run", side_effect=runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_setup(args)
+
+            flattened = "\n".join(" ".join(command) for command in commands)
+            self.assertNotIn(secret, flattened)
+            self.assertNotIn("--workload-json", flattened)
+
+    def test_run_log_redacts_sensitive_flags_and_secret_patterns(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            self.orchestrate.subprocess, "run", return_value=completed
+        ), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.orchestrate._run(
+                [
+                    "tool", "--token", "flag-secret",
+                    "API_TOKEN=pattern-secret", "--safe", "visible",
+                ]
+            )
+        logged = stderr.getvalue()
+        self.assertNotIn("flag-secret", logged)
+        self.assertNotIn("pattern-secret", logged)
+        self.assertIn("visible", logged)
+
+    def test_run_hard_timeout_kills_the_entire_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child_pid_path = root / "child.pid"
+            script = root / "hang.py"
+            script.write_text(
+                "\n".join(
+                    [
+                        "import signal, subprocess, sys, time",
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                        "child = subprocess.Popen([sys.executable, '-c', "
+                        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])",
+                        f"open({str(child_pid_path)!r}, 'w').write(str(child.pid))",
+                        "time.sleep(60)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.orchestrate._run(
+                [sys.executable, str(script)],
+                capture_output=True,
+                hard_timeout=0.2,
+                term_grace=0.1,
+            )
+
+            self.assertTrue(result.timed_out)
+            self.assertEqual(result.returncode, 124)
+            child_pid = int(child_pid_path.read_text("utf-8"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail("timed-out grandchild process was left running")
+
+    def test_setup_rejects_bad_baseline_evidence_and_cleans_run(self) -> None:
+        bad_payloads = (
+            {"correctness": {"passed": False}, "kernel": {"average_ms": 1.0}},
+            {"correctness": {"passed": True}, "kernel": {"average_ms": 0.0}},
+            {"correctness": {"passed": 1}, "kernel": {"average_ms": 1.0}},
+        )
+        for payload in bad_payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                baseline = root / "kernel.py"
+                ref = root / "ref.py"
+                baseline.write_text("# kernel\n", encoding="utf-8")
+                ref.write_text("# ref\n", encoding="utf-8")
+                allocated = root / "allocated-run"
+                allocated.mkdir()
+                args = self.orchestrate.build_parser().parse_args(
+                    [
+                        "setup", "--baseline", str(baseline), "--ref", str(ref),
+                        "--dims", "{}", "--output-root", str(root),
+                    ]
+                )
+
+                def runner(command, **_kwargs):
+                    script = Path(command[1]).name
+                    if script == "check_env.py":
+                        Path(command[command.index("--out") + 1]).write_text("{}")
+                        return SimpleNamespace(returncode=0, stdout="", stderr="")
+                    if script == "state.py":
+                        return subprocess.run(command, capture_output=True, text=True)
+                    if script == "run_iteration.py":
+                        state_path = Path(command[command.index("--state") + 1])
+                        state = json.loads(state_path.read_text("utf-8"))
+                        bench = Path(state["run_dir"]) / "baseline" / "bench.json"
+                        bench.write_text(json.dumps(payload), encoding="utf-8")
+                        return SimpleNamespace(returncode=0, stdout="", stderr="")
+                    raise AssertionError(script)
+
+                with mock.patch.object(
+                    self.orchestrate, "_allocate_run_dir", return_value=allocated
+                ), mock.patch.object(
+                    self.orchestrate, "normalize_workload", return_value=None
+                ), mock.patch.object(
+                    self.orchestrate.preflight,
+                    "run",
+                    return_value={"ok": True, "errors": []},
+                ), mock.patch.object(
+                    self.orchestrate, "_run", side_effect=runner
+                ), self.assertRaisesRegex(ValueError, "baseline"):
+                    self.orchestrate.cmd_setup(args)
+                self.assertFalse(allocated.exists())
+
+    def test_setup_aliases_and_removed_options_are_explicit(self) -> None:
+        parser = self.orchestrate.build_parser()
+        alias = parser.parse_args(
+            [
+                "setup", "--baseline", "a", "--ref", "b", "--dims", "{}",
+                "--iterations", "3",
+            ]
+        )
+        self.assertEqual(self.orchestrate.resolve_setup_policy(alias).max_rounds, 3)
+        conflict = parser.parse_args(
+            [
+                "setup", "--baseline", "a", "--ref", "b", "--dims", "{}",
+                "--iterations", "3", "--max-rounds", "2",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "iterations.*max-rounds"):
+            self.orchestrate.resolve_setup_policy(conflict)
+        for option in ("--env-out", "--noise-threshold-pct"):
+            with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(
+                        [
+                            "setup", "--baseline", "a", "--ref", "b",
+                            "--dims", "{}", option, "value",
+                        ]
+                    )
+                self.assertIn("removed", stderr.getvalue())
 
     def test_output_root_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -648,6 +883,22 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             if Path(command[1]).name == "state.py":
                 return subprocess.run(command, capture_output=True, text=True)
+            if Path(command[1]).name == "run_iteration.py":
+                state_path = Path(command[command.index("--state") + 1])
+                state = json.loads(state_path.read_text("utf-8"))
+                bench = Path(state["run_dir"]) / "baseline" / "bench.json"
+                bench.write_text(
+                    json.dumps(
+                        {
+                            "correctness": {"passed": True},
+                            "kernel": {"average_ms": 1.0},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state["best_metric_ms"] = 1.0
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected setup command: {command}")
 
         with mock.patch.object(self.orchestrate, "normalize_workload", return_value=None), \
@@ -782,6 +1033,85 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 "complete",
             )
 
+    def test_no_win_round_one_resumes_and_runs_branch_for_round_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+
+            def write_no_win(iteration: int) -> None:
+                iter_dir = run_dir / f"iterv{iteration}"
+                (iter_dir / "methods.json").write_text(
+                    json.dumps({"methods": []}), encoding="utf-8"
+                )
+                (iter_dir / "branch_results.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "no_confirmed_kernel_win",
+                            "champion": None,
+                            "shortlist": [],
+                            "completed_comparisons": 2,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (iter_dir / "decision.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "no_confirmed_kernel_win",
+                            "candidate_file": None,
+                            "statistics": None,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            def runner(command, **_kwargs):
+                if Path(command[1]).name == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            write_no_win(1)
+            with mock.patch.object(self.orchestrate, "_run", side_effect=runner), \
+                    contextlib.redirect_stdout(io.StringIO()) as first_stdout:
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+            self.assertEqual(json.loads(first_stdout.getvalue())["next_iter"], 2)
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            restored = self.orchestrate.resume(
+                checkpoint,
+                input_hash=checkpoint["input_hash"],
+                max_rounds=2,
+            )
+            self.assertEqual(restored["next_stage"], "candidate_correctness")
+            self.assertEqual(restored["next_iteration"], 2)
+            history = json.loads(state_path.read_text("utf-8"))["history"]
+            self.assertEqual(history[-1]["status"], "no_confirmed_kernel_win")
+
+            write_no_win(2)
+            calls = []
+
+            def second_runner(command, **kwargs):
+                calls.append(Path(command[1]).name)
+                return runner(command, **kwargs)
+
+            args = self._close_args(run_dir)
+            args.iter = 2
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=second_runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(args)
+            self.assertEqual(calls.count("branch_explore.py"), 1)
+            final_checkpoint = json.loads(
+                (run_dir / "checkpoint.json").read_text("utf-8")
+            )
+            self.assertEqual(final_checkpoint["iteration"], 2)
+            self.assertEqual(
+                self.orchestrate.resume(
+                    final_checkpoint,
+                    input_hash=final_checkpoint["input_hash"],
+                    max_rounds=2,
+                )["next_stage"],
+                "complete",
+            )
+
     def test_real_setup_winning_close_records_ordered_stage_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -861,8 +1191,14 @@ class LifecycleIntegrationTests(unittest.TestCase):
             root = Path(tmp)
             run_dir, state_path = self._setup(root)
             state = json.loads(state_path.read_text("utf-8"))
-            state["started_at"] = 100.0
             state_path.write_text(json.dumps(state), encoding="utf-8")
+            checkpoint_path = run_dir / "checkpoint.json"
+            checkpoint = json.loads(checkpoint_path.read_text("utf-8"))
+            checkpoint["budget"] = {
+                "elapsed_seconds": state["budget"]["max_seconds"],
+                "remaining_seconds": 0.0,
+            }
+            checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
             iter_dir = run_dir / "iterv1"
             (iter_dir / "methods.json").write_text(
                 json.dumps({"methods": []}), encoding="utf-8"
@@ -873,7 +1209,6 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 warmup=1, repeat=1, retries=0,
             )
             with mock.patch.object(self.orchestrate, "_run", runner), \
-                    mock.patch.object(self.orchestrate.time, "time", return_value=10_000.0), \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.orchestrate.cmd_close_iter(close_args)
 
@@ -892,6 +1227,93 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 )["next_stage"],
                 "candidate_correctness",
             )
+
+    def test_branch_hard_timeout_is_durably_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+            state = json.loads(state_path.read_text("utf-8"))
+            iter_dir = run_dir / "iterv1"
+            (iter_dir / "methods.json").write_text(
+                json.dumps({"methods": []}), encoding="utf-8"
+            )
+            timed_out = SimpleNamespace(
+                returncode=124, stdout="", stderr="", timed_out=True
+            )
+            close_args = SimpleNamespace(
+                run_dir=str(run_dir), iter=1, benchmark="benchmark.py",
+                warmup=1, repeat=1, retries=0,
+            )
+
+            with mock.patch.object(
+                self.orchestrate, "_run", return_value=timed_out
+            ) as runner, contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.orchestrate.cmd_close_iter(close_args)
+
+            self.assertGreater(runner.call_args.kwargs["hard_timeout"], 0.0)
+            self.assertEqual(json.loads(stdout.getvalue())["status"], "budget_exhausted")
+            checkpoint = json.loads(
+                (run_dir / "checkpoint.json").read_text("utf-8")
+            )
+            self.assertEqual(checkpoint["stage"], "candidate_correctness")
+            self.assertEqual(checkpoint["status"], "budget_exhausted")
+            self.assertEqual(checkpoint["candidate_status"], "inconclusive")
+            self.assertEqual(
+                checkpoint["stage_evidence"]["candidate_correctness"]["status"],
+                "inconclusive",
+            )
+            self.assertEqual(checkpoint["input_hash"], state["input_hash"])
+
+    def test_resume_reverifies_frozen_workload_source_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir, state_path = self._setup(root)
+            adapter = root / "workload.py"
+            adapter.write_text(
+                "\n".join(
+                    [
+                        "def prepare(candidate): return None",
+                        "def validate(candidate): return True",
+                        "def benchmark(candidate): return {'latency_ms': 1.0}",
+                        "def metrics(): return {'primary_metric': {'name': 'latency_ms', 'direction': 'lower'}, 'min_effect_pct': 1.0, 'constraints': []}",
+                        "def cleanup(): return None",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            spec = self.orchestrate.normalize_workload(workload=adapter)
+            snapshot = self.orchestrate._workload_snapshot(spec)
+            manifest_path = run_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+            manifest["mode"] = "full"
+            manifest["workload"] = snapshot
+            manifest["input_hash"] = self.orchestrate._frozen_input_hash(
+                manifest,
+                workload=snapshot,
+                dims=manifest["dims"],
+                backend=manifest["backend"],
+                budget=manifest["budget"],
+                confidence=manifest["confidence"],
+                min_effect_pct=manifest["min_effect_pct"],
+                ptr_size=manifest["ptr_size"],
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            state = json.loads(state_path.read_text("utf-8"))
+            state.update(
+                mode="full", workload=snapshot, input_hash=manifest["input_hash"]
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            checkpoint_path = run_dir / "checkpoint.json"
+            checkpoint = json.loads(checkpoint_path.read_text("utf-8"))
+            checkpoint["input_hash"] = manifest["input_hash"]
+            checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+            adapter.write_text(
+                adapter.read_text("utf-8") + "\n# drifted\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "source_hash"):
+                self.orchestrate.cmd_resume(
+                    SimpleNamespace(run_dir=str(run_dir))
+                )
 
     def test_correctness_checkpoint_resumes_at_paired_without_rerunning_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1091,6 +1513,7 @@ class CheckpointAndResumeTests(unittest.TestCase):
             "schema_version": 2,
             "input_hash": "frozen",
             "run_dir": str(root),
+            "iteration": 0,
             "stage": "baseline",
             "stage_index": 0,
             "status": "ready",
@@ -1099,6 +1522,64 @@ class CheckpointAndResumeTests(unittest.TestCase):
             "budget": {"elapsed_seconds": 0.0, "remaining_seconds": 20.0},
             "updated_at": 100.0,
         }
+
+    def test_checkpoint_iteration_is_strict_and_decision_wraps_one_round(self) -> None:
+        invalid = self._checkpoint(Path("/tmp/run"))
+        del invalid["iteration"]
+        with self.assertRaisesRegex(ValueError, "iteration"):
+            self.orchestrate._validate_checkpoint(invalid)
+        invalid = self._checkpoint(Path("/tmp/run"))
+        invalid["iteration"] = True
+        with self.assertRaisesRegex(ValueError, "iteration"):
+            self.orchestrate._validate_checkpoint(invalid)
+
+        baseline = self.orchestrate.transition_checkpoint(
+            self._checkpoint(Path("/tmp/run")),
+            "baseline",
+            status="stage_complete",
+        )
+        first = self.orchestrate.resume(
+            baseline, input_hash="frozen", max_rounds=2
+        )
+        self.assertEqual(first["next_stage"], "candidate_correctness")
+        self.assertEqual(first["next_iteration"], 1)
+
+        decision = self._checkpoint(Path("/tmp/run"))
+        decision.update(
+            stage="decision",
+            stage_index=self.orchestrate.STAGES.index("decision"),
+            status="stage_complete",
+            iteration=1,
+        )
+        second = self.orchestrate.resume(
+            decision, input_hash="frozen", max_rounds=2
+        )
+        self.assertEqual(second["next_stage"], "candidate_correctness")
+        self.assertEqual(second["next_iteration"], 2)
+        wrapped = self.orchestrate.transition_checkpoint(
+            decision, "candidate_correctness", status="ready", iteration=2
+        )
+        self.assertEqual(wrapped["iteration"], 2)
+        with self.assertRaisesRegex(ValueError, "iteration|wrap"):
+            self.orchestrate.transition_checkpoint(
+                decision, "candidate_correctness", status="ready", iteration=3
+            )
+
+    def test_close_iteration_must_match_checkpoint_next_iteration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = LifecycleIntegrationTests()
+            helper.setUp()
+            run_dir, _state_path = helper._setup(Path(tmp))
+            (run_dir / "iterv2" / "methods.json").write_text(
+                json.dumps({"methods": []}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "iteration.*checkpoint"):
+                helper.orchestrate.cmd_close_iter(
+                    SimpleNamespace(
+                        run_dir=str(run_dir), iter=2, benchmark="benchmark.py",
+                        warmup=1, repeat=1, retries=0,
+                    )
+                )
 
     def test_deadline_stops_and_writes_the_real_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1367,23 +1848,29 @@ class OuterLoopTests(unittest.TestCase):
             )
             clock = self.orchestrate.BudgetClock(policy, started_at=100.0)
             evaluator = mock.Mock()
-            result = self.orchestrate.evaluate_outer_candidate(
-                candidate,
-                mode="full",
-                workload_spec=spec,
-                baseline="best.py",
-                policy=policy,
-                confidence=0.95,
-                evaluator=evaluator,
-                budget_clock=clock,
-                now=116.0,
-                estimated_seconds_per_pair=1.0,
-            )
+            decider = mock.Mock(side_effect=AssertionError("decision must not run"))
+            with mock.patch.object(
+                self.orchestrate.decision_engine, "decide", decider
+            ):
+                result = self.orchestrate.evaluate_outer_candidate(
+                    candidate,
+                    mode="full",
+                    workload_spec=spec,
+                    baseline="best.py",
+                    policy=policy,
+                    confidence=0.95,
+                    evaluator=evaluator,
+                    budget_clock=clock,
+                    now=116.0,
+                    estimated_seconds_per_pair=1.0,
+                )
 
         evaluator.assert_not_called()
+        decider.assert_not_called()
         self.assertEqual(result["candidate_status"], "inconclusive")
         self.assertTrue(result["budget_exhausted"])
-        self.assertEqual(result["status"], "kernel_only_win")
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(result["kernel_evidence"]["status"], "confirmed_win")
 
     def test_outer_blocks_are_capped_by_execution_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

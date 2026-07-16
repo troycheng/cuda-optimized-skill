@@ -31,6 +31,22 @@ def sha256_file(path: _PathLike) -> str:
     return digest.hexdigest()
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry update, with a portable open fallback."""
+    flags = os.O_RDONLY
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags | directory_flag)
+    except OSError:
+        if not directory_flag:
+            raise
+        fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def atomic_write_json(path: _PathLike, payload: Any) -> None:
     """Atomically replace *path* with a formatted UTF-8 JSON document."""
     target = Path(path)
@@ -45,6 +61,7 @@ def atomic_write_json(path: _PathLike, payload: Any) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
     except BaseException:
         try:
             temporary.unlink()
