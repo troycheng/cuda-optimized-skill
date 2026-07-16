@@ -12,15 +12,669 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
+import math
 import os
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict
+from numbers import Real
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from artifact_store import (  # noqa: E402
+    ArtifactStore,
+    CURRENT_SCHEMA_VERSION,
+    atomic_write_json,
+    sha256_file,
+)
+from budget import BudgetClock, BudgetPolicy, resolve_budget  # noqa: E402
+import decision as decision_engine  # noqa: E402
+import preflight  # noqa: E402
+import state as state_manager  # noqa: E402
+from workload_adapter import WorkloadSpec, normalize_workload  # noqa: E402
+import workload_evaluate  # noqa: E402
+
 _BRANCH_RESULT_STATUSES = {"shortlist_ready", "no_confirmed_kernel_win"}
+
+STAGES = (
+    "baseline",
+    "candidate_correctness",
+    "candidate_paired",
+    "candidate_profile",
+    "candidate_sanitizer",
+    "workload_paired",
+    "decision",
+    "complete",
+)
+_CHECKPOINT_STATUSES = {
+    "ready",
+    "in_progress",
+    "stage_complete",
+    "budget_exhausted",
+    "interrupted",
+    "failed",
+    "complete",
+}
+_UNSET = object()
+
+
+def _finite_real(value, field: str, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a finite number") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite number")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field} must be at least {minimum:g}")
+    return number
+
+
+def _positive_int(value, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _strict_json_copy(value, field: str = "value", active: set[int] | None = None):
+    if active is None:
+        active = set()
+    if value is None or type(value) in {bool, str, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{field} numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{field} must not contain a cycle")
+        active.add(identity)
+        result = {}
+        try:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValueError(f"{field} mappings must use string keys")
+                result[key] = _strict_json_copy(
+                    item, f"{field}.{key}", active
+                )
+            return result
+        finally:
+            active.remove(identity)
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{field} must not contain a cycle")
+        active.add(identity)
+        try:
+            return [
+                _strict_json_copy(item, f"{field}[{index}]", active)
+                for index, item in enumerate(value)
+            ]
+        finally:
+            active.remove(identity)
+    raise ValueError(f"{field} must contain only strict JSON values")
+
+
+def _workload_snapshot(spec: WorkloadSpec | None) -> dict | None:
+    if spec is None:
+        return None
+    return _strict_json_copy(
+        {
+            "kind": spec.kind,
+            "source": spec.source,
+            "objective": spec.objective,
+            "cases": list(spec.cases),
+            "source_hash": spec.source_hash,
+        },
+        "workload",
+    )
+
+
+def _workload_from_snapshot(snapshot) -> WorkloadSpec | None:
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("state workload must be a mapping")
+    required = {"kind", "source", "objective", "cases", "source_hash"}
+    if set(snapshot) != required:
+        raise ValueError("state workload snapshot is incomplete")
+    cases = snapshot["cases"]
+    if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes, bytearray)):
+        raise ValueError("state workload cases must be a sequence")
+    return WorkloadSpec(
+        kind=snapshot["kind"],
+        source=_strict_json_copy(snapshot["source"], "workload.source"),
+        objective=_strict_json_copy(snapshot["objective"], "workload.objective"),
+        cases=tuple(_strict_json_copy(cases, "workload.cases")),
+        source_hash=snapshot["source_hash"],
+    )
+
+
+def _budget_payload(policy: BudgetPolicy) -> dict:
+    return _strict_json_copy(asdict(policy), "budget")
+
+
+def resolve_setup_policy(args) -> BudgetPolicy:
+    confidence = _finite_real(args.confidence, "confidence")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must be between zero and one")
+    _finite_real(args.min_effect_pct, "min_effect_pct", minimum=0.0)
+    overrides = {}
+    for field in (
+        "max_seconds",
+        "max_rounds",
+        "branches",
+        "min_pairs",
+        "max_pairs",
+        "outer_candidates",
+    ):
+        value = getattr(args, field, None)
+        if value is not None:
+            overrides[field] = _positive_int(value, field)
+    return resolve_budget(args.budget, **overrides)
+
+
+def _validate_checkpoint(checkpoint, *, input_hash: str | None = None) -> dict:
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("checkpoint must be a mapping")
+    clean = _strict_json_copy(checkpoint, "checkpoint")
+    required = {
+        "schema_version",
+        "input_hash",
+        "stage",
+        "stage_index",
+        "status",
+        "candidate_id",
+        "candidate_status",
+        "budget",
+        "updated_at",
+    }
+    missing = sorted(required - set(clean))
+    if missing:
+        raise ValueError(f"checkpoint missing required field: {missing[0]}")
+    if type(clean["schema_version"]) is not int or clean["schema_version"] != CURRENT_SCHEMA_VERSION:
+        raise ValueError(
+            f"checkpoint schema_version must be {CURRENT_SCHEMA_VERSION}; start a new run"
+        )
+    stage = clean["stage"]
+    if type(stage) is not str or stage not in STAGES:
+        raise ValueError("checkpoint stage is unknown")
+    stage_index = clean["stage_index"]
+    if type(stage_index) is not int or stage_index != STAGES.index(stage):
+        raise ValueError("checkpoint stage_index does not match stage")
+    status = clean["status"]
+    if type(status) is not str or status not in _CHECKPOINT_STATUSES:
+        raise ValueError("checkpoint status is invalid")
+    if stage == "complete" and status != "complete":
+        raise ValueError("complete checkpoint stage requires complete status")
+    if status == "complete" and stage != "complete":
+        raise ValueError("complete checkpoint status requires complete stage")
+    if not isinstance(clean["input_hash"], str) or not clean["input_hash"]:
+        raise ValueError("checkpoint input_hash must be non-empty")
+    if input_hash is not None and clean["input_hash"] != input_hash:
+        raise ValueError("checkpoint does not match the frozen input")
+    budget = clean["budget"]
+    if not isinstance(budget, Mapping):
+        raise ValueError("checkpoint budget must be a mapping")
+    for field in ("elapsed_seconds", "remaining_seconds"):
+        _finite_real(budget.get(field), f"checkpoint budget.{field}", minimum=0.0)
+    _finite_real(clean["updated_at"], "checkpoint updated_at")
+    candidate_id = clean["candidate_id"]
+    if candidate_id is not None and (
+        type(candidate_id) is not str or not candidate_id.strip()
+    ):
+        raise ValueError("checkpoint candidate_id must be null or a non-empty string")
+    candidate_status = clean["candidate_status"]
+    if candidate_status is not None and (
+        type(candidate_status) is not str or not candidate_status.strip()
+    ):
+        raise ValueError(
+            "checkpoint candidate_status must be null or a non-empty string"
+        )
+    declared_run_dir = clean.get("run_dir")
+    if declared_run_dir is not None and (
+        type(declared_run_dir) is not str or not declared_run_dir.strip()
+    ):
+        raise ValueError("checkpoint run_dir must be a non-empty path")
+    candidate_file = clean.get("candidate_file")
+    candidate_hash = clean.get("candidate_sha256")
+    if candidate_file is not None or candidate_hash is not None:
+        if not isinstance(candidate_file, str) or not candidate_file:
+            raise ValueError("checkpoint candidate_file must be a non-empty path")
+        if (
+            not isinstance(candidate_hash, str)
+            or len(candidate_hash) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in candidate_hash)
+        ):
+            raise ValueError("checkpoint candidate_sha256 must be a sha256 digest")
+        candidate = Path(candidate_file).expanduser()
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("checkpoint candidate file drifted or is unsafe")
+        if sha256_file(candidate) != candidate_hash.lower():
+            raise ValueError("checkpoint candidate file drifted from frozen sha256")
+    return clean
+
+
+def transition_checkpoint(
+    checkpoint,
+    stage: str,
+    *,
+    status: str = "stage_complete",
+    candidate_id=_UNSET,
+    candidate_status=_UNSET,
+    budget=None,
+    updated_at: float | None = None,
+) -> dict:
+    """Return an ordered, detached checkpoint transition."""
+    current = _validate_checkpoint(checkpoint)
+    if stage not in STAGES:
+        raise ValueError(f"unknown checkpoint stage: {stage}")
+    if status not in _CHECKPOINT_STATUSES:
+        raise ValueError(f"unknown checkpoint status: {status}")
+    current_index = current["stage_index"]
+    target_index = STAGES.index(stage)
+    if target_index < current_index:
+        raise ValueError("checkpoint stage order cannot move backward")
+    if target_index > current_index + 1:
+        raise ValueError("checkpoint stage order cannot skip stages")
+    if (
+        target_index == current_index
+        and current["status"] in {"stage_complete", "complete"}
+        and status != current["status"]
+    ):
+        raise ValueError("checkpoint stage order cannot reopen a completed stage")
+    if target_index == current_index + 1 and current["status"] not in {
+        "stage_complete",
+        "complete",
+    }:
+        raise ValueError("checkpoint stage order requires the current stage to complete")
+    result = copy.deepcopy(current)
+    result.update(
+        {
+            "stage": stage,
+            "stage_index": target_index,
+            "status": status,
+            "candidate_id": (
+                current.get("candidate_id") if candidate_id is _UNSET else candidate_id
+            ),
+            "candidate_status": (
+                current.get("candidate_status")
+                if candidate_status is _UNSET
+                else candidate_status
+            ),
+            "updated_at": time.time() if updated_at is None else _finite_real(
+                updated_at, "updated_at"
+            ),
+        }
+    )
+    if budget is not None:
+        result["budget"] = _strict_json_copy(budget, "budget")
+    if stage == "complete":
+        result["status"] = "complete"
+    return _validate_checkpoint(result)
+
+
+checkpoint_transition = transition_checkpoint
+
+
+def resume(checkpoint, *, input_hash: str) -> dict:
+    """Validate and detach resumable state without replaying completed work."""
+    current = _validate_checkpoint(checkpoint, input_hash=input_hash)
+    result = copy.deepcopy(current)
+    if current["stage"] == "complete":
+        result["status"] = "complete"
+        result["next_stage"] = "complete"
+        return result
+    if current["status"] == "stage_complete":
+        result["next_stage"] = STAGES[current["stage_index"] + 1]
+    else:
+        result["next_stage"] = current["stage"]
+    return result
+
+
+def schedule_next(
+    state,
+    clock: BudgetClock,
+    estimated_seconds,
+    *,
+    now: float | None = None,
+    run_dir=None,
+    store: ArtifactStore | None = None,
+    candidate_id=None,
+) -> dict:
+    """Admit work against the execution deadline or durably stop the run."""
+    if not isinstance(clock, BudgetClock):
+        raise ValueError("clock must be a BudgetClock")
+    estimate = _finite_real(estimated_seconds, "estimated_seconds", minimum=0.0)
+    current_time = time.time() if now is None else _finite_real(now, "now")
+    elapsed = max(0.0, current_time - clock.started_at)
+    remaining = clock.remaining_seconds(now=current_time)
+    if isinstance(state, Mapping) and "stage" not in state:
+        checkpoint = {
+            "schema_version": state.get("schema_version", CURRENT_SCHEMA_VERSION),
+            "input_hash": state.get("input_hash"),
+            "run_dir": state.get("run_dir"),
+            "stage": STAGES[0],
+            "stage_index": 0,
+            "status": "ready",
+            "candidate_id": None,
+            "candidate_status": None,
+            "budget": {
+                "elapsed_seconds": elapsed,
+                "remaining_seconds": remaining,
+            },
+            "updated_at": current_time,
+        }
+        checkpoint = _validate_checkpoint(checkpoint)
+    else:
+        checkpoint = _validate_checkpoint(state)
+    checkpoint["budget"] = {
+        "elapsed_seconds": elapsed,
+        "remaining_seconds": remaining,
+    }
+    checkpoint["updated_at"] = current_time
+    checkpoint["checkpoint_written"] = False
+    if clock.can_start(now=current_time, estimated_seconds=estimate):
+        checkpoint["status"] = "in_progress"
+        checkpoint["candidate_id"] = candidate_id
+        return checkpoint
+
+    checkpoint["status"] = "budget_exhausted"
+    checkpoint["candidate_id"] = candidate_id
+    checkpoint["candidate_status"] = "inconclusive"
+    selected_store = store
+    if selected_store is None:
+        selected_root = run_dir or checkpoint.get("run_dir")
+        if selected_root is not None:
+            selected_store = ArtifactStore(selected_root)
+    if selected_store is not None:
+        persisted = copy.deepcopy(checkpoint)
+        persisted["checkpoint_written"] = True
+        try:
+            selected_store.write_checkpoint(persisted)
+        except Exception as error:
+            checkpoint["checkpoint_error"] = f"{type(error).__name__}: {error}"
+        else:
+            checkpoint = persisted
+    return checkpoint
+
+
+def execute_stage(
+    checkpoint,
+    stage: str,
+    action,
+    *,
+    store: ArtifactStore,
+    cleanup=None,
+    updated_at: float | None = None,
+):
+    """Execute one stage and checkpoint success or a safe interruption."""
+    if not callable(action):
+        raise ValueError("action must be callable")
+    if cleanup is not None and not callable(cleanup):
+        raise ValueError("cleanup must be callable")
+    current = _validate_checkpoint(checkpoint)
+    if current["stage"] != stage:
+        raise ValueError("execute_stage must run the checkpoint current stage")
+    cleaned = False
+
+    def clean_once():
+        nonlocal cleaned
+        if cleanup is not None and not cleaned:
+            cleaned = True
+            cleanup()
+
+    try:
+        value = action()
+    except BaseException as error:
+        try:
+            clean_once()
+        finally:
+            failed = transition_checkpoint(
+                current,
+                stage,
+                status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                candidate_id=current.get("candidate_id"),
+                candidate_status=current.get("candidate_status"),
+                updated_at=updated_at,
+            )
+            store.write_checkpoint(failed)
+        raise
+    completed = transition_checkpoint(
+        current,
+        stage,
+        status="stage_complete",
+        candidate_id=current.get("candidate_id"),
+        candidate_status=current.get("candidate_status"),
+        updated_at=updated_at,
+    )
+    store.write_checkpoint(completed)
+    return value, completed
+
+
+def select_outer_candidates(items, limit: int) -> list[dict]:
+    """Return the stable top confirmed candidates without mutating input."""
+    _positive_int(limit, "limit")
+    if isinstance(items, (str, bytes, bytearray, Mapping)):
+        raise ValueError("items must be a sequence of candidate mappings")
+    try:
+        source = list(items)
+    except TypeError as error:
+        raise ValueError("items must be a sequence of candidate mappings") from error
+    selected = []
+    for index, item in enumerate(source):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"items[{index}] must be a mapping")
+        if item.get("status") != "confirmed_win":
+            continue
+        statistics = item.get("statistics")
+        if not isinstance(statistics, Mapping) or "estimate_pct" not in statistics:
+            raise ValueError(f"items[{index}] confirmed win requires estimate_pct")
+        estimate = _finite_real(
+            statistics["estimate_pct"], f"items[{index}].statistics.estimate_pct"
+        )
+        selected.append((estimate, index, _strict_json_copy(item, f"items[{index}]")))
+    selected.sort(key=lambda row: -row[0])
+    return [item for _, _, item in selected[:limit]]
+
+
+def _candidate_file(candidate: Mapping) -> str:
+    value = candidate.get("candidate_file") or candidate.get("kernel")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("candidate must provide candidate_file or kernel")
+    path = Path(value).expanduser()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("candidate artifact must be a non-symlink regular file")
+    return str(path.resolve(strict=True))
+
+
+def build_terminal_decision(
+    *,
+    mode: str,
+    candidate: Mapping,
+    workload_result=None,
+    decide_fn=None,
+) -> dict:
+    """Build the authoritative terminal decision bound to candidate bytes."""
+    selected_decider = decision_engine.decide if decide_fn is None else decide_fn
+    kernel = {
+        "status": candidate.get("status"),
+        "statistics": _strict_json_copy(candidate.get("statistics"), "statistics"),
+    }
+    result = selected_decider(
+        mode=mode,
+        kernel=kernel,
+        workload=workload_result,
+        constraints=None,
+    )
+    candidate_file = _candidate_file(candidate)
+    result["candidate_file"] = candidate_file
+    result["candidate_sha256"] = sha256_file(candidate_file)
+    return _strict_json_copy(result, "decision")
+
+
+def evaluate_outer_candidate(
+    candidate: Mapping,
+    *,
+    mode: str,
+    workload_spec: WorkloadSpec | None,
+    baseline,
+    policy: BudgetPolicy,
+    confidence: float,
+    evaluator=None,
+    remaining_seconds: float | None = None,
+    estimated_seconds_per_pair: float = 0.0,
+    budget_clock: BudgetClock | None = None,
+    now: float | None = None,
+    candidate_root=None,
+    retries: int = 2,
+    seed: int = 0,
+) -> dict:
+    """Evaluate one confirmed inner winner through the applicable outer loop."""
+    candidate_path = Path(_candidate_file(candidate))
+    if candidate_path.suffix not in {".cu", ".py"}:
+        raise ValueError("outer candidate must be a .cu or .py kernel")
+    if candidate_root is not None:
+        iteration_root = Path(candidate_root).expanduser().resolve(strict=True)
+        try:
+            candidate_path.relative_to(iteration_root)
+        except ValueError as error:
+            raise ValueError("outer candidate escapes the current iteration") from error
+    normalized_candidate = dict(candidate)
+    normalized_candidate["candidate_file"] = str(candidate_path)
+    if mode == "kernel-only":
+        return build_terminal_decision(mode=mode, candidate=normalized_candidate)
+    if mode != "full" or workload_spec is None:
+        raise ValueError("full mode requires a frozen WorkloadSpec")
+    blocks = policy.max_pairs
+    pair_estimate = _finite_real(
+        estimated_seconds_per_pair, "estimated_seconds_per_pair", minimum=0.0
+    )
+    budget_exhausted = False
+    if budget_clock is not None:
+        if not isinstance(budget_clock, BudgetClock):
+            raise ValueError("budget_clock must be a BudgetClock")
+        current_time = time.time() if now is None else _finite_real(now, "now")
+        if not budget_clock.can_start(
+            now=current_time,
+            estimated_seconds=policy.min_pairs * pair_estimate,
+        ):
+            budget_exhausted = True
+        if pair_estimate > 0.0:
+            execution_remaining = max(
+                0.0,
+                budget_clock.started_at
+                + budget_clock.policy.max_seconds
+                - budget_clock.policy.reserve_seconds
+                - current_time,
+            )
+            blocks = min(blocks, int(execution_remaining // pair_estimate))
+    if remaining_seconds is not None:
+        remaining = _finite_real(
+            remaining_seconds, "remaining_seconds", minimum=0.0
+        )
+        if pair_estimate > 0.0:
+            blocks = min(blocks, int(remaining // pair_estimate))
+    if budget_exhausted or blocks < policy.min_pairs:
+        workload_result = {
+            "status": "workload_failed",
+            "reason": "budget_exhausted",
+            "candidate_status": "inconclusive",
+        }
+    else:
+        selected_evaluator = (
+            workload_evaluate.evaluate_pairs if evaluator is None else evaluator
+        )
+        workload_result = selected_evaluator(
+            workload_spec,
+            baseline,
+            str(candidate_path),
+            blocks=blocks,
+            retries=retries,
+            seed=seed,
+            confidence=_finite_real(confidence, "confidence"),
+        )
+    terminal = build_terminal_decision(
+        mode=mode,
+        candidate=normalized_candidate,
+        workload_result=workload_result,
+    )
+    if budget_exhausted or blocks < policy.min_pairs:
+        terminal["candidate_status"] = "inconclusive"
+        terminal["budget_exhausted"] = True
+    return terminal
+
+
+def apply_decision(
+    decision_payload,
+    *,
+    run_dir,
+    iteration: int,
+    state_path,
+    kernel,
+    bench,
+    methods_json,
+    retries: int = 0,
+    attribution=None,
+    sass_check=None,
+    runner=None,
+) -> dict:
+    """Atomically publish a decision, then invoke state update with its path."""
+    _positive_int(iteration, "iteration")
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        raise ValueError("retries must be a non-negative integer")
+    root = Path(run_dir).expanduser().resolve(strict=True)
+    iter_dir = (root / f"iterv{iteration}").resolve(strict=True)
+    if iter_dir.parent != root:
+        raise ValueError("iteration directory escapes run root")
+    decision_path = iter_dir / "decision.json"
+    payload = _strict_json_copy(decision_payload, "decision")
+    atomic_write_json(decision_path, payload)
+
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "state.py"),
+        "update",
+        "--state",
+        str(state_path),
+        "--iter",
+        str(iteration),
+        "--kernel",
+        str(kernel),
+        "--bench",
+        str(bench),
+        "--methods-json",
+        str(methods_json),
+        "--retries",
+        str(retries),
+        "--decision",
+        str(decision_path),
+    ]
+    if attribution is not None and Path(attribution).is_file():
+        command.extend(["--attribution", str(attribution)])
+    if sass_check is not None and Path(sass_check).is_file():
+        command.extend(["--sass-check", str(sass_check)])
+    selected_runner = _run if runner is None else runner
+    completed = selected_runner(command)
+    return {
+        "decision_path": str(decision_path),
+        "command": command,
+        "returncode": completed.returncode,
+    }
 
 
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -89,114 +743,338 @@ def _selected_kernel(
     return os.path.abspath(str(candidate))
 
 
+def _policy_from_state(state: Mapping) -> BudgetPolicy:
+    budget = state.get("budget")
+    if not isinstance(budget, Mapping):
+        raise ValueError("state budget must be a mapping")
+    fields = {
+        name: budget.get(name)
+        for name in (
+            "name",
+            "max_seconds",
+            "branches",
+            "max_rounds",
+            "min_pairs",
+            "max_pairs",
+            "outer_candidates",
+            "max_cases",
+            "sanitizer_mode",
+            "reserve_seconds",
+        )
+    }
+    try:
+        policy = BudgetPolicy(**fields)
+    except TypeError as error:
+        raise ValueError(f"state budget policy is incomplete: {error}") from error
+    # Reuse budget.py's public validator through an exact custom resolution.
+    return resolve_budget(
+        "custom",
+        max_seconds=policy.max_seconds,
+        branches=policy.branches,
+        max_rounds=policy.max_rounds,
+        min_pairs=policy.min_pairs,
+        max_pairs=policy.max_pairs,
+        outer_candidates=policy.outer_candidates,
+        max_cases=policy.max_cases,
+        sanitizer_mode=policy.sanitizer_mode,
+        reserve_seconds=policy.reserve_seconds,
+    )
+
+
+def _publish_outer_candidate(candidate: Mapping, *, iter_dir: Path) -> str:
+    source = Path(_candidate_file(candidate))
+    suffix = source.suffix
+    if suffix not in {".cu", ".py"}:
+        raise ValueError("outer candidate must be a .cu or .py kernel")
+    destination = iter_dir / f"kernel{suffix}"
+    if source != destination.resolve(strict=False):
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=str(iter_dir)
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copy2(source, temporary)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+    for stale_suffix in {".cu", ".py"} - {suffix}:
+        stale = iter_dir / f"kernel{stale_suffix}"
+        if stale.is_symlink() or stale.is_file():
+            stale.unlink()
+        elif stale.exists():
+            raise ValueError("stale iteration kernel is not a regular file")
+    source_bench = source.parent / "bench.json"
+    destination_bench = iter_dir / "bench.json"
+    if source_bench.is_file() and source_bench.resolve() != destination_bench.resolve():
+        shutil.copy2(source_bench, destination_bench)
+    return str(destination.resolve(strict=True))
+
+
+def _select_terminal_outer_result(results: list[tuple[dict, dict]]) -> tuple[dict, dict]:
+    if not results:
+        raise ValueError("outer loop did not produce a terminal decision")
+    end_to_end = [
+        pair for pair in results if pair[1].get("status") == "end_to_end_win"
+    ]
+    if end_to_end:
+        def estimate(pair):
+            statistics = pair[1].get("workload_statistics") or {}
+            value = statistics.get("estimate_pct", float("-inf"))
+            return _finite_real(value, "workload_statistics.estimate_pct")
+
+        end_to_end.sort(key=estimate, reverse=True)
+        return end_to_end[0]
+    return results[0]
+
+
 # ---------------------------------------------------------------------------
 # setup  —  steps 0, 1, 2, and open-iter(1)
 # ---------------------------------------------------------------------------
 
-def cmd_setup(args):
-    env_json = os.path.abspath(args.env_out or "./env.json")
+def _strict_json_object(text: str, field: str) -> dict:
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            if key in result:
+                raise ValueError(f"{field} contains duplicate key: {key}")
+            result[key] = value
+        return result
 
-    # 0. env
-    rc = _run([sys.executable, str(SCRIPT_DIR / "check_env.py"),
-               "--out", env_json]).returncode
-    if rc != 0:
-        sys.exit(f"check_env failed rc={rc}")
+    def nonfinite(token):
+        raise ValueError(f"{field} contains non-finite JSON constant: {token}")
 
-    # 0b. preflight
-    rc = _run([
-        sys.executable, str(SCRIPT_DIR / "preflight.py"),
-        "--baseline", os.path.abspath(args.baseline),
-        "--ref", os.path.abspath(args.ref),
-        "--dims", args.dims,
-    ]).returncode
-    if rc != 0:
-        sys.exit("preflight failed — fix baseline/ref/dims above, then retry")
-
-    # 1. init run dir + state
-    init = _run([
-        sys.executable, str(SCRIPT_DIR / "state.py"), "init",
-        "--baseline", os.path.abspath(args.baseline),
-        "--ref", os.path.abspath(args.ref),
-        "--iterations", str(args.iterations),
-        "--ncu-num", str(args.ncu_num),
-        "--branches", str(args.branches),
-        "--dims", args.dims,
-        "--env", env_json,
-        "--noise-threshold-pct", str(args.noise_threshold_pct),
-        "--ptr-size", str(args.ptr_size),
-    ], capture_output=True)
-    if init.returncode != 0:
-        sys.stderr.write(init.stderr or "")
-        sys.exit("state init failed")
-    sys.stderr.write(init.stderr or "")
-
-    init_info = {}
     try:
-        init_info = json.loads(init.stdout or "{}")
-    except json.JSONDecodeError:
-        for line in reversed((init.stdout or "").splitlines()):
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    init_info = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    continue
-    run_dir = init_info.get("run_dir")
-    state_path = init_info.get("state")
-    if not run_dir or not state_path:
-        sys.exit(f"could not parse state init output:\n{init.stdout}")
+        value = json.loads(
+            text,
+            object_pairs_hook=pairs,
+            parse_constant=nonfinite,
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{field} must be valid strict JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be a JSON object")
+    return value
 
-    # 2. seed baseline
-    rc = _run([
-        sys.executable, str(SCRIPT_DIR / "run_iteration.py"), "seed-baseline",
-        "--state", state_path,
-        "--benchmark", os.path.abspath(args.benchmark),
-        "--warmup", str(args.warmup),
-        "--repeat", str(args.repeat),
-    ]).returncode
-    if rc != 0:
-        sys.exit("baseline seed failed")
 
-    # 3a for iter 1: profile best_input
-    rc = _run([
-        sys.executable, str(SCRIPT_DIR / "profile_ncu.py"),
-        "--state", state_path,
-        "--iter", "1",
-        "--which", "best_input",
-        "--benchmark", os.path.abspath(args.benchmark),
-    ]).returncode
-    if rc != 0:
-        print("[warn] ncu profiling failed or degraded", file=sys.stderr)
+def validate_output_root(output_root, *, baseline) -> Path:
+    """Resolve an existing non-symlink directory that may own new runs."""
+    if output_root is None:
+        root_arg = Path(baseline).expanduser().resolve(strict=True).parent
+    else:
+        root_arg = Path(output_root).expanduser()
+        if root_arg.is_symlink():
+            raise ValueError("output_root must not be a symlink")
+    try:
+        info = root_arg.lstat()
+    except OSError as error:
+        raise ValueError(f"output_root does not exist: {root_arg}") from error
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("output_root must be a directory")
+    root = root_arg.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("output_root must resolve to a directory")
+    return root
 
-    # 3b for iter 1: roofline
-    rc = _run([
-        sys.executable, str(SCRIPT_DIR / "roofline.py"),
-        "--state", state_path,
-        "--iter", "1",
-    ]).returncode
 
-    # Check for early stop
-    iter_dir = os.path.join(run_dir, "iterv1")
-    roofline_path = os.path.join(iter_dir, "roofline.json")
-    early_stop = False
-    if os.path.isfile(roofline_path):
-        roofline = _read(roofline_path)
-        early_stop = roofline.get("near_peak", False)
+def _allocate_run_dir(output_root: Path) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    nanos = time.time_ns() % 1_000_000_000
+    for suffix in range(1000):
+        name = f"run_{stamp}_{nanos:09d}"
+        if suffix:
+            name += f"_{suffix}"
+        run_dir = output_root / name
+        try:
+            run_dir.mkdir(mode=0o755)
+        except FileExistsError:
+            continue
+        resolved = run_dir.resolve(strict=True)
+        if resolved.parent != output_root:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise ValueError("allocated run directory escaped output_root")
+        return resolved
+    raise ValueError("could not allocate a unique run directory")
 
-    print(json.dumps({
-        "run_dir": run_dir,
-        "state": state_path,
-        "env": env_json,
-        "early_stop": early_stop,
-        "next_step": (
-            "The agent should now read iterv1/roofline.json (for axis budgets), "
-            "iterv1/ncu_top.json, and state.json, then write "
-            f"iterv1/branches/b{{1..K}}/kernel.<ext>, iterv1/methods.json, "
-            "and iterv1/analysis.md. "
-            "After that, run: orchestrate.py close-iter --run-dir <run_dir> --iter 1"
-        ) if not early_stop else "Near roofline — consider stopping.",
-    }, indent=2))
+
+def _frozen_input_hash(
+    manifest: Mapping,
+    *,
+    workload,
+    dims,
+    backend: str,
+    budget,
+    confidence: float,
+    min_effect_pct: float,
+    ptr_size: int,
+) -> str:
+    input_digests = {
+        key: value["sha256"]
+        for key, value in sorted(manifest["inputs"].items())
+    }
+    frozen = {
+        "inputs": input_digests,
+        "workload": workload,
+        "dims": dims,
+        "backend": backend,
+        "budget": budget,
+        "confidence": confidence,
+        "min_effect_pct": min_effect_pct,
+        "ptr_size": ptr_size,
+    }
+    encoded = json.dumps(
+        frozen,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def cmd_setup(args):
+    started_at = time.time()
+    policy = resolve_setup_policy(args)
+    confidence = _finite_real(args.confidence, "confidence")
+    min_effect_pct = _finite_real(
+        args.min_effect_pct, "min_effect_pct", minimum=0.0
+    )
+    dims = _strict_json_object(args.dims, "--dims")
+    baseline = str(Path(args.baseline).expanduser().resolve(strict=True))
+    ref = str(Path(args.ref).expanduser().resolve(strict=True))
+
+    # Normalize exactly the caller-supplied workload form before preflight.
+    workload_spec = normalize_workload(
+        workload=args.workload,
+        workload_cmd=args.workload_cmd,
+        workload_manifest=args.workload_manifest,
+        objective=args.objective,
+    )
+    report = preflight.run(
+        baseline,
+        ref,
+        copy.deepcopy(dims),
+        False,
+        workload_spec,
+    )
+    if not report.get("ok"):
+        errors = report.get("errors") or ["unknown preflight failure"]
+        raise ValueError("preflight failed: " + "; ".join(map(str, errors)))
+
+    output_root = validate_output_root(args.output_root, baseline=baseline)
+    run_dir = _allocate_run_dir(output_root)
+    try:
+        env_path = run_dir / "env.json"
+        environment_result = _run(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "check_env.py"),
+                "--out",
+                str(env_path),
+            ]
+        )
+        if environment_result.returncode != 0:
+            raise ValueError(f"check_env failed rc={environment_result.returncode}")
+        environment = _read(str(env_path)) if env_path.is_file() else {}
+        if not isinstance(environment, Mapping):
+            raise ValueError("env.json must contain a JSON object")
+
+        budget_payload = _budget_payload(policy)
+        workload_snapshot = _workload_snapshot(workload_spec)
+        mode = "full" if workload_spec is not None else "kernel-only"
+        store = ArtifactStore(run_dir)
+        manifest = store.initialize(
+            inputs={"baseline": baseline, "ref": ref},
+            budget=budget_payload,
+            environment=dict(environment),
+        )
+        manifest.update(
+            {
+                "mode": mode,
+                "workload": workload_snapshot,
+                "confidence": confidence,
+                "min_effect_pct": min_effect_pct,
+                "started_at": started_at,
+                "dims": copy.deepcopy(dims),
+                "backend": args.backend,
+            }
+        )
+        manifest["input_hash"] = _frozen_input_hash(
+            manifest,
+            workload=workload_snapshot,
+            dims=dims,
+            backend=args.backend,
+            budget=budget_payload,
+            confidence=confidence,
+            min_effect_pct=min_effect_pct,
+            ptr_size=args.ptr_size,
+        )
+        atomic_write_json(run_dir / "manifest.json", manifest)
+
+        state, state_path = state_manager.initialize_state(
+            run_dir=run_dir,
+            baseline=baseline,
+            ref=ref,
+            manifest=manifest,
+            budget=budget_payload,
+            environment=environment,
+            env_path=env_path,
+            dims=dims,
+            ptr_size=args.ptr_size,
+            ncu_num=args.ncu_num,
+            mode=mode,
+            workload=workload_snapshot,
+            started_at=started_at,
+            backend=args.backend,
+            confidence=confidence,
+            min_effect_pct=min_effect_pct,
+            noise_threshold_pct=None,
+        )
+        now = time.time()
+        checkpoint = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "input_hash": manifest["input_hash"],
+            "run_dir": str(run_dir),
+            "stage": STAGES[0],
+            "stage_index": 0,
+            "status": "ready",
+            "candidate_id": None,
+            "candidate_status": None,
+            "budget": {
+                "elapsed_seconds": max(0.0, now - started_at),
+                "remaining_seconds": max(
+                    0.0, policy.max_seconds - (now - started_at)
+                ),
+            },
+            "updated_at": now,
+            "checkpoint_written": True,
+        }
+        store.write_checkpoint(checkpoint)
+    except BaseException:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
+
+    print(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "state": str(state_path),
+                "manifest": str(run_dir / "manifest.json"),
+                "checkpoint": str(run_dir / "checkpoint.json"),
+                "env": str(env_path),
+                "mode": mode,
+                "input_hash": state["input_hash"],
+                "next_stage": "baseline",
+            },
+            indent=2,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -309,11 +1187,107 @@ def cmd_close_iter(args):
         }, indent=2))
         return
 
-    # Bind every downstream step to the exact champion named by the artifact.
     decision_path = os.path.join(iter_dir, "decision.json")
-    kernel = _selected_kernel(
-        branch_payload, iter_dir=iter_dir, decision_path=decision_path
+    terminal_decision = None
+    budgeted_run = (
+        state.get("schema_version") == CURRENT_SCHEMA_VERSION
+        and isinstance(state.get("budget"), Mapping)
+        and isinstance(state.get("input_hash"), str)
     )
+    if budgeted_run:
+        mode = state.get("mode", "kernel-only")
+        policy = _policy_from_state(state)
+        if mode == "full":
+            candidates = select_outer_candidates(
+                branch_payload.get("shortlist", []), policy.outer_candidates
+            )
+            if not candidates:
+                raise ValueError("full mode shortlist contains no confirmed kernel win")
+            workload_spec = _workload_from_snapshot(state.get("workload"))
+            current_time = time.time()
+            budget_clock = BudgetClock(
+                policy, started_at=state.get("started_at", current_time)
+            )
+            checkpoint_path = Path(args.run_dir) / "checkpoint.json"
+            checkpoint_state = None
+            checkpoint_store = None
+            if checkpoint_path.is_file() and not checkpoint_path.is_symlink():
+                checkpoint_state = _validate_checkpoint(
+                    _read(str(checkpoint_path)), input_hash=state["input_hash"]
+                )
+                checkpoint_store = ArtifactStore(args.run_dir)
+            evaluated = []
+            for candidate in candidates:
+                iteration_now = time.time()
+                elapsed = max(0.0, iteration_now - budget_clock.started_at)
+                remaining = max(0.0, policy.max_seconds - elapsed)
+                pair_estimate = state.get("estimated_workload_pair_seconds", 0.0)
+                if checkpoint_state is not None:
+                    admission = schedule_next(
+                        checkpoint_state,
+                        budget_clock,
+                        policy.min_pairs
+                        * _finite_real(
+                            pair_estimate,
+                            "estimated_workload_pair_seconds",
+                            minimum=0.0,
+                        ),
+                        now=iteration_now,
+                        store=checkpoint_store,
+                        candidate_id=candidate.get("id", candidate.get("branch_index")),
+                    )
+                    if admission["status"] == "budget_exhausted":
+                        checkpoint_state = admission
+                terminal = evaluate_outer_candidate(
+                    candidate,
+                    mode="full",
+                    workload_spec=workload_spec,
+                    baseline=state.get("best_file"),
+                    policy=policy,
+                    confidence=state.get("confidence", 0.95),
+                    remaining_seconds=remaining,
+                    estimated_seconds_per_pair=pair_estimate,
+                    budget_clock=budget_clock,
+                    now=iteration_now,
+                    candidate_root=iter_dir,
+                    retries=args.retries,
+                    seed=state.get("seed", 0),
+                )
+                evaluated.append((candidate, terminal))
+            selected_candidate, terminal_decision = _select_terminal_outer_result(
+                evaluated
+            )
+        elif mode == "kernel-only":
+            champion = branch_payload.get("champion")
+            if not isinstance(champion, Mapping):
+                raise ValueError("branch_results champion must be a mapping")
+            selected_candidate = dict(champion)
+            selected_candidate["candidate_file"] = branch_payload.get(
+                "selected_kernel"
+            )
+            terminal_decision = evaluate_outer_candidate(
+                selected_candidate,
+                mode="kernel-only",
+                workload_spec=None,
+                baseline=state.get("best_file"),
+                policy=policy,
+                confidence=state.get("confidence", 0.95),
+                candidate_root=iter_dir,
+            )
+        else:
+            raise ValueError("state mode must be full or kernel-only")
+
+        kernel = _publish_outer_candidate(
+            selected_candidate, iter_dir=Path(iter_dir).resolve()
+        )
+        terminal_decision["candidate_file"] = kernel
+        terminal_decision["candidate_sha256"] = sha256_file(kernel)
+        terminal_decision = _strict_json_copy(terminal_decision, "decision")
+    else:
+        # Preserve the legacy close-iter contract for existing v2 runs.
+        kernel = _selected_kernel(
+            branch_payload, iter_dir=iter_dir, decision_path=decision_path
+        )
 
     bench_json = os.path.join(iter_dir, "bench.json")
     if not os.path.isfile(bench_json):
@@ -362,23 +1336,22 @@ def cmd_close_iter(args):
         "--iter", str(args.iter),
     ])
 
-    # Step 3j: Update state
-    update_cmd = [
-        sys.executable, str(SCRIPT_DIR / "state.py"), "update",
-        "--state", state_path,
-        "--iter", str(args.iter),
-        "--kernel", kernel,
-        "--bench", bench_json,
-        "--methods-json", methods_json,
-        "--retries", str(args.retries),
-    ]
-    if os.path.isfile(attribution_path):
-        update_cmd.extend(["--attribution", attribution_path])
-    if os.path.isfile(sass_check_path):
-        update_cmd.extend(["--sass-check", sass_check_path])
-
-    rc = _run(update_cmd).returncode
-    if rc != 0:
+    # Step 3j: persist the terminal decision before the explicit state update.
+    if terminal_decision is None:
+        terminal_decision = _read(decision_path)
+    applied = apply_decision(
+        terminal_decision,
+        run_dir=args.run_dir,
+        iteration=args.iter,
+        state_path=state_path,
+        kernel=kernel,
+        bench=bench_json,
+        methods_json=methods_json,
+        retries=args.retries,
+        attribution=attribution_path,
+        sass_check=sass_check_path,
+    )
+    if applied["returncode"] != 0:
         sys.exit("state update failed")
 
     # Open next iteration if needed
@@ -425,6 +1398,25 @@ def cmd_close_iter(args):
 def cmd_finalize(args):
     state_path = os.path.join(args.run_dir, "state.json")
     summary_path = os.path.join(args.run_dir, "summary.md")
+    checkpoint_path = Path(args.run_dir) / "checkpoint.json"
+    complete_checkpoint = None
+    if checkpoint_path.is_symlink():
+        raise ValueError("checkpoint.json must not be a symlink")
+    if checkpoint_path.is_file():
+        current = _validate_checkpoint(_read(str(checkpoint_path)))
+        if current["stage"] == "complete":
+            complete_checkpoint = current
+        elif current["stage"] == "decision" and current["status"] == "stage_complete":
+            complete_checkpoint = transition_checkpoint(
+                current,
+                "complete",
+                status="complete",
+                updated_at=time.time(),
+            )
+        else:
+            raise ValueError(
+                "cannot finalize before the decision stage checkpoint is complete"
+            )
     rc = _run([
         sys.executable, str(SCRIPT_DIR / "summarize.py"),
         "--state", state_path,
@@ -432,33 +1424,154 @@ def cmd_finalize(args):
     ]).returncode
     if rc != 0:
         sys.exit("summarize failed")
+    if complete_checkpoint is not None:
+        ArtifactStore(args.run_dir).write_checkpoint(complete_checkpoint)
     print(json.dumps({"summary": summary_path}, indent=2))
+
+
+def _safe_run_file(run_dir: Path, name: str) -> Path:
+    path = run_dir / name
+    if path.is_symlink():
+        raise ValueError(f"{name} must not be a symlink")
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise ValueError(f"{name} is missing: {path}") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{name} must be a regular file")
+    if path.resolve(strict=True).parent != run_dir:
+        raise ValueError(f"{name} escapes the run directory")
+    return path
+
+
+def _verify_state_candidates(state: Mapping) -> None:
+    candidates = state.get("candidates", {})
+    if not isinstance(candidates, Mapping):
+        raise ValueError("state candidates must be a mapping")
+    for candidate_id, record in candidates.items():
+        if not isinstance(record, Mapping):
+            raise ValueError(f"state candidate {candidate_id!r} is malformed")
+        path = record.get("candidate_file") or record.get("path")
+        digest = record.get("candidate_sha256") or record.get("sha256")
+        if path is None and digest is None:
+            continue
+        if not isinstance(path, str) or not isinstance(digest, str):
+            raise ValueError(f"state candidate {candidate_id!r} binding is malformed")
+        candidate = Path(path).expanduser()
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError(f"state candidate {candidate_id!r} file drifted")
+        if sha256_file(candidate) != digest.lower():
+            raise ValueError(f"state candidate {candidate_id!r} file drifted")
+
+
+def cmd_resume(args) -> None:
+    run_arg = Path(args.run_dir).expanduser()
+    if run_arg.is_symlink():
+        raise ValueError("run directory must not be a symlink")
+    try:
+        run_dir = run_arg.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"run directory does not exist: {run_arg}") from error
+    if not run_dir.is_dir():
+        raise ValueError("run directory must be a directory")
+    checkpoint_path = _safe_run_file(run_dir, "checkpoint.json")
+    state_path = _safe_run_file(run_dir, "state.json")
+    try:
+        checkpoint = _read(str(checkpoint_path))
+        state = _read(str(state_path))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"run checkpoint/state is malformed: {error}") from error
+    state_manager.validate_state(state)
+    declared_run_dir = state.get("run_dir")
+    if not isinstance(declared_run_dir, str) or Path(declared_run_dir).resolve() != run_dir:
+        raise ValueError("state run_dir does not match --run-dir")
+    if checkpoint.get("run_dir") is not None and Path(checkpoint["run_dir"]).resolve() != run_dir:
+        raise ValueError("checkpoint run_dir does not match --run-dir")
+    if checkpoint.get("input_hash") != state.get("input_hash"):
+        raise ValueError("checkpoint/state frozen input_hash mismatch")
+    _verify_state_candidates(state)
+    restored = resume(checkpoint, input_hash=state["input_hash"])
+    print(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "status": restored["status"],
+                "stage": restored["stage"],
+                "next_stage": restored["next_stage"],
+                "input_hash": restored["input_hash"],
+            },
+            indent=2,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
-    p = argparse.ArgumentParser()
+def _cli_positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _removed_noise_option(_text: str):
+    raise argparse.ArgumentTypeError(
+        "--noise-threshold-pct was removed; migrate to --min-effect-pct"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Budget-aware CUDA kernel optimization orchestrator"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     _default_bench = str(SCRIPT_DIR / "benchmark.py")
 
-    ps = sub.add_parser("setup")
+    ps = sub.add_parser("setup", help="preflight and initialize a frozen run")
     ps.add_argument("--baseline", required=True)
     ps.add_argument("--ref", required=True)
     ps.add_argument("--benchmark", default=_default_bench)
-    ps.add_argument("--iterations", type=int, default=3)
     ps.add_argument("--ncu-num", type=int, default=5)
-    ps.add_argument("--branches", type=int, default=4)
+    ps.add_argument(
+        "--budget",
+        choices=("quick", "balanced", "thorough", "custom"),
+        default="balanced",
+    )
+    ps.add_argument("--max-seconds", type=_cli_positive_int, default=None)
+    ps.add_argument("--max-rounds", type=_cli_positive_int, default=None)
+    ps.add_argument("--branches", type=_cli_positive_int, default=None)
+    ps.add_argument("--min-pairs", type=_cli_positive_int, default=None)
+    ps.add_argument("--max-pairs", type=_cli_positive_int, default=None)
+    ps.add_argument("--outer-candidates", type=_cli_positive_int, default=None)
+    ps.add_argument("--confidence", type=float, default=0.95)
+    ps.add_argument("--min-effect-pct", type=float, default=0.5)
+    ps.add_argument("--output-root", default=None)
     ps.add_argument("--dims", required=True, help="JSON dict of name->int")
-    ps.add_argument("--noise-threshold-pct", type=float, default=2.0)
+    ps.add_argument("--backend", choices=("auto", "cuda", "cutlass", "triton"), default="auto")
+    ps.add_argument("--workload", default=None)
+    ps.add_argument("--workload-cmd", default=None)
+    ps.add_argument("--workload-manifest", default=None)
+    ps.add_argument("--objective", default=None)
+    ps.add_argument(
+        "--noise-threshold-pct",
+        type=_removed_noise_option,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     ps.add_argument("--ptr-size", type=int, default=0)
-    ps.add_argument("--env-out", type=str, default="")
     ps.add_argument("--warmup", type=int, default=10)
     ps.add_argument("--repeat", type=int, default=20)
     ps.set_defaults(func=cmd_setup)
+
+    pr = sub.add_parser("resume", help="validate and resume a frozen run")
+    pr.add_argument("--run-dir", required=True)
+    pr.set_defaults(func=cmd_resume)
 
     po = sub.add_parser("open-iter")
     po.add_argument("--run-dir", required=True)
@@ -479,7 +1592,12 @@ def main():
     pf.add_argument("--run-dir", required=True)
     pf.set_defaults(func=cmd_finalize)
 
-    args = p.parse_args()
+    return p
+
+
+def main(argv=None):
+    p = build_parser()
+    args = p.parse_args(argv)
     args.func(args)
 
 

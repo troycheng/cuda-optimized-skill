@@ -22,7 +22,10 @@ state.json schema (all paths stored absolute):
   "iterations_total": int,
   "ncu_num": int,
   "branches": int,
-  "noise_threshold_pct": float,
+  "budget": {...},
+  "confidence": float,
+  "min_effect_pct": float,
+  "noise_threshold_pct": float,  # legacy init compatibility only
   "ptr_size": int,
   "dims": dict,
   "selected_methods":   [ {id, name, axis, iter} ],
@@ -47,6 +50,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
@@ -398,6 +402,125 @@ def _promotion_for(status: str, mode: str) -> tuple[str, bool]:
 # init
 # ---------------------------------------------------------------------------
 
+def _new_run_dir(output_root: str | os.PathLike) -> Path:
+    root = Path(output_root).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("output_root must be a directory")
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    for suffix in range(1000):
+        name = f"run_{stamp}" if suffix == 0 else f"run_{stamp}_{suffix}"
+        candidate = root / name
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise ValueError("could not allocate a unique run directory")
+
+
+def initialize_state(
+    *,
+    run_dir: str | os.PathLike,
+    baseline: str | os.PathLike,
+    ref: str | os.PathLike,
+    manifest: Mapping,
+    budget: Mapping,
+    environment: Mapping | None,
+    env_path: str | os.PathLike | None,
+    dims: Mapping,
+    ptr_size: int,
+    ncu_num: int,
+    mode: str,
+    workload,
+    started_at: float,
+    backend: str = "auto",
+    confidence: float = 0.95,
+    min_effect_pct: float = 0.5,
+    noise_threshold_pct: float | None = None,
+) -> tuple[dict, Path]:
+    """Create state.json from an already durable frozen manifest."""
+    root = Path(run_dir).expanduser().resolve(strict=True)
+    baseline_path = Path(baseline).expanduser().resolve(strict=True)
+    ref_path = Path(ref).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("run_dir must be a directory")
+    if not baseline_path.is_file():
+        raise ValueError(f"baseline not found: {baseline_path}")
+    if not ref_path.is_file():
+        raise ValueError(f"ref not found: {ref_path}")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must be a mapping")
+    if manifest.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise ValueError("manifest schema_version is invalid")
+    input_hash = manifest.get("input_hash")
+    if not isinstance(input_hash, str) or not input_hash:
+        raise ValueError("manifest input_hash must be non-empty")
+    if mode not in {"full", "kernel-only"}:
+        raise ValueError("mode must be full or kernel-only")
+
+    clean_budget = json.loads(json.dumps(budget, allow_nan=False))
+    iterations_total = clean_budget.get(
+        "max_rounds", clean_budget.get("iterations_total")
+    )
+    branches = clean_budget.get("branches")
+    if (
+        isinstance(iterations_total, bool)
+        or not isinstance(iterations_total, int)
+        or iterations_total <= 0
+    ):
+        raise ValueError("budget max_rounds must be a positive integer")
+    if isinstance(branches, bool) or not isinstance(branches, int) or branches <= 0:
+        raise ValueError("budget branches must be a positive integer")
+
+    baseline_copy_dir = root / "baseline"
+    baseline_copy_dir.mkdir(parents=True, exist_ok=True)
+    baseline_copy = baseline_copy_dir / baseline_path.name
+    shutil.copy2(baseline_path, baseline_copy)
+
+    state = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "run_dir": str(root),
+        "input_hash": input_hash,
+        "budget": clean_budget,
+        "mode": mode,
+        "workload": json.loads(json.dumps(workload, allow_nan=False)),
+        "started_at": float(started_at),
+        "confidence": float(confidence),
+        "min_effect_pct": float(min_effect_pct),
+        "backend": backend,
+        "baseline_file": str(baseline_copy),
+        "baseline_file_original": str(baseline_path),
+        "ref_file": str(ref_path),
+        "best_file": str(baseline_copy),
+        "best_kernel_statistics": None,
+        "best_workload_statistics": None,
+        "best_metric_ms": None,
+        "best_ncu_rep": None,
+        "env": json.loads(json.dumps(environment or {}, allow_nan=False)),
+        "env_path": str(Path(env_path).expanduser().resolve()) if env_path else None,
+        "iterations_total": iterations_total,
+        "ncu_num": int(ncu_num),
+        "branches": branches,
+        "ptr_size": int(ptr_size),
+        "dims": json.loads(json.dumps(dims, allow_nan=False)),
+        "selected_methods": [],
+        "effective_methods": [],
+        "ineffective_methods": [],
+        "implementation_failed_methods": [],
+        "candidates": {},
+        "history": [],
+        "roofline_history": [],
+        "frontier": [],
+        "created_at": _dt.datetime.now().strftime("%Y%m%d_%H%M%S"),
+    }
+    if noise_threshold_pct is not None:
+        state["noise_threshold_pct"] = float(noise_threshold_pct)
+    state_path = root / "state.json"
+    _write(str(state_path), state)
+    for iteration in range(1, iterations_total + 1):
+        (root / f"iterv{iteration}").mkdir(exist_ok=True)
+    return state, state_path
+
 def cmd_init(args: argparse.Namespace) -> None:
     baseline = os.path.abspath(args.baseline)
     ref = os.path.abspath(args.ref)
@@ -405,10 +528,6 @@ def cmd_init(args: argparse.Namespace) -> None:
         sys.exit(f"baseline not found: {baseline}")
     if not os.path.isfile(ref):
         sys.exit(f"ref not found: {ref}")
-
-    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(os.path.dirname(baseline), f"run_{ts}")
-    os.makedirs(run_dir, exist_ok=False)
 
     env = {}
     if args.env and os.path.isfile(args.env):
@@ -419,62 +538,41 @@ def cmd_init(args: argparse.Namespace) -> None:
     except json.JSONDecodeError as e:
         sys.exit(f"--dims must be valid JSON: {e}")
 
-    budget = {
+    supplied_budget = getattr(args, "budget", None)
+    budget = dict(supplied_budget) if supplied_budget is not None else {
         "iterations_total": int(args.iterations),
+        "max_rounds": int(args.iterations),
         "ncu_num": int(args.ncu_num),
         "branches": int(args.branches),
     }
+    output_root = getattr(args, "output_root", None) or os.path.dirname(baseline)
+    run_dir = _new_run_dir(output_root)
     store = ArtifactStore(run_dir)
     manifest = store.initialize(
         inputs={"baseline": baseline, "ref": ref},
         budget=budget,
         environment=env,
     )
-
-    baseline_copy_dir = os.path.join(run_dir, "baseline")
-    baseline_copy = os.path.join(baseline_copy_dir, os.path.basename(baseline))
-    shutil.copy2(baseline, baseline_copy)
-
-    state = {
-        "schema_version": CURRENT_SCHEMA_VERSION,
-        "run_dir": run_dir,
-        "input_hash": manifest["input_hash"],
-        "budget": budget,
-        "mode": "kernel-only",
-        "workload": None,
-        "baseline_file": baseline_copy,
-        "baseline_file_original": baseline,
-        "ref_file": ref,
-        "best_file": baseline_copy,
-        "best_kernel_statistics": None,
-        "best_workload_statistics": None,
-        "best_metric_ms": None,
-        "best_ncu_rep": None,
-        "env": env,
-        "env_path": os.path.abspath(args.env) if args.env and os.path.isfile(args.env) else None,
-        "iterations_total": int(args.iterations),
-        "ncu_num": int(args.ncu_num),
-        "branches": int(args.branches),
-        "noise_threshold_pct": float(args.noise_threshold_pct),
-        "ptr_size": int(args.ptr_size),
-        "dims": dims,
-        "selected_methods": [],
-        "effective_methods": [],
-        "ineffective_methods": [],
-        "implementation_failed_methods": [],
-        "candidates": {},
-        "history": [],
-        "roofline_history": [],
-        "frontier": [],
-        "created_at": ts,
-    }
-    state_path = os.path.join(run_dir, "state.json")
-    _write(state_path, state)
-
-    for i in range(1, state["iterations_total"] + 1):
-        os.makedirs(os.path.join(run_dir, f"iterv{i}"), exist_ok=True)
-
-    print(json.dumps({"run_dir": run_dir, "state": state_path}, indent=2))
+    state, state_path = initialize_state(
+        run_dir=run_dir,
+        baseline=baseline,
+        ref=ref,
+        manifest=manifest,
+        budget=budget,
+        environment=env,
+        env_path=args.env if args.env and os.path.isfile(args.env) else None,
+        dims=dims,
+        ptr_size=args.ptr_size,
+        ncu_num=args.ncu_num,
+        mode=getattr(args, "mode", "kernel-only"),
+        workload=getattr(args, "workload", None),
+        started_at=getattr(args, "started_at", time.time()),
+        backend=getattr(args, "backend", "auto"),
+        confidence=getattr(args, "confidence", 0.95),
+        min_effect_pct=getattr(args, "min_effect_pct", 0.5),
+        noise_threshold_pct=getattr(args, "noise_threshold_pct", None),
+    )
+    print(json.dumps({"run_dir": str(run_dir), "state": str(state_path)}, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +770,12 @@ def cmd_update(args: argparse.Namespace) -> None:
     })
 
     _verify_candidate_binding(candidate_binding)
+    if candidate_binding is not None:
+        state["candidates"][f"iter-{int(args.iter)}"] = {
+            "candidate_file": candidate_binding["path"],
+            "candidate_sha256": candidate_binding["sha256"],
+            "status": terminal_status,
+        }
     _write(args.state, state)
     print(json.dumps({
         "iter": args.iter,

@@ -295,11 +295,15 @@ class StateDecisionPromotionTests(unittest.TestCase):
             )
             output = self._run_update(args)
             updated = json.loads(state_path.read_text("utf-8"))
+            candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
 
         self.assertEqual(updated["best_file"], str(candidate.resolve()))
         self.assertTrue(output["improved"])
         self.assertEqual(output["status"], "kernel_only_win")
         self.assertEqual(updated["best_kernel_statistics"]["estimate_pct"], 3.0)
+        binding = updated["candidates"]["iter-1"]
+        self.assertEqual(binding["candidate_file"], str(candidate.resolve()))
+        self.assertEqual(binding["candidate_sha256"], candidate_hash)
 
     def test_full_mode_end_to_end_win_is_the_only_global_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
