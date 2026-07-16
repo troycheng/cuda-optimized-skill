@@ -102,6 +102,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "best_metric_ms": None,
         "best_ncu_rep": None,
         "env": env,
+        "env_path": os.path.abspath(args.env) if args.env and os.path.isfile(args.env) else None,
         "iterations_total": int(args.iterations),
         "ncu_num": int(args.ncu_num),
         "branches": int(args.branches),

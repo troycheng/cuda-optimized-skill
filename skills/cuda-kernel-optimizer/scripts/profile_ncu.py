@@ -133,6 +133,53 @@ def _write_json(path: str, obj) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
+def _counter_access_verdict(
+    returncode: int, log: str, report_exists: bool
+) -> tuple[bool | None, str | None]:
+    """Classify counter access only from a real target profile."""
+    if "ERR_NVGPUCTRPERM" in log or (
+        "permission" in log.lower() and "performance counter" in log.lower()
+    ):
+        return False, "ERR_NVGPUCTRPERM"
+    if returncode == 0 and report_exists:
+        return True, None
+    return None, None
+
+
+def _record_counter_access(
+    state_path: str,
+    state: dict,
+    verdict: bool | None,
+    error: str | None,
+) -> None:
+    """Persist a real-profile counter verdict in state and its env snapshot."""
+    if verdict is None:
+        return
+
+    ncu = state.setdefault("env", {}).setdefault("ncu", {})
+    ncu["can_read_counters"] = verdict
+    if error:
+        ncu["counter_access_error"] = error
+    else:
+        ncu.pop("counter_access_error", None)
+    _write_json(state_path, state)
+
+    env_path = state.get("env_path")
+    if not env_path or not os.path.isfile(env_path):
+        return
+    try:
+        env = _read_state(env_path)
+    except (OSError, json.JSONDecodeError):
+        return
+    env_ncu = env.setdefault("ncu", {})
+    env_ncu["can_read_counters"] = verdict
+    if error:
+        env_ncu["counter_access_error"] = error
+    else:
+        env_ncu.pop("counter_access_error", None)
+    _write_json(env_path, env)
+
+
 def _detect_backend(file: str) -> str:
     ext = os.path.splitext(file)[1].lower()
     if ext == ".py":
@@ -581,6 +628,12 @@ def main() -> None:
     log_path = os.path.join(iter_dir, f"{os.path.splitext(rep_name)[0]}.ncu.log")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(log)
+    counter_verdict, counter_error = _counter_access_verdict(
+        rc, log, report_exists=os.path.isfile(rep_path)
+    )
+    _record_counter_access(
+        args.state, state, counter_verdict, counter_error
+    )
     if rc != 0 or not os.path.isfile(rep_path):
         top = {
             "degraded": True,

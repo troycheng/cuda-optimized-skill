@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -75,6 +77,44 @@ class ProfileNcuTests(unittest.TestCase):
             result = check_env._detect_ncu()
         self.assertTrue(result["metrics_query_available"])
         self.assertIsNone(result["can_read_counters"])
+
+    def test_real_counter_permission_failure_is_recorded_in_state_and_env(self) -> None:
+        profile_ncu = _load("profile_ncu")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_path = root / "env.json"
+            state_path = root / "state.json"
+            env = {"ncu": {"available": True, "can_read_counters": None}}
+            state = {
+                "env": env,
+                "env_path": str(env_path),
+            }
+            env_path.write_text(json.dumps(env), encoding="utf-8")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            verdict, note = profile_ncu._counter_access_verdict(
+                1,
+                "==ERROR== ERR_NVGPUCTRPERM - permission denied",
+                report_exists=False,
+            )
+            profile_ncu._record_counter_access(
+                str(state_path), state, verdict, note
+            )
+
+            recorded_state = json.loads(state_path.read_text(encoding="utf-8"))
+            recorded_env = json.loads(env_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(recorded_state["env"]["ncu"]["can_read_counters"])
+        self.assertFalse(recorded_env["ncu"]["can_read_counters"])
+        self.assertEqual(recorded_env["ncu"]["counter_access_error"], "ERR_NVGPUCTRPERM")
+
+    def test_successful_real_profile_records_counter_access(self) -> None:
+        profile_ncu = _load("profile_ncu")
+        verdict, note = profile_ncu._counter_access_verdict(
+            0, "==PROF== Disconnected", report_exists=True
+        )
+        self.assertTrue(verdict)
+        self.assertIsNone(note)
 
     def test_long_form_csv_is_normalized(self) -> None:
         profile_ncu = _load("profile_ncu")
