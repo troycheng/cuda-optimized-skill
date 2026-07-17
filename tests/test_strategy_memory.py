@@ -1782,6 +1782,103 @@ class StrategyMemoryTests(unittest.TestCase):
                 self.memory.record_run(memory, run, output)
             self.assertEqual(self._tree_snapshot(root), before)
 
+    def test_suggest_rejects_memory_lock_output_aliases_without_mutation(self) -> None:
+        for alias in ("missing-exact", "relative", "hardlink", "held-exact"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                manifest = self._manifest(root)
+                scope = self.memory.scope_document(manifest)
+                memory = root / "memory.json"
+                lock = Path(f"{memory}.lock")
+                held_fd = None
+                if alias != "missing-exact":
+                    self.memory.append_run(memory, scope, self._record(scope=scope))
+                if alias == "relative":
+                    output = Path(os.path.relpath(lock, Path.cwd()))
+                elif alias == "hardlink":
+                    output = root / "memory-lock-hardlink"
+                    try:
+                        os.link(lock, output)
+                    except OSError as error:
+                        self.skipTest(f"hardlinks unavailable: {error}")
+                else:
+                    output = lock
+                if alias == "held-exact":
+                    held_fd = os.open(lock, os.O_RDWR)
+                    self.memory.fcntl.flock(
+                        held_fd,
+                        self.memory.fcntl.LOCK_EX | self.memory.fcntl.LOCK_NB,
+                    )
+                before = self._tree_snapshot(root)
+                lock_identity = (
+                    (lock.lstat().st_dev, lock.lstat().st_ino, lock.read_bytes())
+                    if lock.exists()
+                    else None
+                )
+                try:
+                    with self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                        self.memory.suggest_strategies(memory, manifest, output)
+                finally:
+                    if held_fd is not None:
+                        self.memory.fcntl.flock(held_fd, self.memory.fcntl.LOCK_UN)
+                        os.close(held_fd)
+                self.assertEqual(self._tree_snapshot(root), before)
+                if lock_identity is not None:
+                    metadata = lock.lstat()
+                    self.assertEqual(
+                        (metadata.st_dev, metadata.st_ino, lock.read_bytes()),
+                        lock_identity,
+                    )
+
+    def test_record_rejects_memory_lock_output_before_lock_or_append(self) -> None:
+        for alias in ("missing-exact", "held-exact", "hardlink"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                run = self._completed_run(root / "fixture")
+                memory = root / "memory.json"
+                lock = Path(f"{memory}.lock")
+                held_fd = None
+                if alias != "missing-exact":
+                    self.memory.append_run(memory, self._scope(), self._record())
+                if alias == "hardlink":
+                    output = root / "memory-lock-hardlink"
+                    try:
+                        os.link(lock, output)
+                    except OSError as error:
+                        self.skipTest(f"hardlinks unavailable: {error}")
+                else:
+                    output = lock
+                if alias == "held-exact":
+                    held_fd = os.open(lock, os.O_RDWR)
+                    self.memory.fcntl.flock(
+                        held_fd,
+                        self.memory.fcntl.LOCK_EX | self.memory.fcntl.LOCK_NB,
+                    )
+                before = self._tree_snapshot(root)
+                lock_identity = (
+                    (lock.lstat().st_dev, lock.lstat().st_ino, lock.read_bytes())
+                    if lock.exists()
+                    else None
+                )
+                try:
+                    with mock.patch.object(
+                        self.memory.fcntl,
+                        "flock",
+                        side_effect=AssertionError("record reached memory lock"),
+                    ), self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                        self.memory.record_run(memory, run, output)
+                finally:
+                    if held_fd is not None:
+                        self.memory.fcntl.flock(held_fd, self.memory.fcntl.LOCK_UN)
+                        os.close(held_fd)
+                self.assertEqual(self._tree_snapshot(root), before)
+                if lock_identity is not None:
+                    metadata = lock.lstat()
+                    self.assertEqual(
+                        (metadata.st_dev, metadata.st_ino, lock.read_bytes()),
+                        lock_identity,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

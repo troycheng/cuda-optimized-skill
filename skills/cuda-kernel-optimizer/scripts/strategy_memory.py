@@ -1445,6 +1445,10 @@ def _paths_alias(first: str | os.PathLike, second: str | os.PathLike) -> bool:
         raise ValueError("cannot safely compare strategy input and output paths") from error
 
 
+def _memory_lock_path(memory_path: str | os.PathLike) -> str:
+    return f"{os.fspath(memory_path)}.lock"
+
+
 def _reject_output_aliases(
     output_path: str | os.PathLike,
     protected_paths: list[str | os.PathLike],
@@ -1462,11 +1466,14 @@ def record_run(
     output_path: str | os.PathLike,
 ) -> dict:
     """Validate fully, update memory under lock, then publish the record output."""
+    _reject_output_aliases(
+        output_path,
+        [memory_path, _memory_lock_path(memory_path)],
+    )
     record = load_completed_run(run_dir)
     _reject_output_aliases(
         output_path,
         [
-            memory_path,
             Path(run_dir) / "manifest.json",
             *(item["path"] for item in record["evidence"]),
         ],
@@ -1599,7 +1606,10 @@ def suggest_strategies(
     output_path: str | os.PathLike,
 ) -> dict:
     """Publish exact-scope search hints without reading or changing run state."""
-    _reject_output_aliases(output_path, [memory_path, manifest_path])
+    _reject_output_aliases(
+        output_path,
+        [memory_path, _memory_lock_path(memory_path), manifest_path],
+    )
     scope = _scope_document_from_manifest(manifest_path, verify_files=False)
     key = _scope_key_from_document(scope)
     memory = _optional_memory(memory_path)
