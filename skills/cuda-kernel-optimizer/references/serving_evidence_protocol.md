@@ -3,6 +3,10 @@
 Use the narrowest claim supported by the evidence. A faster instruction path is
 useful evidence, but it is not a serving result.
 
+For the executable V2.5 contracts and `scripts/evidence.py` commands, read
+`references/evidence_automation.md`. This document explains the claim boundary;
+the executable validators enforce the normalized evidence files.
+
 ## Claim ladder
 
 | Layer | Minimum evidence | Allowed claim |
@@ -75,7 +79,7 @@ or a contamination marker invalidates the attempt; do not analyze its timing.
 Assign every run an immutable attempt ID and one terminal state:
 `valid`, `invalid_contaminated`, `invalid_identity`, `partial`, or `superseded`.
 Never merge rows across attempts or turn a partial/invalid attempt into a result.
-Before analysis, seal hashes for the schedule and analysis code; runner and guard
+At terminal closure, seal hashes for the schedule and analysis code; runner and guard
 scripts; source and binaries; plugin, engine, backend, and server; image digest
 (not only a tag); workload/request corpus; raw samples; phase markers; and guard
 telemetry. The final audit must distinguish `evidence_integrity=PASS` from the
@@ -109,6 +113,10 @@ resampling unit and method, confidence, minimum effect, wins requirement, and
 relative plus absolute guardrails per concurrency/stratum. Do not add a new
 bootstrap or exclusion rule after seeing results. Quick exact-runtime pairs are
 reject-only; formal promotion uses an independent schedule and samples.
+
+For endpoint evidence, freeze HTTP and/or gRPC c1/c2/c4/c8/c12 strata. An Nsys
+or NCU explanation bundle is always `non_promotional`; profiler observations
+cannot replace endpoint constraints or `evidence_integrity=PASS`.
 
 Once timed work begins, retain every uncontaminated row. Do not retry one role
 independently, remove a slow startup mode, or select a favorable subset. A whole

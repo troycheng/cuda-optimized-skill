@@ -12,9 +12,103 @@ SKILL_MD = SKILL_DIR / "SKILL.md"
 OPENAI_YAML = SKILL_DIR / "agents" / "openai.yaml"
 SERVING_EVIDENCE = SKILL_DIR / "references" / "serving_evidence_protocol.md"
 SYSTEMS_IR_COVERAGE = SKILL_DIR / "references" / "systems_and_ir_coverage.md"
+EVIDENCE_AUTOMATION = SKILL_DIR / "references" / "evidence_automation.md"
+MIGRATION_V2_5 = SKILL_DIR / "references" / "migration_v2_5.md"
 
 
 class SkillMetadataTests(unittest.TestCase):
+    def test_skill_routes_formal_v2_5_evidence_automation(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for marker in (
+            "V2.5",
+            "scripts/evidence.py guard-audit",
+            "scripts/evidence.py seal",
+            "scripts/evidence.py audit",
+            "scripts/evidence.py decide",
+            "scripts/self_check.py",
+            "valid",
+            "invalid_contaminated",
+            "invalid_identity",
+            "partial",
+            "superseded",
+            "evidence_integrity",
+            "performance verdict",
+            "references/evidence_automation.md",
+            "references/migration_v2_5.md",
+            "templates/execution_path.schema.json",
+            "templates/artifact_identities.schema.json",
+            "templates/performance_verdict.schema.json",
+            "templates/evidence_manifest.schema.json",
+        ):
+            self.assertIn(marker, text)
+
+    def test_evidence_reference_is_executable_fail_closed_and_non_promotional(self) -> None:
+        self.assertTrue(EVIDENCE_AUTOMATION.is_file())
+        text = EVIDENCE_AUTOMATION.read_text(encoding="utf-8")
+        lower = text.lower()
+        for marker in (
+            "target",
+            "peer",
+            "sibling",
+            "cpu",
+            "numa",
+            "allowlist",
+            "swap",
+            "memory pressure",
+            "clock",
+            "temperature",
+            "power",
+            "thermal",
+            "continuous",
+            "maximum gap",
+            "watcher-ready",
+            "correctness",
+            "sanitizer",
+            "diagnostic",
+            "timing",
+            "fail closed",
+            "execution-path",
+            "c1/c2/c4/c8/c12",
+            "qps",
+            "p95",
+            "p99",
+            "server input/infer/output",
+            "seal -> audit -> decision",
+            "read-only imported",
+            "non_promotional",
+        ):
+            self.assertIn(marker, lower)
+        self.assertIn("normalized", lower)
+        self.assertIn("does not collect", lower)
+
+    def test_v2_5_migration_preserves_v2_4_1_without_rewriting_evidence(self) -> None:
+        self.assertTrue(MIGRATION_V2_5.is_file())
+        text = MIGRATION_V2_5.read_text(encoding="utf-8")
+        for marker in (
+            "V2.4.1",
+            "legacy_unsealed",
+            "no in-place",
+            "frozen experiment design",
+            "guard",
+            "execution-path",
+            "artifact identities",
+            "seal",
+            "audit",
+            "decision",
+        ):
+            self.assertIn(marker, text)
+
+    def test_serving_protocol_routes_to_executable_v2_5_contract(self) -> None:
+        text = SERVING_EVIDENCE.read_text(encoding="utf-8")
+        for marker in (
+            "references/evidence_automation.md",
+            "scripts/evidence.py",
+            "c1/c2/c4/c8/c12",
+            "evidence_integrity",
+            "non_promotional",
+        ):
+            self.assertIn(marker, text)
+
     def test_frontmatter_uses_portable_quoted_scalars(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         self.assertTrue(text.startswith("---\n"))
@@ -145,6 +239,8 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("runtime or serving evidence", prompt)
         self.assertIn("user-provided workload", prompt)
         self.assertIn("end-to-end", prompt)
+        self.assertIn("formal evidence", prompt)
+        self.assertIn("shared-host", prompt)
 
     def test_skill_documents_v2_4_workload_controller_and_safety_boundaries(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")

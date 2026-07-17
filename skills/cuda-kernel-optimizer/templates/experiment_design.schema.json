@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/experiment-design.json",
+  "title": "CUDA optimizer V2.5 frozen experiment design",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "formal", "schedule", "experimental_unit", "aggregation", "resampling_unit", "ci", "min_valid_pairs", "wins_required", "guardrails", "exclusion_policy", "retry_policy"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/experiment-design-v1"},
+    "formal": {"const": true},
+    "schedule": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pair_id", "order"],
+        "properties": {
+          "pair_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+          "order": {"enum": ["AB", "BA"]}
+        }
+      }
+    },
+    "experimental_unit": {"type": "string", "minLength": 1},
+    "aggregation": {"enum": ["median_paired_improvement", "mean_paired_improvement", "ratio_of_sums"]},
+    "resampling_unit": {"const": "pair"},
+    "ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "confidence", "samples", "seed"],
+      "properties": {
+        "method": {"const": "paired_bootstrap"},
+        "confidence": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+        "samples": {"type": "integer", "minimum": 1},
+        "seed": {"type": "integer"}
+      }
+    },
+    "min_valid_pairs": {"type": "integer", "minimum": 2},
+    "wins_required": {"type": "integer", "minimum": 1},
+    "guardrails": {"$ref": "#/$defs/guardrails"},
+    "exclusion_policy": {"const": "no_exclusion"},
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role_retries", "whole_pair_only", "allowed_reasons"],
+      "properties": {
+        "role_retries": {"const": 0},
+        "whole_pair_only": {"const": true},
+        "allowed_reasons": {"const": ["pre_measurement_infrastructure_failure"]}
+      }
+    }
+  },
+  "$defs": {
+    "guardrails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative", "absolute"],
+      "properties": {
+        "relative": {"type": "array", "minItems": 1},
+        "absolute": {"type": "array", "minItems": 1}
+      }
+    }
+  }
+}

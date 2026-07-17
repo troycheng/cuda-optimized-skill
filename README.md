@@ -114,6 +114,11 @@ original implementation and record where the candidate failed. Missing optional
 evidence, such as NCU counter access, is reported as degraded coverage and is
 never presented as a successful measurement.
 
+For a V2.5 formal serving result, the attempt can be sealed as `valid` only when
+the continuous shared-host guard and frozen c1/c2/c4/c8/c12 serving strata pass
+their validators. The result records `evidence_integrity` separately from the performance verdict.
+The installed `self_check` is CPU/static only and does not claim a new GPU validation.
+
 ## What you receive
 
 A completed task delivers:
@@ -165,7 +170,7 @@ a promise that unrelated projects will see the same speedup.
 
 | Validation | Environment and result | What it demonstrates |
 |---|---|---|
-| Automated tests | 690 total; 685 passed, five RTX 5090 opt-in tests skipped outside a GPU environment, zero failed | State recovery, evidence binding, timeouts, restoration, and input validation |
+| Automated tests | 745 total; 740 passed, five RTX 5090 opt-in tests skipped outside a GPU environment, zero failed | State recovery, evidence binding, shared-host guard, timeouts, restoration, and input validation |
 | Full RTX 5090 run | The current test environment passed 13/13 checks in 34.302 seconds; target-side NCU profiling returned `ERR_NVGPUCTRPERM` | CUDA, CUTLASS, Triton, and the complete GPU workload optimization flow; no privilege or driver policy was changed |
 | Reproducible workload fixture | End-to-end latency improved 60.4616%, with constraints passing | The full path from bottleneck analysis to keeping a verified change |
 | User-supplied vLLM workload | The kernel metric improved 26.3287%, while the real workload changed -0.0097% | End-to-end evidence was insufficient, so the original was kept; a faster kernel does not guarantee a faster product workload |
@@ -200,6 +205,8 @@ Further documentation:
 - [Kernel optimization walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [Optimization catalog](skills/cuda-kernel-optimizer/references/optimization_catalog.md)
 - [Compatibility notes](skills/cuda-kernel-optimizer/references/compatibility.md)
+- [V2.5 evidence automation](skills/cuda-kernel-optimizer/references/evidence_automation.md)
+- [V2.5 migration notes](skills/cuda-kernel-optimizer/references/migration_v2_5.md)
 - [RTX 5090 test guide](tests/gpu/sm120/README.md)
 - [MIT License](LICENSE)
 

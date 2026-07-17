@@ -69,6 +69,47 @@ def _observation(workload, *, role, case, metrics, validation=True):
     }
 
 
+def _formal_design(orders=("BA", "AB")):
+    return {
+        "schema_version": "cuda-evidence/experiment-design-v1",
+        "formal": True,
+        "schedule": [
+            {"pair_id": f"pair-{index + 1}", "order": order}
+            for index, order in enumerate(orders)
+        ],
+        "experimental_unit": "fresh_process_pair",
+        "aggregation": "median_paired_improvement",
+        "resampling_unit": "pair",
+        "ci": {
+            "method": "paired_bootstrap",
+            "confidence": 0.95,
+            "samples": 100,
+            "seed": 7,
+        },
+        "min_valid_pairs": 2,
+        "wins_required": 2,
+        "guardrails": {
+            "relative": [
+                {
+                    "metric": "latency_ms",
+                    "comparison": "min_improvement",
+                    "direction": "lower",
+                    "limit_pct": 1.0,
+                }
+            ],
+            "absolute": [
+                {"metric": "memory_mb", "operator": "<=", "limit": 101.0}
+            ],
+        },
+        "exclusion_policy": "no_exclusion",
+        "retry_policy": {
+            "role_retries": 0,
+            "whole_pair_only": True,
+            "allowed_reasons": ["pre_measurement_infrastructure_failure"],
+        },
+    }
+
+
 class MeasureCandidateTests(unittest.TestCase):
     def test_numeric_timeout_is_recomputed_before_each_attempt(self) -> None:
         module = _load_workload_evaluate()
@@ -283,6 +324,116 @@ class MeasureCandidateTests(unittest.TestCase):
 
 
 class EvaluatePairsTests(unittest.TestCase):
+    def test_formal_design_uses_exact_schedule_and_records_pair_ids(self) -> None:
+        module = _load_workload_evaluate()
+        workload = _workload(module)
+        calls = []
+
+        def runner(spec, *, candidate, role, case, timeout):
+            calls.append(role)
+            metrics = {"latency_ms": 100.0, "memory_mb": 100.0}
+            if role == "candidate":
+                metrics["latency_ms"] = 90.0
+            return _observation(spec, role=role, case=case, metrics=metrics)
+
+        result = module.evaluate_pairs(
+            workload,
+            "baseline.py",
+            "candidate.py",
+            blocks=2,
+            retries=0,
+            bootstrap_samples=100,
+            experiment_design=_formal_design(),
+            runner=runner,
+        )
+
+        self.assertEqual(calls, ["candidate", "baseline", "baseline", "candidate"])
+        self.assertEqual([row["pair_id"] for row in result["pairs"]], ["pair-1", "pair-2"])
+        self.assertEqual([row["order"] for row in result["pairs"]], ["BA", "AB"])
+        self.assertEqual(result["experiment_design"]["formal"], True)
+
+    def test_formal_design_owns_ci_pair_and_win_settings(self) -> None:
+        module = _load_workload_evaluate()
+        workload = _workload(module)
+        candidate_calls = 0
+
+        def runner(spec, *, candidate, role, case, timeout):
+            nonlocal candidate_calls
+            metrics = {"latency_ms": 100.0, "memory_mb": 100.0}
+            if role == "candidate":
+                candidate_calls += 1
+                metrics["latency_ms"] = 90.0 if candidate_calls == 1 else 100.0
+            return _observation(spec, role=role, case=case, metrics=metrics)
+
+        result = module.evaluate_pairs(
+            workload,
+            "baseline.py",
+            "candidate.py",
+            blocks=2,
+            retries=0,
+            confidence=0.80,
+            bootstrap_samples=10,
+            seed=99,
+            experiment_design=_formal_design(),
+            runner=runner,
+        )
+
+        self.assertEqual(result["confidence"], 0.95)
+        self.assertEqual(result["bootstrap_samples"], 100)
+        self.assertEqual(result["seed"], 7)
+        self.assertEqual(result["primary"]["valid_pairs"], 2)
+        self.assertEqual(result["primary"]["wins_required"], 2)
+        self.assertEqual(result["primary"]["wins_observed"], 1)
+        self.assertEqual(result["primary"]["status"], "inconclusive")
+
+    def test_formal_evaluator_rejects_unsupported_frozen_aggregation_before_running(self) -> None:
+        module = _load_workload_evaluate()
+        workload = _workload(module)
+        runner = mock.Mock()
+        design = _formal_design()
+        design["aggregation"] = "mean_paired_improvement"
+
+        with self.assertRaisesRegex(ValueError, "aggregation"):
+            module.evaluate_pairs(
+                workload,
+                "baseline.py",
+                "candidate.py",
+                blocks=2,
+                retries=0,
+                experiment_design=design,
+                runner=runner,
+            )
+
+        runner.assert_not_called()
+
+    def test_formal_design_forbids_role_retries_and_block_drift_before_running(self) -> None:
+        module = _load_workload_evaluate()
+        workload = _workload(module)
+        runner = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "role retries"):
+            module.evaluate_pairs(
+                workload,
+                "baseline.py",
+                "candidate.py",
+                blocks=2,
+                retries=1,
+                experiment_design=_formal_design(),
+                runner=runner,
+            )
+        with self.assertRaisesRegex(ValueError, "schedule length"):
+            module.evaluate_pairs(
+                workload,
+                "baseline.py",
+                "candidate.py",
+                blocks=3,
+                retries=0,
+                experiment_design=_formal_design(),
+                runner=runner,
+            )
+
+        runner.assert_not_called()
+
     def test_seed_controls_ab_ba_order_without_touching_global_rng(self) -> None:
         module = _load_workload_evaluate()
         workload = _workload(

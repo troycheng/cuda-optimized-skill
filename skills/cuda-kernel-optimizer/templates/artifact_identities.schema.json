@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/artifact-identities.json",
+  "title": "CUDA optimizer V2.5 TensorRT and Triton artifact identities",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "binary", "plugin", "engine", "backend", "server", "image"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/artifact-identities-v1"},
+    "source": {"$ref": "#/$defs/digestOnly"},
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "source_sha256", "build_config_sha256"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "build_config_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "source_sha256", "compiler_version", "abi"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "compiler_version": {"$ref": "#/$defs/nonempty"},
+        "abi": {"$ref": "#/$defs/nonempty"}
+      }
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "plugin_sha256", "builder_version", "runtime_version", "tactic_digest", "timing_cache_digest"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "plugin_sha256": {"$ref": "#/$defs/sha256"},
+        "builder_version": {"$ref": "#/$defs/nonempty"},
+        "runtime_version": {"$ref": "#/$defs/nonempty"},
+        "tactic_digest": {"$ref": "#/$defs/sha256"},
+        "timing_cache_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "backend": {"$ref": "#/$defs/versionedBinary"},
+    "server": {"$ref": "#/$defs/versionedBinary"},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "tag"],
+      "properties": {
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "tag": {"$ref": "#/$defs/nonempty"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonempty": {"type": "string", "minLength": 1},
+    "digestOnly": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256"],
+      "properties": {"sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "versionedBinary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "version", "abi"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "version": {"$ref": "#/$defs/nonempty"},
+        "abi": {"$ref": "#/$defs/nonempty"}
+      }
+    }
+  }
+}

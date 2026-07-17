@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/attempt.json",
+  "title": "CUDA optimizer V2.5 terminal attempt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "attempt_id", "state", "claim_layer", "artifacts"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/attempt-v1"},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "state": {"enum": ["valid", "invalid_contaminated", "invalid_identity", "partial", "superseded"]},
+    "claim_layer": {"enum": ["isolated_operator", "matched_runtime", "serving_endpoint"]},
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "path"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

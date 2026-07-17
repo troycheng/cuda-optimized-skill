@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/performance-verdict.json",
+  "title": "CUDA optimizer V2.5 performance-only verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "promotional_eligible", "analysis_sha256", "experiment_design_sha256", "raw_rows_sha256"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/performance-verdict-v1"},
+    "status": {"enum": ["confirmed_win", "confirmed_loss", "inconclusive", "failed"]},
+    "promotional_eligible": {"type": "boolean"},
+    "analysis_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "experiment_design_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "raw_rows_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
