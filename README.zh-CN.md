@@ -2,13 +2,16 @@
 
 [English](README.md) | **简体中文**
 
-这是一个用于优化 CUDA、CUTLASS 与 Triton kernel 的 Codex skill。V2.2 使用
-双环流程：先确认 kernel 的正确性和收益；用户提供 workload 时，再检查真实
-KPI。每次晋级都有可复核的持久证据。
+这是一个用于优化 CUDA、CUTLASS 与 Triton 的 Codex skill。V2.4 新增 workload
+controller，用来处理瓶颈不一定在 kernel 内的场景。原有 V2.2 kernel 双环流程仍然
+保留：先确认 kernel 的正确性和收益；用户提供 workload 时，再检查真实 KPI。
+每次晋级都有可复核的持久证据。
 
 ## 按任务开始
 
 - **优化 kernel**：从 baseline 和 Python reference 开始，运行受控候选循环。
+- **优化完整 GPU workload**：对用户提供的可运行 workload 做 profile，定位瓶颈，
+  完成一次边界明确的修改并做端到端评测。
 - **验证真实 workload**：需要端到端结论时，显式提供 workload 和 objective。
 - **分析已有 NCU report**：读取 `.ncu-rep`，不启动原 target。
 - **使用显式 advisory memory**：记录已完成 run，再按严格 scope 获取搜索建议。
@@ -95,6 +98,41 @@ full 模式下不推进 global best。`end_to_end_win` 要求 kernel 与主 KPI 
 先运行上面的首跑命令。后续轮次递增 `--iter`，并以 `checkpoint.json` 为准。
 每轮写 branch 前，先看方法目录和当前可用的 profiler 证据。
 
+### 优化完整 GPU workload
+
+Workload controller 从真实 workload 和业务指标出发，不预设问题一定在 kernel。
+先按完整示例准备 `control.json`，采集 baseline、probe 和 diagnosis：
+
+```bash
+python3 scripts/workload_controller.py run \
+  --control /path/to/control.json \
+  --run-dir /path/to/workload_run
+```
+
+读取 `diagnosis.json`，写好边界明确的 ChangeSet，并在 Codex 修改声明范围前注册：
+
+```bash
+python3 scripts/workload_controller.py register-change \
+  --control /path/to/control.json \
+  --run-dir /path/to/workload_run \
+  --change-set /path/to/change.json
+
+python3 scripts/workload_controller.py evaluate \
+  --run-dir /path/to/workload_run
+```
+
+任务中断后，可以查看或恢复准确的 checkpoint：
+
+```bash
+python3 scripts/workload_controller.py status --run-dir /path/to/workload_run
+python3 scripts/workload_controller.py resume --run-dir /path/to/workload_run
+```
+
+确定性诊断分为 `kernel`、`framework`、`cpu_data`、`transfer`、
+`communication`、`io`、`environment` 和 `mixed`。外部 profiler 与内部工具
+只需输出 normalized probe，不必迁就某一种固定格式。完整可运行契约见
+[`examples/workload-controller.md`](skills/cuda-kernel-optimizer/examples/workload-controller.md)。
+
 ### 验证真实 workload
 
 ```bash
@@ -153,6 +191,33 @@ Report 分析器最后写 `analysis.json`，把它作为完成标记。分析包
 Strategy memory 只接收严格校验完成、manifest scope 完全一致的 V2.2 run。
 建议是 detached 搜索提示。它不能删除 branch，不能改变 profiler 或预算策略，
 也不能覆盖证据；它与 `decision.json` 和 promotion 没有连接。
+
+### Workload controller 边界
+
+```mermaid
+flowchart LR
+    runtime["用户 workload 与运行环境"] --> baseline["冻结 baseline"]
+    baseline --> probes["标准化 probes"]
+    probes --> diagnosis["确定性 diagnosis"]
+    diagnosis --> change["边界明确的 ChangeSet"]
+    change --> review["可选审阅"]
+    review --> evaluation["成对 workload 评测"]
+    evaluation --> workload_decision["确定性决策"]
+    workload_decision --> promote_or_rollback["晋级或回滚"]
+```
+
+Codex 仍是主优化器。第三方本地 reviewer 通过 JSON stdin/stdout 工作，只提供审阅意见，
+没有命令回调，也拿不到晋级句柄。它与当前进程同权，不是 OS sandbox；需要更强隔离时，
+请把 reviewer 放进只读容器或系统 sandbox。
+
+| 范围 | 自动操作 | 边界 |
+|---|---|---|
+| 声明过的项目路径 | 允许 | 实际 diff 必须与 ChangeSet 一致 |
+| 用户所有的 `isolated_environment` | 允许 | 必须与项目及宿主机系统目录隔离 |
+| 宿主机系统、驱动、频率、功耗、权限 | 禁止 | 宿主机修改只给建议 |
+
+控制契约把 `host_policy` 固定为 `recommend_only`。正确性失败、diff 越界、workload
+漂移、预算过期、主指标没有确认收益或约束失败时，控制器会恢复冻结快照。
 
 ## 输入、预算与状态
 

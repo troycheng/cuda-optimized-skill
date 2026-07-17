@@ -1,4 +1,4 @@
 interface:
   display_name: "CUDA Kernel Optimizer"
-  short_description: "Trustworthy CUDA kernel and workload optimization"
-  default_prompt: "Use $cuda-kernel-optimizer to optimize this CUDA, CUTLASS, or Triton kernel against its reference implementation and optional user-provided workload, analyze an existing NCU report, or assess runtime or serving evidence; require a user-provided workload for any end-to-end claim."
+  short_description: "Evidence-driven GPU kernel and workload optimization"
+  default_prompt: "Use $cuda-kernel-optimizer to optimize a CUDA, CUTLASS, or Triton kernel against its reference implementation and optional user-provided workload, diagnose a full workload bottleneck across kernels, framework scheduling, the data pipeline, transfers, communication, I/O, or environment, analyze an existing NCU report, or assess runtime or serving evidence. Require a user-provided workload for end-to-end claims; Codex owns changes and decisions, a local reviewer is advisory, and host changes are recommendations only."

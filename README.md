@@ -2,15 +2,18 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Codex skill for evidence-driven optimization of CUDA, CUTLASS, and Triton
-kernels. V2.2 uses a dual-loop workflow: it first establishes a kernel result,
-then checks that result on a user-owned workload when one is provided. Every
-promotion remains tied to inspectable artifacts.
+A Codex skill for evidence-driven optimization of CUDA, CUTLASS, and Triton.
+V2.4 adds a workload controller for cases where the bottleneck may sit outside
+the kernel. The V2.2 dual-loop kernel workflow remains available: it establishes
+a kernel result, then checks that result on a user-owned workload when one is
+provided. Every promotion remains tied to inspectable artifacts.
 
 ## Start by task
 
 - **Optimize a kernel** — run the controlled candidate loop from a baseline and
   Python reference.
+- **Optimize a GPU workload** — profile a user-provided runnable workload,
+  classify the bottleneck, make one bounded change, and evaluate it end to end.
 - **Validate a real workload** — add an explicit workload and objective when an
   end-to-end claim matters.
 - **Analyze an existing NCU report** — import a `.ncu-rep` without launching its
@@ -108,6 +111,44 @@ Start with the first-run commands above. For later rounds, increment `--iter` an
 follow `checkpoint.json`. Read the method catalog and available profiler
 evidence before writing each budgeted branch.
 
+### Optimize a GPU workload
+
+The workload controller starts from the workload and its business objective,
+not from an assumed kernel bottleneck. Create `control.json` from the full
+example, then collect the baseline, probes, and diagnosis:
+
+```bash
+python3 scripts/workload_controller.py run \
+  --control /path/to/control.json \
+  --run-dir /path/to/workload_run
+```
+
+Read `diagnosis.json`, write a bounded ChangeSet, and register it before Codex
+edits the declared files:
+
+```bash
+python3 scripts/workload_controller.py register-change \
+  --control /path/to/control.json \
+  --run-dir /path/to/workload_run \
+  --change-set /path/to/change.json
+
+python3 scripts/workload_controller.py evaluate \
+  --run-dir /path/to/workload_run
+```
+
+After interruption, inspect or resume the exact checkpoint:
+
+```bash
+python3 scripts/workload_controller.py status --run-dir /path/to/workload_run
+python3 scripts/workload_controller.py resume --run-dir /path/to/workload_run
+```
+
+The deterministic classes are `kernel`, `framework`, `cpu_data`, `transfer`,
+`communication`, `io`, `environment`, and `mixed`. External profilers and
+internal tools supply a normalized probe instead of forcing one profiler format.
+The complete runnable contracts are in
+[`examples/workload-controller.md`](skills/cuda-kernel-optimizer/examples/workload-controller.md).
+
 ### Validate a real workload
 
 ```bash
@@ -169,6 +210,35 @@ Strategy memory accepts only a completed, strictly verified V2.2 run in the
 exact manifest scope. Suggestions are detached search hints. They cannot remove
 branches, change profiler or budget policy, overwrite evidence, or connect to
 `decision.json` and promotion.
+
+### Workload controller boundary
+
+```mermaid
+flowchart LR
+    runtime["User workload and environment"] --> baseline["Frozen baseline"]
+    baseline --> probes["Normalized probes"]
+    probes --> diagnosis["Deterministic diagnosis"]
+    diagnosis --> change["Bounded ChangeSet"]
+    change --> review["Optional advisory review"]
+    review --> evaluation["Paired workload evaluation"]
+    evaluation --> workload_decision["Deterministic decision"]
+    workload_decision --> promote_or_rollback["Promote or rollback"]
+```
+
+Codex remains the primary optimizer. A local third-party reviewer uses JSON stdin/stdout
+and is advisory only: it has no command callback and no promotion
+handle. Running it as the same user is not an OS sandbox; use a read-only
+container or system sandbox when stronger isolation is required.
+
+| Scope | Automatic action | Boundary |
+|---|---|---|
+| Declared project paths | Allowed | Actual diff must match the ChangeSet |
+| User-owned `isolated_environment` | Allowed | Must be outside the project and host system roots |
+| Host OS, driver, clocks, power, permissions | Never | Host changes are recommendations only |
+
+The control contract fixes `host_policy` to `recommend_only`. A failed
+correctness check, escaped diff, workload drift, expired budget, primary-metric
+loss, or constraint failure restores the frozen snapshot.
 
 ## Inputs, budgets, and statuses
 

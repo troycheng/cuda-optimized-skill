@@ -1,9 +1,9 @@
 ---
 name: cuda-kernel-optimizer
-description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, or Triton kernel against a reference implementation, especially for kernel benchmarking, real-workload validation, Nsight Compute, existing NCU report analysis, branch exploration, SASS verification, or runtime and serving evidence."
+description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.2)
+# CUDA Kernel and Workload Optimizer (V2.4)
 
 ## Principle
 
@@ -45,6 +45,60 @@ Start a Python adapter from `templates/workload.py`. Validate objectives against
 `templates/objective.schema.json`. Treat adapter source, declared local
 dependencies, objective, cases, baseline, reference, dimensions, backend,
 budget, confidence, and minimum effect as frozen run inputs.
+
+## Workload controller
+
+Use the V2.4 controller when the user has a user-provided runnable workload and
+the bottleneck is not known to be inside one kernel. Codex is the primary optimizer:
+it reads the evidence, writes a bounded ChangeSet, edits only the declared scope,
+and interprets the result. An optional local reviewer can challenge the diagnosis
+or experiment over JSON stdin/stdout, but it is advisory only. It cannot execute a
+change or promote a candidate, and the protocol does not provide an OS sandbox.
+
+The deterministic diagnosis classes are `kernel`, `framework`, `cpu_data`,
+`transfer`, `communication`, `io`, `environment`, and `mixed`. Probe commands
+come from the user environment and write a normalized probe artifact. This keeps
+Nsight Systems, framework profilers, internal observability, and application
+metrics usable without binding the skill to one profiler.
+
+The fixed stage order is:
+
+```text
+baseline -> probes -> diagnosis -> change -> review -> evaluation -> decision
+```
+
+Start and inspect the evidence:
+
+```bash
+python3 <skill>/scripts/workload_controller.py run \
+  --control ./control.json --run-dir ./workload_run
+python3 <skill>/scripts/workload_controller.py status --run-dir ./workload_run
+```
+
+After reading `diagnosis.json`, write a ChangeSet, then freeze it before editing:
+
+```bash
+python3 <skill>/scripts/workload_controller.py register-change \
+  --control ./control.json --run-dir ./workload_run \
+  --change-set ./change.json
+```
+
+Codex may edit declared project paths or a user-owned `isolated_environment`.
+The controller verifies the actual diff, runs correctness commands, optionally
+requests review, and performs paired workload evaluation:
+
+```bash
+python3 <skill>/scripts/workload_controller.py evaluate \
+  --run-dir ./workload_run
+python3 <skill>/scripts/workload_controller.py resume \
+  --run-dir ./workload_run
+```
+
+`host_policy` must be `recommend_only`. Host changes are never executed; write
+them to `host_recommendations.md` with evidence and manual checks. Reject a
+ChangeSet that escapes its paths, changes the frozen workload, exceeds its
+deadline, or asks for host scope. See `examples/workload-controller.md` for the
+complete control, probe, ChangeSet, and reviewer contracts.
 
 ## Compute budget
 

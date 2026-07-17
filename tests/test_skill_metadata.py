@@ -34,7 +34,7 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertRegex(text, r'(?m)^interface:\s*$')
         self.assertIn('display_name: "CUDA Kernel Optimizer"', text)
         self.assertIn(
-            'short_description: "Trustworthy CUDA kernel and workload optimization"',
+            'short_description: "Evidence-driven GPU kernel and workload optimization"',
             text,
         )
         self.assertIn("$cuda-kernel-optimizer", text)
@@ -145,6 +145,49 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("runtime or serving evidence", prompt)
         self.assertIn("user-provided workload", prompt)
         self.assertIn("end-to-end", prompt)
+
+    def test_skill_documents_v2_4_workload_controller_and_safety_boundaries(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        lower = text.lower()
+        self.assertIn("V2.4", text)
+        self.assertIn("scripts/workload_controller.py run", text)
+        self.assertIn("scripts/workload_controller.py register-change", text)
+        self.assertIn("scripts/workload_controller.py evaluate", text)
+        self.assertIn("scripts/workload_controller.py resume", text)
+        self.assertIn("user-provided runnable workload", lower)
+        for category in (
+            "kernel",
+            "framework",
+            "cpu_data",
+            "transfer",
+            "communication",
+            "io",
+            "environment",
+            "mixed",
+        ):
+            self.assertIn(f"`{category}`", text)
+        self.assertIn("Codex is the primary optimizer", text)
+        self.assertIn("optional local reviewer", lower)
+        self.assertIn("JSON stdin/stdout", text)
+        self.assertIn("advisory only", lower)
+        self.assertIn("does not provide an OS sandbox", text)
+        self.assertIn("project", lower)
+        self.assertIn("isolated_environment", text)
+        self.assertIn("recommend_only", text)
+        self.assertIn("host changes", lower)
+        self.assertIn("normalized probe", lower)
+        self.assertIn("examples/workload-controller.md", text)
+
+    def test_agent_prompt_routes_full_workload_optimization_to_v2_4(self) -> None:
+        text = OPENAI_YAML.read_text(encoding="utf-8").lower()
+        for marker in (
+            "workload bottleneck",
+            "framework",
+            "data pipeline",
+            "local reviewer",
+            "host changes are recommendations only",
+        ):
+            self.assertIn(marker, text)
 
     def test_skill_output_contract_contains_durable_evidence(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")

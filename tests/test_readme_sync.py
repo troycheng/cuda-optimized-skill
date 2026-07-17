@@ -167,15 +167,17 @@ class ReadmeSyncTests(unittest.TestCase):
             h1s = [line for line in text.splitlines() if line.startswith("# ")]
             self.assertEqual(h1s, ["# cuda-kernel-optimizer"])
 
-    def test_readmes_offer_the_same_four_task_entries(self) -> None:
+    def test_readmes_offer_the_same_five_task_entries(self) -> None:
         english_tasks = (
             "Optimize a kernel",
+            "Optimize a GPU workload",
             "Validate a real workload",
             "Analyze an existing NCU report",
             "Use explicit advisory memory",
         )
         chinese_tasks = (
             "优化 kernel",
+            "优化完整 GPU workload",
             "验证真实 workload",
             "分析已有 NCU report",
             "使用显式 advisory memory",
@@ -185,7 +187,7 @@ class ReadmeSyncTests(unittest.TestCase):
         for marker in chinese_tasks:
             self.assertIn(marker, self.chinese)
 
-    def test_readmes_have_exactly_two_matching_mermaid_topologies(self) -> None:
+    def test_readmes_have_exactly_three_matching_mermaid_topologies(self) -> None:
         expected = (
             sorted(
                 (
@@ -207,17 +209,66 @@ class ReadmeSyncTests(unittest.TestCase):
                     ("memory", "-.->", "suggestion"),
                 )
             ),
+            sorted(
+                (
+                    ("runtime", "-->", "baseline"),
+                    ("baseline", "-->", "probes"),
+                    ("probes", "-->", "diagnosis"),
+                    ("diagnosis", "-->", "change"),
+                    ("change", "-->", "review"),
+                    ("review", "-->", "evaluation"),
+                    ("evaluation", "-->", "workload_decision"),
+                    ("workload_decision", "-->", "promote_or_rollback"),
+                )
+            ),
         )
         english_blocks = MERMAID.findall(self.english)
         chinese_blocks = MERMAID.findall(self.chinese)
-        self.assertEqual(len(english_blocks), 2)
-        self.assertEqual(len(chinese_blocks), 2)
+        self.assertEqual(len(english_blocks), 3)
+        self.assertEqual(len(chinese_blocks), 3)
         for blocks in (english_blocks, chinese_blocks):
             self.assertEqual(tuple(map(mermaid_topology, blocks)), expected)
         self.assertEqual(
             tuple(map(mermaid_topology, english_blocks)),
             tuple(map(mermaid_topology, chinese_blocks)),
         )
+
+    def test_readmes_document_v2_4_workload_controller_and_boundaries(self) -> None:
+        for text in (self.english, self.chinese):
+            self.assertIn("V2.4", text)
+            for command in (
+                "workload_controller.py run",
+                "workload_controller.py register-change",
+                "workload_controller.py evaluate",
+                "workload_controller.py resume",
+            ):
+                self.assertIn(command, text)
+            for category in (
+                "kernel",
+                "framework",
+                "cpu_data",
+                "transfer",
+                "communication",
+                "io",
+                "environment",
+                "mixed",
+            ):
+                self.assertIn(f"`{category}`", text)
+            for marker in (
+                "JSON stdin/stdout",
+                "isolated_environment",
+                "recommend_only",
+                "examples/workload-controller.md",
+            ):
+                self.assertIn(marker, text)
+        self.assertIn("Codex remains the primary optimizer", self.english)
+        self.assertIn("advisory only", self.english.lower())
+        self.assertIn("not an OS sandbox", self.english)
+        self.assertIn("Codex 仍是主优化器", self.chinese)
+        self.assertIn("只提供审阅意见", self.chinese)
+        self.assertIn("不是 OS sandbox", self.chinese)
+        self.assertIn("Host changes are recommendations only", self.english)
+        self.assertIn("宿主机修改只给建议", self.chinese)
 
     def test_readmes_document_standalone_cli_surfaces_and_boundaries(self) -> None:
         for text in (self.english, self.chinese):
