@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import shutil
@@ -258,6 +259,13 @@ def _analyze_csv(csv_text: str, ncu_num: int) -> dict[str, Any]:
     """Normalize and rank imported CSV through the optimizer's shared rubric."""
     rows = profile_ncu._parse_ncu_csv(csv_text)
     aggregate = profile_ncu._aggregate_across_kernels(rows)
+    aggregate = {
+        name: info
+        for name, info in aggregate.items()
+        if isinstance(info.get("value"), (int, float))
+        and not isinstance(info.get("value"), bool)
+        and math.isfinite(float(info["value"]))
+    }
     rankings = profile_ncu._rank_by_axis(aggregate, ncu_num)
     kernels = sorted(
         {
@@ -388,7 +396,7 @@ def _run_analysis(args: argparse.Namespace) -> int:
             raise ValueError("SOURCE identity changed during import")
 
     available = {
-        name: result["returncode"] == 0 and bool(result["stdout"])
+        name: result["returncode"] == 0 and bool(result["stdout"].strip())
         for name, result in results.items()
     }
     csv_analysis = (
@@ -440,7 +448,6 @@ def _run_analysis(args: argparse.Namespace) -> int:
         "raw.csv": results["raw"]["stdout"].encode("utf-8") if available["raw"] else b"",
     }
     writes["analysis.md"] = _render_markdown(payload)
-    hashes = artifact_store.publish_regular_bundle(output, writes)
     availability = {
         "summary.txt": available["summary"],
         "summary.stderr.txt": bool(results["summary"]["stderr"]),
@@ -451,13 +458,19 @@ def _run_analysis(args: argparse.Namespace) -> int:
     }
     payload["artifacts"] = {
         name: {
-            "sha256": hashes[name],
+            "sha256": hashlib.sha256(writes[name]).hexdigest(),
             "size": len(writes[name]),
             "available": availability[name],
         }
         for name in SUPPORTING_FILES
     }
-    artifact_store.atomic_write_json(marker, payload)
+    writes["analysis.json"] = json.dumps(
+        payload,
+        allow_nan=False,
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    artifact_store.publish_regular_bundle(output, writes)
     return 0 if status == "success" else 2
 
 

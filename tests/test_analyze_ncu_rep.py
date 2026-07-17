@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import signal
 import stat
@@ -631,6 +632,70 @@ class AnalyzeNcuRepImportTests(unittest.TestCase):
         for name in names:
             self.assertEqual(payload["commands"][name]["stderr"], f"{name} bounded stderr")
 
+    def test_non_finite_metrics_are_removed_before_strict_json_publication(self) -> None:
+        module = _load()
+        raw = (
+            '"Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+            '"kernel","dram__bytes.sum","byte","1,024"\n'
+            '"kernel","sm__pipe_fp32_cycles_active.avg.pct_of_peak_sustained_active","%","NaN"\n'
+            '"kernel","smsp__warp_issue_stalled_wait_per_inst_issued","cycle","Infinity"\n'
+            '"kernel","lts__t_sector_hit_rate.pct","%","-Infinity"\n'
+        )
+        result = {"timed_out": False, "truncated": False, "returncode": 0, "stdout": "", "stderr": ""}
+        responses = [
+            {**result, "stdout": "NCU 1"},
+            {**result, "stdout": "summary"},
+            {**result, "stdout": "details"},
+            {**result, "stdout": raw},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "input.ncu-rep"
+            report.write_bytes(b"report")
+            output = root / "analysis"
+            ncu = _fake_ncu(root)
+            with mock.patch.object(module, "_run_bounded", side_effect=responses):
+                returncode = module.main(
+                    [str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)]
+                )
+            encoded = (output / "analysis.json").read_text(encoding="utf-8")
+        payload = json.loads(
+            encoded,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant: {value}")
+            ),
+        )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(payload["metric_count"], 1)
+        for metrics in payload["rankings"].values():
+            self.assertTrue(all(math.isfinite(metric["value"]) for metric in metrics))
+        self.assertNotIn(": NaN", encoded)
+        self.assertNotIn(": Infinity", encoded)
+        self.assertNotIn(": -Infinity", encoded)
+
+    def test_whitespace_only_imports_are_unavailable_and_do_not_publish_marker(self) -> None:
+        module = _load()
+        success = {"timed_out": False, "truncated": False, "returncode": 0, "stdout": " \n\t", "stderr": ""}
+        raw_failure = {**success, "returncode": 7}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "input.ncu-rep"
+            report.write_bytes(b"report")
+            output = root / "analysis"
+            output.mkdir()
+            marker = output / "analysis.json"
+            marker.write_text('{"old": true}', encoding="utf-8")
+            ncu = _fake_ncu(root)
+            version = {**success, "stdout": "NCU 1"}
+            with mock.patch.object(
+                module, "_run_bounded", side_effect=[version, success, success, raw_failure]
+            ):
+                returncode = module.main(
+                    [str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)]
+                )
+            self.assertEqual(returncode, 1)
+            self.assertFalse(marker.exists())
+
     def test_report_and_source_same_metadata_drift_are_hard_failures(self) -> None:
         module = _load()
         for drift_target in ("report", "source"):
@@ -708,26 +773,39 @@ class AnalyzeNcuRepImportTests(unittest.TestCase):
                 {**result, "stdout": "details"},
                 {**result, "stdout": raw},
             ]
-            events = []
-            real_remove = module.artifact_store.remove_regular_file
+            leaf_names = []
+            directory_identities = []
+            marker_payload = {}
             real_publish = module.artifact_store.publish_regular_bundle
-            real_json = module.artifact_store.atomic_write_json
+            real_write = module.artifact_store._atomic_write_leaf
+
+            def record_leaf(directory_fd, leaf, target, payload):
+                leaf_names.append(leaf)
+                metadata = os.fstat(directory_fd)
+                directory_identities.append((metadata.st_dev, metadata.st_ino))
+                if leaf == "analysis.json":
+                    marker_payload.update(json.loads(payload.decode("utf-8")))
+                return real_write(directory_fd, leaf, target, payload)
+
             with mock.patch.object(module, "_run_bounded", side_effect=responses), mock.patch.object(
                 module.artifact_store,
-                "remove_regular_file",
-                side_effect=lambda *a, **kw: (events.append("remove"), real_remove(*a, **kw))[1],
-            ), mock.patch.object(
-                module.artifact_store,
                 "publish_regular_bundle",
-                side_effect=lambda *a, **kw: (events.append("bundle"), real_publish(*a, **kw))[1],
-            ), mock.patch.object(
-                module.artifact_store,
-                "atomic_write_json",
-                side_effect=lambda *a, **kw: (events.append("marker"), real_json(*a, **kw))[1],
+                wraps=real_publish,
+            ) as publish, mock.patch.object(
+                module.artifact_store, "_atomic_write_leaf", side_effect=record_leaf
             ):
                 returncode = module.main([str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)])
             self.assertEqual(returncode, 0)
-            self.assertEqual(events, ["remove", "bundle", "marker"])
+            self.assertEqual(publish.call_count, 1)
+            self.assertEqual(leaf_names, [*module.SUPPORTING_FILES, "analysis.json"])
+            output_metadata = output.stat()
+            self.assertEqual(
+                set(directory_identities), {(output_metadata.st_dev, output_metadata.st_ino)}
+            )
+            self.assertEqual(
+                set(marker_payload["artifacts"]), set(module.SUPPORTING_FILES)
+            )
+            self.assertIn("analysis.json", publish.call_args.args[1])
             markdown = (output / "analysis.md").read_text(encoding="utf-8")
             for unsafe in ("![x]", "](file:", "|\n# heading", "<>"):
                 self.assertNotIn(unsafe, markdown)
@@ -740,6 +818,40 @@ class AnalyzeNcuRepImportTests(unittest.TestCase):
                 content = (output / name).read_bytes()
                 self.assertEqual(info["sha256"], hashlib.sha256(content).hexdigest())
                 self.assertEqual(info["size"], len(content))
+
+    def test_output_replacement_between_supporting_leaf_and_marker_fails_closed(self) -> None:
+        module = _load()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "input.ncu-rep"
+            report.write_bytes(b"report")
+            output = root / "analysis"
+            output.mkdir()
+            ncu = _fake_ncu(root)
+            result = {"timed_out": False, "truncated": False, "returncode": 0, "stdout": "ok", "stderr": ""}
+            real_write = module.artifact_store._atomic_write_leaf
+            moved = root / "moved-analysis"
+            replaced = False
+
+            def replace_before_marker(directory_fd, leaf, target, payload):
+                nonlocal replaced
+                if leaf == "analysis.json" and not replaced:
+                    output.rename(moved)
+                    output.mkdir()
+                    replaced = True
+                return real_write(directory_fd, leaf, target, payload)
+
+            with mock.patch.object(
+                module, "_run_bounded", side_effect=[result, result, result, result]
+            ), mock.patch.object(
+                module.artifact_store, "_atomic_write_leaf", side_effect=replace_before_marker
+            ):
+                returncode = module.main(
+                    [str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)]
+                )
+            self.assertTrue(replaced)
+            self.assertEqual(returncode, 1)
+            self.assertFalse((output / "analysis.json").exists())
 
     def test_supporting_publish_failure_after_one_write_leaves_no_completion_marker(self) -> None:
         module = _load()
