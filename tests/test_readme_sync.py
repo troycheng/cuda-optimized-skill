@@ -135,7 +135,7 @@ class ReadmeSyncTests(unittest.TestCase):
                     "CUDA, CUTLASS, and Triton",
                     "## Start by task",
                     "## Install",
-                    "## Five-minute first run",
+                    "## Start your first run",
                     "## Trusted promotion path",
                     "## Task commands",
                     "## Standalone tool boundaries",
@@ -151,7 +151,7 @@ class ReadmeSyncTests(unittest.TestCase):
                     "CUDA、CUTLASS 与 Triton",
                     "## 按任务开始",
                     "## 安装",
-                    "## 5 分钟首跑",
+                    "## 开始第一次运行",
                     "## 可信晋级路径",
                     "## 各任务命令",
                     "## 独立工具边界",
@@ -243,8 +243,8 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_readmes_publish_identical_current_validation_facts(self) -> None:
         facts = (
-            "609",
-            "605",
+            "611",
+            "607",
             "25/25",
             "595.71.05",
             "2026.1.1.0",
@@ -278,6 +278,71 @@ class ReadmeSyncTests(unittest.TestCase):
             for banned in ("旨在", "赋能", "无缝", "强大", "全面"):
                 self.assertNotIn(banned, text)
         self.assertNotRegex(self.chinese, r"通过[^。\n]{0,80}从而")
+
+    def test_first_run_is_honest_about_stages_and_frozen_runtime(self) -> None:
+        expectations = (
+            (
+                self.english,
+                "## Start your first run",
+                "## Trusted promotion path",
+                "returned `run_dir`",
+                "profiles the current best, computes Roofline evidence, and creates the branch directories",
+                "prepare the requested branch kernels",
+            ),
+            (
+                self.chinese,
+                "## 开始第一次运行",
+                "## 可信晋级路径",
+                "返回的 `run_dir`",
+                "profile 当前 best、计算 Roofline 证据并创建 branch 目录",
+                "准备本轮要求的 branch kernel",
+            ),
+        )
+        for text, start, end, run_dir, opened, prepare in expectations:
+            section = text[text.index(start) : text.index(end)]
+            blocks = re.findall(r"```bash\n(.*?)```", section, re.DOTALL)
+            self.assertEqual(len(blocks), 3)
+            self.assertIn("orchestrate.py setup", blocks[0])
+            self.assertIn("orchestrate.py open-iter", blocks[0])
+            self.assertNotIn("close-iter", blocks[0])
+            self.assertNotIn("finalize", blocks[0])
+            self.assertIn("orchestrate.py close-iter", blocks[1])
+            self.assertNotIn("finalize", blocks[1])
+            self.assertIn("orchestrate.py finalize", blocks[2])
+            self.assertIn(run_dir, section)
+            self.assertIn(opened, section)
+            self.assertIn(prepare, section)
+            self.assertIn("methods.json", section)
+            self.assertIn("analysis.md", section)
+            self.assertIn("10,800", section)
+            self.assertNotIn("admits work", section)
+        self.assertNotIn("Five-minute first run", self.english)
+        self.assertNotIn("5 分钟首跑", self.chinese)
+
+    def test_runtime_requirements_are_scoped_by_task(self) -> None:
+        english = self.english[
+            self.english.index("## Compatibility and verification") :
+            self.english.index("## References and license")
+        ]
+        chinese = self.chinese[
+            self.chinese.index("## 兼容性与验证") :
+            self.chinese.index("## 参考与许可证")
+        ]
+        for text in (english, chinese):
+            self.assertIn("Python 3.10+", text)
+            self.assertIn("Strategy memory", text)
+            self.assertIn("Darwin/Linux", text)
+        for marker in ("CUDA-enabled `torch`", "compatible `ncu`", "launches no GPU target"):
+            self.assertIn(marker, english)
+        for marker in ("CUDA 版 `torch`", "兼容的 `ncu`", "不启动 GPU target"):
+            self.assertIn(marker, chinese)
+        self.assertIn("Kernel optimization requires", english)
+        self.assertIn("Standalone report analysis requires", english)
+        self.assertIn("优化 kernel 需要", chinese)
+        self.assertIn("独立 report 分析需要", chinese)
+        for text in (english, chinese):
+            self.assertNotIn("`ncu` is optional", text)
+            self.assertNotIn("`ncu` 是可选依赖", text)
 
 
 if __name__ == "__main__":

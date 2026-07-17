@@ -2,10 +2,10 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Codex skill for optimizing CUDA, CUTLASS, and Triton kernels with durable
-correctness, paired-performance, sanitizer, profiler, SASS, and real-workload
-evidence. V2.2 uses a dual-loop workflow: the inner loop establishes a kernel
-result; the optional outer loop checks it against a workload owned by the user.
+A Codex skill for evidence-driven optimization of CUDA, CUTLASS, and Triton
+kernels. V2.2 uses a dual-loop workflow: it first establishes a kernel result,
+then checks that result on a user-owned workload when one is provided. Every
+promotion remains tied to inspectable artifacts.
 
 ## Start by task
 
@@ -33,7 +33,10 @@ The installer does not overwrite an existing directory. Move the old copy
 before reinstalling, then start a new Codex session. Repository contributors can
 instead `cd skills/cuda-kernel-optimizer`; the commands below stay the same.
 
-## Five-minute first run
+## Start your first run
+
+Run setup first. It returns a `run_dir`; use the returned `run_dir` for
+`--run-dir` in `open-iter`.
 
 ```bash
 python3 scripts/orchestrate.py setup \
@@ -44,18 +47,31 @@ python3 scripts/orchestrate.py setup \
 
 python3 scripts/orchestrate.py open-iter \
   --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
-
-python3 scripts/orchestrate.py close-iter \
-  --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
-
-python3 scripts/orchestrate.py finalize \
-  --run-dir /path/to/run_YYYYMMDD_HHMMSS
 ```
 
 `setup` validates and freezes inputs, seeds the baseline, and writes the first
 checkpoint. It does not profile the current best or create branch directories.
-`open-iter` admits work within the frozen budget. `close-iter` evaluates the
-candidates. Finalize only after the decision stage is complete.
+`open-iter` profiles the current best, computes Roofline evidence, and creates the branch directories
+allowed for this iteration.
+
+The agent or user must then prepare the requested branch kernels plus
+`methods.json` and `analysis.md`. Close the iteration only after those files are
+ready.
+
+```bash
+python3 scripts/orchestrate.py close-iter \
+  --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
+```
+
+Finalize only after the decision stage completes.
+
+```bash
+python3 scripts/orchestrate.py finalize \
+  --run-dir /path/to/run_YYYYMMDD_HHMMSS
+```
+
+Runtime follows the chosen frozen budget. The default `balanced` preset permits
+at most 10,800 seconds.
 
 ## Trusted promotion path
 
@@ -238,13 +254,22 @@ workload coverage remains visibly missing or degraded in `summary.md`.
 
 ## Compatibility and verification
 
-Runtime requirements are Python 3.10+, a CUDA GPU with a working driver, and a
-CUDA-enabled `torch`. Triton kernels need `triton`; CUDA/CUTLASS kernels use
-`nvcc`; SASS evidence uses `cuobjdump`. Supply CUTLASS headers with
-`$CUTLASS_PATH` or `$CUTLASS_INCLUDE_DIR`. `ncu` is optional. The skill does not
-redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
+Kernel optimization requires Python 3.10+, a CUDA GPU, a working driver, and
+CUDA-enabled `torch`. Triton kernels also need `triton`; CUDA/CUTLASS kernels
+use `nvcc`; CUTLASS builds need headers from `$CUTLASS_PATH` or
+`$CUTLASS_INCLUDE_DIR`; SASS evidence uses `cuobjdump`. NCU profiling is
+optional for this task and is recorded as unavailable or degraded when it
+cannot run.
 
-Current CPU acceptance contains 609 tests: 605 passed, four opt-in RTX 5090
+Standalone report analysis requires Python 3.10+ and a compatible `ncu`. It
+imports the supplied report and launches no GPU target.
+
+Strategy memory requires only Python 3.10+ on supported POSIX Darwin/Linux
+systems. Its storage must honor file locking and atomic rename semantics.
+
+The skill does not redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
+
+Current CPU acceptance contains 611 tests: 607 passed, four opt-in RTX 5090
 tests skipped, and zero failed. All 25/25 scripts pass `py_compile` and `--help`
 smoke checks, and the skill validator reports valid.
 

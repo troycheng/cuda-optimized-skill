@@ -2,9 +2,9 @@
 
 [English](README.md) | **简体中文**
 
-一个面向 Codex 的 CUDA、CUTLASS 与 Triton kernel 优化 skill。它保存正确性、
-paired performance、sanitizer、profiler、SASS 和真实 workload 证据。V2.2 使用
-双环流程：内环确认 kernel 结果；用户提供 workload 时，外环再检查真实 KPI。
+这是一个用于优化 CUDA、CUTLASS 与 Triton kernel 的 Codex skill。V2.2 使用
+双环流程：先确认 kernel 的正确性和收益；用户提供 workload 时，再检查真实
+KPI。每次晋级都有可复核的持久证据。
 
 ## 按任务开始
 
@@ -28,7 +28,9 @@ cd "${CODEX_HOME:-$HOME/.codex}/skills/cuda-kernel-optimizer"
 安装器不会覆盖已有目录。重新安装前先移走旧版本，再新建 Codex 会话。参与项目
 开发时也可以进入 `skills/cuda-kernel-optimizer`；后面的命令无需调整。
 
-## 5 分钟首跑
+## 开始第一次运行
+
+先执行 setup。它会返回 `run_dir`；在 `open-iter` 中使用返回的 `run_dir`。
 
 ```bash
 python3 scripts/orchestrate.py setup \
@@ -39,17 +41,28 @@ python3 scripts/orchestrate.py setup \
 
 python3 scripts/orchestrate.py open-iter \
   --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
+```
 
+`setup` 校验并冻结输入，seed baseline，同时写入首个 checkpoint；它不会 profile
+当前 best，也不会创建 branch 目录。`open-iter` 会 profile 当前 best、计算 Roofline 证据并创建 branch 目录，
+数量受本轮预算限制。
+
+接下来，Agent 或用户必须准备本轮要求的 branch kernel，并写好 `methods.json`
+和 `analysis.md`。这些文件就绪后才能关闭本轮。
+
+```bash
 python3 scripts/orchestrate.py close-iter \
   --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
+```
 
+Decision 阶段完成后才能 finalize。
+
+```bash
 python3 scripts/orchestrate.py finalize \
   --run-dir /path/to/run_YYYYMMDD_HHMMSS
 ```
 
-`setup` 校验并冻结输入，seed baseline，同时写入首个 checkpoint；它不会 profile
-当前 best，也不会创建 branch 目录。`open-iter` 按冻结预算接纳工作，
-`close-iter` 评估候选。Decision 阶段完成后再执行 finalize。
+实际耗时取决于已冻结的预算。默认 `balanced` 最多运行 10,800 秒。
 
 ## 可信晋级路径
 
@@ -223,13 +236,21 @@ sanitizer、compiler 或 workload 的可选覆盖若缺失或降级，`summary.m
 
 ## 兼容性与验证
 
-运行环境需要 Python 3.10+、CUDA GPU、正常驱动和 CUDA 版 `torch`。Triton
-kernel 还需安装 `triton`；CUDA/CUTLASS 使用 `nvcc`；SASS 证据来自
-`cuobjdump`。CUTLASS headers 可由 `$CUTLASS_PATH` 或 `$CUTLASS_INCLUDE_DIR`
-指定。`ncu` 是可选依赖。这个 skill 不重新分发 CUDA、CUTLASS、Triton 或
-Nsight Compute。
+优化 kernel 需要 Python 3.10+、CUDA GPU、正常驱动和 CUDA 版 `torch`。
+Triton kernel 还需安装 `triton`；CUDA/CUTLASS 使用 `nvcc`；CUTLASS build
+需要 `$CUTLASS_PATH` 或 `$CUTLASS_INCLUDE_DIR` 指定 headers；SASS 证据来自
+`cuobjdump`。这个任务可以不做 NCU profile；无法运行时会明确记录为 unavailable
+或 degraded。
 
-当前 CPU 验收共 609 项：605 项通过，4 项 opt-in RTX 5090 测试跳过，失败为
+独立 report 分析需要 Python 3.10+ 和兼容的 `ncu`。它只导入指定 report，
+不启动 GPU target。
+
+Strategy memory 只需要 Python 3.10+，支持 POSIX 语义的 Darwin/Linux 系统。
+存储位置必须支持 file lock 和 atomic rename。
+
+这个 skill 不重新分发 CUDA、CUTLASS、Triton 或 Nsight Compute。
+
+当前 CPU 验收共 611 项：607 项通过，4 项 opt-in RTX 5090 测试跳过，失败为
 0。25/25 个脚本均通过 `py_compile` 和 `--help` smoke check，skill validator
 也确认结构有效。
 
