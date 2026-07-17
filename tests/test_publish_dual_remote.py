@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +12,8 @@ from tools.publish_dual_remote import (
     ensure_fast_forward,
     inspect_local,
     inspect_remote,
+    main,
+    publish,
 )
 
 
@@ -73,6 +78,11 @@ class RepositoryCase(unittest.TestCase):
         git(clone, "config", "user.name", "Remote User")
         git(clone, "config", "user.email", "remote@example.com")
         return clone
+
+    def reject_pushes(self, remote: Path) -> None:
+        hook = remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
 
 
 class PreflightTests(RepositoryCase):
@@ -156,6 +166,95 @@ class PreflightTests(RepositoryCase):
 
         self.assertEqual("not_started", caught.exception.status)
         self.assertIn("origin", str(caught.exception))
+
+
+class PublishFlowTests(RepositoryCase):
+    def test_dry_run_never_writes_either_remote(self) -> None:
+        result = publish(
+            self.repo,
+            "v1.0.0",
+            self.targets,
+            execute=False,
+            validate=False,
+        )
+
+        self.assertEqual("dry_run", result["status"])
+        self.assertIsNone(inspect_remote(self.repo, "origin", "v1.0.0").main_commit)
+        self.assertIsNone(inspect_remote(self.repo, "internal", "v1.0.0").main_commit)
+
+    def test_execute_pushes_github_then_internal_and_verifies_both(self) -> None:
+        result = publish(
+            self.repo,
+            "v1.0.0",
+            self.targets,
+            execute=True,
+            validate=False,
+        )
+        identity = inspect_local(self.repo, "v1.0.0", self.targets)
+
+        self.assertEqual("complete", result["status"])
+        for remote_name in ("origin", "internal"):
+            state = inspect_remote(self.repo, remote_name, "v1.0.0")
+            self.assertEqual(identity.main_commit, state.main_commit)
+            self.assertEqual(identity.tag_object, state.tag_object)
+            self.assertEqual(identity.tag_commit, state.tag_commit)
+
+    def test_github_failure_never_writes_internal(self) -> None:
+        self.reject_pushes(self.github)
+
+        with self.assertRaises(PublishError) as caught:
+            publish(
+                self.repo,
+                "v1.0.0",
+                self.targets,
+                execute=True,
+                validate=False,
+            )
+
+        self.assertEqual("github_failed", caught.exception.status)
+        self.assertIsNone(inspect_remote(self.repo, "internal", "v1.0.0").main_commit)
+
+    def test_internal_failure_reports_pending_after_github_succeeds(self) -> None:
+        self.reject_pushes(self.internal)
+
+        with self.assertRaises(PublishError) as caught:
+            publish(
+                self.repo,
+                "v1.0.0",
+                self.targets,
+                execute=True,
+                validate=False,
+            )
+
+        identity = inspect_local(self.repo, "v1.0.0", self.targets)
+        github_state = inspect_remote(self.repo, "origin", "v1.0.0")
+        self.assertEqual("internal_pending", caught.exception.status)
+        self.assertEqual(identity.main_commit, github_state.main_commit)
+        self.assertIsNone(inspect_remote(self.repo, "internal", "v1.0.0").main_commit)
+
+    def test_cli_json_does_not_expose_url_credentials(self) -> None:
+        git(
+            self.repo,
+            "remote",
+            "set-url",
+            "origin",
+            "https://test-user:test-secret@example.invalid/repo.git",
+        )
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = main(
+                ["--tag", "v1.0.0"],
+                repo=self.repo,
+                targets=self.targets,
+                validate=False,
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(1, exit_code)
+        self.assertEqual("not_started", payload["status"])
+        self.assertNotIn("test-user", output.getvalue())
+        self.assertNotIn("test-secret", output.getvalue())
 
 
 if __name__ == "__main__":

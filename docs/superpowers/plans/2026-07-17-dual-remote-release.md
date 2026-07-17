@@ -125,7 +125,7 @@ git commit -m "feat(发布): 添加双远端安全检查"
 - 修改：`README.md`
 - 修改：`README.zh-CN.md`
 
-- [ ] **步骤 1：为发布顺序和失败语义编写失败测试**
+- [x] **步骤 1：为发布顺序和失败语义编写失败测试**
 
 `PublishFlowTests` 必须包含 5 个完整测试：
 
@@ -142,7 +142,7 @@ git commit -m "feat(发布): 添加双远端安全检查"
 成功测试检查两个 bare remote 的 `refs/heads/main`、标签对象和 peeled commit；失败测试使用
 只读目录或注入的 Git runner 让指定 push 失败，并检查调用顺序。
 
-- [ ] **步骤 2：运行测试，确认 RED**
+- [x] **步骤 2：运行测试，确认 RED**
 
 运行：
 
@@ -152,7 +152,7 @@ python3 -m unittest tests.test_publish_dual_remote.PublishFlowTests -v
 
 预期：FAIL，尚无 publisher 和 CLI。
 
-- [ ] **步骤 3：实现最小发布流程和 CLI**
+- [x] **步骤 3：实现最小发布流程和 CLI**
 
 实现 `publish(repo: Path, tag: str, targets: ReleaseTargets, *, execute: bool,
 validate: bool = True) -> dict[str, object]`。参数 `validate=False` 只供 Python 单元测试注入，
@@ -179,13 +179,13 @@ GitLab；GitLab 失败返回 `internal_pending`。默认 dry-run 只输出 `not_
 计划状态，不执行 push。测试可从 Python 接口传入 `validate=False`，CLI 不提供跳过测试的
 参数。
 
-- [ ] **步骤 4：更新双语 README**
+- [x] **步骤 4：更新双语 README**
 
 在两份 README 的兼容性与验证部分增加简短的「仓库发布」说明：GitHub 是权威源，GitLab
 是单向镜像，只同步 `main` 和发布标签；给出 dry-run 和 `--execute` 命令；明确禁止从
 GitLab 反向开发和覆盖 GitHub。
 
-- [ ] **步骤 5：运行 focused tests 和文档同步测试**
+- [x] **步骤 5：运行 focused tests 和文档同步测试**
 
 运行：
 
@@ -199,7 +199,7 @@ git diff --check
 
 预期：全部通过，help 退出码为 0，diff 无格式错误。
 
-- [ ] **步骤 6：提交发布流程**
+- [x] **步骤 6：提交发布流程**
 
 ```bash
 git add tools/publish_dual_remote.py tests/test_publish_dual_remote.py README.md README.zh-CN.md

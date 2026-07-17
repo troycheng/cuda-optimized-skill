@@ -286,6 +286,23 @@ CSV 可用，共解析 140 项 metrics。分析包记录 `counter_access: not_pr
 Opt-in 命令见 [SM120 测试说明](tests/gpu/sm120/README.md)，版本和架构路由见
 [兼容性说明](skills/cuda-kernel-optimizer/references/compatibility.md)。
 
+### 仓库发布
+
+[GitHub](https://github.com/troycheng/cuda-optimized-skill) 是唯一权威仓库，
+内网 GitLab 只做单向镜像。每次发布只同步 `main` 和一个明确指定的带注释标签，
+不会从内网仓库反向开发或覆盖 GitHub。
+
+先运行不带 `--execute` 的检查。它会验证仓库身份、快进关系、完整 CPU 测试和
+两个精确 refs，全程不写远端：
+
+```bash
+python3 tools/publish_dual_remote.py --tag v2.3.0
+python3 tools/publish_dual_remote.py --tag v2.3.0 --execute
+```
+
+第二条命令先发布并回读 GitHub，再发布并回读 GitLab。工具不会强推、删除 ref
+或向 upstream 写入。
+
 ## 参考与许可证
 
 - [Skill 正式流程](skills/cuda-kernel-optimizer/SKILL.md)

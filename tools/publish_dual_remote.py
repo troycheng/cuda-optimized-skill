@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -19,6 +23,16 @@ class ReleaseTargets:
     upstream_remote: str
     upstream_fetch_url: str
     upstream_push_url: str = "DISABLED"
+
+
+PRODUCTION_TARGETS = ReleaseTargets(
+    github_remote="origin",
+    github_url="https://github.com/troycheng/cuda-optimized-skill.git",
+    internal_remote="internal",
+    internal_url="git@git.yukework.com:mlsys/cuda-optimized-skill.git",
+    upstream_remote="upstream",
+    upstream_fetch_url="https://github.com/KernelFlow-ops/cuda-optimized-skill.git",
+)
 
 
 @dataclass(frozen=True)
@@ -217,3 +231,191 @@ def ensure_fast_forward(
     )
     if is_ancestor.returncode != 0:
         raise PublishError(f"main on {remote} cannot be fast-forwarded")
+
+
+def _run_validation(repo: Path) -> None:
+    commands = (
+        (
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-p",
+            "test_*.py",
+            "-q",
+        ),
+        (sys.executable, "-m", "unittest", "tests.test_skill_metadata", "-q"),
+    )
+    for command in commands:
+        completed = subprocess.run(
+            list(command),
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if completed.returncode != 0:
+            output = "\n".join(completed.stdout.splitlines()[-40:])
+            raise PublishError(f"release validation failed:\n{output}")
+
+
+def _verify_exact(remote: str, identity: ReleaseIdentity, state: RemoteState) -> None:
+    if state.main_commit != identity.main_commit:
+        raise PublishError(f"main verification failed on {remote}")
+    if state.tag_object != identity.tag_object:
+        raise PublishError(f"tag object verification failed on {remote}")
+    if state.tag_commit != identity.tag_commit:
+        raise PublishError(f"tag commit verification failed on {remote}")
+
+
+def _push_release(
+    repo: Path,
+    remote: str,
+    identity: ReleaseIdentity,
+    *,
+    failure_status: str,
+) -> None:
+    pushed = _git(
+        repo,
+        "push",
+        "--atomic",
+        remote,
+        "refs/heads/main:refs/heads/main",
+        f"refs/tags/{identity.tag_name}:refs/tags/{identity.tag_name}",
+        check=False,
+    )
+    if pushed.returncode != 0:
+        detail = pushed.stderr.strip() or pushed.stdout.strip()
+        raise PublishError(
+            f"push to {remote} failed: {detail}",
+            status=failure_status,
+        )
+
+
+def _summary(
+    status: str,
+    identity: ReleaseIdentity,
+    *,
+    github: str,
+    internal: str,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "main_commit": identity.main_commit,
+        "tag": {
+            "name": identity.tag_name,
+            "object": identity.tag_object,
+            "commit": identity.tag_commit,
+        },
+        "remotes": {
+            "github": github,
+            "internal": internal,
+        },
+    }
+
+
+def publish(
+    repo: Path,
+    tag: str,
+    targets: ReleaseTargets,
+    *,
+    execute: bool,
+    validate: bool = True,
+) -> dict[str, object]:
+    repo = repo.resolve()
+    identity = inspect_local(repo, tag, targets)
+    github_before = inspect_remote(repo, targets.github_remote, tag)
+    ensure_fast_forward(repo, targets.github_remote, identity, github_before)
+    internal_before = inspect_remote(repo, targets.internal_remote, tag)
+    ensure_fast_forward(repo, targets.internal_remote, identity, internal_before)
+
+    if validate:
+        _run_validation(repo)
+    if not execute:
+        return _summary(
+            "dry_run",
+            identity,
+            github="planned",
+            internal="planned",
+        )
+
+    _push_release(
+        repo,
+        targets.github_remote,
+        identity,
+        failure_status="github_failed",
+    )
+    try:
+        github_after = inspect_remote(repo, targets.github_remote, tag)
+        _verify_exact(targets.github_remote, identity, github_after)
+    except PublishError as exc:
+        raise PublishError(str(exc), status="github_failed") from exc
+
+    _push_release(
+        repo,
+        targets.internal_remote,
+        identity,
+        failure_status="internal_pending",
+    )
+    try:
+        internal_after = inspect_remote(repo, targets.internal_remote, tag)
+        _verify_exact(targets.internal_remote, identity, internal_after)
+    except PublishError as exc:
+        raise PublishError(str(exc), status="internal_pending") from exc
+
+    return _summary(
+        "complete",
+        identity,
+        github="verified",
+        internal="verified",
+    )
+
+
+def _redact(message: str) -> str:
+    return re.sub(r"(?i)(https?://)([^/@\s]+)@", r"\1***@", message)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Publish main and one annotated release tag to the GitHub source "
+            "and internal GitLab mirror. The default is dry-run."
+        )
+    )
+    parser.add_argument("--tag", required=True, help="annotated release tag")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform both remote pushes after all checks pass",
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    repo: Path | None = None,
+    targets: ReleaseTargets = PRODUCTION_TARGETS,
+    validate: bool = True,
+) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = publish(
+            repo or Path.cwd(),
+            args.tag,
+            targets,
+            execute=args.execute,
+            validate=validate,
+        )
+    except PublishError as exc:
+        result = {"status": exc.status, "error": _redact(str(exc))}
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 1
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

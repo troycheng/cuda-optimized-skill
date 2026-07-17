@@ -308,6 +308,24 @@ See [the SM120 test guide](tests/gpu/sm120/README.md) for opt-in commands and
 [compatibility notes](skills/cuda-kernel-optimizer/references/compatibility.md)
 for version and architecture routing.
 
+### Repository publishing
+
+[GitHub](https://github.com/troycheng/cuda-optimized-skill) is the authoritative
+repository. The internal GitLab project is a one-way mirror. Releases copy only
+`main` and one explicit annotated tag; development never flows back from the
+mirror.
+
+Run the publisher without `--execute` first. It verifies repository identity,
+fast-forward safety, the full CPU suite, and both exact refs without writing:
+
+```bash
+python3 tools/publish_dual_remote.py --tag v2.3.0
+python3 tools/publish_dual_remote.py --tag v2.3.0 --execute
+```
+
+The second command publishes GitHub first, verifies it, then publishes and
+verifies GitLab. It never force-pushes, deletes refs, or writes to upstream.
+
 ## References and license
 
 - [Skill workflow](skills/cuda-kernel-optimizer/SKILL.md)
