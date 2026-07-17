@@ -237,9 +237,9 @@ def _input_identity(
     return actual, len(current)
 
 
-def _scope_document_from_manifest(
+def _validated_manifest_scope(
     manifest_path: str | os.PathLike, *, verify_files: bool
-) -> dict:
+) -> tuple[dict, dict]:
     """Load a frozen manifest and derive its complete strategy scope."""
     raw = artifact_store.read_regular_bytes(manifest_path)
     manifest = _strict_json_bytes(raw, "manifest")
@@ -327,7 +327,15 @@ def _scope_document_from_manifest(
         "ref_sha256": ref_sha,
         "workload": workload,
     }
-    return _validate_scope_document(scope)
+    return manifest, _validate_scope_document(scope)
+
+
+def _scope_document_from_manifest(
+    manifest_path: str | os.PathLike, *, verify_files: bool
+) -> dict:
+    return _validated_manifest_scope(
+        manifest_path, verify_files=verify_files
+    )[1]
 
 
 def scope_document(manifest_path: str | os.PathLike) -> dict:
@@ -1449,6 +1457,44 @@ def _memory_lock_path(memory_path: str | os.PathLike) -> str:
     return f"{os.fspath(memory_path)}.lock"
 
 
+def _protected_frozen_inputs(
+    manifest_path: str | os.PathLike,
+) -> tuple[dict, list[str | os.PathLike]]:
+    manifest, scope = _validated_manifest_scope(
+        manifest_path, verify_files=False
+    )
+    protected: list[str | os.PathLike] = [
+        manifest_path,
+        manifest["inputs"]["baseline"]["path"],
+        manifest["inputs"]["ref"]["path"],
+    ]
+    if manifest["mode"] == "full":
+        raw = manifest["workload"]
+        spec = workload_adapter.WorkloadSpec(
+            kind=raw["kind"],
+            source=_strict_copy(raw["source"], "manifest.workload.source"),
+            objective=workload_adapter.validate_objective(raw["objective"]),
+            cases=tuple(_strict_copy(raw["cases"], "manifest.workload.cases")),
+            source_hash=raw["source_hash"],
+        )
+        if spec.kind == "python":
+            bundle = workload_adapter._read_python_bundle(spec.source)
+            snapshots = (bundle.source,) + tuple(
+                snapshot for _, snapshot in bundle.dependencies
+            )
+        else:
+            normalized, snapshots = workload_adapter._normalize_command_source(
+                spec.source
+            )
+            if normalized != list(spec.source):
+                raise ValueError(
+                    "workload source_hash mismatch; command normalization changed"
+                )
+        workload_adapter._verify_source_hash(spec, snapshots)
+        protected.extend(snapshot.path for snapshot in snapshots)
+    return scope, protected
+
+
 def _reject_output_aliases(
     output_path: str | os.PathLike,
     protected_paths: list[str | os.PathLike],
@@ -1470,11 +1516,14 @@ def record_run(
         output_path,
         [memory_path, _memory_lock_path(memory_path)],
     )
+    _scope, frozen_inputs = _protected_frozen_inputs(
+        Path(run_dir) / "manifest.json"
+    )
+    _reject_output_aliases(output_path, frozen_inputs)
     record = load_completed_run(run_dir)
     _reject_output_aliases(
         output_path,
         [
-            Path(run_dir) / "manifest.json",
             *(item["path"] for item in record["evidence"]),
         ],
     )
@@ -1608,9 +1657,10 @@ def suggest_strategies(
     """Publish exact-scope search hints without reading or changing run state."""
     _reject_output_aliases(
         output_path,
-        [memory_path, _memory_lock_path(memory_path), manifest_path],
+        [memory_path, _memory_lock_path(memory_path)],
     )
-    scope = _scope_document_from_manifest(manifest_path, verify_files=False)
+    scope, frozen_inputs = _protected_frozen_inputs(manifest_path)
+    _reject_output_aliases(output_path, frozen_inputs)
     key = _scope_key_from_document(scope)
     memory = _optional_memory(memory_path)
     if memory is None:

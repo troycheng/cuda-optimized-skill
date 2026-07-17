@@ -1708,6 +1708,81 @@ class StrategyMemoryTests(unittest.TestCase):
                     self.memory.suggest_strategies(memory, manifest, output)
                 self.assertEqual(self._tree_snapshot(root), before)
 
+        for alias in (
+            "baseline-exact",
+            "reference-relative",
+            "reference-hardlink",
+            "python-source",
+            "python-dependency",
+            "command-executable",
+            "command-script",
+        ):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                if alias.startswith("python-"):
+                    manifest = self._manifest(root, mode="full")
+                elif alias.startswith("command-"):
+                    executable = root / "runner.sh"
+                    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    executable.chmod(0o755)
+                    script = root / "script.py"
+                    script.write_text("print('ok')\n", encoding="utf-8")
+                    objective = root / "objective.json"
+                    objective.write_text(
+                        json.dumps(self._objective()), encoding="utf-8"
+                    )
+                    spec = self.workloads.normalize_workload(
+                        workload_cmd=[str(executable), str(script)],
+                        objective=objective,
+                    )
+                    manifest = self._manifest(root)
+                    payload = json.loads(manifest.read_text("utf-8"))
+                    payload["mode"] = "full"
+                    payload["workload"] = {
+                        "kind": spec.kind,
+                        "source": list(spec.source),
+                        "objective": spec.objective,
+                        "cases": list(spec.cases),
+                        "source_hash": spec.source_hash,
+                    }
+                    manifest.write_text(json.dumps(payload), encoding="utf-8")
+                else:
+                    manifest = self._manifest(root)
+                payload = json.loads(manifest.read_text("utf-8"))
+                if alias == "baseline-exact":
+                    output = Path(payload["inputs"]["baseline"]["path"])
+                elif alias.startswith("reference-"):
+                    reference = Path(payload["inputs"]["ref"]["path"])
+                    if alias == "reference-relative":
+                        output = Path(os.path.relpath(reference, Path.cwd()))
+                    else:
+                        output = root / "reference-hardlink.py"
+                        try:
+                            os.link(reference, output)
+                        except OSError as error:
+                            self.skipTest(f"hardlinks unavailable: {error}")
+                elif alias == "python-source":
+                    output = Path(payload["workload"]["source"])
+                elif alias == "python-dependency":
+                    output = Path(payload["workload"]["source"]).with_name("helper.py")
+                elif alias == "command-executable":
+                    output = Path(payload["workload"]["source"][0])
+                else:
+                    output = Path(payload["workload"]["source"][1])
+                before = self._tree_snapshot(root)
+                no_execute = mock.patch.object(
+                    self.memory.workload_adapter,
+                    "_load_python_bundle",
+                    side_effect=AssertionError("strategy executed workload source"),
+                )
+                with no_execute, self.assertRaisesRegex(
+                    ValueError, "output.*alias|collision"
+                ):
+                    self.memory.suggest_strategies(
+                        root / "missing-memory.json", manifest, output
+                    )
+                self.assertEqual(self._tree_snapshot(root), before)
+
     def test_record_rejects_memory_output_alias_before_append(self) -> None:
         for alias in ("missing-exact", "existing-hardlink"):
             with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
@@ -1727,6 +1802,40 @@ class StrategyMemoryTests(unittest.TestCase):
                         self.skipTest(f"hardlinks unavailable: {error}")
                 before = self._tree_snapshot(root)
                 with self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                    self.memory.record_run(memory, run, output)
+                self.assertEqual(self._tree_snapshot(root), before)
+
+        for declared_input in (
+            "baseline",
+            "reference",
+            "workload-source",
+            "workload-dependency",
+        ):
+            with self.subTest(
+                declared_input=declared_input
+            ), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                run = self._completed_run(
+                    root / "fixture", status="end_to_end_win"
+                )
+                payload = json.loads((run / "manifest.json").read_text("utf-8"))
+                if declared_input == "baseline":
+                    output = Path(payload["inputs"]["baseline"]["path"])
+                elif declared_input == "reference":
+                    output = Path(payload["inputs"]["ref"]["path"])
+                elif declared_input == "workload-source":
+                    output = Path(payload["workload"]["source"])
+                else:
+                    output = Path(payload["workload"]["source"]).with_name(
+                        "helper-run.py"
+                    )
+                memory = root / "memory.json"
+                before = self._tree_snapshot(root)
+                with mock.patch.object(
+                    self.memory.workload_adapter,
+                    "_load_python_bundle",
+                    side_effect=AssertionError("strategy executed workload source"),
+                ), self.assertRaisesRegex(ValueError, "output.*alias|collision"):
                     self.memory.record_run(memory, run, output)
                 self.assertEqual(self._tree_snapshot(root), before)
 
