@@ -3,6 +3,7 @@ from __future__ import annotations
 import struct
 import unittest
 import xml.etree.ElementTree as ET
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -38,18 +39,80 @@ def fills(root: ET.Element) -> Counter[str]:
     )
 
 
-def read_png_ihdr(name: str) -> tuple[int, int, int]:
-    with (ASSET_DIR / name).open("rb") as file:
-        signature = file.read(8)
-        length = struct.unpack(">I", file.read(4))[0]
-        chunk_type = file.read(4)
-        data = file.read(length)
-    if signature != b"\x89PNG\r\n\x1a\n" or chunk_type != b"IHDR" or length != 13:
-        raise AssertionError(f"{name} does not start with a valid PNG IHDR")
-    width, height, _depth, color_type, _compression, _filter, _interlace = struct.unpack(
-        ">IIBBBBB", data
-    )
-    return width, height, color_type
+def paeth(left: int, up: int, upper_left: int) -> int:
+    estimate = left + up - upper_left
+    distances = (abs(estimate - left), abs(estimate - up), abs(estimate - upper_left))
+    return (left, up, upper_left)[distances.index(min(distances))]
+
+
+def read_png(name: str) -> tuple[int, int, int, bytes]:
+    content = (ASSET_DIR / name).read_bytes()
+    if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise AssertionError(f"{name} does not have a PNG signature")
+    offset = 8
+    idat = bytearray()
+    width = height = color_type = None
+    while offset < len(content):
+        length = struct.unpack(">I", content[offset : offset + 4])[0]
+        chunk_type = content[offset + 4 : offset + 8]
+        data = content[offset + 8 : offset + 8 + length]
+        offset += length + 12
+        if chunk_type == b"IHDR":
+            width, height, depth, color_type, compression, filtering, interlace = struct.unpack(
+                ">IIBBBBB", data
+            )
+            if (depth, color_type, compression, filtering, interlace) != (8, 6, 0, 0, 0):
+                raise AssertionError(f"{name} is not an 8-bit non-interlaced RGBA PNG")
+        elif chunk_type == b"IDAT":
+            idat.extend(data)
+        elif chunk_type == b"IEND":
+            break
+    if width is None or height is None:
+        raise AssertionError(f"{name} does not contain IHDR")
+
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    previous = bytearray(stride)
+    alpha = bytearray()
+    position = 0
+    for _row in range(height):
+        filter_type = raw[position]
+        position += 1
+        scanline = bytearray(raw[position : position + stride])
+        position += stride
+        for index, value in enumerate(scanline):
+            left = scanline[index - 4] if index >= 4 else 0
+            up = previous[index]
+            upper_left = previous[index - 4] if index >= 4 else 0
+            if filter_type == 1:
+                scanline[index] = (value + left) & 0xFF
+            elif filter_type == 2:
+                scanline[index] = (value + up) & 0xFF
+            elif filter_type == 3:
+                scanline[index] = (value + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                scanline[index] = (value + paeth(left, up, upper_left)) & 0xFF
+            elif filter_type != 0:
+                raise AssertionError(f"{name} uses unknown PNG filter {filter_type}")
+        alpha.extend(scanline[3::4])
+        previous = scanline
+    return width, height, color_type, bytes(alpha)
+
+
+def expected_geometry() -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    result = [("title", (("id", "title"),))]
+    for y in (7, 36, 65):
+        for x in (7, 36, 65):
+            if (x, y) == (36, 36):
+                continue
+            result.append(
+                (
+                    "rect",
+                    tuple(sorted({"x": str(x), "y": str(y), "width": "24", "height": "24", "rx": "5"}.items())),
+                )
+            )
+    result.append(("path", (("d", "M34 48 48 34 62 48 48 62Z"),)))
+    return tuple(result)
 
 
 class LogoAssetTests(unittest.TestCase):
@@ -64,13 +127,21 @@ class LogoAssetTests(unittest.TestCase):
         self.assertNotIn("width", dark.attrib)
         self.assertNotIn("height", dark.attrib)
         self.assertEqual(geometry(light), geometry(dark))
+        self.assertEqual(geometry(light), expected_geometry())
         self.assertEqual(fills(light), Counter({"#172033": 8, "#16B8A6": 1}))
         self.assertEqual(fills(dark), Counter({"#F5F7FA": 8, "#28D6C2": 1}))
-        self.assertEqual(read_png_ihdr("logo-128.png"), (128, 128, 6))
-        self.assertEqual(read_png_ihdr("logo-512.png"), (512, 512, 6))
+        for name, size in (("logo-128.png", 128), ("logo-512.png", 512)):
+            width, height, color_type, alpha = read_png(name)
+            self.assertEqual((width, height, color_type), (size, size, 6))
+            self.assertEqual(min(alpha), 0)
+            self.assertEqual(max(alpha), 255)
 
         for readme_name in ("README.md", "README.zh-CN.md"):
             readme = (ROOT / readme_name).read_text(encoding="utf-8")
+            self.assertIn(
+                '<source media="(prefers-color-scheme: dark)" srcset="asset/logo-dark.svg">',
+                readme,
+            )
             self.assertIn('<img src="asset/logo.svg" width="88"', readme)
 
 

@@ -1,7 +1,10 @@
 # cuda-kernel-optimizer
 
 <p align="center">
-  <img src="asset/logo.svg" width="88" alt="cuda-kernel-optimizer Thread Tile logo">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="asset/logo-dark.svg">
+    <img src="asset/logo.svg" width="88" alt="cuda-kernel-optimizer Thread Tile logo">
+  </picture>
 </p>
 
 [English](README.md) | **简体中文**

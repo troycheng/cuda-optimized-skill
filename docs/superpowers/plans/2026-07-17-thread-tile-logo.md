@@ -4,9 +4,9 @@
 
 **目标：** 制作 Thread Tile 的浅色、深色 SVG 与透明 PNG，并把主版本加入中英文 README 后发布到双远端。
 
-**架构：** SVG 是唯一几何源文件，两个版本只允许填充色不同。PNG 由 macOS Quick Look 从主 SVG 确定性导出；Python 标准库测试验证几何、颜色、PNG 尺寸和 README 引用。
+**架构：** SVG 是唯一几何源文件，两个版本只允许填充色不同。PNG 由 `librsvg` 从主 SVG 确定性导出；Python 标准库测试验证几何、颜色、PNG 尺寸、实际透明像素和 README 引用。
 
-**技术栈：** SVG、Python `unittest`/`xml.etree.ElementTree`/`struct`、macOS `qlmanage`/`sips`、Git。
+**技术栈：** SVG、Python `unittest`/`xml.etree.ElementTree`/`struct`/`zlib`、`librsvg`、macOS `sips`、Git。
 
 ---
 
@@ -75,10 +75,8 @@ git commit -m "test(logo): 固定 Thread Tile 资源契约"
 - [ ] **步骤 2：导出透明 PNG**
 
 ```bash
-qlmanage -t -s 128 -o /tmp/thread-tile-128 asset/logo.svg
-qlmanage -t -s 512 -o /tmp/thread-tile-512 asset/logo.svg
-mv /tmp/thread-tile-128/logo.svg.png asset/logo-128.png
-mv /tmp/thread-tile-512/logo.svg.png asset/logo-512.png
+rsvg-convert --width 128 --height 128 --output asset/logo-128.png asset/logo.svg
+rsvg-convert --width 512 --height 512 --output asset/logo-512.png asset/logo.svg
 sips -g pixelWidth -g pixelHeight -g hasAlpha asset/logo-128.png asset/logo-512.png
 ```
 
@@ -90,7 +88,10 @@ sips -g pixelWidth -g pixelHeight -g hasAlpha asset/logo-128.png asset/logo-512.
 
 ```html
 <p align="center">
-  <img src="asset/logo.svg" width="88" alt="cuda-kernel-optimizer Thread Tile logo">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="asset/logo-dark.svg">
+    <img src="asset/logo.svg" width="88" alt="cuda-kernel-optimizer Thread Tile logo">
+  </picture>
 </p>
 ```
 
