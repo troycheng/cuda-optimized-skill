@@ -25,7 +25,7 @@
 - 创建：`tools/publish_dual_remote.py`
 - 创建：`tests/test_publish_dual_remote.py`
 
-- [ ] **步骤 1：为本地身份和拓扑规则编写失败测试**
+- [x] **步骤 1：为本地身份和拓扑规则编写失败测试**
 
 测试用 `tempfile.TemporaryDirectory()` 创建工作仓库和两个 bare remote，辅助函数只运行
 参数数组：
@@ -50,7 +50,7 @@ def git(cwd, *args, check=True):
 - `test_repeated_matching_refs_are_idempotent`：远端 refs 与本地完全一致，断言检查成功且不要求
   写入。
 
-- [ ] **步骤 2：运行测试，确认 RED**
+- [x] **步骤 2：运行测试，确认 RED**
 
 运行：
 
@@ -60,7 +60,7 @@ python3 -m unittest tests.test_publish_dual_remote.PreflightTests -v
 
 预期：FAIL，`tools.publish_dual_remote` 尚不存在。
 
-- [ ] **步骤 3：实现最小 preflight**
+- [x] **步骤 3：实现最小 preflight**
 
 模块先实现以下稳定数据类型：
 
@@ -100,7 +100,7 @@ remote_state: RemoteState) -> None`。
 独立临时 ref，再由 `merge-base --is-ancestor` 判断。任何不一致都抛出
 `PublishError(status="not_started")`。
 
-- [ ] **步骤 4：运行测试，确认 GREEN**
+- [x] **步骤 4：运行测试，确认 GREEN**
 
 运行：
 
@@ -110,7 +110,7 @@ python3 -m unittest tests.test_publish_dual_remote.PreflightTests -v
 
 预期：全部通过。
 
-- [ ] **步骤 5：提交核心检查**
+- [x] **步骤 5：提交核心检查**
 
 ```bash
 git add tools/__init__.py tools/publish_dual_remote.py tests/test_publish_dual_remote.py
