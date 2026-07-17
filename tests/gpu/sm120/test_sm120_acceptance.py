@@ -602,7 +602,7 @@ class Sm120AcceptanceTests(unittest.TestCase):
                 "path": str(candidate),
             },
             "paths": ["candidate.py"],
-            "commands": [[sys.executable, "-m", "py_compile", str(candidate)]],
+            "commands": [],
             "rollback": "restore_frozen_snapshot",
             "expected_metrics": ["gpu_busy_pct", "latency_ms", "output_checksum"],
         }

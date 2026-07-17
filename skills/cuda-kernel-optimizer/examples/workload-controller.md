@@ -1,7 +1,7 @@
 # Workload controller example
 
 This example starts with a runnable workload, diagnoses why the GPU is idle,
-and evaluates one project-scoped change. Replace the absolute paths and commands
+and evaluates one project-scoped change. Replace the absolute paths and probe argv
 with the user's real environment; keep the schemas and boundaries unchanged.
 
 ## 1. Describe the run
@@ -30,7 +30,8 @@ with the user's real environment; keep the schemas and boundaries unchanged.
   ],
   "reviewer": {
     "argv": ["reviewer-cli", "--json"],
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "include_diff": false
   }
 }
 ```
@@ -92,9 +93,7 @@ like this:
   "scope": "project",
   "candidate": {"name": "dataloader-workers-8", "revision": "worktree"},
   "paths": ["configs/serve.json"],
-  "commands": [
-    ["python3", "-m", "unittest", "tests.test_serve_config"]
-  ],
+  "commands": [],
   "rollback": "restore_frozen_snapshot",
   "expected_metrics": [
     "data_wait_pct",
@@ -138,8 +137,10 @@ The optional reviewer receives a digest-bound request on stdin. It may return:
 ```
 
 Only `support`, `challenge`, and `insufficient` are valid verdicts. The reviewer
-cannot return commands or approve promotion. The local process still has the
-current user's OS permissions; put it in a read-only sandbox when that matters.
+cannot return commands or approve promotion. Source diff content is withheld by
+default; set `include_diff` to `true` only when the selected reviewer may receive
+it. The local process still has the current user's OS permissions; put it in a
+read-only sandbox when that matters.
 
 Evaluate the registered candidate:
 
@@ -148,11 +149,20 @@ python3 scripts/workload_controller.py evaluate \
   --run-dir /workspace/workload_run
 ```
 
-The controller checks the actual diff, runs the correctness argv, reviews the
-proposal when configured, and evaluates randomized baseline/candidate pairs on
-the frozen workload. Promotion requires a confirmed primary-metric win and all
-constraints passing. Otherwise the frozen project or environment snapshot is
-restored.
+The controller checks the actual diff, records a separate binding between the
+unchanged candidate descriptor and post-change identity, reviews the proposal,
+and evaluates
+randomized baseline/candidate pairs on the frozen workload. `commands` must be
+empty: correctness comes from the workload adapter's `validate()` contract, so
+the controller does not add an unrestricted same-user command surface.
+Promotion requires a confirmed primary-metric win and all constraints passing.
+Otherwise the frozen project or environment snapshot is restored.
+
+The adapter owns the semantic mapping from its candidate descriptor to the
+implementation it measures. Its `validate()` must reject a descriptor that does
+not select the registered candidate. `candidate_binding.json` makes the
+descriptor, ChangeSet digest, and filesystem identity auditable without adding
+private keys to the user candidate object.
 
 Inspect or resume without replaying completed stages:
 

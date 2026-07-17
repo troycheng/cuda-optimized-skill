@@ -16,6 +16,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -42,7 +43,7 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _LOG_SECRET = re.compile(
-    r"(?i)([A-Z0-9_]*(?:API[_-]?KEY|AUTH|COOKIE|CREDENTIAL|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*)\s*[:=]\s*([^\s,;]+)"
+    r'''(?i)(["']?\b[A-Z0-9_]{0,128}(?:API[_-]?KEY|AUTH|COOKIE|CREDENTIAL|PASSWORD|SECRET|TOKEN)[A-Z0-9_]{0,128}\b["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,;}]+)'''
 )
 _DEFAULT_LOG_LIMIT = 64 * 1024
 _OUTPUT_LIMIT = 1024 * 1024
@@ -287,7 +288,6 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
     protected_environment_roots = {
         Path(path).resolve(strict=False)
         for path in (
-            "/",
             "/System",
             "/Library",
             "/Applications",
@@ -295,20 +295,31 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
             "/sbin",
             "/usr",
             "/etc",
-            "/var",
-            "/opt",
-            "/private",
             "/private/etc",
-            "/private/var",
         )
     }
     if (
         _is_within(environment_root, project_root)
         or _is_within(project_root, environment_root)
-        or environment_root in protected_environment_roots
+        or environment_root == Path("/")
+        or any(_is_within(environment_root, root) for root in protected_environment_roots)
     ):
         raise ValidationError(
             "environment_root must be isolated from project_root and host system roots"
+        )
+    allowed_workspace_roots = [
+        Path(tempfile.gettempdir()).resolve(strict=False),
+        Path("/workspace").resolve(strict=False),
+        Path("/data").resolve(strict=False),
+    ]
+    if os.geteuid() != 0:
+        allowed_workspace_roots.append(Path.home().resolve(strict=False))
+    if not any(
+        environment_root != root and _is_within(environment_root, root)
+        for root in allowed_workspace_roots
+    ):
+        raise ValidationError(
+            "environment_root must be below a user workspace, data, or temporary root"
         )
     if mutation["host_policy"] != "recommend_only":
         raise ValidationError("host_policy must be recommend_only")
@@ -334,11 +345,13 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
     reviewer = control.get("reviewer")
     if reviewer is not None:
         reviewer = _object(reviewer, "reviewer")
-        fields = {"argv", "timeout_seconds"}
+        fields = {"argv", "timeout_seconds", "include_diff"}
         _closed(reviewer, fields, "reviewer")
-        _required(reviewer, fields, "reviewer")
+        _required(reviewer, {"argv", "timeout_seconds"}, "reviewer")
         _argv(reviewer["argv"], "reviewer")
         _timeout(reviewer["timeout_seconds"], "reviewer.timeout_seconds")
+        if "include_diff" in reviewer and type(reviewer["include_diff"]) is not bool:
+            raise ValidationError("reviewer.include_diff must be a boolean")
 
     return _json_copy(control, "control", reject_sensitive=True)
 
@@ -370,6 +383,8 @@ def validate_change_set(value: Mapping[str, Any], control: Mapping[str, Any]) ->
     candidate = _object(change["candidate"], "change_set.candidate")
     if not candidate:
         raise ValidationError("change_set.candidate must not be empty")
+    if "_cuda_optimizer_identity_digest" in candidate:
+        raise ValidationError("change_set.candidate uses a reserved identity field")
     _json_copy(candidate, "change_set.candidate", reject_sensitive=True)
 
     paths = _string_list(change["paths"], "change_set.paths")
@@ -391,6 +406,10 @@ def validate_change_set(value: Mapping[str, Any], control: Mapping[str, Any]) ->
     commands = change["commands"]
     if type(commands) is not list:
         raise ValidationError("change_set.commands must be an array of argv arrays")
+    if commands:
+        raise ValidationError(
+            "change_set.commands must be empty; correctness runs through the workload adapter"
+        )
     for index, command in enumerate(commands):
         if type(command) is not list:
             raise ValidationError("change_set.commands must contain argv arrays")
@@ -539,24 +558,39 @@ def _drain(stream, capture: _BoundedLog) -> None:
         stream.close()
 
 
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _stop_group(process: Any) -> None:
+    process_group = process.pid
+
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
-    try:
-        process.wait(timeout=0.25)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    deadline = time.monotonic() + 0.25
+    while _process_group_exists(process_group) and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.01)
+    if _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        pass
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
 
 
 def _is_secret_name(name: str) -> bool:
@@ -586,7 +620,7 @@ def _probe_environment(overrides: Mapping[str, str]) -> tuple[dict, tuple[str, .
 
 
 def _redact_log(value: str, secrets: Sequence[str]) -> str:
-    result = _LOG_SECRET.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    result = _LOG_SECRET.sub(lambda match: f"{match.group(1)}[REDACTED]", value)
     for secret in sorted(set(secrets), key=len, reverse=True):
         if secret:
             result = result.replace(secret, "[REDACTED]")
@@ -628,6 +662,7 @@ def run_probe(
     run_dir: os.PathLike[str] | str,
     *,
     log_limit_bytes: int = _DEFAULT_LOG_LIMIT,
+    deadline_epoch: float | None = None,
 ) -> dict:
     """Execute one argv-only probe and persist normalized evidence plus bounded logs."""
     if isinstance(log_limit_bytes, bool) or not isinstance(log_limit_bytes, int):
@@ -639,6 +674,12 @@ def run_probe(
     if len(matching) != 1 or matching[0] != probe:
         raise ValidationError("probe must exactly match one validated control probe")
     selected = matching[0]
+    actual_timeout = float(selected["timeout_seconds"])
+    if deadline_epoch is not None:
+        remaining = float(deadline_epoch) - time.time()
+        if remaining <= 0:
+            raise ValidationError("workload optimization budget deadline has expired")
+        actual_timeout = min(actual_timeout, remaining)
     run_root = Path(run_dir).expanduser().resolve(strict=False)
     probes_dir = run_root / "probes"
     probes_dir.mkdir(parents=True, exist_ok=True)
@@ -677,11 +718,14 @@ def run_probe(
         for reader in readers:
             reader.start()
         try:
-            exit_code = process.wait(timeout=float(selected["timeout_seconds"]))
+            exit_code = process.wait(timeout=actual_timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             _stop_group(process)
             exit_code = process.returncode
+        else:
+            if _process_group_exists(process.pid):
+                _stop_group(process)
         for reader in readers:
             reader.join(timeout=1)
     except FileNotFoundError as error:
@@ -698,7 +742,7 @@ def run_probe(
                 selected,
                 "unavailable",
                 "environment:probe-timeout",
-                f"probe exceeded {selected['timeout_seconds']} seconds",
+                f"probe exceeded {actual_timeout:.6g} seconds",
             )
         elif exit_code != 0:
             result = _failure_probe(
@@ -746,9 +790,22 @@ def run_probe(
     return result
 
 
-def run_probes(control: Mapping[str, Any], run_dir: os.PathLike[str] | str) -> list[dict]:
+def run_probes(
+    control: Mapping[str, Any],
+    run_dir: os.PathLike[str] | str,
+    *,
+    deadline_epoch: float | None = None,
+) -> list[dict]:
     normalized = validate_control_manifest(control)
-    return [run_probe(probe, normalized, run_dir) for probe in normalized["probes"]]
+    return [
+        run_probe(
+            probe,
+            normalized,
+            run_dir,
+            deadline_epoch=deadline_epoch,
+        )
+        for probe in normalized["probes"]
+    ]
 
 
 def diagnose_run(run_dir: os.PathLike[str] | str) -> dict:
@@ -784,6 +841,8 @@ def review_change(
     control: Mapping[str, Any],
     run_dir: os.PathLike[str] | str,
     change_set: Mapping[str, Any],
+    *,
+    deadline_epoch: float | None = None,
 ) -> dict:
     normalized = validate_control_manifest(control)
     change = validate_change_set(change_set, normalized)
@@ -791,11 +850,14 @@ def review_change(
     diagnosis_path = run_root / "diagnosis.json"
     diagnosis = load_json_object(diagnosis_path)
     diff_path = run_root / "candidate.diff"
-    redacted_diff = ""
+    redacted_diff = "Diff content withheld; set reviewer.include_diff=true to opt in."
     if diff_path.exists():
         if diff_path.stat().st_size > 256 * 1024:
             raise ValidationError("candidate.diff exceeds reviewer request limit")
-        redacted_diff = _redact_log(diff_path.read_text("utf-8"), ())
+        if normalized.get("reviewer", {}).get("include_diff", False):
+            redacted_diff = _redact_log(diff_path.read_text("utf-8"), ())
+        else:
+            redacted_diff += f" sha256={_sha256_path(diff_path)}"
     change_path = run_root / "change_set.json"
     _atomic_json(change_path, change)
     reviewer = _load_reviewer_module()
@@ -817,7 +879,18 @@ def review_change(
     _atomic_json(run_root / "review_request.json", request)
     if "reviewer" not in normalized:
         return reviewer.write_skipped_review(request, run_root)
-    return reviewer.run_reviewer(normalized["reviewer"], request, run_root)
+    reviewer_config = {
+        "argv": normalized["reviewer"]["argv"],
+        "timeout_seconds": normalized["reviewer"]["timeout_seconds"],
+    }
+    if deadline_epoch is not None:
+        remaining = float(deadline_epoch) - time.time()
+        if remaining < 1:
+            return reviewer.write_skipped_review(request, run_root)
+        reviewer_config["timeout_seconds"] = min(
+            float(reviewer_config["timeout_seconds"]), remaining
+        )
+    return reviewer.run_reviewer(reviewer_config, request, run_root)
 
 
 def _scope_layout(control: Mapping[str, Any], scope: str) -> tuple[Path, list[str], str]:
@@ -911,10 +984,23 @@ def _remove_path(path: Path) -> None:
 
 
 def _restore_snapshot(
-    control: Mapping[str, Any], run_root: Path, scope: str
+    control: Mapping[str, Any],
+    run_root: Path,
+    scope: str,
+    expected_identity_digest: str,
 ) -> None:
     base, roots, snapshot_name = _scope_layout(control, scope)
     snapshot = run_root / "snapshot" / snapshot_name
+    if snapshot.is_symlink():
+        raise ValidationError("frozen snapshot must not be a symlink")
+    snapshot_control = copy.deepcopy(control)
+    if scope == "project":
+        snapshot_control["project_root"] = str(snapshot)
+    else:
+        snapshot_control["mutation"]["environment_root"] = str(snapshot)
+    snapshot_identity = _identity(snapshot_control, scope)
+    if snapshot_identity["digest"] != expected_identity_digest:
+        raise ValidationError("frozen snapshot identity does not match registration")
     if scope == "isolated_environment":
         if base.exists() or base.is_symlink():
             _remove_path(base)
@@ -982,11 +1068,40 @@ def _candidate_diff(
 
 
 def read_run_state(run_dir: os.PathLike[str] | str) -> dict:
-    return load_json_object(Path(run_dir).expanduser().resolve(strict=False) / "state.json")
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    commit = load_json_object(run_root / "state_commit.json")
+    if set(commit) != {"schema_version", "state_digest"} or commit.get(
+        "schema_version"
+    ) != "cuda-workload-optimizer/state-commit-v1":
+        raise ValidationError("state commit marker is invalid")
+    digest = commit.get("state_digest")
+    if type(digest) is not str or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        raise ValidationError("state commit digest is invalid")
+    state = load_json_object(run_root / "state_generations" / f"{digest}.json")
+    if _canonical_digest(state) != digest:
+        raise ValidationError("committed state generation digest is invalid")
+    for name in ("state.json", "checkpoint.json"):
+        path = run_root / name
+        try:
+            mirror = load_json_object(path)
+        except (OSError, ValidationError):
+            mirror = None
+        if mirror != state:
+            _atomic_json(path, state)
+    return state
 
 
 def _write_state(run_root: Path, state: Mapping[str, Any]) -> dict:
     detached = _json_copy(state, "state")
+    digest = _canonical_digest(detached)
+    _atomic_json(run_root / "state_generations" / f"{digest}.json", detached)
+    _atomic_json(
+        run_root / "state_commit.json",
+        {
+            "schema_version": "cuda-workload-optimizer/state-commit-v1",
+            "state_digest": digest,
+        },
+    )
     _atomic_json(run_root / "state.json", detached)
     _atomic_json(run_root / "checkpoint.json", detached)
     return detached
@@ -1009,8 +1124,14 @@ def _advance(
     return _write_state(run_root, updated)
 
 
-def _load_frozen_control(run_root: Path) -> dict:
-    return validate_control_manifest(load_json_object(run_root / "control_manifest.json"))
+def _load_frozen_control(run_root: Path, state: Mapping[str, Any] | None = None) -> dict:
+    active_state = read_run_state(run_root) if state is None else state
+    control = validate_control_manifest(
+        load_json_object(run_root / "control_manifest.json")
+    )
+    if _canonical_digest(control) != active_state.get("control_digest"):
+        raise ValidationError("frozen control manifest digest does not match state")
+    return control
 
 
 def _normalize_frozen_workload(control: Mapping[str, Any]):
@@ -1042,11 +1163,40 @@ def start_run(
         state = read_run_state(run_root)
         if state["control_digest"] != control_digest:
             raise ValidationError("control manifest drifted after run initialization")
-        if state["next_action"] in {"register_change", "edit_then_evaluate", "done"}:
+        _load_frozen_control(run_root, state)
+        if state["next_action"] in {
+            "register_change",
+            "edit_then_evaluate",
+            "done",
+            "manual_recovery",
+        }:
             return state
     else:
         run_root.mkdir(parents=True, exist_ok=True)
+        baseline_identity = _identity(normalized, "project")
+        environment_root = Path(normalized["mutation"]["environment_root"])
+        environment_identity = None
+        if environment_root.exists() or environment_root.is_symlink():
+            if (
+                environment_root.is_symlink()
+                or not environment_root.is_dir()
+                or environment_root.stat().st_uid != os.getuid()
+            ):
+                raise ValidationError(
+                    "existing environment_root must be a user-owned non-symlink directory"
+                )
+            environment_identity = _identity(normalized, "isolated_environment")
         workload = _normalize_frozen_workload(normalized)
+        if _identity(normalized, "project")["digest"] != baseline_identity["digest"]:
+            raise ValidationError(
+                "declared project identity changed while loading the workload adapter"
+            )
+        if environment_identity is not None and _identity(
+            normalized, "isolated_environment"
+        )["digest"] != environment_identity["digest"]:
+            raise ValidationError(
+                "isolated environment changed while loading the workload adapter"
+            )
         now = time.time()
         runtime = _BUDGET_RUNTIME[normalized["budget"]]
         state = {
@@ -1063,6 +1213,16 @@ def start_run(
             "deadline_epoch": now + runtime["deadline_seconds"],
         }
         _atomic_json(run_root / "control_manifest.json", normalized)
+        _atomic_json(run_root / "baseline_identity.json", baseline_identity)
+        state["baseline_identity_digest"] = baseline_identity["digest"]
+        state["baseline_environment_identity_digest"] = (
+            None if environment_identity is None else environment_identity["digest"]
+        )
+        if environment_identity is not None:
+            _atomic_json(
+                run_root / "baseline_environment_identity.json",
+                environment_identity,
+            )
         (run_root / "host_recommendations.md").write_text(
             "# Host recommendations\n\nNo host mutation was executed. Add evidence-backed suggestions here for manual review.\n",
             encoding="utf-8",
@@ -1070,19 +1230,25 @@ def start_run(
         state = _write_state(run_root, state)
 
     _check_deadline(state)
+    _load_frozen_control(run_root, state)
     workload = _normalize_frozen_workload(normalized)
     if workload.source_hash != state["workload_source_hash"]:
         raise ValidationError("workload identity drifted after run initialization")
     runtime = _BUDGET_RUNTIME[normalized["budget"]]
 
     if "baseline" not in state["completed_stages"]:
-        timeout = None if workload.kind == "python" else 120
+        timeout = (
+            None
+            if workload.kind == "python"
+            else min(120, max(0.001, state["deadline_epoch"] - time.time()))
+        )
         baseline = _load_evaluate_module().measure_candidate(
             workload,
             normalized["baseline_candidate"],
             role="baseline",
             retries=runtime["retries"],
             timeout=timeout,
+            deadline_epoch=state["deadline_epoch"],
         )
         _atomic_json(run_root / "baseline" / "observation.json", baseline)
         if baseline["status"] != "measured":
@@ -1092,7 +1258,11 @@ def start_run(
         )
     _check_deadline(state)
     if "probes" not in state["completed_stages"]:
-        run_probes(normalized, run_root)
+        run_probes(
+            normalized,
+            run_root,
+            deadline_epoch=state["deadline_epoch"],
+        )
         state = _advance(
             run_root, state, "probes", stage="diagnosis", next_action="diagnosis"
         )
@@ -1119,47 +1289,132 @@ def register_change(
     state = read_run_state(run_root)
     if state["control_digest"] != _canonical_digest(normalized):
         raise ValidationError("control manifest drifted before ChangeSet registration")
+    _load_frozen_control(run_root, state)
+    change = validate_change_set(change_set, normalized)
+    change_digest = _canonical_digest(change)
+    pending_path = run_root / "registration_pending.json"
+    if state["next_action"] == "edit_then_evaluate":
+        if state.get("change_set_digest") != change_digest:
+            raise ValidationError("a different ChangeSet is already registered")
+        try:
+            pending_path.unlink()
+        except FileNotFoundError:
+            pass
+        return state
     if state["next_action"] != "register_change":
         raise ValidationError("run is not ready to register a ChangeSet")
     _check_deadline(state)
-    change = validate_change_set(change_set, normalized)
-    before = _snapshot_scope(normalized, run_root, change["scope"])
+    if change["scope"] == "project":
+        current_identity = _identity(normalized, "project")
+        if current_identity["digest"] != state.get("baseline_identity_digest"):
+            raise ValidationError(
+                "declared project identity drifted after baseline capture"
+            )
+    else:
+        expected_environment = state.get("baseline_environment_identity_digest")
+        if expected_environment is None:
+            raise ValidationError(
+                "environment_root must exist before baseline capture for isolated changes"
+            )
+        if _identity(normalized, "isolated_environment")["digest"] != expected_environment:
+            raise ValidationError(
+                "isolated environment drifted after baseline capture"
+            )
+    pending = {
+        "schema_version": "cuda-workload-optimizer/registration-pending-v1",
+        "change_set_digest": change_digest,
+        "scope": change["scope"],
+    }
+    if pending_path.exists():
+        if load_json_object(pending_path) != pending:
+            raise ValidationError("pending ChangeSet registration does not match retry")
+        before_path = run_root / "rounds" / "round-1" / "before_identity.json"
+        if before_path.exists():
+            before_value = load_json_object(before_path)
+            before = _validated_identity_artifact(
+                before_value, before_value.get("digest", "")
+            )
+        else:
+            snapshot_name = "project" if change["scope"] == "project" else "environment"
+            incomplete_snapshot = run_root / "snapshot" / snapshot_name
+            if incomplete_snapshot.exists() or incomplete_snapshot.is_symlink():
+                _remove_path(incomplete_snapshot)
+            before = _snapshot_scope(normalized, run_root, change["scope"])
+    else:
+        _atomic_json(pending_path, pending)
+        before = _snapshot_scope(normalized, run_root, change["scope"])
     _atomic_json(run_root / "change_set.json", change)
     _atomic_json(run_root / "rounds" / "round-1" / "change_set.json", change)
-    updated = _advance(
-        run_root, state, "change", stage="review", next_action="edit_then_evaluate"
+    updated = copy.deepcopy(state)
+    if "change" not in updated["completed_stages"]:
+        updated["completed_stages"].append("change")
+    updated.update(
+        {
+            "stage": "review",
+            "next_action": "edit_then_evaluate",
+            "updated_at_epoch": time.time(),
+            "before_identity_digest": before["digest"],
+            "change_set_digest": change_digest,
+            "change_scope": change["scope"],
+        }
     )
-    updated["before_identity_digest"] = before["digest"]
-    return _write_state(run_root, updated)
+    committed = _write_state(run_root, updated)
+    try:
+        pending_path.unlink()
+    except FileNotFoundError:
+        pass
+    return committed
 
 
 def _run_correctness_commands(
-    control: Mapping[str, Any], change: Mapping[str, Any], run_root: Path
+    control: Mapping[str, Any],
+    change: Mapping[str, Any],
+    run_root: Path,
+    *,
+    timeout_seconds: float = 300,
 ) -> dict:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise ValidationError("correctness timeout must be a positive finite number")
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
+        raise ValidationError("correctness timeout must be positive and at most 300 seconds")
     records = []
     environment, secrets = _probe_environment({})
     for index, argv in enumerate(change["commands"]):
         started = time.monotonic()
+        stdout = _BoundedLog(_DEFAULT_LOG_LIMIT)
+        stderr = _BoundedLog(_DEFAULT_LOG_LIMIT)
+        process = None
+        returncode = None
+        failure = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 argv,
                 cwd=control["project_root"],
                 env=environment,
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=False,
-                timeout=300,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            stdout = _redact_log(completed.stdout[-_DEFAULT_LOG_LIMIT:].decode("utf-8", "replace"), secrets)
-            stderr = _redact_log(completed.stderr[-_DEFAULT_LOG_LIMIT:].decode("utf-8", "replace"), secrets)
-            returncode = completed.returncode
-            failure = None
-        except (OSError, subprocess.TimeoutExpired) as error:
-            stdout = ""
-            stderr = ""
-            returncode = None
+            readers = [
+                threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+                threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+            ]
+            for reader in readers:
+                reader.start()
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                failure = "TimeoutExpired"
+                _stop_group(process)
+                returncode = process.returncode
+            else:
+                if _process_group_exists(process.pid):
+                    _stop_group(process)
+            for reader in readers:
+                reader.join(timeout=1)
+        except OSError as error:
             failure = type(error).__name__
         records.append(
             {
@@ -1167,8 +1422,8 @@ def _run_correctness_commands(
                 "argv_sha256": _canonical_digest(argv),
                 "returncode": returncode,
                 "duration_seconds": time.monotonic() - started,
-                "stdout": stdout,
-                "stderr": stderr,
+                "stdout": _redact_log(stdout.text(), secrets),
+                "stderr": _redact_log(stderr.text(), secrets),
                 "failure": failure,
             }
         )
@@ -1197,7 +1452,37 @@ def _finish_rejected(
     reason: str,
     primary_status: str | None,
 ) -> dict:
-    _restore_snapshot(control, run_root, scope)
+    try:
+        _restore_snapshot(
+            control,
+            run_root,
+            scope,
+            state["before_identity_digest"],
+        )
+    except (OSError, ValidationError) as error:
+        decision = {
+            "schema_version": "cuda-workload-optimizer/decision-v1",
+            "status": "manual_recovery_required",
+            "reason": "rollback_failed",
+            "rejected_reason": reason,
+            "primary_status": primary_status,
+            "rolled_back": False,
+            "error": f"{type(error).__name__}: {error}",
+            "snapshot": str(run_root / "snapshot" / ("project" if scope == "project" else "environment")),
+        }
+        _atomic_json(run_root / "decision.json", decision)
+        updated = copy.deepcopy(state)
+        updated.update(
+            {
+                "status": "manual_recovery_required",
+                "stage": "decision",
+                "next_action": "manual_recovery",
+                "updated_at_epoch": time.time(),
+                "decision_digest": _canonical_digest(decision),
+            }
+        )
+        _write_state(run_root, updated)
+        return decision
     decision = {
         "schema_version": "cuda-workload-optimizer/decision-v1",
         "status": "rejected",
@@ -1216,10 +1501,29 @@ def _finish_rejected(
             "stage": "decision",
             "next_action": "done",
             "updated_at_epoch": time.time(),
+            "decision_digest": _canonical_digest(decision),
         }
     )
     _write_state(run_root, updated)
     return decision
+
+
+def _validated_identity_artifact(value: Mapping[str, Any], expected_digest: str) -> dict:
+    identity = _object(value, "identity artifact")
+    fields = {"schema_version", "scope", "roots", "missing_roots", "files", "digest"}
+    _closed(identity, fields, "identity artifact")
+    _required(identity, fields, "identity artifact")
+    if identity["schema_version"] != "cuda-workload-optimizer/project-identity-v1":
+        raise ValidationError("identity artifact schema is invalid")
+    computed = _canonical_digest(
+        {
+            "missing_roots": identity["missing_roots"],
+            "files": identity["files"],
+        }
+    )
+    if identity["digest"] != computed or computed != expected_digest:
+        raise ValidationError("frozen identity artifact digest does not match state")
+    return copy.deepcopy(identity)
 
 
 def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
@@ -1227,11 +1531,34 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
     run_root = Path(run_dir).expanduser().resolve(strict=False)
     state = read_run_state(run_root)
     if state["status"] == "completed":
-        return load_json_object(run_root / "decision.json")
+        decision = load_json_object(run_root / "decision.json")
+        if _canonical_digest(decision) != state.get("decision_digest"):
+            raise ValidationError("decision artifact digest does not match state")
+        return decision
     if state["next_action"] != "edit_then_evaluate":
         raise ValidationError("run is not ready to evaluate a ChangeSet")
-    control = _load_frozen_control(run_root)
-    change = validate_change_set(load_json_object(run_root / "change_set.json"), control)
+    control = _load_frozen_control(run_root, state)
+    change = validate_change_set(
+        load_json_object(run_root / "change_set.json"), control
+    )
+    frozen_change = validate_change_set(
+        load_json_object(run_root / "rounds" / "round-1" / "change_set.json"),
+        control,
+    )
+    change_digest = _canonical_digest(change)
+    if (
+        change != frozen_change
+        or change_digest != state.get("change_set_digest")
+        or change["scope"] != state.get("change_scope")
+    ):
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=state["change_scope"],
+            reason="frozen_artifact_drift",
+            primary_status=None,
+        )
     if time.time() > state["deadline_epoch"]:
         _atomic_json(
             run_root / "review.json",
@@ -1260,20 +1587,70 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
         )
     workload = _normalize_frozen_workload(control)
     if workload.source_hash != state["workload_source_hash"]:
-        _restore_snapshot(control, run_root, change["scope"])
+        decision = _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="workload_identity_drift",
+            primary_status=None,
+        )
+        if decision["status"] == "manual_recovery_required":
+            return decision
         raise ValidationError("workload identity drifted before evaluation")
-    before = load_json_object(run_root / "rounds" / "round-1" / "before_identity.json")
+    try:
+        before = _validated_identity_artifact(
+            load_json_object(
+                run_root / "rounds" / "round-1" / "before_identity.json"
+            ),
+            state["before_identity_digest"],
+        )
+    except (OSError, ValidationError, KeyError):
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="frozen_artifact_drift",
+            primary_status=None,
+        )
     after = _identity(control, change["scope"])
     changed = _changed_paths(before, after)
     if not changed:
-        raise ValidationError("ChangeSet produced no scoped changes")
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="no_scoped_changes",
+            primary_status=None,
+        )
     outside = [path for path in changed if not _path_allowed(path, change["paths"])]
     if outside:
-        _restore_snapshot(control, run_root, change["scope"])
+        decision = _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="change_set_path_escape",
+            primary_status=None,
+        )
+        if decision["status"] == "manual_recovery_required":
+            return decision
         raise ValidationError(
             "actual scoped diff is outside ChangeSet paths: " + ", ".join(outside)
         )
     _atomic_json(run_root / "rounds" / "round-1" / "after_identity.json", after)
+    bound_candidate = copy.deepcopy(change["candidate"])
+    candidate_binding = {
+        "schema_version": "cuda-workload-optimizer/candidate-binding-v1",
+        "candidate": bound_candidate,
+        "candidate_digest": _canonical_digest(bound_candidate),
+        "change_set_digest": change_digest,
+        "after_identity_digest": after["digest"],
+    }
+    candidate_binding["digest"] = _canonical_digest(candidate_binding)
+    _atomic_json(run_root / "candidate_binding.json", candidate_binding)
     (run_root / "candidate.diff").write_text(
         _candidate_diff(control, run_root, changed, change["scope"]), encoding="utf-8"
     )
@@ -1306,7 +1683,12 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             primary_status=None,
         )
 
-    review_change(control, run_root, change)
+    review_change(
+        control,
+        run_root,
+        change,
+        deadline_epoch=state["deadline_epoch"],
+    )
     if time.time() > state["deadline_epoch"]:
         _atomic_json(
             run_root / "evaluation.json",
@@ -1324,20 +1706,43 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             primary_status=None,
         )
     runtime = _BUDGET_RUNTIME[control["budget"]]
-    timeout = None if workload.kind == "python" else 120
+    timeout = (
+        None
+        if workload.kind == "python"
+        else min(120, max(0.001, state["deadline_epoch"] - time.time()))
+    )
     evaluation = _load_evaluate_module().evaluate_pairs(
         workload,
         control["baseline_candidate"],
-        change["candidate"],
+        bound_candidate,
         blocks=runtime["blocks"],
         retries=runtime["retries"],
         seed=0,
         timeout=timeout,
+        deadline_epoch=state["deadline_epoch"],
         bootstrap_samples=runtime["bootstrap"],
     )
     _atomic_json(run_root / "evaluation.json", evaluation)
+    if time.time() > state["deadline_epoch"]:
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="budget_expired",
+            primary_status=evaluation.get("primary", {}).get("status"),
+        )
     if _identity(control, change["scope"])["digest"] != after["digest"]:
-        _restore_snapshot(control, run_root, change["scope"])
+        decision = _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="scoped_identity_drift",
+            primary_status=evaluation.get("primary", {}).get("status"),
+        )
+        if decision["status"] == "manual_recovery_required":
+            return decision
         raise ValidationError("scoped identity drifted during paired evaluation")
     primary_status = evaluation.get("primary", {}).get("status")
     constraints = evaluation.get("constraints", [])
@@ -1368,6 +1773,10 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
         "reason": "paired_workload_win",
         "primary_status": primary_status,
         "rolled_back": False,
+        "change_set_digest": change_digest,
+        "candidate_binding_digest": candidate_binding["digest"],
+        "after_identity_digest": after["digest"],
+        "evaluation_digest": _canonical_digest(evaluation),
     }
     _atomic_json(run_root / "decision.json", decision)
     updated = copy.deepcopy(state)
@@ -1380,6 +1789,7 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             "stage": "decision",
             "next_action": "done",
             "updated_at_epoch": time.time(),
+            "decision_digest": _canonical_digest(decision),
         }
     )
     _write_state(run_root, updated)
@@ -1389,7 +1799,13 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
 def resume_run(run_dir: os.PathLike[str] | str) -> dict:
     run_root = Path(run_dir).expanduser().resolve(strict=False)
     state = read_run_state(run_root)
-    if state["next_action"] in {"register_change", "edit_then_evaluate", "done"}:
+    _load_frozen_control(run_root, state)
+    if state["next_action"] in {
+        "register_change",
+        "edit_then_evaluate",
+        "done",
+        "manual_recovery",
+    }:
         return state
     return start_run(_load_frozen_control(run_root), run_root)
 

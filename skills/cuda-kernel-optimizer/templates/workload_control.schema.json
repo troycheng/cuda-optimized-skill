@@ -102,6 +102,10 @@
           "type": "number",
           "minimum": 1,
           "maximum": 3600
+        },
+        "include_diff": {
+          "type": "boolean",
+          "default": false
         }
       }
     }

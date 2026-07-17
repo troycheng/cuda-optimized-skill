@@ -210,7 +210,8 @@ Add:
 - baseline capture via existing workload APIs;
 - validated ChangeSet registration before Codex edits;
 - before/after diff verification limited to declared paths;
-- correctness commands using argv only;
+- correctness through the workload adapter's `validate()` contract, with
+  ChangeSet `commands` fixed to an empty array;
 - paired evaluation and deterministic promotion decision;
 - rollback from a frozen snapshot for rejected changes;
 - idempotent `run`, `status`, `register-change`, `evaluate`, and `resume` CLI subcommands.

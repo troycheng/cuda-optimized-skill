@@ -84,8 +84,9 @@ python3 <skill>/scripts/workload_controller.py register-change \
 ```
 
 Codex may edit declared project paths or a user-owned `isolated_environment`.
-The controller verifies the actual diff, runs correctness commands, optionally
-requests review, and performs paired workload evaluation:
+The controller verifies the actual diff, binds it to the candidate, optionally
+requests review, and performs paired workload evaluation. ChangeSet `commands`
+must remain empty; correctness uses the workload adapter's `validate()`:
 
 ```bash
 python3 <skill>/scripts/workload_controller.py evaluate \
@@ -112,8 +113,11 @@ use `balanced` by default.
 | `thorough` | 36000 s | 16 | 8 | 30-200 | 3 | unlimited | full |
 
 Use `--budget custom` only with all required explicit limits. A budget deadline
-stops admission of new work and preserves a resumable checkpoint; it does not
-turn partial evidence into a win.
+stops admission of new work, caps external-process timeouts to the remaining
+budget, and preserves a resumable checkpoint; partial or late evidence never
+becomes a win. A Python workload adapter runs in process and may return after
+the wall-clock deadline when blocked in native code. It must bound its own
+operations; use a command workload when the controller must be able to kill it.
 
 ## Setup, open, and resume
 

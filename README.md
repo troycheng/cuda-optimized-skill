@@ -228,7 +228,15 @@ flowchart LR
 Codex remains the primary optimizer. A local third-party reviewer uses JSON stdin/stdout
 and is advisory only: it has no command callback and no promotion
 handle. Running it as the same user is not an OS sandbox; use a read-only
-container or system sandbox when stronger isolation is required.
+container or system sandbox when stronger isolation is required. Source diff
+content is withheld unless `reviewer.include_diff` is explicitly enabled.
+
+ChangeSet `commands` must be empty. Correctness is checked by the frozen
+workload adapter's `validate()` contract, so the controller does not expose an
+additional same-user command runner. The candidate descriptor is bound to the
+post-change identity digest in a separate artifact before paired evaluation;
+the workload adapter's `validate()` remains responsible for confirming that
+the descriptor selects the implementation being measured.
 
 | Scope | Automatic action | Boundary |
 |---|---|---|
@@ -282,8 +290,11 @@ match the adapter's `metrics()` contract.
 | `thorough` | 36000 | 16 | 8 | 30 | 200 | 3 | unlimited | full |
 
 Use `--budget custom` only with every required limit. The deadline stops new
-stage admission and leaves a resumable checkpoint; partial evidence never
-becomes a win.
+stage admission, caps external probe, reviewer, and command-workload timeouts,
+and leaves a resumable checkpoint; partial or late evidence never becomes a
+win. A Python adapter runs in process and therefore cannot be forcibly stopped
+inside a blocking native call. Give it its own bounded operations, or use the
+command-workload form when a killable wall-clock boundary is required.
 
 ### Terminal statuses
 
@@ -339,7 +350,7 @@ systems. Its storage must honor file locking and atomic rename semantics.
 
 The skill does not redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
 
-Current CPU acceptance contains 676 tests: 671 passed, five opt-in RTX 5090
+Current CPU acceptance contains 690 tests: 685 passed, five opt-in RTX 5090
 tests skipped, and zero failed. All 28/28 scripts pass `py_compile` and `--help`
 smoke checks, and the skill validator reports valid.
 
@@ -400,8 +411,8 @@ Run the publisher without `--execute` first. It verifies repository identity,
 fast-forward safety, the full CPU suite, and both exact refs without writing:
 
 ```bash
-python3 tools/publish_dual_remote.py --tag v2.3.0
-python3 tools/publish_dual_remote.py --tag v2.3.0 --execute
+python3 tools/publish_dual_remote.py --tag v2.4.0
+python3 tools/publish_dual_remote.py --tag v2.4.0 --execute
 ```
 
 The second command publishes GitHub first, verifies it, then publishes and

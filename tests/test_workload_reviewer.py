@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import sys
 import tempfile
 import textwrap
@@ -35,6 +36,23 @@ def _load_reviewer():
         sys.modules.pop(module_name, None)
         raise
     return module
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_pid_gone(pid: int, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.02)
+    return not _pid_exists(pid)
 
 
 def _request(reviewer) -> dict:
@@ -216,6 +234,77 @@ class ReviewerProcessTests(unittest.TestCase):
                     self.assertLess(time.monotonic() - started, 5)
                     self.assertEqual(artifact["status"], "unavailable")
                     self.assertEqual(artifact["response"], None)
+
+    def test_timeout_kills_term_ignoring_reviewer_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            pid_file = root / "child.pid"
+            script = self._script(
+                root,
+                f"""
+                import signal
+                import subprocess
+                child = subprocess.Popen([
+                    sys.executable,
+                    "-c",
+                    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+                ])
+                pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
+                time.sleep(30)
+                """,
+            )
+
+            artifact = self.reviewer.run_reviewer(
+                {"argv": [sys.executable, str(script)], "timeout_seconds": 1},
+                _request(self.reviewer),
+                root / "run",
+            )
+
+            self.assertEqual(artifact["status"], "unavailable")
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text("utf-8"))
+            try:
+                self.assertTrue(_wait_pid_gone(child_pid))
+            finally:
+                if _pid_exists(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
+
+    def test_successful_reviewer_cleans_background_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            pid_file = root / "child.pid"
+            script = self._script(
+                root,
+                f"""
+                import subprocess
+                request = json.load(sys.stdin)
+                child = subprocess.Popen([
+                    sys.executable, "-c", "import time; time.sleep(30)"
+                ])
+                pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
+                print(json.dumps({{
+                    "schema_version": "cuda-workload-optimizer/review-v1",
+                    "request_digest": request["request_digest"],
+                    "verdict": "support",
+                    "concerns": [],
+                    "suggested_experiments": []
+                }}))
+                """,
+            )
+
+            artifact = self.reviewer.run_reviewer(
+                {"argv": [sys.executable, str(script)], "timeout_seconds": 5},
+                _request(self.reviewer),
+                root / "run",
+            )
+
+            self.assertEqual(artifact["status"], "completed")
+            child_pid = int(pid_file.read_text("utf-8"))
+            try:
+                self.assertTrue(_wait_pid_gone(child_pid))
+            finally:
+                if _pid_exists(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
 
     def test_stderr_is_bounded_and_secret_values_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

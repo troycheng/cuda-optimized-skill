@@ -5,6 +5,8 @@ import importlib.util
 import json
 import math
 import os
+import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,6 +14,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +41,23 @@ def _load_controller():
         sys.modules.pop(module_name, None)
         raise
     return module
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_pid_gone(pid: int, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.02)
+    return not _pid_exists(pid)
 
 
 def _control(root: Path) -> dict:
@@ -77,7 +97,7 @@ def _change_set() -> dict:
         "scope": "project",
         "candidate": {"name": "dataloader-workers-8", "revision": "worktree"},
         "paths": ["configs/serve.json"],
-        "commands": [["python3", "-m", "unittest", "tests.test_config"]],
+        "commands": [],
         "rollback": "restore_frozen_snapshot",
         "expected_metrics": ["data_wait_pct", "gpu_busy_pct", "p50_latency_ms"],
     }
@@ -196,6 +216,8 @@ class WorkloadControllerContractTests(unittest.TestCase):
                 str(root),
                 "/",
                 "/etc",
+                "/etc/cuda-optimized-skill-isolated",
+                "/usr/local/cuda-optimized-skill-isolated",
             ):
                 control = _control(root)
                 control["mutation"]["environment_root"] = path
@@ -269,6 +291,13 @@ class WorkloadControllerContractTests(unittest.TestCase):
             shell_command["commands"] = ["python3 -m unittest"]
             with self.assertRaisesRegex(self.controller.ValidationError, "commands"):
                 self.controller.validate_change_set(shell_command, control)
+
+            executable_command = _change_set()
+            executable_command["commands"] = [[sys.executable, "-c", "pass"]]
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "commands.*empty"
+            ):
+                self.controller.validate_change_set(executable_command, control)
 
     def test_versions_budgets_timeouts_and_numbers_are_strict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,6 +456,44 @@ class ProbeRunnerTests(unittest.TestCase):
             self.assertEqual(result["status"], "unavailable")
             self.assertEqual(result["issues"][0]["id"], "environment:probe-timeout")
 
+    def test_successful_probe_cleans_background_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir = self._workspace(root)
+            pid_file = root / "child.pid"
+            script = self._probe_script(
+                root / "project",
+                f"""
+                import subprocess
+                child = subprocess.Popen([
+                    sys.executable, "-c", "import time; time.sleep(30)"
+                ])
+                pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
+                pathlib.Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text(json.dumps({{
+                    "schema_version": "cuda-workload-optimizer/probe-v1",
+                    "probe_id": "timeline",
+                    "kind": "timeline",
+                    "status": "ok",
+                    "metrics": {{"gpu_busy_pct": 70}},
+                    "issues": [],
+                    "artifacts": []
+                }}))
+                """,
+            )
+            normalized = self._configure(control, script)
+
+            result = self.controller.run_probe(
+                normalized["probes"][0], normalized, run_dir
+            )
+
+            self.assertEqual(result["status"], "ok")
+            child_pid = int(pid_file.read_text("utf-8"))
+            try:
+                self.assertTrue(_wait_pid_gone(child_pid))
+            finally:
+                if _pid_exists(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
+
     def test_nonzero_exit_and_malformed_output_become_failed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -582,6 +649,11 @@ class ReviewerControllerTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (run_dir / "candidate.diff").write_text(
+                '+{"token": "do-not-send"}\n'
+                '+headers = {"Authorization": "Bearer do-not-send"}\n',
+                encoding="utf-8",
+            )
 
             result = subprocess.run(
                 [
@@ -605,6 +677,11 @@ class ReviewerControllerTests(unittest.TestCase):
             artifact = json.loads((run_dir / "review.json").read_text("utf-8"))
             self.assertEqual(artifact["status"], "skipped")
             self.assertIsNone(artifact["response"])
+            request = json.loads(
+                (run_dir / "review_request.json").read_text("utf-8")
+            )
+            self.assertIn("withheld", request["redacted_diff"])
+            self.assertNotIn("do-not-send", json.dumps(request))
 
 
 class WorkloadRoundTests(unittest.TestCase):
@@ -627,7 +704,12 @@ class WorkloadRoundTests(unittest.TestCase):
                     return None
 
                 def validate(candidate):
-                    return {"valid": isinstance(candidate, dict) and "revision" in candidate}
+                    return {
+                        "valid": (
+                            isinstance(candidate, dict)
+                            and candidate.get("revision") != "invalid"
+                        )
+                    }
 
                 def benchmark(candidate):
                     revision = candidate["revision"]
@@ -805,14 +887,12 @@ class WorkloadRoundTests(unittest.TestCase):
             self.assertFalse(outside.exists())
             self.assertFalse((run_dir / "evaluation.json").exists())
 
-    def test_correctness_command_failure_rejects_and_rolls_back(self) -> None:
+    def test_workload_validation_failure_rejects_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             control, run_dir, project = self._workspace(root)
             self.controller.start_run(control, run_dir)
-            change = self._change(
-                commands=[[sys.executable, "-c", "raise SystemExit(3)"]]
-            )
+            change = self._change(revision="invalid")
             self.controller.register_change(control, run_dir, change)
             config = project / "configs" / "value.json"
             original = config.read_text("utf-8")
@@ -821,8 +901,91 @@ class WorkloadRoundTests(unittest.TestCase):
             decision = self.controller.evaluate_change(run_dir)
 
             self.assertEqual(decision["status"], "rejected")
-            self.assertEqual(decision["reason"], "correctness_failed")
+            self.assertEqual(decision["reason"], "workload_failed")
             self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_correctness_timeout_bounds_output_and_stops_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            pid_file = root / "child.pid"
+            command = [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    f"""
+                    import signal
+                    import subprocess
+                    import sys
+                    import time
+                    from pathlib import Path
+
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    child = subprocess.Popen([
+                        sys.executable,
+                        "-c",
+                        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+                    ])
+                    Path({str(pid_file)!r}).write_text(str(child.pid))
+                    print("x" * 1000000, flush=True)
+                    time.sleep(30)
+                    """
+                ),
+            ]
+            change = self._change(commands=[command])
+
+            started = time.monotonic()
+            result = self.controller._run_correctness_commands(
+                control, change, run_dir, timeout_seconds=0.2
+            )
+
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["commands"][0]["failure"], "TimeoutExpired")
+            self.assertLessEqual(
+                len(result["commands"][0]["stdout"].encode("utf-8")),
+                64 * 1024 + len("...[truncated]"),
+            )
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text("utf-8"))
+            try:
+                self.assertTrue(_wait_pid_gone(child_pid))
+            finally:
+                if _pid_exists(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
+
+    def test_successful_correctness_command_cleans_background_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            pid_file = root / "child.pid"
+            command = [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    f"""
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+                    child = subprocess.Popen([
+                        sys.executable, "-c", "import time; time.sleep(30)"
+                    ])
+                    Path({str(pid_file)!r}).write_text(str(child.pid))
+                    """
+                ),
+            ]
+
+            result = self.controller._run_correctness_commands(
+                control, self._change(commands=[command]), run_dir
+            )
+
+            self.assertEqual(result["status"], "passed")
+            child_pid = int(pid_file.read_text("utf-8"))
+            try:
+                self.assertTrue(_wait_pid_gone(child_pid))
+            finally:
+                if _pid_exists(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
 
     def test_resume_does_not_repeat_completed_stages_or_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -883,6 +1046,35 @@ class WorkloadRoundTests(unittest.TestCase):
                 (run_dir / "host_recommendations.md").read_text("utf-8"),
             )
 
+    def test_isolated_environment_must_exist_and_remain_frozen_from_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for case in ("created_late", "drifted"):
+                with self.subTest(case=case):
+                    case_root = root / case
+                    case_root.mkdir()
+                    control, run_dir, _project = self._workspace(case_root)
+                    environment = Path(control["mutation"]["environment_root"])
+                    if case == "drifted":
+                        environment.mkdir()
+                        (environment / "requirements.lock").write_text(
+                            "triton==3.3.0\n", encoding="utf-8"
+                        )
+                    self.controller.start_run(control, run_dir)
+                    if case == "created_late":
+                        environment.mkdir()
+                    (environment / "requirements.lock").write_text(
+                        "triton==3.4.0\n", encoding="utf-8"
+                    )
+                    change = self._change(scope="isolated_environment")
+                    change["paths"] = ["requirements.lock"]
+
+                    with self.assertRaisesRegex(
+                        self.controller.ValidationError,
+                        "exist before baseline|drifted after baseline",
+                    ):
+                        self.controller.register_change(control, run_dir, change)
+
     def test_deadline_is_enforced_before_change_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -916,6 +1108,122 @@ class WorkloadRoundTests(unittest.TestCase):
             self.assertEqual(config.read_text("utf-8"), original)
             self.assertFalse((run_dir / "evaluation.json").exists())
 
+    def test_registered_change_set_and_before_identity_are_digest_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for artifact in ("change_set.json", "rounds/round-1/before_identity.json"):
+                with self.subTest(artifact=artifact):
+                    case_root = root / artifact.replace("/", "-")
+                    case_root.mkdir()
+                    control, run_dir, project = self._workspace(case_root)
+                    self.controller.start_run(control, run_dir)
+                    self.controller.register_change(control, run_dir, self._change())
+                    config = project / "configs" / "value.json"
+                    original = config.read_text("utf-8")
+                    config.write_text('{"workers": 8}\n', encoding="utf-8")
+                    target = run_dir / artifact
+                    payload = json.loads(target.read_text("utf-8"))
+                    if artifact == "change_set.json":
+                        payload["candidate"]["revision"] = "slow"
+                    else:
+                        payload["digest"] = "0" * 64
+                    target.write_text(json.dumps(payload), encoding="utf-8")
+
+                    decision = self.controller.evaluate_change(run_dir)
+
+                    self.assertEqual(decision["status"], "rejected")
+                    self.assertEqual(decision["reason"], "frozen_artifact_drift")
+                    self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_change_registration_resumes_after_snapshot_commit_interruption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            change = self._change()
+            original_atomic = self.controller._atomic_json
+            interrupted = False
+
+            def interrupt_once(path, value):
+                nonlocal interrupted
+                if Path(path).name == "change_set.json" and not interrupted:
+                    interrupted = True
+                    raise OSError("simulated interruption")
+                return original_atomic(path, value)
+
+            with mock.patch.object(
+                self.controller, "_atomic_json", side_effect=interrupt_once
+            ):
+                with self.assertRaisesRegex(OSError, "simulated interruption"):
+                    self.controller.register_change(control, run_dir, change)
+
+            self.assertTrue((run_dir / "snapshot" / "project").is_dir())
+            self.assertEqual(
+                self.controller.read_run_state(run_dir)["next_action"],
+                "register_change",
+            )
+
+            resumed = self.controller.register_change(control, run_dir, change)
+            repeated = self.controller.register_change(control, run_dir, change)
+
+            self.assertEqual(resumed["next_action"], "edit_then_evaluate")
+            self.assertEqual(repeated, resumed)
+            self.assertFalse((run_dir / "registration_pending.json").exists())
+
+    def test_state_commit_recovers_interrupted_checkpoint_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            change = self._change()
+            original_atomic = self.controller._atomic_json
+
+            def interrupt_checkpoint(path, value):
+                if (
+                    Path(path).name == "checkpoint.json"
+                    and value.get("next_action") == "edit_then_evaluate"
+                ):
+                    raise OSError("checkpoint write interrupted")
+                return original_atomic(path, value)
+
+            with mock.patch.object(
+                self.controller, "_atomic_json", side_effect=interrupt_checkpoint
+            ):
+                with self.assertRaisesRegex(OSError, "checkpoint write interrupted"):
+                    self.controller.register_change(control, run_dir, change)
+
+            recovered = self.controller.read_run_state(run_dir)
+            self.assertEqual(recovered["next_action"], "edit_then_evaluate")
+            self.assertEqual(
+                json.loads((run_dir / "checkpoint.json").read_text("utf-8")),
+                recovered,
+            )
+            self.assertEqual(
+                self.controller.register_change(control, run_dir, change), recovered
+            )
+
+    def test_frozen_control_drift_fails_and_checkpoint_mirror_repairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            expected = self.controller.start_run(control, run_dir)
+            checkpoint = run_dir / "checkpoint.json"
+            damaged = copy.deepcopy(expected)
+            damaged["next_action"] = "done"
+            checkpoint.write_text(json.dumps(damaged), encoding="utf-8")
+
+            self.assertEqual(self.controller.read_run_state(run_dir), expected)
+            self.assertEqual(json.loads(checkpoint.read_text("utf-8")), expected)
+
+            frozen = run_dir / "control_manifest.json"
+            payload = json.loads(frozen.read_text("utf-8"))
+            payload["budget"] = "thorough"
+            frozen.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "frozen control"
+            ):
+                self.controller.resume_run(run_dir)
+
     def test_expired_budget_after_edit_rejects_and_restores_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -934,6 +1242,74 @@ class WorkloadRoundTests(unittest.TestCase):
             self.assertEqual(decision["status"], "rejected")
             self.assertEqual(decision["reason"], "budget_expired")
             self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_deadline_expiring_during_evaluation_cannot_promote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            config = project / "configs" / "value.json"
+            original = config.read_text("utf-8")
+            config.write_text('{"workers": 8}\n', encoding="utf-8")
+            state = self.controller.read_run_state(run_dir)
+            state["deadline_epoch"] = time.time() + 0.05
+            self.controller._write_state(run_dir, state)
+            evaluator = self.controller._load_evaluate_module()
+            original_evaluate = evaluator.evaluate_pairs
+
+            def delayed_evaluate(*args, **kwargs):
+                time.sleep(0.1)
+                return original_evaluate(*args, **kwargs)
+
+            with mock.patch.object(evaluator, "evaluate_pairs", delayed_evaluate):
+                decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "rejected")
+            self.assertEqual(decision["reason"], "budget_expired")
+            self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_rollback_failure_requires_manual_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(
+                control, run_dir, self._change(revision="slow")
+            )
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+
+            with mock.patch.object(
+                self.controller, "_restore_snapshot", side_effect=OSError("disk full")
+            ):
+                decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "manual_recovery_required")
+            self.assertFalse(decision["rolled_back"])
+            state = self.controller.read_run_state(run_dir)
+            self.assertEqual(state["status"], "manual_recovery_required")
+            self.assertEqual(state["next_action"], "manual_recovery")
+
+    def test_missing_snapshot_never_deletes_project_during_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(
+                control, run_dir, self._change(revision="slow")
+            )
+            config = project / "configs" / "value.json"
+            config.write_text('{"workers": 8}\n', encoding="utf-8")
+            shutil.rmtree(run_dir / "snapshot" / "project")
+
+            decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "manual_recovery_required")
+            self.assertFalse(decision["rolled_back"])
+            self.assertTrue(config.is_file())
+            self.assertTrue((project / "src").is_dir())
 
     def test_snapshot_rejects_symlinked_mutation_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -28,7 +28,7 @@ _SECRET_NAME = re.compile(
     re.IGNORECASE,
 )
 _SECRET_LOG = re.compile(
-    r"(?i)([A-Z0-9_]*(?:API[_-]?KEY|AUTH|COOKIE|CREDENTIAL|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*)\s*[:=]\s*([^\s,;]+)"
+    r'''(?i)(["']?\b[A-Z0-9_]{0,128}(?:API[_-]?KEY|AUTH|COOKIE|CREDENTIAL|PASSWORD|SECRET|TOKEN)[A-Z0-9_]{0,128}\b["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,;}]+)'''
 )
 _SAFE_ENV = {
     "HOME",
@@ -236,24 +236,39 @@ def _drain(stream, capture: _BoundedCapture) -> None:
         stream.close()
 
 
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _stop_group(process) -> None:
+    process_group = process.pid
+
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
-    try:
-        process.wait(timeout=0.25)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    deadline = time.monotonic() + 0.25
+    while _process_group_exists(process_group) and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.01)
+    if _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        pass
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
 
 
 def _environment() -> tuple[dict, tuple[str, ...]]:
@@ -271,7 +286,7 @@ def _environment() -> tuple[dict, tuple[str, ...]]:
 
 def _redact(payload: bytes, secrets: Sequence[str]) -> str:
     value = payload.decode("utf-8", errors="replace")
-    value = _SECRET_LOG.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    value = _SECRET_LOG.sub(lambda match: f"{match.group(1)}[REDACTED]", value)
     for secret in sorted(set(secrets), key=len, reverse=True):
         if secret:
             value = value.replace(secret, "[REDACTED]")
@@ -380,6 +395,9 @@ def run_reviewer(
                 failure = f"reviewer exceeded {timeout} seconds"
                 _stop_group(process)
                 exit_code = process.returncode
+            else:
+                if _process_group_exists(process.pid):
+                    _stop_group(process)
             for reader in readers:
                 reader.join(timeout=1)
         except (FileNotFoundError, OSError) as error:

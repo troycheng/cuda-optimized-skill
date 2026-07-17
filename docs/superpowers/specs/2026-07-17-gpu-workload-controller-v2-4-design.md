@@ -104,7 +104,8 @@ flowchart LR
   ],
   "reviewer": {
     "argv": ["reviewer-cli", "--json"],
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "include_diff": false
   }
 }
 ```
@@ -205,16 +206,19 @@ Codex 写入严格 JSON：
   "scope": "project",
   "candidate": {"name": "dataloader-workers-8", "revision": "worktree"},
   "paths": ["configs/serve.yaml"],
-  "commands": [["python3", "-m", "pytest", "tests/test_config.py"]],
+  "commands": [],
   "rollback": "restore_frozen_snapshot",
   "expected_metrics": ["data_wait_pct", "gpu_busy_pct", "p50_latency_ms"]
 }
 ```
 
 `scope` 只接受 `project` 或 `isolated_environment`。所有 path 必须落在 manifest 允许根目录；
-`host` scope 直接拒绝。控制器冻结修改前身份，修改后验证实际 diff 未越界。Codex 执行编辑
-和允许命令，控制器不接收任意 shell 文本。`candidate` 是交给现有 WorkloadSpec adapter 的
-JSON 描述，必须与实际修改后的候选身份一致，并与评测 artifact 一起冻结。
+`host` scope 直接拒绝。控制器冻结修改前身份，修改后验证实际 diff 未越界。Codex 只执行
+声明范围内的编辑；`commands` 在 v2.4 必须为空，正确性由 WorkloadSpec adapter 的
+`validate()` 负责，避免新增一个拥有当前用户完整写权限的命令执行面。`candidate` 是交给现有
+WorkloadSpec adapter 的 JSON 描述，控制器不修改该描述，而是在独立 binding artifact 中把
+它与修改后 identity digest 一起冻结。adapter 的 `validate()` 负责确认 descriptor 指向本次
+实际候选；控制器负责保存可审计的 descriptor、diff 和 identity 关联，不把关联标签冒充实现证明。
 
 宿主机建议单独写入 `host_recommendations.md`，包含证据、预期影响、风险和人工验证命令，
 永远不进入 ChangeSet 执行队列。
@@ -295,10 +299,14 @@ JSON completion marker 最后写入。失败阶段保留日志和部分 artifact
 
 控制层沿用 `quick`、`balanced`、`thorough` 和完整 custom 预算。预算同时约束 Probe timeout、
 reviewer timeout、ChangeSet 验证、workload pairs 和最大 rounds。Deadline 前停止接纳新阶段，
-已完成阶段可恢复，进行中的外部进程按 TERM、grace、KILL、wait 顺序清理。
+已完成阶段可恢复，外部 Probe、reviewer 和 command workload 的 timeout 截断到剩余预算，
+进程按 TERM、grace、KILL、wait 顺序清理。Python adapter 在控制器进程内运行，阻塞于 native
+call 时无法安全抢占；它必须自行提供有界操作。需要硬 wall-clock 中止时使用 command workload。
+无论 adapter 何时返回，deadline 后的证据都不能晋级。
 
 Reviewer 不可用不会消耗后续全部预算；状态记录 `not_reviewed` 并继续确定性评估。关键 Probe
-缺失时 diagnosis 为 `inconclusive`，不得直接进入 promotion。
+缺失时 diagnosis 为 `inconclusive`，该诊断本身不能授权 promotion；候选只有在后续独立的
+配对 workload 评测确认主指标收益且所有约束通过后才可晋级。
 
 ## 失败与降级
 

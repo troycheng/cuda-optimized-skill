@@ -8,6 +8,7 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +70,34 @@ def _observation(workload, *, role, case, metrics, validation=True):
 
 
 class MeasureCandidateTests(unittest.TestCase):
+    def test_numeric_timeout_is_recomputed_before_each_attempt(self) -> None:
+        module = _load_workload_evaluate()
+        workload = _workload(module)
+        observed_timeouts = []
+
+        def runner(spec, *, candidate, role, case, timeout):
+            observed_timeouts.append(timeout)
+            raise TimeoutError("transient")
+
+        with mock.patch.object(
+            module.time,
+            "time",
+            side_effect=[100.0, 104.0, 111.0],
+        ):
+            result = module.measure_candidate(
+                workload,
+                "candidate.py",
+                retries=3,
+                timeout=120.0,
+                deadline_epoch=110.0,
+                runner=runner,
+            )
+
+        self.assertEqual(observed_timeouts, [10.0, 6.0])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(result["failure"]["error_type"], "TimeoutError")
+
     def test_default_timeout_preserves_python_runner_none_contract(self) -> None:
         module = _load_workload_evaluate()
         workload = _workload(module)
