@@ -244,7 +244,7 @@ CUDA-enabled `torch`. Triton kernels need `triton`; CUDA/CUTLASS kernels use
 `$CUTLASS_PATH` or `$CUTLASS_INCLUDE_DIR`. `ncu` is optional. The skill does not
 redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
 
-Current CPU acceptance contains 603 tests: 599 passed, four opt-in RTX 5090
+Current CPU acceptance contains 609 tests: 605 passed, four opt-in RTX 5090
 tests skipped, and zero failed. All 25/25 scripts pass `py_compile` and `--help`
 smoke checks, and the skill validator reports valid.
 

@@ -229,7 +229,7 @@ kernel 还需安装 `triton`；CUDA/CUTLASS 使用 `nvcc`；SASS 证据来自
 指定。`ncu` 是可选依赖。这个 skill 不重新分发 CUDA、CUTLASS、Triton 或
 Nsight Compute。
 
-当前 CPU 验收共 603 项：599 项通过，4 项 opt-in RTX 5090 测试跳过，失败为
+当前 CPU 验收共 609 项：605 项通过，4 项 opt-in RTX 5090 测试跳过，失败为
 0。25/25 个脚本均通过 `py_compile` 和 `--help` smoke check，skill validator
 也确认结构有效。
 
