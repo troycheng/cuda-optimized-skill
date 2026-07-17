@@ -229,6 +229,73 @@ class StrategyMemoryTests(unittest.TestCase):
             "evidence": evidence,
         }
 
+    def _suggestion_record(
+        self,
+        marker: str,
+        method_id: str,
+        *,
+        performance: str | None = None,
+        completed_at: float = 1.0,
+        scope: dict | None = None,
+        implementation: str | None = None,
+    ) -> dict:
+        record = self._record(marker, scope=scope)
+        record["completed_at"] = completed_at
+        record["bundle"]["method_ids"] = [method_id]
+        if performance is not None:
+            champion_ms, ablated_ms = (
+                (10.0, 12.0) if performance == "positive" else (12.0, 10.0)
+            )
+            attribution_ms = ablated_ms - champion_ms
+            evidence = []
+            for role in (
+                "attribution",
+                "champion_bench",
+                f"ablation_kernel:{method_id}",
+                f"ablation_bench:{method_id}",
+            ):
+                identity = {
+                    "role": role,
+                    "path": str(
+                        Path(record["run_root"]["path"])
+                        / "iterv1"
+                        / f"{marker}-{role.replace(':', '-')}.json"
+                    ),
+                    "sha256": hashlib.sha256(
+                        f"{marker}:{role}".encode("utf-8")
+                    ).hexdigest(),
+                }
+                evidence.append(identity)
+                record["evidence"].append(identity)
+            record["methods"]["performance"][method_id] = {
+                "outcome": performance,
+                "champion_ms": champion_ms,
+                "ablated_ms": ablated_ms,
+                "attribution_ms": attribution_ms,
+                "attribution_pct": attribution_ms / champion_ms * 100.0,
+                "evidence_quality": "diagnostic_unpaired_ablation",
+                "promotion_authority": False,
+                "evidence": evidence,
+            }
+        if implementation is not None:
+            identity = {
+                "role": "sass_check",
+                "path": str(
+                    Path(record["run_root"]["path"])
+                    / "iterv1"
+                    / f"{marker}-sass-check.json"
+                ),
+                "sha256": hashlib.sha256(
+                    f"{marker}:sass_check".encode("utf-8")
+                ).hexdigest(),
+            }
+            record["evidence"].append(identity)
+            record["methods"]["implementation"][method_id] = {
+                "status": implementation,
+                "evidence": identity,
+            }
+        return self.memory._validate_record(record)
+
     def _scope(self, marker: str = "a") -> dict:
         return {
             "manifest_schema_version": 2,
@@ -1379,6 +1446,227 @@ class StrategyMemoryTests(unittest.TestCase):
             self.assertFalse(result["inserted"])
             self.assertEqual(len(next(iter(self.memory.load_memory(memory)["scopes"].values()))["runs"]), 1)
             self.assertEqual(json.loads(output.read_text("utf-8"))["schema_version"], self.memory.RECORD_SCHEMA)
+
+    def test_suggestion_uses_only_exact_scope_and_traceable_ablation_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            manifest = self._manifest(root)
+            scope = self.memory.scope_document(manifest)
+            memory = root / "memory.json"
+            records = [
+                self._suggestion_record("1", "preferred", performance="positive", completed_at=4.0, scope=scope),
+                self._suggestion_record("2", "preferred", performance="positive", completed_at=2.0, scope=scope),
+                self._suggestion_record("3", "negative", performance="negative", completed_at=3.0, scope=scope),
+                self._suggestion_record("4", "conflicting", performance="positive", completed_at=5.0, scope=scope),
+                self._suggestion_record("5", "conflicting", performance="negative", completed_at=6.0, scope=scope),
+                self._suggestion_record("6", "inconclusive", completed_at=7.0, scope=scope, implementation="unavailable"),
+                self._suggestion_record("7", "bundle-only", completed_at=1.0, scope=scope),
+            ]
+            for record in records:
+                self.memory.append_run(memory, scope, record)
+
+            other_scope = self._scope("f")
+            for marker in ("8", "9"):
+                self.memory.append_run(
+                    memory,
+                    other_scope,
+                    self._suggestion_record(
+                        marker,
+                        "other-scope",
+                        performance="positive",
+                        completed_at=8.0,
+                        scope=other_scope,
+                    ),
+                )
+
+            output = root / "suggestion.json"
+            suggestion = self.memory.suggest_strategies(memory, manifest, output)
+            self.assertEqual(
+                suggestion["schema_version"],
+                "cuda-kernel-optimizer/strategy-suggestion-v1",
+            )
+            self.assertEqual(suggestion["status"], "available")
+            self.assertEqual(suggestion["preferred_method_ids"], ["preferred"])
+            self.assertEqual(
+                suggestion["caution_method_ids"], ["conflicting", "negative"]
+            )
+            self.assertNotIn("inconclusive", suggestion["caution_method_ids"])
+            self.assertNotIn("bundle-only", suggestion["method_evidence"])
+            self.assertNotIn("other-scope", suggestion["method_evidence"])
+
+            preferred = suggestion["method_evidence"]["preferred"]
+            self.assertEqual(preferred["count"], 2)
+            self.assertEqual(preferred["positive_count"], 2)
+            self.assertEqual(preferred["negative_count"], 0)
+            for item in preferred["records"]:
+                self.assertEqual(item["count"], 1)
+                self.assertRegex(item["record_identity"], r"^[0-9a-f]{64}$")
+                self.assertEqual(item["decision_evidence"]["role"], "decision")
+                self.assertRegex(
+                    item["decision_evidence"]["sha256"], r"^[0-9a-f]{64}$"
+                )
+                self.assertEqual(
+                    {entry["role"] for entry in item["ablation_evidence"]},
+                    {
+                        "attribution",
+                        "champion_bench",
+                        "ablation_kernel:preferred",
+                        "ablation_bench:preferred",
+                    },
+                )
+                for evidence in item["ablation_evidence"]:
+                    self.assertTrue(os.path.isabs(evidence["path"]))
+                    self.assertRegex(evidence["sha256"], r"^[0-9a-f]{64}$")
+
+            conflicting = suggestion["method_evidence"]["conflicting"]
+            self.assertEqual(conflicting["positive_count"], 1)
+            self.assertEqual(conflicting["negative_count"], 1)
+            self.assertEqual(
+                [item["outcome"] for item in conflicting["records"]],
+                ["positive", "negative"],
+            )
+            bundles = suggestion["prior_bundles"]
+            self.assertEqual(
+                [(item["completed_at"], item["record_identity"]) for item in bundles],
+                sorted(
+                    (item["completed_at"], item["record_identity"])
+                    for item in bundles
+                ),
+            )
+            self.assertEqual(len(bundles), len(records))
+            self.assertTrue(any(item["method_ids"] == ["bundle-only"] for item in bundles))
+            for item in bundles:
+                self.assertEqual(item["count"], 1)
+                self.assertEqual(item["decision_evidence"]["role"], "decision")
+                self.assertRegex(item["decision_evidence"]["sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(json.loads(output.read_text("utf-8")), suggestion)
+
+    def test_suggestion_is_read_only_and_has_fixed_advisory_guardrail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            manifest = self._manifest(root, mode="full")
+            scope = self.memory.scope_document(manifest)
+            memory = root / "memory.json"
+            self.memory.append_run(
+                memory,
+                scope,
+                self._suggestion_record(
+                    "1", "vectorize", performance="positive", scope=scope
+                ),
+            )
+            run_files = [
+                manifest,
+                root / "state.json",
+                root / "checkpoint.json",
+                root / "decision.json",
+                root / "candidate.py",
+            ]
+            for path in run_files[1:]:
+                path.write_bytes(f"do-not-read-or-change:{path.name}".encode("utf-8"))
+            watched = [memory, *run_files]
+            before = {
+                str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in watched
+            }
+            output = root / "suggestion.json"
+            real_read = self.memory.artifact_store.read_regular_bytes
+
+            def read_manifest_only(path):
+                if os.path.abspath(path) != os.path.abspath(manifest):
+                    raise AssertionError(f"suggest read outside manifest/memory: {path}")
+                return real_read(path)
+
+            with mock.patch.object(
+                self.memory.orchestrate,
+                "main",
+                side_effect=AssertionError("suggest must not call orchestrator"),
+            ), mock.patch.object(
+                self.memory.artifact_store,
+                "read_regular_bytes",
+                side_effect=read_manifest_only,
+            ):
+                suggestion = self.memory.suggest_strategies(memory, manifest, output)
+            after = {
+                str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in watched
+            }
+            self.assertEqual(after, before)
+            self.assertTrue(suggestion["advisory"])
+            self.assertEqual(suggestion["guardrail"], self.memory.ADVISORY_GUARDRAIL)
+            for required in (
+                "delete or prune branches",
+                "profiler",
+                "budget",
+                "correctness",
+                "sanitizer",
+                "paired",
+                "workload",
+                "decision gate",
+                "promotion",
+            ):
+                self.assertIn(required, suggestion["guardrail"])
+
+    def test_missing_memory_publishes_unavailable_advisory_and_cli_is_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            manifest = self._manifest(root)
+            memory = root / "missing-memory.json"
+            output = root / "suggestion.json"
+            exit_code = self.memory.main(
+                [
+                    "suggest",
+                    "--memory",
+                    str(memory),
+                    "--manifest",
+                    str(manifest),
+                    "--out",
+                    str(output),
+                ]
+            )
+            self.assertNotEqual(exit_code, 0)
+            suggestion = json.loads(output.read_text("utf-8"))
+            self.assertEqual(suggestion["status"], "unavailable")
+            self.assertTrue(suggestion["advisory"])
+            self.assertEqual(suggestion["preferred_method_ids"], [])
+            self.assertEqual(suggestion["caution_method_ids"], [])
+            self.assertEqual(suggestion["prior_bundles"], [])
+
+    def test_parser_has_only_explicit_record_and_suggest_paths(self) -> None:
+        parser = self.memory.build_parser()
+        action = next(
+            item
+            for item in parser._actions
+            if isinstance(item, argparse._SubParsersAction)
+        )
+        self.assertEqual(set(action.choices), {"record", "suggest"})
+        for command, required in (
+            ("record", {"memory", "run_dir", "out"}),
+            ("suggest", {"memory", "manifest", "out"}),
+        ):
+            subparser = action.choices[command]
+            options = {
+                item.dest: item.required
+                for item in subparser._actions
+                if item.dest != "help"
+            }
+            self.assertEqual(set(options), required)
+            self.assertTrue(all(options.values()))
+            self.assertNotIn("orchestrator", subparser.format_help().lower())
+
+    def test_suggestion_output_rejects_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            manifest = self._manifest(root)
+            scope = self.memory.scope_document(manifest)
+            memory = root / "memory.json"
+            self.memory.append_run(memory, scope, self._record(scope=scope))
+            target = root / "target.json"
+            target.write_text("unchanged", encoding="utf-8")
+            output = root / "suggestion.json"
+            output.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "symlink|unsafe"):
+                self.memory.suggest_strategies(memory, manifest, output)
+            self.assertEqual(target.read_text("utf-8"), "unchanged")
 
 
 if __name__ == "__main__":

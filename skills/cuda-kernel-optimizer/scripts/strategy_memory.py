@@ -34,6 +34,12 @@ import workload_adapter  # noqa: E402
 
 MEMORY_SCHEMA = "cuda-kernel-optimizer/strategy-memory-v1"
 RECORD_SCHEMA = "cuda-kernel-optimizer/strategy-record-v1"
+SUGGESTION_SCHEMA = "cuda-kernel-optimizer/strategy-suggestion-v1"
+ADVISORY_GUARDRAIL = (
+    "Advisory only: cannot delete or prune branches; cannot override profiler "
+    "evidence or budget policy; cannot bypass correctness, sanitizer, paired "
+    "benchmark, workload, or decision gates; and cannot authorize promotion."
+)
 MAX_SCOPES = 256
 MAX_RUNS_PER_SCOPE = 128
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -205,7 +211,9 @@ def _scope_key_from_document(scope: Mapping) -> str:
     return hashlib.sha256(_canonical_bytes(clean)).hexdigest()
 
 
-def _input_identity(manifest: Mapping, name: str) -> tuple[str, int]:
+def _input_identity(
+    manifest: Mapping, name: str, *, verify_content: bool = True
+) -> tuple[str, int]:
     inputs = manifest.get("inputs")
     if not isinstance(inputs, Mapping) or set(inputs) != {"baseline", "ref"}:
         raise ValueError("manifest.inputs must contain exactly baseline and ref")
@@ -218,6 +226,8 @@ def _input_identity(manifest: Mapping, name: str) -> tuple[str, int]:
     expected = _sha(record["sha256"], f"manifest.inputs.{name}.sha256")
     if type(record["size_bytes"]) is not int or record["size_bytes"] < 0:
         raise ValueError(f"manifest.inputs.{name}.size_bytes is invalid")
+    if not verify_content:
+        return expected, record["size_bytes"]
     current = artifact_store.read_regular_bytes(path)
     actual = hashlib.sha256(current).hexdigest()
     if actual != expected:
@@ -227,7 +237,9 @@ def _input_identity(manifest: Mapping, name: str) -> tuple[str, int]:
     return actual, len(current)
 
 
-def scope_document(manifest_path: str | os.PathLike) -> dict:
+def _scope_document_from_manifest(
+    manifest_path: str | os.PathLike, *, verify_files: bool
+) -> dict:
     """Load a frozen manifest and derive its complete strategy scope."""
     raw = artifact_store.read_regular_bytes(manifest_path)
     manifest = _strict_json_bytes(raw, "manifest")
@@ -263,8 +275,10 @@ def scope_document(manifest_path: str | os.PathLike) -> dict:
         raise ValueError("manifest.backend must be a non-empty string")
     dims = manifest["dims"]
     ptr_size = manifest["ptr_size"]
-    baseline_sha, _ = _input_identity(manifest, "baseline")
-    ref_sha, _ = _input_identity(manifest, "ref")
+    baseline_sha, _ = _input_identity(
+        manifest, "baseline", verify_content=verify_files
+    )
+    ref_sha, _ = _input_identity(manifest, "ref", verify_content=verify_files)
     mode = manifest["mode"]
     raw_workload = manifest["workload"]
     if mode == "kernel-only":
@@ -293,11 +307,12 @@ def scope_document(manifest_path: str | os.PathLike) -> dict:
             cases=tuple(_strict_copy(cases, "manifest.workload.cases")),
             source_hash=source_hash,
         )
-        if spec.kind == "python" and isinstance(spec.source, str):
-            artifact_store.read_regular_bytes(spec.source)
-        elif spec.kind == "command" and isinstance(spec.source, list) and spec.source:
-            artifact_store.read_regular_bytes(spec.source[0])
-        workload_adapter.verify_frozen_spec(spec)
+        if verify_files:
+            if spec.kind == "python" and isinstance(spec.source, str):
+                artifact_store.read_regular_bytes(spec.source)
+            elif spec.kind == "command" and isinstance(spec.source, list) and spec.source:
+                artifact_store.read_regular_bytes(spec.source[0])
+            workload_adapter.verify_frozen_spec(spec)
         workload = {"mode": "full", **dict(raw_workload)}
     else:
         raise ValueError("manifest.mode must be full or kernel-only")
@@ -313,6 +328,11 @@ def scope_document(manifest_path: str | os.PathLike) -> dict:
         "workload": workload,
     }
     return _validate_scope_document(scope)
+
+
+def scope_document(manifest_path: str | os.PathLike) -> dict:
+    """Load a frozen manifest and verify the files bound into its scope."""
+    return _scope_document_from_manifest(manifest_path, verify_files=True)
 
 
 def scope_key(manifest_or_scope: str | os.PathLike | Mapping) -> str:
@@ -1424,9 +1444,155 @@ def record_run(
     return {"inserted": inserted, "record": record}
 
 
+def _optional_memory(path: str | os.PathLike) -> dict | None:
+    """Read a memory snapshot without following path components."""
+    try:
+        directory_fd, leaf, target = artifact_store._open_parent_directory(
+            path, create=False
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        raw = artifact_store._read_regular_leaf(
+            directory_fd, leaf, target, missing_ok=True
+        )
+    finally:
+        os.close(directory_fd)
+    if raw is None:
+        return None
+    return _validate_memory(_strict_json_bytes(raw, "strategy memory"))
+
+
+def _suggestion_base(scope: Mapping, key: str, *, status: str) -> dict:
+    return {
+        "schema_version": SUGGESTION_SCHEMA,
+        "status": status,
+        "advisory": True,
+        "guardrail": ADVISORY_GUARDRAIL,
+        "scope_key": key,
+        "scope": _strict_copy(scope, "suggestion scope"),
+        "preferred_method_ids": [],
+        "caution_method_ids": [],
+        "method_evidence": {},
+        "prior_bundles": [],
+    }
+
+
+def _method_suggestion(method_id: str, records: list[Mapping]) -> dict:
+    evidence_records = []
+    positive_count = 0
+    negative_count = 0
+    for item in records:
+        performance = item["performance"]
+        if performance is None:
+            continue
+        outcome = performance["outcome"]
+        positive_count += outcome == "positive"
+        negative_count += outcome == "negative"
+        run = item["run"]
+        evidence_records.append(
+            {
+                "record_identity": item["record_identity"],
+                "completed_at": item["completed_at"],
+                "outcome": outcome,
+                "decision_evidence": _strict_copy(
+                    run["bundle"]["decision_evidence"],
+                    "suggestion decision evidence",
+                ),
+                "ablation_evidence": sorted(
+                    _strict_copy(
+                        performance["evidence"], "suggestion ablation evidence"
+                    ),
+                    key=lambda value: (value["role"], value["path"], value["sha256"]),
+                ),
+                "count": 1,
+            }
+        )
+    evidence_records.sort(
+        key=lambda value: (value["completed_at"], value["record_identity"])
+    )
+    return {
+        "method_id": method_id,
+        "count": len(evidence_records),
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "records": evidence_records,
+    }
+
+
+def _available_suggestion(scope: Mapping, key: str, entry: Mapping) -> dict:
+    suggestion = _suggestion_base(scope, key, status="available")
+    runs = {_record_key(record): record for record in entry["runs"]}
+    selected = {}
+    for method_id in sorted(entry["methods"]):
+        indexed = []
+        for item in entry["methods"][method_id]["records"]:
+            indexed.append({**item, "run": runs[item["record_identity"]]})
+        method = _method_suggestion(method_id, indexed)
+        if method["positive_count"] >= 2 and method["negative_count"] == 0:
+            suggestion["preferred_method_ids"].append(method_id)
+            selected[method_id] = method
+        elif method["negative_count"] > 0:
+            suggestion["caution_method_ids"].append(method_id)
+            selected[method_id] = method
+    suggestion["method_evidence"] = {
+        method_id: selected[method_id] for method_id in sorted(selected)
+    }
+
+    prior_bundles = []
+    for bundle in entry["bundles"].values():
+        for item in bundle["records"]:
+            prior_bundles.append(
+                {
+                    "record_identity": item["record_identity"],
+                    "completed_at": item["completed_at"],
+                    "outcome": item["outcome"],
+                    "method_ids": list(bundle["method_ids"]),
+                    "decision_evidence": _strict_copy(
+                        item["decision_evidence"], "suggestion bundle evidence"
+                    ),
+                    "count": 1,
+                }
+            )
+    suggestion["prior_bundles"] = sorted(
+        prior_bundles,
+        key=lambda value: (value["completed_at"], value["record_identity"]),
+    )
+    return suggestion
+
+
+def suggest_strategies(
+    memory_path: str | os.PathLike,
+    manifest_path: str | os.PathLike,
+    output_path: str | os.PathLike,
+) -> dict:
+    """Publish exact-scope search hints without reading or changing run state."""
+    scope = _scope_document_from_manifest(manifest_path, verify_files=False)
+    key = _scope_key_from_document(scope)
+    memory = _optional_memory(memory_path)
+    if memory is None:
+        suggestion = _suggestion_base(scope, key, status="unavailable")
+        suggestion["reason"] = "strategy memory does not exist"
+    else:
+        entry = memory["scopes"].get(key)
+        if entry is None:
+            suggestion = _suggestion_base(scope, key, status="unavailable")
+            suggestion["reason"] = "strategy memory has no records for the exact scope"
+        else:
+            suggestion = _available_suggestion(scope, key, entry)
+    _atomic_write_output(output_path, suggestion)
+    return suggestion
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage explicit CUDA strategy evidence")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    suggest_parser = subparsers.add_parser(
+        "suggest", help="write exact-scope advisory search hints"
+    )
+    suggest_parser.add_argument("--memory", required=True)
+    suggest_parser.add_argument("--manifest", required=True)
+    suggest_parser.add_argument("--out", required=True)
     record_parser = subparsers.add_parser("record", help="record one completed v2.2 run")
     record_parser.add_argument("--memory", required=True)
     record_parser.add_argument("--run-dir", required=True)
@@ -1436,6 +1602,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "suggest":
+        result = suggest_strategies(args.memory, args.manifest, args.out)
+        print(json.dumps({"status": result["status"], "out": args.out}, sort_keys=True))
+        return 0 if result["status"] == "available" else 2
     if args.command == "record":
         result = record_run(args.memory, args.run_dir, args.out)
         print(json.dumps({"inserted": result["inserted"], "out": args.out}, sort_keys=True))
