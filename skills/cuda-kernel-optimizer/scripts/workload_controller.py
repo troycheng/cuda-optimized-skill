@@ -5,11 +5,17 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
+import signal
+import subprocess
 import sys
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -33,6 +39,23 @@ _SENSITIVE_KEY = re.compile(
     r"(^|[_-])(api[_-]?key|authorization|cookie|credential|password|secret|token)($|[_-])",
     re.IGNORECASE,
 )
+_LOG_SECRET = re.compile(
+    r"(?i)([A-Z0-9_]*(?:API[_-]?KEY|AUTH|COOKIE|CREDENTIAL|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*)\s*[:=]\s*([^\s,;]+)"
+)
+_DEFAULT_LOG_LIMIT = 64 * 1024
+_OUTPUT_LIMIT = 1024 * 1024
+_SAFE_ENV = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "PYTHONPATH",
+    "TMPDIR",
+    "CUDA_VISIBLE_DEVICES",
+    "CUDA_DEVICE_ORDER",
+    "NVIDIA_VISIBLE_DEVICES",
+}
+_DIAGNOSIS_MODULE = None
 
 
 class ValidationError(ValueError):
@@ -330,6 +353,308 @@ def validate_change_set(value: Mapping[str, Any], control: Mapping[str, Any]) ->
     return _json_copy(change, "change_set", reject_sensitive=True)
 
 
+def _load_diagnosis_module():
+    global _DIAGNOSIS_MODULE
+    if _DIAGNOSIS_MODULE is not None:
+        return _DIAGNOSIS_MODULE
+    path = Path(__file__).with_name("workload_diagnosis.py")
+    spec = importlib.util.spec_from_file_location(
+        "cuda_optimizer_workload_diagnosis_runtime", path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load workload diagnosis module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    _DIAGNOSIS_MODULE = module
+    return module
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class _BoundedLog:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.value = bytearray()
+        self.truncated = False
+
+    def append(self, chunk: bytes) -> None:
+        available = max(0, self.limit - len(self.value))
+        self.value.extend(chunk[:available])
+        if len(chunk) > available:
+            self.truncated = True
+
+    def text(self) -> str:
+        decoded = bytes(self.value).decode("utf-8", errors="replace")
+        return decoded + ("...[truncated]" if self.truncated else "")
+
+
+def _drain(stream, capture: _BoundedLog) -> None:
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            capture.append(chunk)
+    finally:
+        stream.close()
+
+
+def _stop_group(process: Any) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=0.25)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _is_secret_name(name: str) -> bool:
+    return _SENSITIVE_KEY.search(name) is not None
+
+
+def _probe_environment(overrides: Mapping[str, str]) -> tuple[dict, tuple[str, ...]]:
+    inherited = dict(os.environ)
+    explicit = {
+        name.strip()
+        for name in inherited.get("CUDA_OPTIMIZER_PASS_ENV", "").split(",")
+        if name.strip()
+    }
+    allowed = _SAFE_ENV | explicit
+    environment = {
+        name: value
+        for name, value in inherited.items()
+        if name in allowed and not _is_secret_name(name)
+    }
+    environment.update(overrides)
+    secrets = tuple(
+        value
+        for name, value in inherited.items()
+        if _is_secret_name(name) and value
+    )
+    return environment, secrets
+
+
+def _redact_log(value: str, secrets: Sequence[str]) -> str:
+    result = _LOG_SECRET.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            result = result.replace(secret, "[REDACTED]")
+    return result
+
+
+def _failure_probe(probe: Mapping[str, Any], status: str, issue_id: str, message: str) -> dict:
+    return {
+        "schema_version": "cuda-workload-optimizer/probe-v1",
+        "probe_id": probe["id"],
+        "kind": probe["kind"],
+        "status": status,
+        "metrics": {},
+        "issues": [
+            {
+                "id": issue_id,
+                "category": "environment",
+                "severity": "error",
+                "message": message,
+            }
+        ],
+        "artifacts": [],
+    }
+
+
+def _read_probe_output(path: Path) -> dict:
+    try:
+        info = path.stat()
+    except FileNotFoundError as error:
+        raise ValidationError("probe did not create CUDA_OPTIMIZER_OUTPUT") from error
+    if not path.is_file() or info.st_size > _OUTPUT_LIMIT:
+        raise ValidationError(f"probe output must be a regular file under {_OUTPUT_LIMIT} bytes")
+    return load_json_object(path)
+
+
+def run_probe(
+    probe: Mapping[str, Any],
+    control: Mapping[str, Any],
+    run_dir: os.PathLike[str] | str,
+    *,
+    log_limit_bytes: int = _DEFAULT_LOG_LIMIT,
+) -> dict:
+    """Execute one argv-only probe and persist normalized evidence plus bounded logs."""
+    if isinstance(log_limit_bytes, bool) or not isinstance(log_limit_bytes, int):
+        raise ValidationError("log_limit_bytes must be a positive integer")
+    if log_limit_bytes <= 0 or log_limit_bytes > _OUTPUT_LIMIT:
+        raise ValidationError("log_limit_bytes must be between 1 and 1048576")
+    normalized_control = validate_control_manifest(control)
+    matching = [item for item in normalized_control["probes"] if item["id"] == probe.get("id")]
+    if len(matching) != 1 or matching[0] != probe:
+        raise ValidationError("probe must exactly match one validated control probe")
+    selected = matching[0]
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    probes_dir = run_root / "probes"
+    probes_dir.mkdir(parents=True, exist_ok=True)
+    output_path = probes_dir / f".{selected['id']}.output.json"
+    try:
+        output_path.unlink()
+    except FileNotFoundError:
+        pass
+    environment, secret_values = _probe_environment(
+        {
+            "CUDA_OPTIMIZER_OUTPUT": str(output_path),
+            "CUDA_OPTIMIZER_RUN_DIR": str(run_root),
+            "CUDA_OPTIMIZER_PROJECT_ROOT": normalized_control["project_root"],
+        }
+    )
+    stdout = _BoundedLog(log_limit_bytes)
+    stderr = _BoundedLog(log_limit_bytes)
+    started = time.monotonic()
+    timed_out = False
+    exit_code = None
+    process = None
+    try:
+        process = subprocess.Popen(
+            selected["argv"],
+            cwd=normalized_control["project_root"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        readers = [
+            threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+            threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        try:
+            exit_code = process.wait(timeout=float(selected["timeout_seconds"]))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _stop_group(process)
+            exit_code = process.returncode
+        for reader in readers:
+            reader.join(timeout=1)
+    except FileNotFoundError as error:
+        result = _failure_probe(
+            selected, "unavailable", "environment:probe-unavailable", str(error)
+        )
+    except OSError as error:
+        result = _failure_probe(
+            selected, "failed", "environment:probe-launch", str(error)
+        )
+    else:
+        if timed_out:
+            result = _failure_probe(
+                selected,
+                "unavailable",
+                "environment:probe-timeout",
+                f"probe exceeded {selected['timeout_seconds']} seconds",
+            )
+        elif exit_code != 0:
+            result = _failure_probe(
+                selected,
+                "failed",
+                "environment:probe-exit",
+                f"probe exited with status {exit_code}",
+            )
+        else:
+            try:
+                result = _load_diagnosis_module().validate_probe(
+                    _read_probe_output(output_path)
+                )
+                if result["probe_id"] != selected["id"] or result["kind"] != selected["kind"]:
+                    raise ValidationError("probe output identity does not match control")
+            except (ValidationError, ValueError) as error:
+                result = _failure_probe(
+                    selected,
+                    "failed",
+                    "environment:probe-output",
+                    f"invalid normalized probe output: {error}",
+                )
+    finally:
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    result = _load_diagnosis_module().validate_probe(result)
+    duration = time.monotonic() - started
+    execution = {
+        "schema_version": "cuda-workload-optimizer/probe-execution-v1",
+        "probe_id": selected["id"],
+        "argv_sha256": _canonical_digest(selected["argv"]),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_seconds": duration,
+        "stdout": _redact_log(stdout.text(), secret_values),
+        "stderr": _redact_log(stderr.text(), secret_values),
+        "stdout_truncated": stdout.truncated,
+        "stderr_truncated": stderr.truncated,
+    }
+    _atomic_json(probes_dir / f"{selected['id']}.json", result)
+    _atomic_json(probes_dir / f"{selected['id']}.execution.json", execution)
+    return result
+
+
+def run_probes(control: Mapping[str, Any], run_dir: os.PathLike[str] | str) -> list[dict]:
+    normalized = validate_control_manifest(control)
+    return [run_probe(probe, normalized, run_dir) for probe in normalized["probes"]]
+
+
+def diagnose_run(run_dir: os.PathLike[str] | str) -> dict:
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    probes_dir = run_root / "probes"
+    values = []
+    for path in sorted(probes_dir.glob("*.json")):
+        if path.name.endswith(".execution.json"):
+            continue
+        values.append(load_json_object(path))
+    policy_path = Path(__file__).resolve().parents[1] / "references" / "workload_diagnosis_policy.json"
+    diagnosis_module = _load_diagnosis_module()
+    result = diagnosis_module.diagnose(values, diagnosis_module.load_policy(policy_path))
+    _atomic_json(run_root / "diagnosis.json", result)
+    return result
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate and run bounded GPU workload optimization rounds."
@@ -338,6 +663,13 @@ def _build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate", help="validate controller JSON")
     validate.add_argument("--control", required=True)
     validate.add_argument("--change-set")
+    probe = subparsers.add_parser("probe", help="collect normalized probe evidence")
+    probe.add_argument("--control", required=True)
+    probe.add_argument("--run-dir", required=True)
+    diagnose_parser = subparsers.add_parser(
+        "diagnose", help="classify stored normalized probe evidence"
+    )
+    diagnose_parser.add_argument("--run-dir", required=True)
     return parser
 
 
@@ -352,6 +684,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.change_set:
                 validate_change_set(load_json_object(args.change_set), control)
             print(json.dumps({"status": "valid"}, sort_keys=True))
+            return 0
+        if args.command == "probe":
+            values = run_probes(load_json_object(args.control), args.run_dir)
+            print(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "probe_count": len(values),
+                        "available_probe_count": sum(
+                            item["status"] in {"ok", "degraded"} for item in values
+                        ),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "diagnose":
+            print(json.dumps(diagnose_run(args.run_dir), sort_keys=True))
             return 0
     except ValidationError as error:
         print(f"validation error: {error}", file=sys.stderr)

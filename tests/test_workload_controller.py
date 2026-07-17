@@ -4,9 +4,12 @@ import copy
 import importlib.util
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -316,6 +319,219 @@ class WorkloadControllerContractTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["status"], "valid")
+
+
+class ProbeRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller = _load_controller()
+
+    def _workspace(self, root: Path) -> tuple[dict, Path]:
+        project = root / "project"
+        project.mkdir()
+        (project / "src").mkdir()
+        (project / "configs").mkdir()
+        (project / "workload.json").write_text("{}", encoding="utf-8")
+        run_dir = root / "run"
+        control = _control(root)
+        return control, run_dir
+
+    def _probe_script(self, project: Path, body: str) -> Path:
+        script = project / "probe.py"
+        script.write_text(
+            "import json, os, pathlib, sys, time\n"
+            + textwrap.dedent(body),
+            encoding="utf-8",
+        )
+        return script
+
+    def _configure(self, control: dict, script: Path, timeout: float = 10) -> dict:
+        control["probes"] = [
+            {
+                "id": "timeline",
+                "kind": "timeline",
+                "argv": [sys.executable, str(script)],
+                "timeout_seconds": timeout,
+            }
+        ]
+        return self.controller.validate_control_manifest(control, script.parent / "c.json")
+
+    def test_run_probe_captures_valid_output_and_required_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir = self._workspace(root)
+            script = self._probe_script(
+                root / "project",
+                """
+                output = pathlib.Path(os.environ["CUDA_OPTIMIZER_OUTPUT"])
+                assert pathlib.Path(os.environ["CUDA_OPTIMIZER_RUN_DIR"]).is_absolute()
+                assert os.environ["CUDA_OPTIMIZER_PROJECT_ROOT"] == str(pathlib.Path.cwd())
+                output.write_text(json.dumps({
+                    "schema_version": "cuda-workload-optimizer/probe-v1",
+                    "probe_id": "timeline",
+                    "kind": "timeline",
+                    "status": "ok",
+                    "metrics": {"gpu_busy_pct": 88, "kernel_time_pct": 72},
+                    "issues": [],
+                    "artifacts": []
+                }))
+                """,
+            )
+            normalized = self._configure(control, script)
+
+            result = self.controller.run_probe(
+                normalized["probes"][0], normalized, run_dir
+            )
+
+            self.assertEqual(result["status"], "ok")
+            stored = json.loads(
+                (run_dir / "probes" / "timeline.json").read_text("utf-8")
+            )
+            self.assertEqual(stored, result)
+            execution = json.loads(
+                (run_dir / "probes" / "timeline.execution.json").read_text("utf-8")
+            )
+            self.assertEqual(execution["exit_code"], 0)
+            self.assertEqual(len(execution["argv_sha256"]), 64)
+
+    def test_timeout_stops_process_group_and_returns_unavailable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir = self._workspace(root)
+            script = self._probe_script(root / "project", "time.sleep(30)\n")
+            normalized = self._configure(control, script, timeout=1)
+
+            started = time.monotonic()
+            result = self.controller.run_probe(
+                normalized["probes"][0], normalized, run_dir
+            )
+
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(result["status"], "unavailable")
+            self.assertEqual(result["issues"][0]["id"], "environment:probe-timeout")
+
+    def test_nonzero_exit_and_malformed_output_become_failed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for name, body, issue_id in (
+                ("exit", "sys.exit(7)\n", "environment:probe-exit"),
+                (
+                    "json",
+                    'pathlib.Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text("not-json")\n',
+                    "environment:probe-output",
+                ),
+            ):
+                with self.subTest(name=name):
+                    case_root = root / name
+                    case_root.mkdir()
+                    control, run_dir = self._workspace(case_root)
+                    script = self._probe_script(case_root / "project", body)
+                    normalized = self._configure(control, script)
+                    result = self.controller.run_probe(
+                        normalized["probes"][0], normalized, run_dir
+                    )
+                    self.assertEqual(result["status"], "failed")
+                    self.assertEqual(result["issues"][0]["id"], issue_id)
+
+    def test_logs_are_bounded_and_secrets_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir = self._workspace(root)
+            script = self._probe_script(
+                root / "project",
+                """
+                print("x" * 2000)
+                print("API_TOKEN=" + os.environ.get("API_TOKEN", "missing"), file=sys.stderr)
+                pathlib.Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text(json.dumps({
+                    "schema_version": "cuda-workload-optimizer/probe-v1",
+                    "probe_id": "timeline",
+                    "kind": "timeline",
+                    "status": "ok",
+                    "metrics": {"gpu_busy_pct": 70},
+                    "issues": [],
+                    "artifacts": []
+                }))
+                """,
+            )
+            normalized = self._configure(control, script)
+            original = os.environ.get("API_TOKEN")
+            os.environ["API_TOKEN"] = "super-secret-value"
+            try:
+                result = self.controller.run_probe(
+                    normalized["probes"][0],
+                    normalized,
+                    run_dir,
+                    log_limit_bytes=128,
+                )
+            finally:
+                if original is None:
+                    os.environ.pop("API_TOKEN", None)
+                else:
+                    os.environ["API_TOKEN"] = original
+
+            self.assertEqual(result["status"], "ok")
+            execution = json.loads(
+                (run_dir / "probes" / "timeline.execution.json").read_text("utf-8")
+            )
+            self.assertTrue(execution["stdout_truncated"])
+            self.assertLessEqual(len(execution["stdout"]), 160)
+            self.assertNotIn("super-secret-value", json.dumps(execution))
+
+    def test_probe_and_diagnose_cli_write_machine_readable_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir = self._workspace(root)
+            script = self._probe_script(
+                root / "project",
+                """
+                pathlib.Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text(json.dumps({
+                    "schema_version": "cuda-workload-optimizer/probe-v1",
+                    "probe_id": "timeline",
+                    "kind": "timeline",
+                    "status": "ok",
+                    "metrics": {"gpu_busy_pct": 90, "kernel_time_pct": 75},
+                    "issues": [],
+                    "artifacts": []
+                }))
+                """,
+            )
+            control = self._configure(control, script)
+            control_path = root / "control.json"
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+
+            probe_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "probe",
+                    "--control",
+                    str(control_path),
+                    "--run-dir",
+                    str(run_dir),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(probe_result.returncode, 0, probe_result.stderr)
+            self.assertEqual(json.loads(probe_result.stdout)["probe_count"], 1)
+
+            diagnosis_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "diagnose",
+                    "--run-dir",
+                    str(run_dir),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(diagnosis_result.returncode, 0, diagnosis_result.stderr)
+            self.assertEqual(
+                json.loads(diagnosis_result.stdout)["primary_category"], "kernel"
+            )
+            self.assertTrue((run_dir / "diagnosis.json").is_file())
 
 
 if __name__ == "__main__":

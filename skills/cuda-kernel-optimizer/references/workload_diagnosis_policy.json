@@ -1,0 +1,74 @@
+{
+  "schema_version": "cuda-workload-optimizer/diagnosis-policy-v1",
+  "mixed_score_delta": 10,
+  "environment_issue_score": 100,
+  "rules": [
+    {
+      "id": "kernel:busy-kernel-time",
+      "category": "kernel",
+      "score": 50,
+      "all": [
+        {"metric": "gpu_busy_pct", "operator": "gte", "threshold": 60},
+        {"metric": "kernel_time_pct", "operator": "gte", "threshold": 60}
+      ]
+    },
+    {
+      "id": "framework:launch-gaps",
+      "category": "framework",
+      "score": 50,
+      "all": [
+        {"metric": "launch_gap_pct", "operator": "gte", "threshold": 25}
+      ]
+    },
+    {
+      "id": "framework:cuda-api",
+      "category": "framework",
+      "score": 20,
+      "all": [
+        {"metric": "cuda_api_time_pct", "operator": "gte", "threshold": 20}
+      ]
+    },
+    {
+      "id": "cpu_data:data-wait",
+      "category": "cpu_data",
+      "score": 50,
+      "all": [
+        {"metric": "data_wait_pct", "operator": "gte", "threshold": 25}
+      ]
+    },
+    {
+      "id": "cpu_data:cpu-pressure",
+      "category": "cpu_data",
+      "score": 20,
+      "all": [
+        {"metric": "cpu_busy_pct", "operator": "gte", "threshold": 80},
+        {"metric": "gpu_busy_pct", "operator": "lte", "threshold": 70}
+      ]
+    },
+    {
+      "id": "transfer:copy-time",
+      "category": "transfer",
+      "score": 50,
+      "all": [
+        {"metric": "transfer_time_pct", "operator": "gte", "threshold": 25}
+      ]
+    },
+    {
+      "id": "communication:collective-time",
+      "category": "communication",
+      "score": 50,
+      "all": [
+        {"metric": "communication_time_pct", "operator": "gte", "threshold": 25}
+      ]
+    },
+    {
+      "id": "io:wait-time",
+      "category": "io",
+      "score": 50,
+      "all": [
+        {"metric": "io_wait_pct", "operator": "gte", "threshold": 25}
+      ]
+    }
+  ],
+  "suggested_probes": ["timeline", "framework", "cpu_data", "environment"]
+}
