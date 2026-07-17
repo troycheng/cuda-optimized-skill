@@ -171,7 +171,7 @@ class ReadmeSyncTests(unittest.TestCase):
             "isolated environment",
             "reviewer",
         ):
-            self.assertIn(marker, self.english)
+            self.assertIn(marker, self.english.lower())
         for marker in (
             "修改后的代码",
             "瓶颈分析",
@@ -259,6 +259,51 @@ class ReadmeSyncTests(unittest.TestCase):
             for banned in ("可信边界", "终局状态", "旁路证据", "赋能", "无缝", "强大"):
                 self.assertNotIn(banned, text)
         self.assertNotRegex(self.chinese, r"通过[^。\n]{0,80}从而")
+
+    def test_readmes_link_to_each_other(self) -> None:
+        self.assertIn("[简体中文](README.zh-CN.md)", self.english)
+        self.assertIn("[English](README.md)", self.chinese)
+
+    def test_budget_tables_use_clear_wall_clock_units(self) -> None:
+        for marker in ("45 minutes", "3 hours", "10 hours"):
+            self.assertIn(marker, self.english)
+        for marker in ("45 分钟", "3 小时", "10 小时"):
+            self.assertIn(marker, self.chinese)
+
+    def test_real_workload_ownership_is_explicit(self) -> None:
+        self.assertIn("A real workload must be supplied by the user", self.english)
+        self.assertIn("真实 workload 必须由用户提供", self.chinese)
+        self.assertIn("does not download", self.english)
+        self.assertIn("不会自行下载", self.chinese)
+
+    def test_validation_results_are_not_presented_as_speedup_promises(self) -> None:
+        self.assertRegex(self.english, r"not\s+a promise")
+        self.assertIn("不代表任意项目都能获得相同提升", self.chinese)
+
+    def test_installation_is_assigned_to_codex(self) -> None:
+        self.assertIn("Installation is performed by Codex", self.english)
+        self.assertIn("安装由 Codex 完成", self.chinese)
+
+    def test_readmes_do_not_reintroduce_legacy_command_sections(self) -> None:
+        for text in (self.english, self.chinese):
+            for heading in (
+                "## Task commands",
+                "## Start your first run",
+                "## Artifacts and resume",
+                "## 任务命令",
+                "## 开始第一次运行",
+                "## 产物与恢复",
+            ):
+                self.assertNotIn(heading, text)
+
+    def test_local_readme_links_resolve(self) -> None:
+        link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+        for path, text in ((README_EN, self.english), (README_ZH, self.chinese)):
+            for target in link_pattern.findall(text):
+                if "://" in target or target.startswith("#"):
+                    continue
+                resolved = (path.parent / target.split("#", 1)[0]).resolve()
+                self.assertTrue(resolved.exists(), f"missing README link: {target}")
 
 
 if __name__ == "__main__":
