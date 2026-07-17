@@ -121,11 +121,11 @@ class ReadmeSyncTests(unittest.TestCase):
         for text in (self.english, self.chinese):
             for fact in (
                 "13/13",
-                "35.765",
-                "61.2694%",
-                "[60.7898%, 61.5326%]",
+                "34.302",
+                "60.4616%",
+                "[60.0894%, 61.4941%]",
                 "3 valid pairs",
-                "gpu_busy_pct=1.0",
+                "gpu_busy_pct=0.0",
                 "inconclusive",
                 "reviewer skipped",
                 "ERR_NVGPUCTRPERM",

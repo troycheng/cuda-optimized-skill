@@ -336,10 +336,10 @@ metrics 的成功 profile。测试没有增加特权、capability，也没有修
 V2.4 workload controller 已于同一台物理 RTX 5090 主机完成验证。当前 lane
 使用镜像
 `sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`，
-35.765 秒内通过 13/13 项检查。真实 probe 记录到 `gpu_busy_pct=1.0`；由于只有
+34.302 秒内通过 13/13 项检查。真实 probe 记录到 `gpu_busy_pct=0.0`；由于只有
 这一项指标，诊断按设计保持 `inconclusive`。受限 ChangeSet 删除了两次多余的
-Triton launch。workload 配对评估得到 **61.2694%** 延迟改善，95% 置信区间为
-**[60.7898%, 61.5326%]**，共 3 valid pairs；输出 checksum 约束通过。在
+Triton launch。workload 配对评估得到 **60.4616%** 延迟改善，95% 置信区间为
+**[60.0894%, 61.4941%]**，共 3 valid pairs；输出 checksum 约束通过。在
 reviewer skipped 的情况下，确定性决策完成 promotion，resume 返回 `done`。
 NCU 返回 `ERR_NVGPUCTRPERM`；测试没有修改宿主机权限或驱动设置。
 

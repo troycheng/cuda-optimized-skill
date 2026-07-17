@@ -361,12 +361,12 @@ compatibility containers each passed 11/11 checks. Their NCU versions were
 profile with real metrics. No privilege, capability, or driver policy changed.
 
 V2.4 workload controller was validated on the same physical RTX 5090 host. The
-current lane passed 13/13 checks in 35.765 seconds with image
+current lane passed 13/13 checks in 34.302 seconds with image
 `sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`.
-The real probe recorded `gpu_busy_pct=1.0`; with only that metric, diagnosis
+The real probe recorded `gpu_busy_pct=0.0`; with only that metric, diagnosis
 correctly remained `inconclusive`. A bounded ChangeSet removed two redundant
-Triton launches. Paired workload evaluation measured a **61.2694%** latency
-improvement, 95% CI **[60.7898%, 61.5326%]**, over 3 valid pairs; the output
+Triton launches. Paired workload evaluation measured a **60.4616%** latency
+improvement, 95% CI **[60.0894%, 61.4941%]**, over 3 valid pairs; the output
 checksum constraint passed. With reviewer skipped, the deterministic decision
 promoted the change and resume returned `done`. NCU returned
 `ERR_NVGPUCTRPERM`; no host permission or driver setting was changed.
