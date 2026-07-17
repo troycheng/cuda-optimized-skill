@@ -55,6 +55,8 @@ Three approaches were considered:
    runtime, and serving claims.
 6. Add systems, CUTLASS, and Triton IR coverage guidance through progressive
    disclosure instead of expanding the core `SKILL.md` substantially.
+7. Make the fork easy to understand and use through task-first English and
+   Chinese READMEs plus an accurate bilingual GitHub About description.
 
 ## Non-goals
 
@@ -68,6 +70,8 @@ Three approaches were considered:
   store, or checkpoint lifecycle.
 - Adding new GPU-selection, tolerance, compiler, or profiler flags to the
   orchestrator in this change.
+- Adding marketing claims, decorative diagrams, a documentation site, or a
+  homepage URL without a real maintained destination.
 
 ## Component 1: evidence references
 
@@ -262,9 +266,98 @@ Keep `SKILL.md` under its current progressive-disclosure structure:
   `decision.json`.
 
 Update `agents/openai.yaml` only if its description/default prompt no longer
-mentions the expanded `.ncu-rep` and serving triggers. Update both READMEs with
-short executable examples and links; detailed rules remain in references and
-`--help` output.
+mentions the expanded `.ncu-rep` and serving triggers. Detailed operational
+rules remain in references and `--help` output.
+
+## Repository documentation and GitHub About
+
+Rewrite `README.md` and `README.zh-CN.md` after the implementation and its
+5090 validation are complete, so the documents describe verified behavior
+rather than planned behavior.
+
+### Information architecture
+
+Both READMEs use the same task-first information architecture:
+
+1. project identity and language switch;
+2. choose a task: optimize a kernel, analyze an existing NCU report, validate
+   a real workload, or reuse verified prior evidence;
+3. installation and a five-minute first run;
+4. the trusted promotion path;
+5. exact commands for each task;
+6. standalone-tool boundaries;
+7. inputs, budgets, and terminal statuses;
+8. artifacts, recovery, and failure handling;
+9. compatibility and a concise RTX 5090 validation summary; and
+10. references, attribution, and license notes.
+
+Remove repeated release narration and long validation prose from the main
+reading path. Preserve exact verified versions, measurements, verdicts, and
+permission behavior in a compact table or collapsed evidence section with
+links to the GPU test documentation. Do not hide a limitation merely to make
+the README shorter.
+
+### Visual design
+
+Use exactly two focused GitHub-native Mermaid diagrams in each README. The
+English and Chinese diagrams have the same topology with localized labels:
+
+1. the authoritative path from candidate correctness through paired kernel
+   evidence, sanitizer/SASS evidence, the optional workload loop,
+   `decision.json`, and promotion; and
+2. the independent-tool boundary: an existing `.ncu-rep` can produce a
+   standalone analysis bundle, while a completed v2.2 run can feed advisory
+   strategy memory, but neither tool owns promotion.
+
+Use solid edges only for authoritative data flow. Use dashed edges for
+advisory hints, and do not draw an edge from strategy memory to
+`decision.json`. Keep the artifact tree as text and stable mappings as tables;
+do not turn linear commands into diagrams.
+
+### Writing standard
+
+The English and Chinese documents must contain the same facts, commands,
+defaults, status semantics, evidence limits, and links, but they are written
+independently rather than translated sentence by sentence.
+
+- Use short, active sentences. Put an executable command before its detailed
+  explanation when that improves task flow.
+- Prefer concrete nouns, exact status names, and measured results over
+  adjectives.
+- Remove filler and marketing language. In Chinese, avoid formulaic phrases
+  such as “旨在”, “赋能”, “无缝”, “强大”, “全面”, and mechanical “通过……从而……”
+  constructions. In English, avoid equivalent claims such as “powerful”,
+  “seamless”, “revolutionary”, and “comprehensive” unless they are literal,
+  bounded technical terms.
+- Preserve industry terms such as CUDA, CUTLASS, Triton, kernel, workload,
+  paired A/B, NCU, SASS, manifest, checkpoint, and decision. Do not force
+  unnatural translations.
+- Keep paragraphs focused on one idea. Delete duplicated explanations rather
+  than paraphrasing them.
+- Perform a final line-by-line editorial pass for natural rhythm, terminology,
+  link accuracy, and English/Chinese factual parity.
+
+### GitHub About
+
+After the verified branch is merged and pushed to the user's fork, update only
+`troycheng/cuda-optimized-skill`. Leave the upstream repository unchanged.
+
+Use this bilingual description, subject only to correction if the final
+implemented capability is narrower:
+
+```text
+Evidence-driven CUDA, CUTLASS and Triton kernel optimization with paired benchmarks, real-workload validation and NCU analysis. / 用成对基准、真实负载验证与 NCU 分析优化 CUDA、CUTLASS 和 Triton kernel。
+```
+
+Use these topics:
+
+```text
+cuda, triton, cutlass, gpu, kernel-optimization, nsight-compute, performance, codex-skills
+```
+
+Do not set a homepage URL. Read back the repository description, topics,
+homepage, fork identity, and parent after the update. A mismatch or an
+upstream target is a hard failure.
 
 ## Error handling
 
@@ -311,6 +404,12 @@ Use strict red-green-refactor cycles.
 
 - future agents can find both new commands and references from `SKILL.md`;
 - README examples match the CLI help;
+- both READMEs follow the same heading-level information architecture and
+  contain exactly two Mermaid diagrams with identical edge topology;
+- task names, CLI options, budgets, terminal statuses, evidence limits,
+  validation facts, and links remain synchronized across languages;
+- the editorial review finds no filler, release-plan language, mechanical
+  translation, or unsupported capability claim;
 - old pending/V2.1 claims do not return;
 - the full existing CPU suite remains green;
 - `quick_validate.py`, all script `--help` commands, `py_compile`, and
@@ -329,3 +428,7 @@ the user's source trees.
 - Do not merge the legacy branch and do not push to the upstream repository.
 - Keep changes local until the user explicitly approves fork integration and
   push for this follow-up.
+- Rewrite and commit both READMEs only after implementation and validation
+  evidence are final.
+- Update GitHub About only after the approved fork `main` push, then read it
+  back and verify it still identifies the expected fork and upstream parent.
