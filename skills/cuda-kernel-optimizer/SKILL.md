@@ -105,13 +105,13 @@ Resume never replays a completed stage. Follow the reported `next_stage` and
 Analyze an existing `.ncu-rep` without launching its target:
 
 ```bash
-python3 scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT
+python3 <skill>/scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT
 ```
 
 The standalone bundle records `counter_access: not_probed`; it does not prove
 current counter permissions, source execution, or an end-to-end result. Source
 binding and other parameters are optional. Run
-`python3 scripts/analyze_ncu_rep.py --help` for details.
+`python3 <skill>/scripts/analyze_ncu_rep.py --help` for details.
 
 ## Dual-loop workflow
 
@@ -163,14 +163,14 @@ Strategy memory is opt-in. Record a completed v2.2 run, then request hints for
 an exact manifest scope:
 
 ```bash
-python3 scripts/strategy_memory.py record --memory MEMORY --run-dir RUN_DIR --out OUT
-python3 scripts/strategy_memory.py suggest --memory MEMORY --manifest MANIFEST --out OUT
+python3 <skill>/scripts/strategy_memory.py record --memory MEMORY --run-dir RUN_DIR --out OUT
+python3 <skill>/scripts/strategy_memory.py suggest --memory MEMORY --manifest MANIFEST --out OUT
 ```
 
 Always provide an explicit `--memory`; there is no default memory, and the
 orchestrator does not call this tool. Suggestions are advisory search hints.
 They never alter run state: `decision.json` owns promotion. Run
-`python3 scripts/strategy_memory.py --help` for command details.
+`python3 <skill>/scripts/strategy_memory.py --help` for command details.
 
 ## Paired verdict and promotion rules
 

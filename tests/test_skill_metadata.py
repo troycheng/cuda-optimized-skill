@@ -90,22 +90,22 @@ class SkillMetadataTests(unittest.TestCase):
     def test_skill_exposes_standalone_report_analysis_next_to_profiling(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         command = (
-            "python3 scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT"
+            "python3 <skill>/scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT"
         )
         self.assertIn(command, text)
         self.assertIn("existing `.ncu-rep`", text)
         self.assertIn("counter_access: not_probed", text)
         self.assertLess(text.index(command), text.index("## Dual-loop workflow"))
-        self.assertIn("analyze_ncu_rep.py --help", text)
+        self.assertIn("python3 <skill>/scripts/analyze_ncu_rep.py --help", text)
 
     def test_skill_exposes_explicit_advisory_memory_after_finalize(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         record = (
-            "python3 scripts/strategy_memory.py record --memory MEMORY "
+            "python3 <skill>/scripts/strategy_memory.py record --memory MEMORY "
             "--run-dir RUN_DIR --out OUT"
         )
         suggest = (
-            "python3 scripts/strategy_memory.py suggest --memory MEMORY "
+            "python3 <skill>/scripts/strategy_memory.py suggest --memory MEMORY "
             "--manifest MANIFEST --out OUT"
         )
         finalize = "python3 <skill>/scripts/orchestrate.py finalize"
@@ -117,7 +117,16 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("explicit `--memory`", text)
         self.assertIn("no default memory", text.lower())
         self.assertIn("`decision.json` owns promotion", text)
-        self.assertIn("strategy_memory.py --help", text)
+        self.assertIn("python3 <skill>/scripts/strategy_memory.py --help", text)
+
+    def test_skill_has_no_location_dependent_new_cli_commands(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIsNone(
+            re.search(
+                r"(?m)^python3 scripts/(?:analyze_ncu_rep|strategy_memory)\.py",
+                text,
+            )
+        )
 
     def test_skill_routes_specialized_evidence_to_on_demand_references(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
