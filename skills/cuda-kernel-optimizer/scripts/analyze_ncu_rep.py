@@ -249,6 +249,7 @@ def _command_result(result: dict[str, Any], *, available: bool) -> dict[str, Any
         "returncode": result["returncode"],
         "timed_out": result["timed_out"],
         "truncated": result["truncated"],
+        "stderr": result["stderr"],
         "available": available,
     }
 
@@ -398,7 +399,6 @@ def _run_analysis(args: argparse.Namespace) -> int:
     available["raw"] = available["raw"] and csv_analysis["metric_count"] > 0
     for name, result in results.items():
         commands[name] = _command_result(result, available=available[name])
-    commands["raw"]["stderr"] = results["raw"]["stderr"]
 
     interpretable = available["summary"] or available["details"] or available["raw"]
     if not interpretable:
@@ -407,6 +407,8 @@ def _run_analysis(args: argparse.Namespace) -> int:
         version_available
         and all(results[name]["returncode"] == 0 for name in results)
         and all(available.values())
+        and not version_result["truncated"]
+        and not any(result["truncated"] for result in results.values())
     )
     status = "success" if complete else "partial"
 

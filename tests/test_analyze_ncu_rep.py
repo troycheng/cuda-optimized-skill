@@ -516,6 +516,73 @@ class AnalyzeNcuRepImportTests(unittest.TestCase):
                     self.assertFalse(analysis["artifacts"]["details.txt"]["available"])
                     self.assertFalse(analysis["artifacts"]["raw.csv"]["available"])
 
+    def test_any_truncated_command_makes_interpretable_analysis_partial(self) -> None:
+        module = _load()
+        raw = (
+            '"Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+            '"kernel","dram__bytes.sum","byte","10"\n'
+        )
+        outputs = ("NCU 1", "summary", "details", raw)
+        names = ("version", "summary", "details", "raw")
+        for truncated_index, command_name in enumerate(names):
+            with self.subTest(command=command_name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                report = root / "input.ncu-rep"
+                report.write_bytes(b"report")
+                output = root / "analysis"
+                ncu = _fake_ncu(root)
+                responses = [
+                    {
+                        "timed_out": False,
+                        "truncated": index == truncated_index,
+                        "returncode": 0,
+                        "stdout": stdout,
+                        "stderr": "",
+                    }
+                    for index, stdout in enumerate(outputs)
+                ]
+                with mock.patch.object(module, "_run_bounded", side_effect=responses):
+                    returncode = module.main(
+                        [str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)]
+                    )
+                payload = json.loads((output / "analysis.json").read_text(encoding="utf-8"))
+                self.assertEqual(returncode, 2)
+                self.assertEqual(payload["status"], "partial")
+                self.assertTrue(payload["commands"][command_name]["truncated"])
+
+    def test_every_command_record_contains_its_bounded_stderr(self) -> None:
+        module = _load()
+        raw = (
+            '"Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+            '"kernel","dram__bytes.sum","byte","10"\n'
+        )
+        outputs = ("NCU 1", "summary", "details", raw)
+        names = ("version", "summary", "details", "raw")
+        responses = [
+            {
+                "timed_out": False,
+                "truncated": False,
+                "returncode": 0,
+                "stdout": stdout,
+                "stderr": f"{name} bounded stderr",
+            }
+            for name, stdout in zip(names, outputs)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "input.ncu-rep"
+            report.write_bytes(b"report")
+            output = root / "analysis"
+            ncu = _fake_ncu(root)
+            with mock.patch.object(module, "_run_bounded", side_effect=responses):
+                returncode = module.main(
+                    [str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)]
+                )
+            payload = json.loads((output / "analysis.json").read_text(encoding="utf-8"))
+        self.assertEqual(returncode, 0)
+        for name in names:
+            self.assertEqual(payload["commands"][name]["stderr"], f"{name} bounded stderr")
+
     def test_report_and_source_same_metadata_drift_are_hard_failures(self) -> None:
         module = _load()
         for drift_target in ("report", "source"):
@@ -626,7 +693,7 @@ class AnalyzeNcuRepImportTests(unittest.TestCase):
                 self.assertEqual(info["sha256"], hashlib.sha256(content).hexdigest())
                 self.assertEqual(info["size"], len(content))
 
-    def test_supporting_publish_failure_leaves_no_completion_marker(self) -> None:
+    def test_supporting_publish_failure_after_one_write_leaves_no_completion_marker(self) -> None:
         module = _load()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -636,13 +703,29 @@ class AnalyzeNcuRepImportTests(unittest.TestCase):
             output.mkdir()
             marker = output / "analysis.json"
             marker.write_text('{"old": true}', encoding="utf-8")
+            summary = output / "summary.txt"
+            summary.write_text("old summary", encoding="utf-8")
             ncu = _fake_ncu(root)
             result = {"timed_out": False, "truncated": False, "returncode": 0, "stdout": "ok", "stderr": ""}
-            with mock.patch.object(module, "_run_bounded", side_effect=[result, result, result, result]), mock.patch.object(
-                module.artifact_store, "publish_regular_bundle", side_effect=OSError("disk full")
+            real_write = module.artifact_store._atomic_write_leaf
+            writes = 0
+
+            def fail_on_second_write(*args, **kwargs):
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("disk full")
+                return real_write(*args, **kwargs)
+
+            with mock.patch.object(
+                module, "_run_bounded", side_effect=[result, result, result, result]
+            ), mock.patch.object(
+                module.artifact_store, "_atomic_write_leaf", side_effect=fail_on_second_write
             ):
                 returncode = module.main([str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)])
             self.assertEqual(returncode, 1)
+            self.assertEqual(writes, 2)
+            self.assertEqual(summary.read_text(encoding="utf-8"), "ok")
             self.assertFalse(marker.exists())
 
 
