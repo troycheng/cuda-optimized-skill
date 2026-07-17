@@ -6,7 +6,9 @@ import json
 import multiprocessing
 import os
 import stat
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -19,6 +21,7 @@ MODULE_PATH = (
     / "scripts"
     / "strategy_memory.py"
 )
+WORKLOAD_ADAPTER_PATH = MODULE_PATH.with_name("workload_adapter.py")
 
 
 def _load_strategy_memory():
@@ -31,6 +34,21 @@ def _load_strategy_memory():
     return module
 
 
+def _load_workload_adapter():
+    module_name = "cuda_optimizer_strategy_memory_workload_adapter_test"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, WORKLOAD_ADAPTER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 def _worker_append(memory: str, scope: dict, record: dict, start) -> None:
     module = _load_strategy_memory()
     start.wait()
@@ -40,6 +58,54 @@ def _worker_append(memory: str, scope: dict, record: dict, start) -> None:
 class StrategyMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.memory = _load_strategy_memory()
+        self.workloads = _load_workload_adapter()
+
+    @staticmethod
+    def _objective() -> dict:
+        return {
+            "primary_metric": {"name": "latency_ms", "direction": "lower"},
+            "min_effect_pct": 1.0,
+            "constraints": [],
+        }
+
+    def _python_workload(self, root: Path, suffix: str) -> dict:
+        helper = root / f"helper{suffix}.py"
+        helper.write_text("VALUE = 1\n", encoding="utf-8")
+        source = root / f"workload{suffix}.py"
+        source.write_text(
+            textwrap.dedent(
+                f"""
+                WORKLOAD_DEPENDENCIES = ["{helper.name}"]
+                def prepare(candidate): return None
+                def validate(candidate): return True
+                def benchmark(candidate): return {{"latency_ms": 1.0}}
+                def metrics(): return {self._objective()!r}
+                def cleanup(): return None
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        contract = root / f"workload-contract{suffix}.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "kind": "python",
+                    "source": source.name,
+                    "objective": self._objective(),
+                    "cases": [{"M": 128}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        spec = self.workloads.normalize_workload(workload_manifest=contract)
+        return {
+            "kind": spec.kind,
+            "source": spec.source,
+            "objective": spec.objective,
+            "cases": list(spec.cases),
+            "source_hash": spec.source_hash,
+        }
 
     def _manifest(
         self,
@@ -68,12 +134,7 @@ class StrategyMemoryTests(unittest.TestCase):
         }
         workload = None
         if mode == "full":
-            workload = {
-                "source_hash": "c" * 64,
-                "objective": {"metric": "latency_ms", "direction": "lower"},
-                "cases": [{"M": 128, "N": 256}],
-                "kind": "python-callable",
-            }
+            workload = self._python_workload(root, suffix)
         manifest = {
             "schema_version": 2,
             "input_hash": ("a" if not suffix else "b") * 64,
@@ -157,8 +218,88 @@ class StrategyMemoryTests(unittest.TestCase):
             workload = self.memory.scope_document(manifest)["workload"]
             self.assertEqual(workload["mode"], "full")
             self.assertEqual(
-                set(workload), {"mode", "source_hash", "objective", "cases", "kind"}
+                set(workload),
+                {"mode", "source", "source_hash", "objective", "cases", "kind"},
             )
+            self.assertTrue(Path(workload["source"]).is_absolute())
+
+    def test_full_scope_rejects_source_and_dependency_byte_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for field in ("source", "dependency"):
+                case_root = root / field
+                case_root.mkdir()
+                manifest = self._manifest(case_root, mode="full")
+                payload = json.loads(manifest.read_text("utf-8"))
+                source = Path(payload["workload"]["source"])
+                target = source if field == "source" else case_root / "helper.py"
+                before = target.stat()
+                original = target.read_text("utf-8")
+                changed = original.replace("1.0", "2.0") if field == "source" else original.replace("1", "2")
+                self.assertEqual(len(original), len(changed))
+                target.write_text(changed, encoding="utf-8")
+                os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, "source_hash"
+                ):
+                    self.memory.scope_key(manifest)
+
+    def test_full_scope_rejects_source_leaf_and_parent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            leaf_root = root / "leaf"
+            leaf_root.mkdir()
+            leaf_manifest = self._manifest(leaf_root, mode="full")
+            leaf_payload = json.loads(leaf_manifest.read_text("utf-8"))
+            source = Path(leaf_payload["workload"]["source"])
+            real_source = source.with_name("real-workload.py")
+            source.rename(real_source)
+            source.symlink_to(real_source)
+            with self.assertRaisesRegex(ValueError, "symlink|unsafe"):
+                self.memory.scope_key(leaf_manifest)
+
+            parent_root = root / "parent"
+            parent_root.mkdir()
+            parent_manifest = self._manifest(parent_root, mode="full")
+            parent_payload = json.loads(parent_manifest.read_text("utf-8"))
+            real_dir = root / "real-parent"
+            parent_root.rename(real_dir)
+            parent_root.symlink_to(real_dir, target_is_directory=True)
+            parent_payload["workload"]["source"] = str(
+                parent_root / Path(parent_payload["workload"]["source"]).name
+            )
+            for input_record in parent_payload["inputs"].values():
+                input_record["path"] = str(real_dir / Path(input_record["path"]).name)
+            linked_manifest = root / "parent-source-manifest.json"
+            linked_manifest.write_text(json.dumps(parent_payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self.memory.scope_key(linked_manifest)
+
+    def test_command_workload_source_list_is_preserved_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runner = root / "runner.sh"
+            runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runner.chmod(0o755)
+            objective = root / "objective.json"
+            objective.write_text(json.dumps(self._objective()), encoding="utf-8")
+            spec = self.workloads.normalize_workload(
+                workload_cmd=[str(runner), "--label", "two words"],
+                objective=objective,
+            )
+            manifest = self._manifest(root)
+            payload = json.loads(manifest.read_text("utf-8"))
+            payload["mode"] = "full"
+            payload["workload"] = {
+                "kind": spec.kind,
+                "source": list(spec.source),
+                "objective": spec.objective,
+                "cases": list(spec.cases),
+                "source_hash": spec.source_hash,
+            }
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            workload = self.memory.scope_document(manifest)["workload"]
+            self.assertEqual(workload["source"], list(spec.source))
 
     def test_each_relevant_identity_change_changes_scope_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,7 +313,6 @@ class StrategyMemoryTests(unittest.TestCase):
                 "arch": lambda value: value["environment"].update(primary_sm_arch="sm_100"),
                 "dims": lambda value: value.update(dims={"M": 64, "N": 256}),
                 "ptr_size": lambda value: value.update(ptr_size=4),
-                "workload": lambda value: value["workload"].update(source_hash="9" * 64),
             }
             for name, mutate in changes.items():
                 changed = copy.deepcopy(original)
@@ -181,6 +321,12 @@ class StrategyMemoryTests(unittest.TestCase):
                 candidate.write_text(json.dumps(changed), encoding="utf-8")
                 with self.subTest(name=name):
                     self.assertNotEqual(base_key, self.memory.scope_key(candidate))
+
+            changed = copy.deepcopy(original)
+            changed["workload"] = self._python_workload(root, "-changed")
+            candidate = root / "changed-workload.json"
+            candidate.write_text(json.dumps(changed), encoding="utf-8")
+            self.assertNotEqual(base_key, self.memory.scope_key(candidate))
 
     def test_same_filename_with_changed_bytes_never_shares_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,6 +23,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import artifact_store  # noqa: E402
+import workload_adapter  # noqa: E402
 
 
 MEMORY_SCHEMA = "cuda-kernel-optimizer/strategy-memory-v1"
@@ -136,14 +137,36 @@ def _validate_scope_document(value: Any) -> dict:
     elif mode == "full":
         _exact_fields(
             workload,
-            {"mode", "source_hash", "objective", "cases", "kind"},
+            {"mode", "source", "source_hash", "objective", "cases", "kind"},
             "scope.workload",
         )
         _sha(workload["source_hash"], "scope.workload.source_hash")
+        if workload["kind"] == "python":
+            if not isinstance(workload["source"], str) or not os.path.isabs(
+                workload["source"]
+            ):
+                raise ValueError("scope.workload.source must be an absolute path")
+        elif workload["kind"] == "command":
+            source = workload["source"]
+            if (
+                not isinstance(source, list)
+                or not source
+                or any(not isinstance(item, str) or not item for item in source)
+            ):
+                raise ValueError("scope command workload.source must be an argv list")
+        else:
+            raise ValueError("scope.workload.kind must be python or command")
         if not isinstance(workload["objective"], Mapping):
             raise ValueError("scope.workload.objective must be a JSON object")
-        if not isinstance(workload["cases"], list):
-            raise ValueError("scope.workload.cases must be a JSON array")
+        normalized_objective = workload_adapter.validate_objective(
+            workload["objective"]
+        )
+        if normalized_objective != workload["objective"]:
+            raise ValueError("scope.workload.objective is not normalized")
+        if not isinstance(workload["cases"], list) or any(
+            not isinstance(case, dict) for case in workload["cases"]
+        ):
+            raise ValueError("scope.workload.cases must be an array of objects")
         if not isinstance(workload["kind"], str) or not workload["kind"].strip():
             raise ValueError("scope.workload.kind must be a non-empty string")
     else:
@@ -223,8 +246,32 @@ def scope_document(manifest_path: str | os.PathLike) -> dict:
             raise ValueError("kernel-only manifest.workload must be null")
         workload = {"mode": "kernel-only"}
     elif mode == "full":
-        workload_fields = {"source_hash", "objective", "cases", "kind"}
+        workload_fields = {"source", "source_hash", "objective", "cases", "kind"}
         raw_workload = _exact_fields(raw_workload, workload_fields, "manifest.workload")
+        source_hash = _sha(
+            raw_workload["source_hash"], "manifest.workload.source_hash"
+        )
+        objective = workload_adapter.validate_objective(raw_workload["objective"])
+        if objective != raw_workload["objective"]:
+            raise ValueError("manifest.workload.objective is not normalized")
+        cases = raw_workload["cases"]
+        if not isinstance(cases, list) or any(
+            not isinstance(case, dict) for case in cases
+        ):
+            raise ValueError("manifest.workload.cases must be an array of objects")
+        source = _strict_copy(raw_workload["source"], "manifest.workload.source")
+        spec = workload_adapter.WorkloadSpec(
+            kind=raw_workload["kind"],
+            source=source,
+            objective=objective,
+            cases=tuple(_strict_copy(cases, "manifest.workload.cases")),
+            source_hash=source_hash,
+        )
+        if spec.kind == "python" and isinstance(spec.source, str):
+            artifact_store.read_regular_bytes(spec.source)
+        elif spec.kind == "command" and isinstance(spec.source, list) and spec.source:
+            artifact_store.read_regular_bytes(spec.source[0])
+        workload_adapter.verify_frozen_spec(spec)
         workload = {"mode": "full", **dict(raw_workload)}
     else:
         raise ValueError("manifest.mode must be full or kernel-only")
