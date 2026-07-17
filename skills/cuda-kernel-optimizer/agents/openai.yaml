@@ -1,4 +1,4 @@
 interface:
   display_name: "CUDA Kernel Optimizer"
   short_description: "Trustworthy CUDA kernel and workload optimization"
-  default_prompt: "Use $cuda-kernel-optimizer to optimize this CUDA, CUTLASS, or Triton kernel against its reference implementation and optional user-provided workload."
+  default_prompt: "Use $cuda-kernel-optimizer to optimize this CUDA, CUTLASS, or Triton kernel against its reference implementation and optional user-provided workload, analyze an existing NCU report, or assess runtime or serving evidence; require a user-provided workload for any end-to-end claim."

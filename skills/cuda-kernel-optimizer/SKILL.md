@@ -1,6 +1,6 @@
 ---
 name: cuda-kernel-optimizer
-description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, or Triton kernel against a reference implementation, especially for kernel benchmarking, real-workload validation, Nsight Compute, branch exploration, or SASS verification."
+description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, or Triton kernel against a reference implementation, especially for kernel benchmarking, real-workload validation, Nsight Compute, existing NCU report analysis, branch exploration, SASS verification, or runtime and serving evidence."
 ---
 
 # CUDA Kernel and Workload Optimizer (V2.2)
@@ -100,6 +100,19 @@ python3 <skill>/scripts/orchestrate.py resume --run-dir ./run_YYYYMMDD_HHMMSS
 Resume never replays a completed stage. Follow the reported `next_stage` and
 `next_iteration`.
 
+### Analyze an existing report
+
+Analyze an existing `.ncu-rep` without launching its target:
+
+```bash
+python3 scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT
+```
+
+The standalone bundle records `counter_access: not_probed`; it does not prove
+current counter permissions, source execution, or an end-to-end result. Source
+binding and other parameters are optional. Run
+`python3 scripts/analyze_ncu_rep.py --help` for details.
+
 ## Dual-loop workflow
 
 For each admitted round:
@@ -143,6 +156,21 @@ Finalize only after the decision stage is complete:
 python3 <skill>/scripts/orchestrate.py finalize \
   --run-dir ./run_YYYYMMDD_HHMMSS
 ```
+
+### Reuse completed-run strategy evidence
+
+Strategy memory is opt-in. Record a completed v2.2 run, then request hints for
+an exact manifest scope:
+
+```bash
+python3 scripts/strategy_memory.py record --memory MEMORY --run-dir RUN_DIR --out OUT
+python3 scripts/strategy_memory.py suggest --memory MEMORY --manifest MANIFEST --out OUT
+```
+
+Always provide an explicit `--memory`; there is no default memory, and the
+orchestrator does not call this tool. Suggestions are advisory search hints.
+They never alter run state: `decision.json` owns promotion. Run
+`python3 scripts/strategy_memory.py --help` for command details.
 
 ## Paired verdict and promotion rules
 
@@ -239,6 +267,10 @@ status.
 - `references/optimization_catalog.md`: method triggers, skip rules, and
   combination constraints.
 - `references/ncu_metrics_guide.md`: profiler metric interpretation.
+- `references/systems_and_ir_coverage.md`: read only for systems-path,
+  CUTLASS/CuTe, or Triton IR evidence tasks.
+- `references/serving_evidence_protocol.md`: read only for runtime or serving
+  evidence and claims.
 - `references/sanitizer_policy.json`: targeted/full sanitizer routing.
 - `references/sass_signatures.json`: instruction signatures.
 - `templates/objective.schema.json`: strict workload objective schema.

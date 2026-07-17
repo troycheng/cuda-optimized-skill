@@ -87,6 +87,56 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("references/sanitizer_policy.json", text)
         self.assertIn("templates/objective.schema.json", text)
 
+    def test_skill_exposes_standalone_report_analysis_next_to_profiling(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        command = (
+            "python3 scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT"
+        )
+        self.assertIn(command, text)
+        self.assertIn("existing `.ncu-rep`", text)
+        self.assertIn("counter_access: not_probed", text)
+        self.assertLess(text.index(command), text.index("## Dual-loop workflow"))
+        self.assertIn("analyze_ncu_rep.py --help", text)
+
+    def test_skill_exposes_explicit_advisory_memory_after_finalize(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        record = (
+            "python3 scripts/strategy_memory.py record --memory MEMORY "
+            "--run-dir RUN_DIR --out OUT"
+        )
+        suggest = (
+            "python3 scripts/strategy_memory.py suggest --memory MEMORY "
+            "--manifest MANIFEST --out OUT"
+        )
+        finalize = "python3 <skill>/scripts/orchestrate.py finalize"
+        self.assertIn(record, text)
+        self.assertIn(suggest, text)
+        self.assertLess(text.index(finalize), text.index(record))
+        self.assertLess(text.index(record), text.index(suggest))
+        self.assertIn("advisory", text.lower())
+        self.assertIn("explicit `--memory`", text)
+        self.assertIn("no default memory", text.lower())
+        self.assertIn("`decision.json` owns promotion", text)
+        self.assertIn("strategy_memory.py --help", text)
+
+    def test_skill_routes_specialized_evidence_to_on_demand_references(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        prose = " ".join(text.split())
+        self.assertIn("systems-path, CUTLASS/CuTe, or Triton IR", prose)
+        self.assertIn("runtime or serving", prose)
+        self.assertIn("references/systems_and_ir_coverage.md", prose)
+        self.assertIn("references/serving_evidence_protocol.md", prose)
+
+    def test_agent_prompt_discovers_report_and_runtime_evidence_tasks(self) -> None:
+        text = OPENAI_YAML.read_text(encoding="utf-8")
+        prompt = next(
+            line for line in text.splitlines() if line.strip().startswith("default_prompt:")
+        ).lower()
+        self.assertIn("existing ncu report", prompt)
+        self.assertIn("runtime or serving evidence", prompt)
+        self.assertIn("user-provided workload", prompt)
+        self.assertIn("end-to-end", prompt)
+
     def test_skill_output_contract_contains_durable_evidence(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         for artifact in (
