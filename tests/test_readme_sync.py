@@ -115,6 +115,24 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("2,232.43", text)
             self.assertIn("140", text)
 
+    def test_readmes_record_completed_v2_4_workload_controller_acceptance(self) -> None:
+        self.assertIn("V2.4 workload controller was validated", self.english)
+        self.assertIn("V2.4 workload controller 已于", self.chinese)
+        for text in (self.english, self.chinese):
+            for fact in (
+                "13/13",
+                "35.765",
+                "61.2694%",
+                "[60.7898%, 61.5326%]",
+                "3 valid pairs",
+                "gpu_busy_pct=1.0",
+                "inconclusive",
+                "reviewer skipped",
+                "ERR_NVGPUCTRPERM",
+                "sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5",
+            ):
+                self.assertIn(fact, text)
+
     def test_readmes_include_reproducible_fork_installation(self) -> None:
         for text in (self.english, self.chinese):
             self.assertIn("troycheng/cuda-optimized-skill", text)

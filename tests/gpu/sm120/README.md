@@ -127,3 +127,16 @@ artifacts/<lane>/
 
 Large profiler reports remain in the isolated artifact tree. `ncu
 --query-metrics` is not treated as proof that hardware counters are readable.
+
+## V2.4 validation result
+
+The V2.4 controller lane ran on a physical RTX 5090 on 2026-07-17. The current
+container passed 13/13 checks in 35.765 seconds using immutable image
+`sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`.
+Its normalized probe recorded `gpu_busy_pct=1.0`; one metric was not enough to
+assign a bottleneck, so diagnosis remained `inconclusive`. A fixture ChangeSet
+removed two redundant Triton launches. Three paired A/B runs all passed the
+checksum constraint and measured a 61.2694% latency improvement with a 95% CI
+of [60.7898%, 61.5326%]. The optional reviewer was not configured, and the
+deterministic controller promoted the change. NCU returned
+`ERR_NVGPUCTRPERM`; the test did not change host permissions or driver policy.
