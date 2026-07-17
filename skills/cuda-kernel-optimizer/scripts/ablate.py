@@ -17,11 +17,19 @@ Writes iterv{i}/attribution.json.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from artifact_store import read_regular_bytes  # noqa: E402
 
 
 _BUNDLED_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py")
@@ -30,6 +38,12 @@ _BUNDLED_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b
 def _load_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _regular_identity(path: str | os.PathLike) -> tuple[str, str, bytes]:
+    absolute = Path(path).expanduser().absolute()
+    payload = read_regular_bytes(absolute)
+    return str(absolute), hashlib.sha256(payload).hexdigest(), payload
 
 
 def _dims_argv(dims: dict) -> list[str]:
@@ -85,7 +99,11 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
     champion_bench = os.path.join(iter_dir, "bench.json")
     if not os.path.isfile(champion_bench):
         sys.exit(f"Champion bench.json not found at {champion_bench}")
-    champion_data = _load_json(champion_bench)
+    try:
+        champion_bench, champion_bench_sha, champion_bytes = _regular_identity(champion_bench)
+        champion_data = json.loads(champion_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        sys.exit(f"Champion bench.json is unsafe or malformed: {error}")
     champion_ms = (champion_data.get("kernel") or {}).get("average_ms")
     if champion_ms is None:
         sys.exit("Champion has no timing data")
@@ -113,9 +131,12 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
         ablated_kernel = None
         for ext in (".cu", ".py"):
             candidate = os.path.join(method_dir, f"kernel{ext}")
-            if os.path.isfile(candidate):
-                ablated_kernel = candidate
-                break
+            try:
+                _regular_identity(candidate)
+            except (OSError, ValueError):
+                continue
+            ablated_kernel = str(Path(candidate).absolute())
+            break
 
         if ablated_kernel is None:
             # No ablated kernel provided — skip, assume neutral
@@ -165,6 +186,25 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
             })
             continue
 
+        try:
+            stable_champion, stable_champion_sha, stable_champion_bytes = _regular_identity(champion_bench)
+            kernel_path, kernel_sha, _ = _regular_identity(ablated_kernel)
+            bench_path, bench_sha, bench_bytes = _regular_identity(ablated_json_out)
+            if (
+                stable_champion != champion_bench
+                or stable_champion_sha != champion_bench_sha
+                or stable_champion_bytes != champion_bytes
+                or json.loads(bench_bytes.decode("utf-8")) != result
+            ):
+                raise ValueError("ablation evidence changed during collection")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            attributions.append({
+                "method_id": mid,
+                "contributed": False,
+                "note": f"unsafe_or_drifted_ablation_evidence: {error}",
+            })
+            continue
+
         # Compute attribution
         attr_ms = ablated_ms - champion_ms
         attr_pct = (attr_ms / champion_ms * 100) if champion_ms > 0 else 0.0
@@ -172,7 +212,12 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
 
         attributions.append({
             "method_id": mid,
-            "ablated_kernel": ablated_kernel,
+            "champion_bench": champion_bench,
+            "champion_bench_sha256": champion_bench_sha,
+            "ablated_kernel": kernel_path,
+            "ablated_kernel_sha256": kernel_sha,
+            "ablated_bench": bench_path,
+            "ablated_bench_sha256": bench_sha,
             "ablated_ms": round(ablated_ms, 4),
             "champion_ms": round(champion_ms, 4),
             "attribution_ms": round(attr_ms, 4),

@@ -326,11 +326,6 @@ def scope_key(manifest_or_scope: str | os.PathLike | Mapping) -> str:
 
 def _validate_record(value: Any) -> dict:
     record = _strict_copy(value, "strategy run")
-    fields = set(record) if isinstance(record, Mapping) else set()
-    if fields == _RECORD_FIELDS:
-        for field in sorted(_RECORD_FIELDS):
-            _sha(record[field], f"strategy run.{field}")
-        return record
     _exact_fields(record, _VERIFIED_RECORD_FIELDS, "strategy run")
     if record["schema_version"] != RECORD_SCHEMA:
         raise ValueError(f"strategy run.schema_version must be {RECORD_SCHEMA}")
@@ -569,8 +564,6 @@ def _derived_indices(records: list[dict]) -> tuple[dict, dict]:
     methods: dict[str, dict] = {}
     bundles: dict[str, dict] = {}
     for record in records:
-        if record.get("schema_version") != RECORD_SCHEMA:
-            continue
         identity = _record_key(record)
         method_ids = record["bundle"]["method_ids"]
         for method_id in method_ids:
@@ -1094,18 +1087,23 @@ def _method_evidence(
     iteration: int,
     method_ids: list[str],
     champion_bench_path: Path,
+    terminal_sass: Any,
 ) -> tuple[dict, list[dict]]:
     iter_dir = root / f"iterv{iteration}"
     performance: dict[str, dict] = {}
     implementation: dict[str, dict] = {}
     evidence: list[dict] = []
 
+    if not isinstance(terminal_sass, Mapping):
+        raise ValueError("terminal SASS snapshot must be a JSON object")
     sass_path = iter_dir / "sass_check.json"
-    if sass_path.exists() or sass_path.is_symlink():
+    if terminal_sass:
         try:
             sass, sass_identity = _strict_document(
                 sass_path, root=root, role="sass_check"
             )
+            if sass != terminal_sass:
+                raise ValueError("current SASS evidence differs from terminal snapshot")
             evidence.append(sass_identity)
             checks = sass.get("checks", [])
             if isinstance(checks, list):
@@ -1119,8 +1117,8 @@ def _method_evidence(
                             "status": status_value,
                             "evidence": sass_identity,
                         }
-        except (OSError, ValueError):
-            raise
+        except (OSError, ValueError) as error:
+            raise ValueError(f"terminal SASS evidence is missing, unsafe, or drifted: {error}") from error
 
     attribution_path = iter_dir / "attribution.json"
     if not attribution_path.exists() and not attribution_path.is_symlink():
@@ -1145,7 +1143,7 @@ def _method_evidence(
         method_id = item.get("method_id")
         if method_id not in method_ids:
             continue
-        method_dir = iter_dir / "ablations" / method_id
+        method_dir = iter_dir / "ablations" / method_id.replace(".", "_")
         try:
             ablated_kernel = Path(item["ablated_kernel"]).absolute()
             ablated_bench_path = Path(item["ablated_bench"]).absolute()
@@ -1191,10 +1189,13 @@ def _method_evidence(
                 item.get("champion_ms"), item.get("ablated_ms"),
                 item.get("attribution_ms"), item.get("attribution_pct"),
             )
-            expected = (champion_ms, ablated_ms, delta, percentage)
+            expected = (
+                round(champion_ms, 4), round(ablated_ms, 4),
+                round(delta, 4), round(percentage, 2),
+            )
             if any(
                 isinstance(actual, bool) or not isinstance(actual, (int, float))
-                or not math.isclose(float(actual), wanted, rel_tol=1e-9, abs_tol=1e-9)
+                or float(actual) != wanted
                 for actual, wanted in zip(declared, expected)
             ):
                 continue
@@ -1282,6 +1283,11 @@ def load_completed_run(run_dir: str | os.PathLike) -> dict:
     if decision_identity["sha256"] != terminal.get("decision_sha256"):
         raise ValueError("terminal decision sha256 drifted")
     replay = _replay_decision(decision_payload)
+    # decision.json is compared field-for-field by _replay_decision.  State's
+    # terminal snapshot predates a mandatory reason field, but if it records
+    # one it must be the replayed reason rather than an independent claim.
+    if "reason" in terminal and terminal.get("reason") != replay.get("reason"):
+        raise ValueError("terminal decision replay mismatch: reason")
     for field in ("candidate_id", "candidate_file", "candidate_sha256"):
         if terminal.get(field) != decision_payload.get(field):
             raise ValueError(f"terminal decision candidate mismatch: {field}")
@@ -1312,7 +1318,7 @@ def load_completed_run(run_dir: str | os.PathLike) -> dict:
     if len(set(method_ids)) != len(method_ids):
         raise ValueError("terminal method ids must be unique")
     method_evidence, optional_evidence = _method_evidence(
-        root, iteration, method_ids, iter_dir / "bench.json"
+        root, iteration, method_ids, iter_dir / "bench.json", terminal.get("sass", {})
     )
     scope = scope_document(manifest_path)
     evidence = [state_identity, checkpoint_identity, decision_identity, methods_identity]

@@ -187,12 +187,46 @@ class StrategyMemoryTests(unittest.TestCase):
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return path
 
-    def _record(self, marker: str = "1") -> dict:
+    def _record(self, marker: str = "1", *, scope: dict | None = None) -> dict:
+        scope = copy.deepcopy(self._scope() if scope is None else scope)
+        candidate_sha = marker if len(marker) == 64 else marker * 64
+        run_root = "/tmp/cuda-strategy-memory-test-run"
+        identities = {
+            "state": "1" * 64, "checkpoint": "e" * 64,
+            "decision": "d" * 64, "methods": "2" * 64,
+            "candidate": candidate_sha, "kernel_paired_samples": "3" * 64,
+        }
+        evidence = [
+            {"role": role, "path": f"{run_root}/iterv1/{role}.json", "sha256": digest}
+            for role, digest in identities.items()
+        ]
+        statistics = {
+            "status": "inconclusive",
+            "statistic": "median_paired_improvement_pct", "direction": "lower",
+            "min_effect_pct": 1.0, "confidence": 0.95,
+            "estimate_pct": 0.0, "ci_low_pct": -1.0, "ci_high_pct": 1.0,
+            "valid_pairs": 1, "invalid_pairs": 0, "improvements_pct": [0.0],
+        }
+        decision_evidence = next(item for item in evidence if item["role"] == "decision")
         return {
-            "input_hash": "a" * 64,
-            "candidate_sha256": marker * 64,
-            "decision_sha256": "d" * 64,
-            "checkpoint_identity": "e" * 64,
+            "schema_version": self.memory.RECORD_SCHEMA,
+            "input_hash": scope["input_hash"], "candidate_sha256": candidate_sha,
+            "decision_sha256": "d" * 64, "checkpoint_identity": "e" * 64,
+            "run_root": {"path": run_root, "device": 1, "inode": 1},
+            "scope": scope, "completed_at": 1.0,
+            "terminal": {
+                "status": "inconclusive", "mode": "kernel-only",
+                "reason": "kernel evidence does not contain a confirmed inner-loop win",
+                "statistics": statistics, "workload_status": None,
+                "workload_statistics": None, "workload_failure": None,
+                "constraints": [], "pareto": None,
+            },
+            "bundle": {
+                "outcome": "inconclusive", "method_ids": [],
+                "promotion_authority": False, "decision_evidence": decision_evidence,
+            },
+            "methods": {"performance": {}, "implementation": {}},
+            "evidence": evidence,
         }
 
     def _scope(self, marker: str = "a") -> dict:
@@ -215,6 +249,9 @@ class StrategyMemoryTests(unittest.TestCase):
         *,
         with_ablation: bool = False,
         workload_failed: bool = False,
+        method_id: str = "vectorize",
+        champion_ms: float = 10.0,
+        ablated_ms: float = 12.0,
     ) -> Path:
         """Build a real terminal snapshot through the production validators."""
         run = root.resolve() / "run"
@@ -346,41 +383,43 @@ class StrategyMemoryTests(unittest.TestCase):
         decision_path = iteration / "decision.json"
         decision_path.write_text(json.dumps(decision), encoding="utf-8")
         methods = iteration / "methods.json"
-        methods.write_text(json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8")
+        methods.write_text(json.dumps({"methods": [{"id": method_id}]}), encoding="utf-8")
         champion_bench = iteration / "bench.json"
         champion_bench.write_text(json.dumps({
-            "correctness": {"passed": True}, "kernel": {"average_ms": 10.0},
+            "correctness": {"passed": True}, "kernel": {"average_ms": champion_ms},
             "reference": {"average_ms": 20.0},
         }), encoding="utf-8")
         sass = iteration / "sass_check.json"
         sass.write_text(json.dumps({
             "status": "passed", "checks": [{
-                "method_id": "vectorize", "status": "passed", "verified": True,
+                "method_id": method_id, "status": "passed", "verified": True,
                 "patterns_missing": [],
             }],
         }), encoding="utf-8")
         attribution_path = None
         if with_ablation:
-            ablation = iteration / "ablations" / "vectorize"
+            ablation = iteration / "ablations" / method_id.replace(".", "_")
             ablation.mkdir(parents=True)
             ablated_kernel = ablation / "kernel.py"
             ablated_kernel.write_text("# ablated\n", encoding="utf-8")
             ablated_bench = ablation / "bench.json"
             ablated_bench.write_text(json.dumps({
-                "correctness": {"passed": True}, "kernel": {"average_ms": 12.0},
+                "correctness": {"passed": True}, "kernel": {"average_ms": ablated_ms},
             }), encoding="utf-8")
             attribution_path = iteration / "attribution.json"
             attribution_path.write_text(json.dumps({
                 "iter": 1, "attributions": [{
-                    "method_id": "vectorize",
+                    "method_id": method_id,
                     "champion_bench": str(champion_bench.resolve()),
                     "champion_bench_sha256": hashlib.sha256(champion_bench.read_bytes()).hexdigest(),
                     "ablated_kernel": str(ablated_kernel.resolve()),
                     "ablated_kernel_sha256": hashlib.sha256(ablated_kernel.read_bytes()).hexdigest(),
                     "ablated_bench": str(ablated_bench.resolve()),
                     "ablated_bench_sha256": hashlib.sha256(ablated_bench.read_bytes()).hexdigest(),
-                    "champion_ms": 10.0, "ablated_ms": 12.0,
-                    "attribution_ms": 2.0, "attribution_pct": 20.0,
+                    "champion_ms": round(champion_ms, 4),
+                    "ablated_ms": round(ablated_ms, 4),
+                    "attribution_ms": round(ablated_ms - champion_ms, 4),
+                    "attribution_pct": round((ablated_ms - champion_ms) / champion_ms * 100.0, 2),
                     "contributed": True,
                 }],
             }), encoding="utf-8")
@@ -793,14 +832,12 @@ class StrategyMemoryTests(unittest.TestCase):
             for index in range(self.memory.MAX_SCOPES):
                 scope = self._scope(f"{index:064x}"[-1])
                 scope["input_hash"] = f"{index:064x}"
-                scoped_record = copy.deepcopy(record)
-                scoped_record["input_hash"] = scope["input_hash"]
+                scoped_record = self._record(scope=scope)
                 self.memory.append_run(memory, scope, scoped_record)
             before = memory.read_bytes()
             overflow = self._scope("f")
             overflow["input_hash"] = "f" * 64
-            overflow_record = copy.deepcopy(record)
-            overflow_record["input_hash"] = overflow["input_hash"]
+            overflow_record = self._record(scope=overflow)
             with self.assertRaisesRegex(ValueError, "scope capacity"):
                 self.memory.append_run(memory, overflow, overflow_record)
             self.assertEqual(memory.read_bytes(), before)
@@ -808,16 +845,13 @@ class StrategyMemoryTests(unittest.TestCase):
             run_memory = root / "run-cap.json"
             scope = self._scope()
             for index in range(self.memory.MAX_RUNS_PER_SCOPE):
-                unique = self._record()
-                unique["candidate_sha256"] = f"{index:064x}"
+                unique = self._record(f"{index:064x}")
                 self.memory.append_run(run_memory, scope, unique)
-            duplicate = self._record()
-            duplicate["candidate_sha256"] = f"{0:064x}"
+            duplicate = self._record(f"{0:064x}")
             before_duplicate = run_memory.read_bytes()
             self.assertFalse(self.memory.append_run(run_memory, scope, duplicate))
             self.assertEqual(run_memory.read_bytes(), before_duplicate)
-            new_record = self._record()
-            new_record["candidate_sha256"] = "f" * 64
+            new_record = self._record("f" * 64)
             with self.assertRaisesRegex(ValueError, "run capacity"):
                 self.memory.append_run(run_memory, scope, new_record)
             self.assertEqual(len(next(iter(self.memory.load_memory(run_memory)["scopes"].values()))["runs"]), self.memory.MAX_RUNS_PER_SCOPE)
@@ -843,7 +877,7 @@ class StrategyMemoryTests(unittest.TestCase):
             original = memory.read_bytes()
             mismatch = self._record("2")
             mismatch["input_hash"] = "f" * 64
-            with self.assertRaisesRegex(ValueError, "input_hash.*scope"):
+            with self.assertRaisesRegex(ValueError, "input_hash.*scope|scope.*input_hash"):
                 self.memory.append_run(memory, scope, mismatch)
             self.assertEqual(memory.read_bytes(), original)
 
@@ -852,7 +886,7 @@ class StrategyMemoryTests(unittest.TestCase):
             entry["runs"][0]["input_hash"] = "f" * 64
             memory.write_text(json.dumps(corrupt), encoding="utf-8")
             corrupt_bytes = memory.read_bytes()
-            with self.assertRaisesRegex(ValueError, "input_hash.*scope"):
+            with self.assertRaisesRegex(ValueError, "input_hash.*scope|scope.*input_hash"):
                 self.memory.load_memory(memory)
             self.assertEqual(memory.read_bytes(), corrupt_bytes)
 
@@ -1096,6 +1130,61 @@ class StrategyMemoryTests(unittest.TestCase):
             implementation = record["methods"]["implementation"]["vectorize"]
             self.assertEqual(implementation["status"], "passed")
             self.assertNotIn("outcome", implementation)
+
+    def test_producer_rounded_dotted_method_ablation_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._completed_run(
+                Path(tmp), with_ablation=True, method_id="memory.coalesce",
+                champion_ms=10.123456, ablated_ms=12.654321,
+            )
+            record = self.memory.load_completed_run(run)
+            performance = record["methods"]["performance"]["memory.coalesce"]
+            self.assertEqual(performance["outcome"], "positive")
+            self.assertEqual(performance["champion_ms"], 10.123456)
+            self.assertEqual(performance["ablated_ms"], 12.654321)
+
+    def test_sass_file_must_match_terminal_snapshot(self) -> None:
+        for mutation in ("missing", "changed"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                run = self._completed_run(Path(tmp))
+                sass = run / "iterv1" / "sass_check.json"
+                if mutation == "missing":
+                    sass.unlink()
+                else:
+                    self._mutate_json(sass, lambda value: value.update(status="failed"))
+                with self.assertRaisesRegex(ValueError, "SASS|sass"):
+                    self.memory.load_completed_run(run)
+
+    def test_terminal_reason_must_match_replayed_reason_when_snapshotted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._completed_run(Path(tmp))
+            self._mutate_json(
+                run / "state.json",
+                lambda value: value["terminal_decision"].update(reason="tampered reason"),
+            )
+            with self.assertRaisesRegex(ValueError, "reason|replay"):
+                self.memory.load_completed_run(run)
+
+    def test_legacy_four_hash_records_are_rejected_from_append_and_load(self) -> None:
+        legacy = {
+            "input_hash": "a" * 64, "candidate_sha256": "1" * 64,
+            "decision_sha256": "d" * 64, "checkpoint_identity": "e" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory = root / "memory.json"
+            with self.assertRaises(ValueError):
+                self.memory.append_run(memory, self._scope(), legacy)
+            payload = {
+                "schema_version": self.memory.MEMORY_SCHEMA,
+                "scopes": {self.memory.scope_key(self._scope()): {
+                    "scope": self._scope(), "runs": [legacy],
+                    "methods": {}, "bundles": {},
+                }},
+            }
+            memory.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.memory.load_memory(memory)
 
     def test_invalid_ablation_never_creates_performance_evidence(self) -> None:
         for field in (
