@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "skills" / "cuda-kernel-optimizer"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 OPENAI_YAML = SKILL_DIR / "agents" / "openai.yaml"
+SERVING_EVIDENCE = SKILL_DIR / "references" / "serving_evidence_protocol.md"
+SYSTEMS_IR_COVERAGE = SKILL_DIR / "references" / "systems_and_ir_coverage.md"
 
 
 class SkillMetadataTests(unittest.TestCase):
@@ -95,6 +97,75 @@ class SkillMetadataTests(unittest.TestCase):
             "summary.md",
         ):
             self.assertIn(artifact, text)
+
+    def test_serving_reference_defines_claim_ladder_and_evidence_boundary(self) -> None:
+        self.assertTrue(SERVING_EVIDENCE.is_file())
+        text = SERVING_EVIDENCE.read_text(encoding="utf-8")
+        lower = text.lower()
+        for layer in (
+            "generated code",
+            "isolated operator",
+            "matched runtime",
+            "serving endpoint",
+        ):
+            self.assertIn(layer, lower)
+        for contract in (
+            "kernel_only_win",
+            "end_to_end_win",
+            "user-provided workload",
+            "paired A/B",
+            "clean window",
+            "shared-host contamination",
+            "raw request",
+            "environment evidence",
+        ):
+            self.assertIn(contract, text)
+        self.assertRegex(
+            lower,
+            r"generated code[^\n]*(only|does not)[^\n]*(emit|mechanism|serving)",
+        )
+        self.assertRegex(
+            lower,
+            r"operator timing[^\n]*(does not|cannot)[^\n]*serving",
+        )
+
+    def test_systems_ir_reference_routes_evidence_without_copying_catalog(self) -> None:
+        self.assertTrue(SYSTEMS_IR_COVERAGE.is_file())
+        text = SYSTEMS_IR_COVERAGE.read_text(encoding="utf-8")
+        lower = text.lower()
+        for term in (
+            "copies",
+            "allocation",
+            "synchronization",
+            "cuda graphs",
+            "launch density",
+            "cutlass",
+            "cute",
+            "dispatch",
+            "layout",
+            "epilogue",
+            "cluster",
+            "architecture",
+            "autotune",
+            "ttir",
+            "ttgir",
+            "llvm",
+            "ptx",
+            "cache",
+            "generated code",
+            "sparse",
+            "variable-length",
+            "fused",
+            "serving",
+            "real request distribution",
+        ):
+            self.assertIn(term, lower)
+        for reference in (
+            "optimization_catalog.md",
+            "compatibility.md",
+            "serving_evidence_protocol.md",
+        ):
+            self.assertIn(reference, text)
 
     def test_skill_artifacts_are_agent_neutral(self) -> None:
         suffixes = {".md", ".py", ".json", ".yaml", ".yml"}
