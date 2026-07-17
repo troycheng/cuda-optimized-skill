@@ -2,431 +2,206 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Codex skill for evidence-driven optimization of CUDA, CUTLASS, and Triton.
-V2.4 adds a workload controller for cases where the bottleneck may sit outside
-the kernel. The V2.2 dual-loop kernel workflow remains available: it establishes
-a kernel result, then checks that result on a user-owned workload when one is
-provided. Every promotion remains tied to inspectable artifacts.
+`cuda-kernel-optimizer` is a CUDA performance optimization project for Codex,
+packaged as a reusable skill. It can optimize one CUDA, CUTLASS, or Triton
+kernel, or analyze and improve a complete GPU workload supplied by the user.
 
-## Start by task
+Given runnable code, a test environment, and a performance goal, the AI handles
+environment checks, profiling, bottleneck analysis, code changes, and paired A/B
+tests. A change is kept only when it remains correct, meets the performance
+target, and satisfies every declared constraint.
 
-- **Optimize a kernel** — run the controlled candidate loop from a baseline and
-  Python reference.
-- **Optimize a GPU workload** — profile a user-provided runnable workload,
-  classify the bottleneck, make one bounded change, and evaluate it end to end.
-- **Validate a real workload** — add an explicit workload and objective when an
-  end-to-end claim matters.
-- **Analyze an existing NCU report** — import a `.ncu-rep` without launching its
-  target.
-- **Use explicit advisory memory** — record a completed run and request scoped
-  search hints. This never changes a run or promotion decision.
+The project may change authorized kernels, runtime parameters, and project code.
+For drivers, permissions, clock settings, power limits, and other host-level
+settings, it provides recommendations that are never applied automatically.
 
-## Install
+## What this project is
 
-```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/install-skill-from-github.py" \
-  --repo troycheng/cuda-optimized-skill \
-  --ref main \
-  --path skills/cuda-kernel-optimizer
+This is an AI-operated performance optimization workflow. It connects environment
+checks, a reproducible baseline, profiling, candidate changes, correctness checks,
+and performance evaluation in one resumable process. The evidence behind each
+decision is saved for later review.
 
-cd "${CODEX_HOME:-$HOME/.codex}/skills/cuda-kernel-optimizer"
-```
+The workflow does not assume that every bottleneck is inside a kernel. For a
+complete GPU workload, it can also examine framework scheduling, CPU data
+processing, host-to-device transfers, multi-GPU communication, I/O, and the
+runtime environment. When the evidence points to the host, the result contains
+host recommendations instead of changing the machine.
 
-The installer does not overwrite an existing directory. Move the old copy
-before reinstalling, then start a new Codex session. Repository contributors can
-instead `cd skills/cuda-kernel-optimizer`; the commands below stay the same.
+## Problems it can solve
 
-## Start your first run
+| Task | When to use it | What the AI does | Main result |
+|---|---|---|---|
+| **Optimize one kernel** | You have a CUDA, CUTLASS, or Triton implementation and a comparable reference | Check correctness, inspect compiler and profiling data, iterate on the implementation, and run paired performance tests | Modified kernel code with a reproducible performance result |
+| **Optimize a complete GPU workload** | Latency, throughput, or cost is off target, but the bottleneck is not yet known | Run the workload, distinguish kernel, framework, CPU, transfer, communication, I/O, and environment limits, then change authorized code or parameters | Bottleneck analysis, a bounded change, and an end-to-end result |
+| **Validate an optimization on a real workload** | A kernel benchmark improved and you need to know whether the product metric also improves | Compare the original and changed implementation on user-supplied real inputs while checking accuracy, memory, output, and other constraints | An end-to-end result that can be adopted, or a clear reason to keep the original |
+| **Analyze an existing NCU report** | You already have a `.ncu-rep` and do not want to launch the profiled program again | Read the report and summarize hot kernels, important metrics, and likely limiting factors | A standalone NCU analysis without launching a new GPU workload |
 
-Run setup first. It returns a `run_dir`; use the returned `run_dir` for
-`--run-dir` in `open-iter`.
+## What you need to provide
 
-```bash
-python3 scripts/orchestrate.py setup \
-  --baseline /path/to/gemm.cu \
-  --ref /path/to/ref.py \
-  --dims '{"M":4096,"N":4096,"K":4096}' \
-  --budget balanced
+Reliable conclusions depend on inputs that represent the real objective. A task
+normally needs:
 
-python3 scripts/orchestrate.py open-iter \
-  --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
-```
+- **A runnable target:** a baseline kernel, a complete workload, or an existing
+  NCU report;
+- **A correctness standard:** a Python reference, test cases, a validation
+  function, or comparable output;
+- **A test environment:** the target GPU, driver, and dependencies, or permission
+  to install project dependencies in an isolated environment;
+- **A performance goal:** latency, throughput, memory use, cost, or another KPI;
+- **Constraints:** accuracy, output consistency, memory limits, files that may be
+  changed, and settings that must remain untouched;
+- **A compute budget:** the allowed runtime and search scale.
 
-`setup` validates and freezes inputs, seeds the baseline, and writes the first
-checkpoint. It does not profile the current best or create branch directories.
-`open-iter` profiles the current best, computes Roofline evidence, and creates the branch directories
-allowed for this iteration.
+A real workload must be supplied by the user. The project does not download,
+invent, or replace it with a microbenchmark. With only a kernel and reference,
+the workflow can establish a kernel-level result, but it cannot claim an
+end-to-end improvement.
 
-The agent or user must then prepare the requested branch kernels plus
-`methods.json` and `analysis.md`. Close the iteration only after those files are
-ready.
+`balanced` is the default when the user does not choose a budget.
 
-```bash
-python3 scripts/orchestrate.py close-iter \
-  --run-dir /path/to/run_YYYYMMDD_HHMMSS --iter 1
-```
+| Budget | Maximum time | Best suited for |
+|---|---:|---|
+| `quick` | 45 minutes | Checking an idea and narrowing the candidate set |
+| `balanced` | 3 hours | The default balance between search coverage and runtime |
+| `thorough` | 10 hours | More candidates, deeper profiling, and broader validation |
 
-Finalize only after the decision stage completes.
+These are upper limits, not fixed runtimes. A task may finish early once it has
+a clear result, no viable candidates remain, or the available evidence is
+insufficient.
 
-```bash
-python3 scripts/orchestrate.py finalize \
-  --run-dir /path/to/run_YYYYMMDD_HHMMSS
-```
-
-Runtime follows the chosen frozen budget. The default `balanced` preset permits
-at most 10,800 seconds.
-
-## Trusted promotion path
+## How the AI works
 
 ```mermaid
 flowchart LR
-    candidate["Candidate"] --> correctness["Reference correctness"]
-    correctness --> paired_kernel["Paired kernel evidence"]
-    paired_kernel --> sanitizer["Sanitizer hard gate"]
-    sanitizer --> workload["Optional user workload"]
-    workload --> decision["decision.json"]
-    decision --> promotion["Conditional promotion"]
-    compiler["Compiler evidence"] -.-> evidence["Evidence side path"]
-    sass["SASS evidence"] -.-> evidence
-    evidence -.-> decision
+    goal["Goal, code, and constraints"] --> environment["Check the test environment"]
+    environment --> baseline["Establish a reproducible baseline"]
+    baseline --> profiling["Profile and locate the bottleneck"]
+    profiling --> change["Create a bounded change"]
+    change --> evaluation["Check correctness and paired performance"]
+    evaluation --> keep["Evidence is sufficient: keep the change"]
+    evaluation --> restore["Evidence is insufficient: restore the original"]
 ```
 
-Solid edges are authoritative flow. Correctness, paired A/B evidence, and the
-sanitizer gate determine eligibility. Compiler provenance and SASS document the
-implementation but are not hard promotion gates. Only `decision.json` can
-advance a candidate.
+The AI first confirms the objective and allowed modification scope, then checks
+the environment and inputs. Profiling and candidate changes begin only after the
+baseline can be reproduced. Each change is bound to declared files and compared
+with the original under the same conditions. If the task is interrupted, it can
+resume from a saved checkpoint without repeating completed stages whose inputs
+have not changed.
 
-`kernel_only_win` confirms only the kernel result. Without a workload it is the
-normal successful terminal result; it may also be the terminal outcome in full mode
-after workload failure/loss/inconclusive evidence. It never advances the
-global best in full mode. `end_to_end_win` requires a confirmed kernel win, a
-confirmed primary-KPI win, and every constraint passing. It is the only
-full-mode result that advances the global best.
+An external model may be used as an optional reviewer for the analysis and
+change rationale. The reviewer is advisory. Local correctness and performance
+evidence still determine whether a change is kept.
 
-## Task commands
+## How results are accepted
 
-### Optimize a kernel
+The project uses paired A/B measurements to compare the original and changed
+implementation. Both variants run repeatedly on the same inputs in an
+interleaved order, reducing bias from machine noise, cache state, and run order.
 
-Start with the first-run commands above. For later rounds, increment `--iter` and
-follow `checkpoint.json`. Read the method catalog and available profiler
-evidence before writing each budgeted branch.
+A change must satisfy all of the following:
 
-### Optimize a GPU workload
+1. **Correctness passes:** output agrees with the reference or workload validation;
+2. **The gain meets the threshold:** the result is not based on one unusually fast run;
+3. **Statistical evidence supports the result:** a 95% confidence interval is checked by default;
+4. **Every constraint passes:** accuracy, memory, checksums, and product metrics remain within bounds;
+5. **The test target has not drifted:** inputs, code identity, and environment definition stay fixed during comparison.
 
-The workload controller starts from the workload and its business objective,
-not from an assumed kernel bottleneck. Create `control.json` from the full
-example, then collect the baseline, probes, and diagnosis:
+If performance regresses, the confidence interval cannot confirm a gain,
+correctness fails, or any constraint is violated, the workflow will restore the
+original implementation and record where the candidate failed. Missing optional
+evidence, such as NCU counter access, is reported as degraded coverage and is
+never presented as a successful measurement.
 
-```bash
-python3 scripts/workload_controller.py run \
-  --control /path/to/control.json \
-  --run-dir /path/to/workload_run
-```
+## What you receive
 
-Read `diagnosis.json`, write a bounded ChangeSet, and register it before Codex
-edits the declared files:
+A completed task delivers:
 
-```bash
-python3 scripts/workload_controller.py register-change \
-  --control /path/to/control.json \
-  --run-dir /path/to/workload_run \
-  --change-set /path/to/change.json
+- **Verified changes:** the modified code, limited to work that passed validation
+  within the authorized scope;
+- **Bottleneck analysis:** whether the limiting factor is in the kernel,
+  framework, CPU, transfer, communication, I/O, or environment;
+- **Performance comparison:** baseline and candidate results, paired samples,
+  improvement percentage, and confidence interval;
+- **Correctness and constraint results:** a pass or fail result for every check;
+- **Rejected attempts:** which ideas failed, regressed, or lacked enough evidence;
+- **Host recommendations:** evidence-backed suggestions when drivers,
+  permissions, clocks, or system settings need attention;
+- **A resumable record:** saved task state and key evidence for later review.
 
-python3 scripts/workload_controller.py evaluate \
-  --run-dir /path/to/workload_run
-```
+If no reliable improvement is found, the result states that the original was
+kept. It does not select the fastest isolated sample when the evidence is weak.
 
-After interruption, inspect or resume the exact checkpoint:
+## Modification scope and safety limits
 
-```bash
-python3 scripts/workload_controller.py status --run-dir /path/to/workload_run
-python3 scripts/workload_controller.py resume --run-dir /path/to/workload_run
-```
-
-The deterministic classes are `kernel`, `framework`, `cpu_data`, `transfer`,
-`communication`, `io`, `environment`, and `mixed`. External profilers and
-internal tools supply a normalized probe instead of forcing one profiler format.
-The complete runnable contracts are in
-[`examples/workload-controller.md`](skills/cuda-kernel-optimizer/examples/workload-controller.md).
-
-### Validate a real workload
-
-```bash
-python3 scripts/orchestrate.py setup \
-  --baseline /path/to/gemm.cu \
-  --ref /path/to/ref.py \
-  --dims '{"M":4096,"N":4096,"K":4096}' \
-  --budget balanced \
-  --workload /path/to/workload.py
-```
-
-The user supplies the workload. The skill does not discover, download, or
-invent one. `--workload-cmd ... --objective ...` and `--workload-manifest ...`
-are the other supported input forms.
-
-### Analyze an existing NCU report
-
-```bash
-python3 scripts/analyze_ncu_rep.py REPORT \
-  --source SOURCE \
-  --out-dir OUTPUT \
-  --ncu-bin NCU \
-  --ncu-num 5 \
-  --timeout 120
-```
-
-Only `REPORT` and `--out-dir` are required. The analyzer reads the report; it
-does not execute the profiled target.
-
-### Use explicit advisory memory
-
-```bash
-python3 scripts/strategy_memory.py record \
-  --memory MEMORY --run-dir RUN_DIR --out OUT
-
-python3 scripts/strategy_memory.py suggest \
-  --memory MEMORY --manifest MANIFEST --out OUT
-```
-
-`--memory` is always explicit. There is no orchestrator default and no implicit
-reuse across projects.
-
-## Standalone tool boundaries
-
-```mermaid
-flowchart LR
-    report["Existing NCU report"] --> analysis_bundle["Standalone analysis bundle"]
-    completed_run["Completed verified run"] --> memory["Explicit strategy memory"]
-    memory -.-> suggestion["Advisory suggestion"]
-```
-
-The report analyzer writes `analysis.json` last as the completion marker. Its
-bundle records `counter_access: not_probed`; importing a report does not prove
-current counter permission, source execution, or end-to-end behavior. A partial
-bundle exits 2 and names the unavailable component. A hard failure does not
-publish a fresh completion marker.
-
-Strategy memory accepts only a completed, strictly verified V2.2 run in the
-exact manifest scope. Suggestions are detached search hints. They cannot remove
-branches, change profiler or budget policy, overwrite evidence, or connect to
-`decision.json` and promotion.
-
-### Workload controller boundary
-
-```mermaid
-flowchart LR
-    runtime["User workload and environment"] --> baseline["Frozen baseline"]
-    baseline --> probes["Normalized probes"]
-    probes --> diagnosis["Deterministic diagnosis"]
-    diagnosis --> change["Bounded ChangeSet"]
-    change --> review["Optional advisory review"]
-    review --> evaluation["Paired workload evaluation"]
-    evaluation --> workload_decision["Deterministic decision"]
-    workload_decision --> promote_or_rollback["Promote or rollback"]
-```
-
-Codex remains the primary optimizer. A local third-party reviewer uses JSON stdin/stdout
-and is advisory only: it has no command callback and no promotion
-handle. Running it as the same user is not an OS sandbox; use a read-only
-container or system sandbox when stronger isolation is required. Source diff
-content is withheld unless `reviewer.include_diff` is explicitly enabled.
-
-ChangeSet `commands` must be empty. Correctness is checked by the frozen
-workload adapter's `validate()` contract, so the controller does not expose an
-additional same-user command runner. The candidate descriptor is bound to the
-post-change identity digest in a separate artifact before paired evaluation;
-the workload adapter's `validate()` remains responsible for confirming that
-the descriptor selects the implementation being measured.
-
-| Scope | Automatic action | Boundary |
+| Scope | What the AI may do | Limit |
 |---|---|---|
-| Declared project paths | Allowed | Actual diff must match the ChangeSet |
-| User-owned `isolated_environment` | Allowed | Must be outside the project and host system roots |
-| Host OS, driver, clocks, power, permissions | Never | Host changes are recommendations only |
+| Project code | Modify explicitly authorized kernels, calling code, and runtime parameters | The actual diff must stay within the declared scope |
+| Isolated environment | Install or adjust project dependencies in a user-provided isolated environment | It must remain separate from the project source and host system directories |
+| Host configuration | Collect information and provide recommendations | Drivers, permissions, clocks, power limits, and system settings are never changed automatically |
+| Third-party reviewer | Receive an analysis summary and return review comments | It cannot run callback commands or decide whether a change is kept |
 
-The control contract fixes `host_policy` to `recommend_only`. A failed
-correctness check, escaped diff, workload drift, expired budget, primary-metric
-loss, or constraint failure restores the frozen snapshot.
+Changes outside the authorized paths, workload drift, an expired budget, or a
+failed validation stop the current candidate. If restoration itself fails, the
+task is marked for manual recovery instead of continuing to overwrite the
+working state.
 
-## Inputs, budgets, and statuses
+## Usage examples
 
-### Inputs
+> Optimize the Triton kernel in this directory for an RTX 5090. Confirm the reference and test inputs first, then profile the bottleneck. Keep a change only if correctness and paired performance both pass.
 
-Every optimization run needs a baseline `.cu` or Triton `.py` kernel, a Python
-reference exposing `reference(**kwargs)`, and JSON dimensions. A real workload
-is optional, but required for an `end_to_end_win` claim.
+> Analyze the latency bottleneck in this GPU workload. The test environment is ready, and project code and runtime parameters may be changed. For host-level settings, provide recommendations only.
 
-Choose exactly one workload form:
+> Analyze this NCU report and identify the kernels and limiting factors worth addressing first. Do not rerun the original workload or change driver and counter permissions.
 
-- `--workload ./workload.py` for a Python adapter;
-- `--workload-cmd 'command ...' --objective ./objective.json` for an argv command;
-- `--workload-manifest ./workload.json` for a strict manifest.
+> Use the balanced budget to validate this CUDA optimization on the real workload. The primary metric is p95 latency, and GPU memory use must not increase by more than 5%.
 
-```json
-{
-  "kind": "python",
-  "source": "./workload.py",
-  "objective": {
-    "primary_metric": {"name": "p50_latency_ms", "direction": "lower"},
-    "min_effect_pct": 1.0,
-    "constraints": []
-  },
-  "cases": [{}]
-}
-```
+## Tested environments and compatibility
 
-The manifest requires `kind`, `source`, and `cases`. Use one objective source:
-embedded objective or --objective, never both. For a Python manifest, the selected objective must
-match the adapter's `metrics()` contract.
+The project has been accepted through CPU tests and runs on physical RTX 5090
+hardware. These figures show which workflow paths have been tested; they are not
+a promise that unrelated projects will see the same speedup.
 
-### Compute budgets
+| Validation | Environment and result | What it demonstrates |
+|---|---|---|
+| Automated tests | 690 total; 685 passed, five RTX 5090 opt-in tests skipped outside a GPU environment, zero failed | State recovery, evidence binding, timeouts, restoration, and input validation |
+| Full RTX 5090 run | The current lane passed 13/13 checks in 34.302 seconds | CUDA, CUTLASS, Triton, NCU, and the complete workload controller path |
+| Reproducible workload fixture | End-to-end latency improved 60.4616%, with constraints passing | The full path from bottleneck analysis to keeping a verified change |
+| User-supplied vLLM workload | The kernel metric improved 26.3287%, while the real workload changed -0.0097% | End-to-end evidence was insufficient, so the original was kept; a faster kernel does not guarantee a faster product workload |
+| Existing NCU report | Parsed 140 metrics without launching the original program | Counter access was not reprobed; `ERR_NVGPUCTRPERM` is recorded as a permission limit and does not trigger privilege changes |
 
-`balanced` is the default when the user does not select a preset.
+Kernel optimization requires Python 3.10+, a working CUDA GPU and driver, and
+the relevant toolchain. Triton tasks need `triton`; CUDA and CUTLASS compilation
+needs `nvcc` and CUTLASS headers; SASS analysis uses `cuobjdump`. NCU profiling
+is optional and is reported as unavailable or degraded when it cannot run.
 
-| Preset | Max seconds | Branches | Max rounds | Min pairs | Max pairs | Outer candidates | Max cases | Sanitizer |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `quick` | 2700 | 4 | 2 | 20 | 50 | 1 | 3 | targeted |
-| `balanced` (default) | 10800 | 8 | 4 | 20 | 100 | 2 | 10 | targeted |
-| `thorough` | 36000 | 16 | 8 | 30 | 200 | 3 | unlimited | full |
+Standalone NCU report analysis only needs a compatible `ncu` and the report
+file. It does not launch the profiled program. The project does not redistribute
+CUDA, CUTLASS, Triton, or Nsight Compute.
 
-Use `--budget custom` only with every required limit. The deadline stops new
-stage admission, caps external probe, reviewer, and command-workload timeouts,
-and leaves a resumable checkpoint; partial or late evidence never becomes a
-win. A Python adapter runs in process and therefore cannot be forcibly stopped
-inside a blocking native call. Give it its own bounded operations, or use the
-command-workload form when a killable wall-clock boundary is required.
+See the [compatibility notes](skills/cuda-kernel-optimizer/references/compatibility.md)
+and [RTX 5090 test guide](tests/gpu/sm120/README.md) for detailed versions,
+architecture routing, and opt-in tests.
 
-### Terminal statuses
+## Installation and further documentation
 
-- `kernel_only_win`: confirmed kernel result only. In full mode it keeps the
-  global best unchanged.
-- `end_to_end_win`: confirmed kernel and workload result with all constraints
-  passing. This is the full-mode promotion status.
-- `rejected_constraint`: a workload constraint has a confirmed failure.
-- loss, timeout, failure, or `inconclusive`: keep the current best.
+Installation is performed by Codex. Give Codex the
+[GitHub repository](https://github.com/troycheng/cuda-optimized-skill) and the
+skill path `skills/cuda-kernel-optimizer`, then ask it to install or update the
+skill. Start a new session afterward so Codex reloads the skill instructions.
+The internal read-only mirror is available on
+[GitLab](https://git.yukework.com/mlsys/cuda-optimized-skill).
 
-## Artifacts and resume
+Further documentation:
 
-```text
-run_YYYYMMDD_HHMMSS/
-├── manifest.json                  # frozen inputs and policy
-├── state.json                     # candidate registry and history
-├── checkpoint.json                # durable resume boundary
-├── env.json                       # GPU and toolchain snapshot
-├── workload/spec.json             # frozen workload or null
-├── baseline/bench.json
-├── itervN/
-│   ├── branches/<candidate>/paired_samples.jsonl
-│   ├── sanitizer.json
-│   ├── sass_check.json
-│   ├── workload/<hash>/paired_samples.jsonl
-│   └── decision.json              # promotion authority
-└── summary.md
-```
-
-```bash
-python3 scripts/orchestrate.py resume --run-dir \
-  /path/to/run_YYYYMMDD_HHMMSS
-```
-
-Resume validates frozen identities and reports the next unfinished stage. It
-does not replay a completed stage. Optional profiler, sanitizer, compiler, or
-workload coverage remains visibly missing or degraded in `summary.md`.
-
-## Compatibility and verification
-
-Kernel optimization requires Python 3.10+, a CUDA GPU, a working driver, and
-CUDA-enabled `torch`. Triton kernels also need `triton`; CUDA/CUTLASS kernels
-use `nvcc`; CUTLASS builds need headers from `$CUTLASS_PATH` or
-`$CUTLASS_INCLUDE_DIR`; SASS evidence uses `cuobjdump`. NCU profiling is
-optional for this task and is recorded as unavailable or degraded when it
-cannot run.
-
-Standalone report analysis requires Python 3.10+ and a compatible `ncu`. It
-imports the supplied report and launches no GPU target.
-
-Strategy memory requires only Python 3.10+ on supported POSIX Darwin/Linux
-systems. Its storage must honor file locking and atomic rename semantics.
-
-The skill does not redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
-
-Current CPU acceptance contains 690 tests: 685 passed, five opt-in RTX 5090
-tests skipped, and zero failed. All 28/28 scripts pass `py_compile` and `--help`
-smoke checks, and the skill validator reports valid.
-
-V2.2 was validated on physical RTX 5090 hardware on 2026-07-17. The current and
-compatibility containers each passed 11/11 checks. Their NCU versions were
-2026.2.1 and 2025.3.1. Capability-dropped lanes returned
-`ERR_NVGPUCTRPERM`; acceptance permits only that exact result or a successful
-profile with real metrics. No privilege, capability, or driver policy changed.
-
-V2.4 workload controller was validated on the same physical RTX 5090 host. The
-current lane passed 13/13 checks in 34.302 seconds with image
-`sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`.
-The real probe recorded `gpu_busy_pct=0.0`; with only that metric, diagnosis
-correctly remained `inconclusive`. A bounded ChangeSet removed two redundant
-Triton launches. Paired workload evaluation measured a **60.4616%** latency
-improvement, 95% CI **[60.0894%, 61.4941%]**, over 3 valid pairs; the output
-checksum constraint passed. With reviewer skipped, the deterministic decision
-promoted the change and resume returned `done`. NCU returned
-`ERR_NVGPUCTRPERM`; no host permission or driver setting was changed.
-
-An isolated user-provided vLLM binary workload used `balanced`: one round, two
-branches, and a 10,800-second cap. Kernel paired A/B improved **26.3287%** with
-a 95% CI of **[22.1801%, 30.6322%]** over 100 valid pairs. Workload
-`latency_us` changed **-0.0097%**, CI **[-0.0390%, 0.0365%]**, below its 2%
-effect threshold. The result was `kernel_only_win`; the global best stayed at
-the baseline. The run took 2,232.43 seconds. This is binary A/B evidence, not
-source-level promotion proof.
-
-<details>
-<summary>Standalone NCU report acceptance</summary>
-
-The report analyzer was accepted separately on 2026-07-17 on a host with 8x
-RTX 5090, driver 595.71.05, and NCU 2026.1.1.0. The source report was 5,966,669
-bytes. Its SHA-256 was unchanged before copy, after copy, and after analysis:
-`01a1356a487cc1ce77c6af541508db2c5a673dbfa9370bed30d095162321574d`.
-
-The analyzer exited 2 because only the summary command returned 1; details and
-raw CSV remained available with 140 metrics. The bundle recorded
-`counter_access: not_probed`, all 6/6 supporting artifact hashes matched, and
-the strict verifier passed 32/32 checks. It launched no workload and changed no
-driver, NCU, or counter configuration. `verification.json` SHA-256:
-`af1ca2f57081f4420d13662127338906d5b808b52a75f53f18c27787d624359e`.
-
-</details>
-
-See [the SM120 test guide](tests/gpu/sm120/README.md) for opt-in commands and
-[compatibility notes](skills/cuda-kernel-optimizer/references/compatibility.md)
-for version and architecture routing.
-
-### Repository publishing
-
-[GitHub](https://github.com/troycheng/cuda-optimized-skill) is the authoritative
-repository. The internal GitLab project is a one-way mirror. Releases copy only
-`main` and one explicit annotated tag; development never flows back from the
-mirror.
-
-Run the publisher without `--execute` first. It verifies repository identity,
-fast-forward safety, the full CPU suite, and both exact refs without writing:
-
-```bash
-python3 tools/publish_dual_remote.py --tag v2.4.0
-python3 tools/publish_dual_remote.py --tag v2.4.0 --execute
-```
-
-The second command publishes GitHub first, verifies it, then publishes and
-verifies GitLab. It never force-pushes, deletes refs, or writes to upstream.
-
-## References and license
-
-- [Skill workflow](skills/cuda-kernel-optimizer/SKILL.md)
-- [Walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
+- [AI execution protocol](skills/cuda-kernel-optimizer/SKILL.md)
+- [Complete workload controller example](skills/cuda-kernel-optimizer/examples/workload-controller.md)
+- [Kernel optimization walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [Optimization catalog](skills/cuda-kernel-optimizer/references/optimization_catalog.md)
-- [NCU metrics guide](skills/cuda-kernel-optimizer/references/ncu_metrics_guide.md)
-- [Serving evidence protocol](skills/cuda-kernel-optimizer/references/serving_evidence_protocol.md)
-- [Systems and Triton IR coverage](skills/cuda-kernel-optimizer/references/systems_and_ir_coverage.md)
-- [Sanitizer policy](skills/cuda-kernel-optimizer/references/sanitizer_policy.json)
+- [Compatibility notes](skills/cuda-kernel-optimizer/references/compatibility.md)
+- [RTX 5090 test guide](tests/gpu/sm120/README.md)
+- [MIT License](LICENSE)
 
-This skill is independent of CUTLASS, Triton, and Nsight Compute and does not
-redistribute them. Install those dependencies under their own licenses.
+This project is independent of CUTLASS, Triton, and Nsight Compute. Install and
+use those dependencies under their respective licenses.
