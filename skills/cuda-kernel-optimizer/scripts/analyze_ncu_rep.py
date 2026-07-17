@@ -41,16 +41,16 @@ def _physical_absolute(path: os.PathLike[str] | str) -> str:
     return os.path.abspath(os.path.expanduser(os.fspath(path)))
 
 
-def capture_regular_file(path: os.PathLike[str] | str) -> dict[str, Any]:
+def capture_regular_file(path: os.PathLike[str] | str, field: str) -> dict[str, Any]:
     """Capture regular bytes without resolving or following symlinks."""
     physical_path = _physical_absolute(path)
     try:
         mode = os.lstat(physical_path).st_mode
-    except FileNotFoundError as error:
-        raise ValueError(f"artifact file does not exist: {physical_path}") from error
-    if not stat.S_ISREG(mode):
-        raise ValueError(f"artifact path is not a regular file: {physical_path}")
-    payload = artifact_store.read_regular_bytes(physical_path)
+        if not stat.S_ISREG(mode):
+            raise ValueError("path is not a regular file")
+        payload = artifact_store.read_regular_bytes(physical_path)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{field}: unsafe regular file: {physical_path}") from error
     return {
         "path": physical_path,
         "size": len(payload),
@@ -58,26 +58,28 @@ def capture_regular_file(path: os.PathLike[str] | str) -> dict[str, Any]:
     }
 
 
-def _assert_no_symlink_path(path: str) -> None:
-    target = Path(path)
-    current = Path(target.anchor)
-    for index, component in enumerate(target.parts[1:]):
-        current /= component
-        try:
-            mode = os.lstat(current).st_mode
-        except FileNotFoundError as error:
-            raise ValueError(f"path does not exist: {target}") from error
-        # macOS compatibility aliases (/var and /tmp) may be symlinks directly
-        # below the filesystem root; descendants remain strictly no-follow.
-        if index and stat.S_ISLNK(mode):
-            raise ValueError(f"path contains a symlink: {target}")
-
-
 def validate_output_directory(path: os.PathLike[str] | str) -> str:
     physical_path = _physical_absolute(path)
-    _assert_no_symlink_path(physical_path)
-    if not stat.S_ISDIR(os.lstat(physical_path).st_mode):
-        raise ValueError(f"output path is not a directory: {physical_path}")
+    target = Path(physical_path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(target.anchor, flags)
+    try:
+        for index, component in enumerate(target.parts[1:]):
+            component_flags = flags if index == 0 else flags | nofollow
+            try:
+                child_fd = os.open(component, component_flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                os.mkdir(component, 0o755, dir_fd=directory_fd)
+                child_fd = os.open(component, component_flags, dir_fd=directory_fd)
+            except OSError as error:
+                raise ValueError(f"output path is unsafe or not a directory: {physical_path}") from error
+            os.close(directory_fd)
+            directory_fd = child_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    os.close(directory_fd)
     return physical_path
 
 
@@ -129,11 +131,50 @@ def _run_bounded(argv: list[str], timeout: float, output_limit: int) -> dict[str
         threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True),
     ]
-    for reader in readers:
-        reader.start()
-    deadline = time.monotonic() + timeout
+    group_gone = False
+
+    def signal_group(signum: int) -> None:
+        nonlocal group_gone
+        if group_gone:
+            return
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            group_gone = True
+        except PermissionError:
+            # If the OS no longer permits addressing the session, still reap
+            # the direct child rather than leaking it during error cleanup.
+            process.kill()
+            group_gone = True
+
+    def group_exists() -> bool:
+        nonlocal group_gone
+        if group_gone:
+            return False
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            group_gone = True
+            return False
+        except PermissionError:
+            process.kill()
+            group_gone = True
+            return False
+        return True
+
+    def stop_group() -> None:
+        signal_group(signal.SIGTERM)
+        grace_deadline = time.monotonic() + 0.2
+        while time.monotonic() < grace_deadline and group_exists():
+            time.sleep(0.01)
+        if group_exists():
+            signal_group(signal.SIGKILL)
+
     timed_out = False
     try:
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if process.poll() is not None and not any(reader.is_alive() for reader in readers):
                 break
@@ -143,29 +184,20 @@ def _run_bounded(argv: list[str], timeout: float, output_limit: int) -> dict[str
         if not timed_out and process.poll() is not None and any(reader.is_alive() for reader in readers):
             timed_out = True
         if timed_out:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            grace_deadline = time.monotonic() + 0.2
-            while time.monotonic() < grace_deadline and any(reader.is_alive() for reader in readers):
-                time.sleep(0.01)
-            if any(reader.is_alive() for reader in readers):
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            stop_group()
         process.wait()
         for reader in readers:
-            reader.join(timeout=1)
+            if reader.ident is not None:
+                reader.join(timeout=1)
     except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        stop_group()
         process.wait()
         for reader in readers:
-            reader.join(timeout=1)
+            if reader.ident is not None:
+                reader.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
         raise
     return {
         "timed_out": timed_out,
@@ -192,20 +224,21 @@ def _positive_float_argument(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report", required=True)
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("report", metavar="REPORT")
+    parser.add_argument("--source", metavar="SOURCE")
+    parser.add_argument("--out-dir", required=True, metavar="OUTPUT")
     parser.add_argument("--ncu-bin", default="ncu")
-    parser.add_argument("--ncu-num", type=_positive_int_argument, default=1)
-    parser.add_argument("--timeout", type=_positive_float_argument, default=30.0)
+    parser.add_argument("--ncu-num", type=_positive_int_argument, default=5)
+    parser.add_argument("--timeout", type=_positive_float_argument, default=120.0)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    capture_regular_file(args.report)
-    capture_regular_file(args.source)
-    validate_output_directory(args.output)
+    capture_regular_file(args.report, "REPORT")
+    if args.source is not None:
+        capture_regular_file(args.source, "SOURCE")
+    validate_output_directory(args.out_dir)
     resolve_executable(args.ncu_bin)
     return 0
 
