@@ -541,13 +541,15 @@ def _validate_record(value: Any) -> dict:
         if len(by_role.get(required, [])) != 1:
             raise ValueError(f"strategy run evidence role {required} must appear exactly once")
     workload_count = len(by_role.get("workload_paired_samples", []))
-    workload_required = terminal["mode"] == "full" and terminal["workload_status"] == "evaluated"
+    workload_required = terminal["mode"] == "full" and terminal["workload_status"] in {
+        "evaluated", "workload_failed"
+    }
     if workload_required and workload_count != 1:
         raise ValueError("evaluated full workload evidence must appear exactly once")
     if not workload_required and workload_count != 0:
         raise ValueError("workload paired evidence is not valid for this terminal outcome")
-    if terminal["workload_status"] == "evaluated" and terminal["mode"] != "full":
-        raise ValueError("evaluated workload requires full mode")
+    if terminal["workload_status"] in {"evaluated", "workload_failed"} and terminal["mode"] != "full":
+        raise ValueError("workload evidence requires full mode")
     if by_role["candidate"][0]["sha256"] != record["candidate_sha256"]:
         raise ValueError("strategy run candidate evidence is inconsistent")
     if by_role["decision"][0]["sha256"] != record["decision_sha256"]:
@@ -1321,10 +1323,10 @@ def load_completed_run(run_dir: str | os.PathLike) -> dict:
         terminal.get("kernel_paired_samples"), Mapping
     ):
         raise ValueError("evaluated terminal outcome requires kernel paired samples")
-    if replay.get("workload_status") == "evaluated" and not isinstance(
+    if replay.get("workload_status") in {"evaluated", "workload_failed"} and not isinstance(
         terminal.get("workload_paired_samples"), Mapping
     ):
-        raise ValueError("evaluated workload requires workload paired samples")
+        raise ValueError("attempted workload requires workload paired samples")
     for field in ("kernel_paired_samples", "workload_paired_samples"):
         binding = terminal.get(field)
         if isinstance(binding, Mapping):

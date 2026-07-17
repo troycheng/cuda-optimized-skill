@@ -214,6 +214,7 @@ class StrategyMemoryTests(unittest.TestCase):
         status: str = "kernel_only_win",
         *,
         with_ablation: bool = False,
+        workload_failed: bool = False,
     ) -> Path:
         """Build a real terminal snapshot through the production validators."""
         run = root.resolve() / "run"
@@ -226,7 +227,7 @@ class StrategyMemoryTests(unittest.TestCase):
         candidate = iteration / "kernel.py"
         candidate.write_text("# candidate\n", encoding="utf-8")
         candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
-        mode = "full" if status == "end_to_end_win" else "kernel-only"
+        mode = "full" if status == "end_to_end_win" or workload_failed else "kernel-only"
         workload = self._python_workload(root, "-run") if mode == "full" else None
         budget = {"elapsed_seconds": 1.0, "remaining_seconds": 9.0}
         inputs = {
@@ -290,20 +291,16 @@ class StrategyMemoryTests(unittest.TestCase):
         workload_evidence = None
         workload_artifact = None
         if mode == "full":
+            objective = workload["objective"]
             raw_workload_pairs = [
                 {"block": index, "order": "AB", "case": None,
                  "baseline_metrics": {"latency_ms": 100.0},
-                 "candidate_metrics": {"latency_ms": 97.0}, "valid": True,
+                 "candidate_metrics": {"latency_ms": 97.0},
+                 "valid": not workload_failed,
                  "attempts": {"baseline": 1, "candidate": 1},
                  "attempt_records": {"baseline": [], "candidate": []}}
                 for index in range(3)
             ]
-            workload_stats = self.paired_stats.classify_pairs(
-                [{"baseline": 100.0, "candidate": 97.0, "valid": True}] * 3,
-                direction="lower", min_effect_pct=1.0, confidence=0.95,
-                bootstrap_samples=20, seed=0,
-            )
-            objective = workload["objective"]
             workload_classifier = {
                 "objective": objective,
                 "objective_sha256": hashlib.sha256(json.dumps(
@@ -317,10 +314,21 @@ class StrategyMemoryTests(unittest.TestCase):
                 candidate_id="b1", candidate_file=candidate,
                 classifier_config=workload_classifier,
             )
-            workload_evidence = {
-                "status": "evaluated", "objective": objective,
-                "primary": workload_stats, "constraints": [],
-            }
+            if workload_failed:
+                workload_evidence = self.orchestrate.workload_evaluate.classify_recorded_pairs(
+                    objective, raw_workload_pairs, confidence=0.95,
+                    bootstrap_samples=20, seed=0,
+                )
+            else:
+                workload_stats = self.paired_stats.classify_pairs(
+                    [{"baseline": 100.0, "candidate": 97.0, "valid": True}] * 3,
+                    direction="lower", min_effect_pct=1.0, confidence=0.95,
+                    bootstrap_samples=20, seed=0,
+                )
+                workload_evidence = {
+                    "status": "evaluated", "objective": objective,
+                    "primary": workload_stats, "constraints": [],
+                }
         decision = self.decision.decide(
             mode=mode, kernel=kernel_evidence, workload=workload_evidence,
             constraints=[], pareto=None,
@@ -1206,6 +1214,41 @@ class StrategyMemoryTests(unittest.TestCase):
                 mutate(record)
                 with self.assertRaises(ValueError):
                     self.memory._validate_record(record)
+
+    def test_failed_full_workload_retains_exactly_one_bound_paired_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self._completed_run(
+                root, "kernel_only_win", workload_failed=True
+            )
+            record = self.memory.load_completed_run(run)
+            self.assertEqual(record["terminal"]["mode"], "full")
+            self.assertEqual(record["terminal"]["workload_status"], "workload_failed")
+            self.assertEqual(
+                sum(item["role"] == "workload_paired_samples" for item in record["evidence"]),
+                1,
+            )
+            for mutation in ("missing", "duplicate"):
+                corrupt = copy.deepcopy(record)
+                if mutation == "missing":
+                    corrupt["evidence"] = [
+                        item for item in corrupt["evidence"]
+                        if item["role"] != "workload_paired_samples"
+                    ]
+                else:
+                    self._duplicate_evidence_role(corrupt, "workload_paired_samples")
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    self.memory._validate_record(corrupt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self._completed_run(
+                root, "kernel_only_win", workload_failed=True
+            )
+            (run / "iterv1" / "workload" / "paired_samples.jsonl").unlink()
+            with self.assertRaises(ValueError):
+                self.memory.record_run(root / "memory.json", run, root / "record.json")
+            self.assertFalse((root / "memory.json").exists())
 
         for mutation in ("missing", "duplicate"):
             with self.subTest(workload=mutation), tempfile.TemporaryDirectory() as tmp:
