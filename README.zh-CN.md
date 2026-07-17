@@ -315,8 +315,8 @@ Strategy memory 只需要 Python 3.10+，支持 POSIX 语义的 Darwin/Linux 系
 
 这个 skill 不重新分发 CUDA、CUTLASS、Triton 或 Nsight Compute。
 
-当前 CPU 验收共 611 项：607 项通过，4 项 opt-in RTX 5090 测试跳过，失败为
-0。25/25 个脚本均通过 `py_compile` 和 `--help` smoke check，skill validator
+当前 CPU 验收共 676 项：671 项通过，5 项 opt-in RTX 5090 测试跳过，失败为
+0。28/28 个脚本均通过 `py_compile` 和 `--help` smoke check，skill validator
 也确认结构有效。
 
 V2.2 已于 2026-07-17 在物理 RTX 5090 上验证。当前环境与兼容环境各完成

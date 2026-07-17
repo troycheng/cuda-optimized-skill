@@ -339,8 +339,8 @@ systems. Its storage must honor file locking and atomic rename semantics.
 
 The skill does not redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
 
-Current CPU acceptance contains 611 tests: 607 passed, four opt-in RTX 5090
-tests skipped, and zero failed. All 25/25 scripts pass `py_compile` and `--help`
+Current CPU acceptance contains 676 tests: 671 passed, five opt-in RTX 5090
+tests skipped, and zero failed. All 28/28 scripts pass `py_compile` and `--help`
 smoke checks, and the skill validator reports valid.
 
 V2.2 was validated on physical RTX 5090 hardware on 2026-07-17. The current and

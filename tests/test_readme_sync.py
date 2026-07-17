@@ -312,9 +312,9 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_readmes_publish_identical_current_validation_facts(self) -> None:
         facts = (
-            "611",
-            "607",
-            "25/25",
+            "676",
+            "671",
+            "28/28",
             "595.71.05",
             "2026.1.1.0",
             "5,966,669",
