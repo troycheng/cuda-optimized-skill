@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate NCU report inputs and provide bounded subprocess execution."""
+"""Analyze an existing NCU report without launching a target kernel."""
 
 from __future__ import annotations
 
@@ -20,6 +20,24 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import artifact_store  # noqa: E402
+import profile_ncu  # noqa: E402
+
+
+SCHEMA_VERSION = "cuda-kernel-optimizer/ncu-analysis-v1"
+OUTPUT_LIMIT = 1024 * 1024
+SUPPORTING_FILES = (
+    "summary.txt",
+    "summary.stderr.txt",
+    "details.txt",
+    "details.stderr.txt",
+    "raw.csv",
+    "analysis.md",
+)
+LIMITS = [
+    "Importing an existing report does not prove current performance-counter permission.",
+    "The captured source identity does not prove that the report was produced from that source.",
+    "Standalone report analysis does not prove an end-to-end performance benefit.",
+]
 
 
 def _strict_positive_int(value: Any) -> int:
@@ -226,6 +244,221 @@ def _positive_float_argument(value: str) -> float:
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def _command_result(result: dict[str, Any], *, available: bool) -> dict[str, Any]:
+    return {
+        "returncode": result["returncode"],
+        "timed_out": result["timed_out"],
+        "truncated": result["truncated"],
+        "available": available,
+    }
+
+
+def _analyze_csv(csv_text: str, ncu_num: int) -> dict[str, Any]:
+    """Normalize and rank imported CSV through the optimizer's shared rubric."""
+    rows = profile_ncu._parse_ncu_csv(csv_text)
+    aggregate = profile_ncu._aggregate_across_kernels(rows)
+    rankings = profile_ncu._rank_by_axis(aggregate, ncu_num)
+    kernels = sorted(
+        {
+            row.get("Kernel Name", "").strip()
+            for row in rows
+            if row.get("Kernel Name", "").strip()
+        }
+    )
+
+    best_axis = "unknown"
+    best_score = float("-inf")
+    for axis in ("compute", "memory", "latency"):
+        for metric in rankings[axis]:
+            value = float(metric["value"])
+            if not math.isfinite(value):
+                continue
+            score = value if metric["higher_is_worse"] else 100.0 - value
+            if score > best_score:
+                best_score = score
+                best_axis = axis
+    return {
+        "metric_count": len(aggregate),
+        "kernels": kernels,
+        "rankings": rankings,
+        "primary_axis": {"axis": best_axis, "quality": "heuristic"},
+    }
+
+
+def _escape_markdown(value: Any) -> str:
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    escaped = []
+    for character in text:
+        if character in r"\\`*_{}[]()#+-.!|<>":
+            escaped.append("\\")
+        escaped.append(character)
+    return "".join(escaped)
+
+
+def _render_markdown(payload: dict[str, Any]) -> bytes:
+    lines = [
+        "# NCU report analysis",
+        "",
+        f"Status: {_escape_markdown(payload['status'])}",
+        f"Report: {_escape_markdown(payload['report']['path'])}",
+        f"Report SHA-256: {_escape_markdown(payload['report']['sha256'])}",
+        f"Primary axis: {_escape_markdown(payload['primary_axis']['axis'])} (heuristic)",
+        "",
+        "## Kernels",
+        "",
+    ]
+    if payload["kernels"]:
+        lines.extend(f"* {_escape_markdown(kernel)}" for kernel in payload["kernels"])
+    else:
+        lines.append("No classified kernel names were available.")
+    lines.extend(["", "## Ranked metrics", ""])
+    for axis in ("compute", "memory", "latency"):
+        lines.append(f"### {axis.capitalize()}")
+        lines.append("")
+        metrics = payload["rankings"][axis]
+        if not metrics:
+            lines.append("No classified metrics were available.")
+        for metric in metrics:
+            unit = metric.get("unit") or ""
+            lines.append(
+                "* "
+                + _escape_markdown(metric["name"])
+                + ": "
+                + _escape_markdown(metric["value"])
+                + (" " + _escape_markdown(unit) if unit else "")
+            )
+        lines.append("")
+    lines.extend(["## Interpretation limits", ""])
+    lines.extend(f"* {_escape_markdown(limit)}" for limit in payload["limits"])
+    lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _same_identity(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return (
+        before["path"] == after["path"]
+        and before["size"] == after["size"]
+        and before["sha256"] == after["sha256"]
+    )
+
+
+def _run_analysis(args: argparse.Namespace) -> int:
+    report = capture_regular_file(args.report, "REPORT")
+    source = capture_regular_file(args.source, "SOURCE") if args.source is not None else None
+    output = validate_output_directory(args.out_dir)
+    marker = os.path.join(output, "analysis.json")
+    artifact_store.remove_regular_file(marker, missing_ok=True)
+
+    ncu = resolve_executable(args.ncu_bin)
+    executable = ncu["resolved"]
+    report_path = report["path"]
+    commands: dict[str, dict[str, Any]] = {}
+
+    version_result = _run_bounded(
+        [executable, "--version"], args.timeout, OUTPUT_LIMIT
+    )
+    if version_result["timed_out"]:
+        raise TimeoutError("NCU version query timed out")
+    version_available = version_result["returncode"] == 0 and bool(
+        version_result["stdout"].strip()
+    )
+    commands["version"] = _command_result(
+        version_result, available=version_available
+    )
+
+    command_specs = (
+        ("summary", [executable, "--import", report_path, "--page", "summary"]),
+        ("details", [executable, "--import", report_path, "--page", "details"]),
+        ("raw", [executable, "--import", report_path, "--csv", "--page", "raw"]),
+    )
+    results: dict[str, dict[str, Any]] = {}
+    for name, argv in command_specs:
+        result = _run_bounded(argv, args.timeout, OUTPUT_LIMIT)
+        if result["timed_out"]:
+            raise TimeoutError(f"NCU {name} import timed out")
+        results[name] = result
+
+    report_after = capture_regular_file(report_path, "REPORT")
+    if not _same_identity(report, report_after):
+        raise ValueError("REPORT identity changed during import")
+    if source is not None:
+        source_after = capture_regular_file(source["path"], "SOURCE")
+        if not _same_identity(source, source_after):
+            raise ValueError("SOURCE identity changed during import")
+
+    available = {
+        name: result["returncode"] == 0 and bool(result["stdout"])
+        for name, result in results.items()
+    }
+    csv_analysis = (
+        _analyze_csv(results["raw"]["stdout"], args.ncu_num)
+        if available["raw"]
+        else _analyze_csv("", args.ncu_num)
+    )
+    available["raw"] = available["raw"] and csv_analysis["metric_count"] > 0
+    for name, result in results.items():
+        commands[name] = _command_result(result, available=available[name])
+    commands["raw"]["stderr"] = results["raw"]["stderr"]
+
+    interpretable = available["summary"] or available["details"] or available["raw"]
+    if not interpretable:
+        raise RuntimeError("all NCU report imports failed or were uninterpretable")
+    complete = (
+        version_available
+        and all(results[name]["returncode"] == 0 for name in results)
+        and all(available.values())
+    )
+    status = "success" if complete else "partial"
+
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "counter_access": "not_probed",
+        "report": report,
+        "source": source,
+        "ncu": {
+            "requested": ncu["requested"],
+            "resolved": executable,
+            "version": version_result["stdout"].strip() if version_available else None,
+        },
+        "commands": commands,
+        **csv_analysis,
+        "limits": list(LIMITS),
+        "artifacts": {},
+    }
+    writes = {
+        "summary.txt": (
+            results["summary"]["stdout"].encode("utf-8") if available["summary"] else b""
+        ),
+        "summary.stderr.txt": results["summary"]["stderr"].encode("utf-8"),
+        "details.txt": (
+            results["details"]["stdout"].encode("utf-8") if available["details"] else b""
+        ),
+        "details.stderr.txt": results["details"]["stderr"].encode("utf-8"),
+        "raw.csv": results["raw"]["stdout"].encode("utf-8") if available["raw"] else b"",
+    }
+    writes["analysis.md"] = _render_markdown(payload)
+    hashes = artifact_store.publish_regular_bundle(output, writes)
+    availability = {
+        "summary.txt": available["summary"],
+        "summary.stderr.txt": bool(results["summary"]["stderr"]),
+        "details.txt": available["details"],
+        "details.stderr.txt": bool(results["details"]["stderr"]),
+        "raw.csv": available["raw"],
+        "analysis.md": True,
+    }
+    payload["artifacts"] = {
+        name: {
+            "sha256": hashes[name],
+            "size": len(writes[name]),
+            "available": availability[name],
+        }
+        for name in SUPPORTING_FILES
+    }
+    artifact_store.atomic_write_json(marker, payload)
+    return 0 if status == "success" else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", metavar="REPORT")
@@ -239,12 +472,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    capture_regular_file(args.report, "REPORT")
-    if args.source is not None:
-        capture_regular_file(args.source, "SOURCE")
-    validate_output_directory(args.out_dir)
-    resolve_executable(args.ncu_bin)
-    return 0
+    try:
+        return _run_analysis(args)
+    except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
