@@ -23,6 +23,7 @@ CHECK_ENV = ROOT / "skills" / "cuda-kernel-optimizer" / "scripts" / "check_env.p
 SCRIPTS = ROOT / "skills" / "cuda-kernel-optimizer" / "scripts"
 RUNNER = Path(__file__).resolve().parent / "remote" / "run_lane.sh"
 ARTIFACTS = Path(os.environ.get("CUDA_E2E_ARTIFACTS", "/tmp/cuda-sm120-acceptance"))
+WORKLOAD_CONTROLLER = SCRIPTS / "workload_controller.py"
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,22 @@ class Sm120AcceptanceHelperTests(unittest.TestCase):
         self.assertIn('expected_cutlass_version="4.6.1"', source)
         self.assertIn("vllm-opt", source)
         self.assertIn('-v "$repo_root:$repo_root:ro"', source)
+
+    def test_v2_4_lane_uses_the_production_workload_controller(self) -> None:
+        source = inspect.getsource(
+            Sm120AcceptanceTests.test_workload_controller_promotes_real_gpu_candidate
+        )
+        for marker in ("start_run", "register_change", "evaluate_change"):
+            self.assertIn(marker, source)
+        for fixture in (
+            "triton_vector_slow.py",
+            "workload_probe.py",
+            "workload_smoke.py",
+        ):
+            self.assertTrue((FIXTURES / fixture).is_file(), fixture)
+        adapter = (FIXTURES / "workload_smoke.py").read_text(encoding="utf-8")
+        self.assertIn("Mapping", adapter)
+        self.assertIn('candidate["path"]', adapter)
 
 @unittest.skipUnless(
     os.environ.get("CUDA_SM120_E2E") == "1",
@@ -516,6 +533,100 @@ class Sm120AcceptanceTests(unittest.TestCase):
             )
         else:
             self.fail("ncu_top.degraded must be a literal boolean")
+
+    def test_workload_controller_promotes_real_gpu_candidate(self) -> None:
+        controller = _load_script("workload_controller")
+        case_root = ARTIFACTS / "workload_controller"
+        workspace = _stage_fixture_workspace("workspace", artifacts=case_root)
+        baseline = workspace / "baseline.py"
+        candidate = workspace / "candidate.py"
+        shutil.copy2(workspace / "triton_vector_slow.py", baseline)
+        shutil.copy2(workspace / "triton_vector_slow.py", candidate)
+        workload_manifest = workspace / "controller_workload.json"
+        workload_manifest.write_text(
+            json.dumps(
+                {
+                    "kind": "python",
+                    "source": "workload_smoke.py",
+                    "objective": json.loads(
+                        (workspace / "objective.json").read_text("utf-8")
+                    ),
+                    "cases": [{"N": 1_048_576}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        control = {
+            "schema_version": "cuda-workload-optimizer/control-v1",
+            "project_root": str(workspace),
+            "workload_manifest": str(workload_manifest),
+            "baseline_candidate": {
+                "name": "slow-baseline",
+                "revision": "fixture-slow",
+                "path": str(baseline),
+            },
+            "budget": "fast",
+            "mutation": {
+                "project_paths": ["candidate.py"],
+                "environment_root": str(case_root / "isolated-environment"),
+                "host_policy": "recommend_only",
+            },
+            "probes": [
+                {
+                    "id": "timeline",
+                    "kind": "timeline",
+                    "argv": [sys.executable, str(workspace / "workload_probe.py")],
+                    "timeout_seconds": 60,
+                }
+            ],
+        }
+        run_dir = case_root / "run"
+        state = controller.start_run(control, run_dir)
+        self.assertEqual(state["next_action"], "register_change")
+        probe = json.loads((run_dir / "probes" / "timeline.json").read_text("utf-8"))
+        diagnosis = json.loads((run_dir / "diagnosis.json").read_text("utf-8"))
+        self.assertEqual(probe["schema_version"], "cuda-workload-optimizer/probe-v1")
+        self.assertEqual(
+            diagnosis["schema_version"], "cuda-workload-optimizer/diagnosis-v1"
+        )
+
+        change = {
+            "schema_version": "cuda-workload-optimizer/change-v1",
+            "id": "round-1-remove-redundant-launches",
+            "hypothesis": "Two redundant launches dominate this fixture workload.",
+            "diagnosis_ids": diagnosis["diagnosis_ids"] or ["kernel:fixture"],
+            "scope": "project",
+            "candidate": {
+                "name": "single-launch",
+                "revision": "fixture-fast",
+                "path": str(candidate),
+            },
+            "paths": ["candidate.py"],
+            "commands": [[sys.executable, "-m", "py_compile", str(candidate)]],
+            "rollback": "restore_frozen_snapshot",
+            "expected_metrics": ["gpu_busy_pct", "latency_ms", "output_checksum"],
+        }
+        controller.register_change(control, run_dir, change)
+        slow_hash = _fixture_hash(candidate)
+        shutil.copy2(workspace / "triton_vector.py", candidate)
+        self.assertNotEqual(_fixture_hash(candidate), slow_hash)
+
+        decision = controller.evaluate_change(run_dir)
+
+        self.assertEqual(decision["status"], "promoted")
+        evaluation = json.loads((run_dir / "evaluation.json").read_text("utf-8"))
+        review = json.loads((run_dir / "review.json").read_text("utf-8"))
+        self.assertEqual(evaluation["primary"]["status"], "confirmed_win")
+        self.assertTrue(
+            all(item["status"] == "passed" for item in evaluation["constraints"])
+        )
+        self.assertEqual(review["status"], "skipped")
+        self.assertEqual(controller.evaluate_change(run_dir), decision)
+        self.assertEqual(controller.resume_run(run_dir)["next_action"], "done")
+        self.assertIn(
+            "No host mutation was executed",
+            (run_dir / "host_recommendations.md").read_text("utf-8"),
+        )
 
 
 if __name__ == "__main__":

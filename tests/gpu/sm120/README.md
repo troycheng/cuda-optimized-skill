@@ -12,6 +12,10 @@ set. It covers:
   GPU through the production outer evaluator, persists its automatic
   `workload_paired_samples` evidence, and verifies that an inconclusive outer
   result cannot be promoted globally;
+- a V2.4 workload-controller round that freezes a deliberately slow real Triton
+  workload, collects a normalized GPU probe, registers a project-scoped
+  ChangeSet, replaces redundant launches, runs paired workload evaluation, and
+  requires a deterministic promotion with no host mutation;
 - a target-bounded Nsight Compute attempt. It must either collect real metrics
   with readable counters or record exactly `ERR_NVGPUCTRPERM`; no other
   degraded result is accepted. The test never adds capabilities or changes
@@ -24,7 +28,7 @@ The no-op check uses the production `run_paired`, `classify_pairs`, and
 
 ## Local and current-lane execution
 
-Without opt-in, seven CPU helper regressions pass and all four GPU tests are
+Without opt-in, eight CPU helper regressions pass and all five GPU tests are
 reported as skipped:
 
 ```bash
@@ -105,6 +109,15 @@ artifacts/<lane>/
 │   └── iterv1/
 │       ├── workspace/...
 │       └── workload/<candidate-sha-prefix>/paired_samples.jsonl
+├── workload_controller/
+│   ├── workspace/...
+│   └── run/
+│       ├── probes/timeline.json
+│       ├── diagnosis.json
+│       ├── change_set.json
+│       ├── review.json
+│       ├── evaluation.json
+│       └── decision.json
 └── ncu_target/
     ├── workspace/...
     └── iterv1/
