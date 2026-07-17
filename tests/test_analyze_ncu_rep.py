@@ -131,14 +131,33 @@ class AnalyzeNcuRepInputTests(unittest.TestCase):
             fake_ncu.chmod(0o700)
             marker = root / "ran"
             base = [sys.executable, str(SCRIPT), str(report), "--source", str(source), "--out-dir", str(output), "--ncu-bin", str(fake_ncu)]
-            invalid = [
-                ([str(root / "missing.rep"), "--out-dir", str(output)], "REPORT"),
-                ([str(report), "--source", str(root / "missing.py"), "--out-dir", str(output)], "SOURCE"),
-                ([str(report), "--out-dir", str(root / "file")], "output"),
-                (base[2:] + ["--ncu-num", "0"], "positive"),
-                (base[2:] + ["--timeout", "nan"], "positive"),
-            ]
-            (root / "file").write_text("x", encoding="utf-8")
+            directory = root / "directory"
+            directory.mkdir()
+            fifo = root / "input.fifo"
+            os.mkfifo(fifo)
+            leaf_link = root / "leaf-link"
+            leaf_link.symlink_to(report)
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            parent_child = real_parent / "child"
+            parent_child.write_text("x", encoding="utf-8")
+            parent_link = root / "parent-link"
+            parent_link.symlink_to(real_parent, target_is_directory=True)
+            unsafe_inputs = [root / "missing", directory, fifo, leaf_link, parent_link / "child"]
+            output_file = root / "output-file"
+            output_file.write_text("x", encoding="utf-8")
+            output_link = root / "output-link"
+            output_link.symlink_to(output, target_is_directory=True)
+            invalid = []
+            for candidate in unsafe_inputs:
+                invalid.append(([str(candidate), "--out-dir", str(output)], "REPORT"))
+                invalid.append(([str(report), "--source", str(candidate), "--out-dir", str(output)], "SOURCE"))
+            for candidate in (output_file, output_link):
+                invalid.append(([str(report), "--out-dir", str(candidate)], "output"))
+            for value in ("0", "-1", "true"):
+                invalid.append((base[2:] + ["--ncu-num", value], "error:"))
+            for value in ("0", "-1", "nan", "inf", "true"):
+                invalid.append((base[2:] + ["--timeout", value], "error:"))
             for pieces, expected in invalid:
                 command = [sys.executable, str(SCRIPT)] + pieces
                 completed = subprocess.run(command, env={**os.environ, "MARKER": str(marker)}, capture_output=True, text=True)
@@ -186,6 +205,20 @@ class AnalyzeNcuRepBoundedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pid_file = Path(tmp) / "child.pid"
             code = "import subprocess,sys; subprocess.Popen([sys.executable,'-c',\"import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)\",sys.argv[1]])"
+            result = module._run_bounded([sys.executable, "-c", code, str(pid_file)], timeout=0.2, output_limit=1024)
+            self.assertTrue(result["timed_out"])
+            pid = int(pid_file.read_text())
+            for _ in range(50):
+                if _gone(pid):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(_gone(pid), pid)
+
+    def test_bounded_run_times_out_when_leader_exits_and_descendant_closes_stdio(self) -> None:
+        module = _load()
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "child.pid"
+            code = "import subprocess,sys; subprocess.Popen([sys.executable,'-c',\"import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); os.close(1); os.close(2); time.sleep(30)\",sys.argv[1]])"
             result = module._run_bounded([sys.executable, "-c", code, str(pid_file)], timeout=0.2, output_limit=1024)
             self.assertTrue(result["timed_out"])
             pid = int(pid_file.read_text())

@@ -176,12 +176,12 @@ def _run_bounded(argv: list[str], timeout: float, output_limit: int) -> dict[str
             reader.start()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if process.poll() is not None and not any(reader.is_alive() for reader in readers):
-                break
+            if process.poll() is not None:
+                process.wait()
+                if not any(reader.is_alive() for reader in readers) and not group_exists():
+                    break
             time.sleep(0.01)
         else:
-            timed_out = True
-        if not timed_out and process.poll() is not None and any(reader.is_alive() for reader in readers):
             timed_out = True
         if timed_out:
             stop_group()
