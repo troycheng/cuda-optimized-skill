@@ -1172,6 +1172,64 @@ class StrategyMemoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "index|bundle"):
                 self.memory.load_memory(memory)
 
+    def test_verified_record_core_evidence_is_unique_and_hash_bound(self) -> None:
+        singleton_roles = (
+            "state", "checkpoint", "decision", "methods", "candidate",
+            "kernel_paired_samples",
+        )
+        cases = []
+        for role in singleton_roles:
+            cases.append((f"missing-{role}", lambda value, role=role: value["evidence"].__setitem__(
+                slice(None), [item for item in value["evidence"] if item["role"] != role]
+            )))
+            cases.append((f"duplicate-{role}", lambda value, role=role: self._duplicate_evidence_role(value, role)))
+        cases.extend(
+            [
+                ("candidate-sha", lambda value: next(
+                    item for item in value["evidence"] if item["role"] == "candidate"
+                ).update(sha256="0" * 64)),
+                ("checkpoint-sha", lambda value: next(
+                    item for item in value["evidence"] if item["role"] == "checkpoint"
+                ).update(sha256="0" * 64)),
+                ("unexpected-workload", lambda value: value["evidence"].append({
+                    "role": "workload_paired_samples",
+                    "path": str(Path(value["run_root"]["path"]) / "iterv1" / "extra-workload.jsonl"),
+                    "sha256": "1" * 64,
+                })),
+            ]
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                record = self.memory.load_completed_run(
+                    self._completed_run(Path(tmp), with_ablation=True)
+                )
+                mutate(record)
+                with self.assertRaises(ValueError):
+                    self.memory._validate_record(record)
+
+        for mutation in ("missing", "duplicate"):
+            with self.subTest(workload=mutation), tempfile.TemporaryDirectory() as tmp:
+                record = self.memory.load_completed_run(
+                    self._completed_run(Path(tmp), "end_to_end_win")
+                )
+                if mutation == "missing":
+                    record["evidence"] = [
+                        item for item in record["evidence"]
+                        if item["role"] != "workload_paired_samples"
+                    ]
+                else:
+                    self._duplicate_evidence_role(record, "workload_paired_samples")
+                with self.assertRaises(ValueError):
+                    self.memory._validate_record(record)
+
+    @staticmethod
+    def _duplicate_evidence_role(record: dict, role: str) -> None:
+        original = next(item for item in record["evidence"] if item["role"] == role)
+        duplicate = dict(original)
+        duplicate["path"] = str(Path(record["run_root"]["path"]) / "iterv1" / f"duplicate-{role}")
+        duplicate["sha256"] = "1" * 64
+        record["evidence"].append(duplicate)
+
     def test_record_writes_memory_before_output_and_retry_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

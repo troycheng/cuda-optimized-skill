@@ -531,14 +531,29 @@ def _validate_record(value: Any) -> dict:
         identity = evidence_identity(item["evidence"], f"strategy implementation {method_id}")
         if identity["role"] != "sass_check" or _canonical_bytes(identity) not in evidence_keys:
             raise ValueError("strategy method implementation evidence is inconsistent")
-    roles = {item["role"] for item in evidence}
-    for required in ("state", "checkpoint", "decision", "methods", "candidate", "kernel_paired_samples"):
-        if required not in roles:
-            raise ValueError(f"strategy run evidence is missing {required}")
-    if terminal["workload_status"] == "evaluated" and "workload_paired_samples" not in roles:
-        raise ValueError("evaluated workload is missing workload paired evidence")
-    checkpoint_items = [item for item in evidence if item["role"] == "checkpoint"]
-    if len(checkpoint_items) != 1 or checkpoint_items[0]["sha256"] != record["checkpoint_identity"]:
+    by_role: dict[str, list[dict]] = {}
+    for item in evidence:
+        by_role.setdefault(item["role"], []).append(item)
+    for required in (
+        "state", "checkpoint", "decision", "methods", "candidate",
+        "kernel_paired_samples",
+    ):
+        if len(by_role.get(required, [])) != 1:
+            raise ValueError(f"strategy run evidence role {required} must appear exactly once")
+    workload_count = len(by_role.get("workload_paired_samples", []))
+    workload_required = terminal["mode"] == "full" and terminal["workload_status"] == "evaluated"
+    if workload_required and workload_count != 1:
+        raise ValueError("evaluated full workload evidence must appear exactly once")
+    if not workload_required and workload_count != 0:
+        raise ValueError("workload paired evidence is not valid for this terminal outcome")
+    if terminal["workload_status"] == "evaluated" and terminal["mode"] != "full":
+        raise ValueError("evaluated workload requires full mode")
+    if by_role["candidate"][0]["sha256"] != record["candidate_sha256"]:
+        raise ValueError("strategy run candidate evidence is inconsistent")
+    if by_role["decision"][0]["sha256"] != record["decision_sha256"]:
+        raise ValueError("strategy run decision evidence is inconsistent")
+    checkpoint_items = by_role["checkpoint"]
+    if checkpoint_items[0]["sha256"] != record["checkpoint_identity"]:
         raise ValueError("strategy run checkpoint evidence is inconsistent")
     return record
 
