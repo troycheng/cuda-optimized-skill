@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-17
 
-**Status:** Approved direction; written specification pending user review
+**Status:** Approved by user
 
 **Target:** `skills/cuda-kernel-optimizer`
 
@@ -136,7 +136,8 @@ python3 scripts/analyze_ncu_rep.py REPORT \
 4. Parse and rank metrics using the current `profile_ncu.py` classification
    behavior.
 5. Re-open and re-hash the report and source; reject any identity drift.
-6. Publish the output bundle atomically.
+6. Publish every evidence file through atomic regular-file replacement, then
+   publish `analysis.json` last as the completion marker.
 
 The analyzer never launches a target kernel and never changes driver or
 counter policy. Importing a report therefore records `counter_access` as
@@ -165,12 +166,15 @@ OUTPUT/
 - per-command return code, timeout flag, and truncation flag;
 - kernel names, metric count, axis rankings, and heuristic primary axis;
 - `counter_access: not_probed` and explicit interpretation limits; and
-- hashes of every published evidence file.
+- hashes of every supporting evidence file (`analysis.json` is not
+  self-hashed).
 
 `analysis.md` escapes all imported names and values so report content cannot
-create Markdown links, images, headings, or tables. A partial import exits 2;
-input/security/timeout failures exit nonzero and do not preserve a stale
-`analysis.json` from an older run.
+create Markdown links, images, headings, or tables. Supporting files use
+atomic regular-file replacement; `analysis.json` is published last and is the
+only completion marker. A partial import exits 2; input/security/timeout
+failures exit nonzero and do not preserve a stale `analysis.json` from an
+older run.
 
 ## Component 3: advisory strategy memory
 
