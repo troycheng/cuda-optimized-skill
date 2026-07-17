@@ -186,7 +186,7 @@ class ReadmeSyncTests(unittest.TestCase):
         self.assertIn("never applied automatically", self.english)
         self.assertIn("不会自动执行", self.chinese)
 
-    def test_natural_language_requests_are_confined_to_examples(self) -> None:
+    def test_natural_language_request_examples_are_confined_to_usage_section(self) -> None:
         english = section(
             self.english,
             "## Usage examples",
@@ -197,8 +197,18 @@ class ReadmeSyncTests(unittest.TestCase):
             "## 使用示例",
             "## 测试情况与兼容性",
         )
-        self.assertEqual(english.count("> "), 4)
-        self.assertEqual(chinese.count("> "), 4)
+        english_examples = re.findall(r"^> ", english, re.MULTILINE)
+        chinese_examples = re.findall(r"^> ", chinese, re.MULTILINE)
+        self.assertEqual(len(english_examples), 4)
+        self.assertEqual(len(chinese_examples), 4)
+        self.assertEqual(
+            len(re.findall(r"^> ", self.english, re.MULTILINE)),
+            len(english_examples),
+        )
+        self.assertEqual(
+            len(re.findall(r"^> ", self.chinese, re.MULTILINE)),
+            len(chinese_examples),
+        )
         for marker in ("Triton", "GPU workload", "NCU", "balanced"):
             self.assertIn(marker, english)
             self.assertIn(marker, chinese)

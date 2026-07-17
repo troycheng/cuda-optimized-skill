@@ -166,10 +166,10 @@ a promise that unrelated projects will see the same speedup.
 | Validation | Environment and result | What it demonstrates |
 |---|---|---|
 | Automated tests | 690 total; 685 passed, five RTX 5090 opt-in tests skipped outside a GPU environment, zero failed | State recovery, evidence binding, timeouts, restoration, and input validation |
-| Full RTX 5090 run | The current lane passed 13/13 checks in 34.302 seconds | CUDA, CUTLASS, Triton, NCU, and the complete workload controller path |
+| Full RTX 5090 run | The current test environment passed 13/13 checks in 34.302 seconds; target-side NCU profiling returned `ERR_NVGPUCTRPERM` | CUDA, CUTLASS, Triton, and the complete GPU workload optimization flow; no privilege or driver policy was changed |
 | Reproducible workload fixture | End-to-end latency improved 60.4616%, with constraints passing | The full path from bottleneck analysis to keeping a verified change |
 | User-supplied vLLM workload | The kernel metric improved 26.3287%, while the real workload changed -0.0097% | End-to-end evidence was insufficient, so the original was kept; a faster kernel does not guarantee a faster product workload |
-| Existing NCU report | Parsed 140 metrics without launching the original program | Counter access was not reprobed; `ERR_NVGPUCTRPERM` is recorded as a permission limit and does not trigger privilege changes |
+| Existing NCU report | Parsed 140 metrics without launching the original program | Counter access was not reprobed; importing a report does not establish whether the current target can read performance counters |
 
 Kernel optimization requires Python 3.10+, a working CUDA GPU and driver, and
 the relevant toolchain. Triton tasks need `triton`; CUDA and CUTLASS compilation
