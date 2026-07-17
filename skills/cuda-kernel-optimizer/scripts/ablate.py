@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from artifact_store import read_regular_bytes  # noqa: E402
+import artifact_store  # noqa: E402
 
 
 _BUNDLED_BENCHMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py")
@@ -40,10 +41,53 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
-def _regular_identity(path: str | os.PathLike) -> tuple[str, str, bytes]:
-    absolute = Path(path).expanduser().absolute()
-    payload = read_regular_bytes(absolute)
-    return str(absolute), hashlib.sha256(payload).hexdigest(), payload
+def _regular_identity(path: str | os.PathLike) -> dict:
+    """Capture one no-follow file descriptor identity and its exact bytes."""
+    directory_fd = None
+    file_fd = None
+    try:
+        directory_fd, leaf, target = artifact_store._open_parent_directory(
+            path, create=False
+        )
+        file_fd = os.open(
+            leaf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd
+        )
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"ablation evidence is not a regular file: {target}")
+        current = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError(f"ablation evidence changed while opening: {target}")
+        chunks = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        final = os.fstat(file_fd)
+        current = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_size)
+        if identity != (final.st_dev, final.st_ino, final.st_size) or (
+            current.st_dev, current.st_ino, current.st_size
+        ) != identity:
+            raise ValueError(f"ablation evidence changed while reading: {target}")
+        if len(payload) != metadata.st_size:
+            raise ValueError(f"ablation evidence size changed while reading: {target}")
+        return {
+            "path": str(target),
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "bytes": payload,
+        }
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def _dims_argv(dims: dict) -> list[str]:
@@ -100,8 +144,9 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
     if not os.path.isfile(champion_bench):
         sys.exit(f"Champion bench.json not found at {champion_bench}")
     try:
-        champion_bench, champion_bench_sha, champion_bytes = _regular_identity(champion_bench)
-        champion_data = json.loads(champion_bytes.decode("utf-8"))
+        champion_identity = _regular_identity(champion_bench)
+        champion_bench = champion_identity["path"]
+        champion_data = json.loads(champion_identity["bytes"].decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         sys.exit(f"Champion bench.json is unsafe or malformed: {error}")
     champion_ms = (champion_data.get("kernel") or {}).get("average_ms")
@@ -154,6 +199,15 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
 
         # Benchmark ablated kernel
         ablated_json_out = os.path.join(method_dir, "bench.json")
+        try:
+            kernel_before = _regular_identity(ablated_kernel)
+        except (OSError, ValueError) as error:
+            attributions.append({
+                "method_id": mid,
+                "contributed": False,
+                "note": f"unsafe_or_drifted_ablation_evidence: {error}",
+            })
+            continue
         result = _bench_kernel(
             bench_py, ablated_kernel, ref_file, dims, ptr_size, ablated_json_out,
         )
@@ -187,14 +241,13 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
             continue
 
         try:
-            stable_champion, stable_champion_sha, stable_champion_bytes = _regular_identity(champion_bench)
-            kernel_path, kernel_sha, _ = _regular_identity(ablated_kernel)
-            bench_path, bench_sha, bench_bytes = _regular_identity(ablated_json_out)
+            stable_champion = _regular_identity(champion_bench)
+            kernel_after = _regular_identity(ablated_kernel)
+            bench_identity = _regular_identity(ablated_json_out)
             if (
-                stable_champion != champion_bench
-                or stable_champion_sha != champion_bench_sha
-                or stable_champion_bytes != champion_bytes
-                or json.loads(bench_bytes.decode("utf-8")) != result
+                stable_champion != champion_identity
+                or kernel_after != kernel_before
+                or json.loads(bench_identity["bytes"].decode("utf-8")) != result
             ):
                 raise ValueError("ablation evidence changed during collection")
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
@@ -213,17 +266,23 @@ def run(state_path: str, iteration: int, benchmark_py: str = None) -> dict:
         attributions.append({
             "method_id": mid,
             "champion_bench": champion_bench,
-            "champion_bench_sha256": champion_bench_sha,
-            "ablated_kernel": kernel_path,
-            "ablated_kernel_sha256": kernel_sha,
-            "ablated_bench": bench_path,
-            "ablated_bench_sha256": bench_sha,
+            "champion_bench_sha256": champion_identity["sha256"],
+            "ablated_kernel": kernel_before["path"],
+            "ablated_kernel_sha256": kernel_before["sha256"],
+            "ablated_bench": bench_identity["path"],
+            "ablated_bench_sha256": bench_identity["sha256"],
             "ablated_ms": round(ablated_ms, 4),
             "champion_ms": round(champion_ms, 4),
             "attribution_ms": round(attr_ms, 4),
             "attribution_pct": round(attr_pct, 2),
             "contributed": contributed,
         })
+
+    try:
+        if _regular_identity(champion_bench) != champion_identity:
+            raise ValueError("champion bench identity drifted before attribution write")
+    except (OSError, ValueError) as error:
+        sys.exit(f"Champion bench.json changed before attribution write: {error}")
 
     output = {
         "iter": iteration,
