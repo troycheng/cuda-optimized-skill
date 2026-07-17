@@ -1668,6 +1668,120 @@ class StrategyMemoryTests(unittest.TestCase):
                 self.memory.suggest_strategies(memory, manifest, output)
             self.assertEqual(target.read_text("utf-8"), "unchanged")
 
+    @staticmethod
+    def _tree_snapshot(root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    def test_suggest_rejects_output_aliases_without_mutating_inputs(self) -> None:
+        for alias in (
+            "manifest-exact",
+            "manifest-relative",
+            "manifest-hardlink",
+            "memory-exact",
+            "missing-memory-exact",
+        ):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                manifest = self._manifest(root)
+                scope = self.memory.scope_document(manifest)
+                memory = root / "memory.json"
+                if alias != "missing-memory-exact":
+                    self.memory.append_run(memory, scope, self._record(scope=scope))
+                if alias == "manifest-exact":
+                    output = manifest
+                elif alias == "manifest-relative":
+                    output = Path(os.path.relpath(manifest, Path.cwd()))
+                elif alias == "manifest-hardlink":
+                    output = root / "manifest-hardlink.json"
+                    try:
+                        os.link(manifest, output)
+                    except OSError as error:
+                        self.skipTest(f"hardlinks unavailable: {error}")
+                else:
+                    output = memory
+                before = self._tree_snapshot(root)
+                with self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                    self.memory.suggest_strategies(memory, manifest, output)
+                self.assertEqual(self._tree_snapshot(root), before)
+
+    def test_record_rejects_memory_output_alias_before_append(self) -> None:
+        for alias in ("missing-exact", "existing-hardlink"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                run = self._completed_run(root / "fixture")
+                memory = root / "memory.json"
+                if alias == "missing-exact":
+                    output = memory
+                else:
+                    self.memory.append_run(
+                        memory, self._scope(), self._record()
+                    )
+                    output = root / "memory-hardlink.json"
+                    try:
+                        os.link(memory, output)
+                    except OSError as error:
+                        self.skipTest(f"hardlinks unavailable: {error}")
+                before = self._tree_snapshot(root)
+                with self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                    self.memory.record_run(memory, run, output)
+                self.assertEqual(self._tree_snapshot(root), before)
+
+    def test_record_rejects_every_verified_artifact_output_before_append(self) -> None:
+        roles = (
+            "manifest",
+            "state",
+            "checkpoint",
+            "decision",
+            "methods",
+            "candidate",
+            "kernel_paired_samples",
+            "sass_check",
+            "attribution",
+            "champion_bench",
+            "ablation_kernel:vectorize",
+            "ablation_bench:vectorize",
+        )
+        for role in roles:
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                run = self._completed_run(root / "fixture", with_ablation=True)
+                record = self.memory.load_completed_run(run)
+                if role == "manifest":
+                    output = run / "manifest.json"
+                else:
+                    output = Path(
+                        next(
+                            item["path"]
+                            for item in record["evidence"]
+                            if item["role"] == role
+                        )
+                    )
+                memory = root / "memory.json"
+                before = self._tree_snapshot(root)
+                with self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                    self.memory.record_run(memory, run, output)
+                self.assertEqual(self._tree_snapshot(root), before)
+
+    def test_record_rejects_hardlink_to_verified_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            run = self._completed_run(root / "fixture")
+            decision_path = run / "iterv1" / "decision.json"
+            output = root / "decision-hardlink.json"
+            try:
+                os.link(decision_path, output)
+            except OSError as error:
+                self.skipTest(f"hardlinks unavailable: {error}")
+            memory = root / "memory.json"
+            before = self._tree_snapshot(root)
+            with self.assertRaisesRegex(ValueError, "output.*alias|collision"):
+                self.memory.record_run(memory, run, output)
+            self.assertEqual(self._tree_snapshot(root), before)
+
 
 if __name__ == "__main__":
     unittest.main()

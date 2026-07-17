@@ -1432,6 +1432,30 @@ def _atomic_write_output(path: str | os.PathLike, payload: Mapping) -> None:
     artifact_store.atomic_write_json(path, _strict_copy(payload, "strategy record output"))
 
 
+def _paths_alias(first: str | os.PathLike, second: str | os.PathLike) -> bool:
+    first_path = os.path.realpath(os.path.abspath(os.fspath(first)))
+    second_path = os.path.realpath(os.path.abspath(os.fspath(second)))
+    if first_path == second_path:
+        return True
+    try:
+        return os.path.samefile(first_path, second_path)
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ENOTDIR}:
+            return False
+        raise ValueError("cannot safely compare strategy input and output paths") from error
+
+
+def _reject_output_aliases(
+    output_path: str | os.PathLike,
+    protected_paths: list[str | os.PathLike],
+) -> None:
+    for protected_path in protected_paths:
+        if _paths_alias(output_path, protected_path):
+            raise ValueError(
+                f"strategy output aliases a protected input: {protected_path}"
+            )
+
+
 def record_run(
     memory_path: str | os.PathLike,
     run_dir: str | os.PathLike,
@@ -1439,6 +1463,14 @@ def record_run(
 ) -> dict:
     """Validate fully, update memory under lock, then publish the record output."""
     record = load_completed_run(run_dir)
+    _reject_output_aliases(
+        output_path,
+        [
+            memory_path,
+            Path(run_dir) / "manifest.json",
+            *(item["path"] for item in record["evidence"]),
+        ],
+    )
     inserted = append_run(memory_path, record["scope"], record)
     _atomic_write_output(output_path, record)
     return {"inserted": inserted, "record": record}
@@ -1567,6 +1599,7 @@ def suggest_strategies(
     output_path: str | os.PathLike,
 ) -> dict:
     """Publish exact-scope search hints without reading or changing run state."""
+    _reject_output_aliases(output_path, [memory_path, manifest_path])
     scope = _scope_document_from_manifest(manifest_path, verify_files=False)
     key = _scope_key_from_document(scope)
     memory = _optional_memory(memory_path)
