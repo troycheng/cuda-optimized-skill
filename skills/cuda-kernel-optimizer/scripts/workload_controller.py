@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,7 @@ import math
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -57,6 +59,23 @@ _SAFE_ENV = {
 }
 _DIAGNOSIS_MODULE = None
 _REVIEWER_MODULE = None
+_WORKLOAD_MODULE = None
+_EVALUATE_MODULE = None
+_BUDGET_RUNTIME = {
+    "fast": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
+    "balanced": {
+        "deadline_seconds": 3600,
+        "blocks": 5,
+        "retries": 1,
+        "bootstrap": 1000,
+    },
+    "thorough": {
+        "deadline_seconds": 14400,
+        "blocks": 9,
+        "retries": 2,
+        "bootstrap": 5000,
+    },
+}
 
 
 class ValidationError(ValueError):
@@ -260,9 +279,37 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         if not _is_within(candidate, project_root):
             raise ValidationError(f"project_paths[{index}] escapes project_root")
         normalized_roots.append(relative)
+    for index, root in enumerate(normalized_roots):
+        for other in normalized_roots[index + 1 :]:
+            if root == other or _is_within(root, other) or _is_within(other, root):
+                raise ValidationError("project_paths must not overlap")
     environment_root = _absolute(mutation["environment_root"], "environment_root")
-    if _is_within(environment_root, project_root):
-        raise ValidationError("environment_root must be outside project_root")
+    protected_environment_roots = {
+        Path(path).resolve(strict=False)
+        for path in (
+            "/",
+            "/System",
+            "/Library",
+            "/Applications",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/etc",
+            "/var",
+            "/opt",
+            "/private",
+            "/private/etc",
+            "/private/var",
+        )
+    }
+    if (
+        _is_within(environment_root, project_root)
+        or _is_within(project_root, environment_root)
+        or environment_root in protected_environment_roots
+    ):
+        raise ValidationError(
+            "environment_root must be isolated from project_root and host system roots"
+        )
     if mutation["host_policy"] != "recommend_only":
         raise ValidationError("host_policy must be recommend_only")
 
@@ -394,6 +441,48 @@ def _load_reviewer_module():
         raise
     _REVIEWER_MODULE = module
     return module
+
+
+def _load_sibling_module(filename: str, module_name: str):
+    path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load controller dependency: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _load_workload_module():
+    global _WORKLOAD_MODULE
+    if _WORKLOAD_MODULE is None:
+        _load_evaluate_module()
+        _WORKLOAD_MODULE = sys.modules["workload_adapter"]
+    return _WORKLOAD_MODULE
+
+
+def _load_evaluate_module():
+    global _EVALUATE_MODULE
+    if _EVALUATE_MODULE is None:
+        # workload_evaluate imports workload_adapter and paired_stats by module
+        # name, so expose this directory only while loading the trusted sibling.
+        script_dir = str(Path(__file__).resolve().parent)
+        inserted = script_dir not in sys.path
+        if inserted:
+            sys.path.insert(0, script_dir)
+        try:
+            _EVALUATE_MODULE = _load_sibling_module(
+                "workload_evaluate.py", "cuda_optimizer_workload_evaluate_controller"
+            )
+        finally:
+            if inserted:
+                sys.path.remove(script_dir)
+    return _EVALUATE_MODULE
 
 
 def _canonical_digest(value: Any) -> str:
@@ -731,6 +820,580 @@ def review_change(
     return reviewer.run_reviewer(normalized["reviewer"], request, run_root)
 
 
+def _scope_layout(control: Mapping[str, Any], scope: str) -> tuple[Path, list[str], str]:
+    if scope == "project":
+        return (
+            Path(control["project_root"]),
+            list(control["mutation"]["project_paths"]),
+            "project",
+        )
+    if scope == "isolated_environment":
+        return Path(control["mutation"]["environment_root"]), ["."], "environment"
+    raise ValidationError("unsupported ChangeSet scope")
+
+
+def _identity(control: Mapping[str, Any], scope: str) -> dict:
+    base, roots, _snapshot_name = _scope_layout(control, scope)
+    files = {}
+    missing_roots = []
+    for relative_root in roots:
+        root = base if relative_root == "." else base / relative_root
+        if not root.exists():
+            missing_roots.append(relative_root)
+            continue
+        if relative_root == "." and not root.is_dir():
+            raise ValidationError("environment_root must be a directory")
+        candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+        for path in candidates:
+            if path.is_symlink():
+                raise ValidationError(f"mutation root contains a symlink: {path}")
+            if not path.is_file():
+                continue
+            relative = path.relative_to(base).as_posix()
+            files[relative] = {
+                "sha256": _sha256_path(path),
+                "size_bytes": path.stat().st_size,
+                "mode": path.stat().st_mode & 0o777,
+            }
+    return {
+        "schema_version": "cuda-workload-optimizer/project-identity-v1",
+        "scope": scope,
+        "roots": roots,
+        "missing_roots": sorted(missing_roots),
+        "files": files,
+        "digest": _canonical_digest(
+            {"missing_roots": sorted(missing_roots), "files": files}
+        ),
+    }
+
+
+def _snapshot_scope(
+    control: Mapping[str, Any], run_root: Path, scope: str
+) -> dict:
+    base, roots, snapshot_name = _scope_layout(control, scope)
+    snapshot = run_root / "snapshot" / snapshot_name
+    if snapshot.exists():
+        raise ValidationError("frozen ChangeSet snapshot already exists")
+    identity = _identity(control, scope)
+    if scope == "isolated_environment":
+        if identity["missing_roots"]:
+            raise ValidationError("environment_root must exist before registration")
+        if base.is_symlink() or base.stat().st_uid != os.getuid():
+            raise ValidationError(
+                "environment_root must be a user-owned non-symlink directory"
+            )
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(base, snapshot, symlinks=False)
+        _atomic_json(
+            run_root / "rounds" / "round-1" / "before_identity.json", identity
+        )
+        return identity
+    snapshot.mkdir(parents=True)
+    for relative_root in roots:
+        source = base / relative_root
+        destination = snapshot / relative_root
+        if not source.exists():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, symlinks=False)
+        else:
+            shutil.copy2(source, destination)
+    _atomic_json(run_root / "rounds" / "round-1" / "before_identity.json", identity)
+    return identity
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _restore_snapshot(
+    control: Mapping[str, Any], run_root: Path, scope: str
+) -> None:
+    base, roots, snapshot_name = _scope_layout(control, scope)
+    snapshot = run_root / "snapshot" / snapshot_name
+    if scope == "isolated_environment":
+        if base.exists() or base.is_symlink():
+            _remove_path(base)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(snapshot, base, symlinks=False)
+        return
+    for relative_root in roots:
+        current = base / relative_root
+        frozen = snapshot / relative_root
+        if current.exists() or current.is_symlink():
+            _remove_path(current)
+        if not frozen.exists():
+            continue
+        current.parent.mkdir(parents=True, exist_ok=True)
+        if frozen.is_dir():
+            shutil.copytree(frozen, current, symlinks=False)
+        else:
+            shutil.copy2(frozen, current)
+
+
+def _changed_paths(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[str]:
+    names = set(before["files"]) | set(after["files"])
+    return sorted(
+        name for name in names if before["files"].get(name) != after["files"].get(name)
+    )
+
+
+def _path_allowed(relative: str, allowed: Sequence[str]) -> bool:
+    path = Path(relative)
+    return any(
+        path == Path(root) or _is_within(path, Path(root))
+        for root in allowed
+    )
+
+
+def _candidate_diff(
+    control: Mapping[str, Any],
+    run_root: Path,
+    changed: Sequence[str],
+    scope: str,
+) -> str:
+    base, _roots, snapshot_name = _scope_layout(control, scope)
+    snapshot = run_root / "snapshot" / snapshot_name
+    chunks = []
+    for relative in changed:
+        before_path = snapshot / relative
+        after_path = base / relative
+        try:
+            before = before_path.read_text("utf-8").splitlines(keepends=True) if before_path.exists() else []
+            after = after_path.read_text("utf-8").splitlines(keepends=True) if after_path.exists() else []
+        except (OSError, UnicodeError):
+            before_hash = _sha256_path(before_path) if before_path.exists() else "missing"
+            after_hash = _sha256_path(after_path) if after_path.exists() else "missing"
+            chunks.append(f"binary {relative}: {before_hash} -> {after_hash}\n")
+            continue
+        chunks.extend(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=f"a/{relative}",
+                tofile=f"b/{relative}",
+            )
+        )
+    return _redact_log("".join(chunks), ())
+
+
+def read_run_state(run_dir: os.PathLike[str] | str) -> dict:
+    return load_json_object(Path(run_dir).expanduser().resolve(strict=False) / "state.json")
+
+
+def _write_state(run_root: Path, state: Mapping[str, Any]) -> dict:
+    detached = _json_copy(state, "state")
+    _atomic_json(run_root / "state.json", detached)
+    _atomic_json(run_root / "checkpoint.json", detached)
+    return detached
+
+
+def _advance(
+    run_root: Path,
+    state: Mapping[str, Any],
+    completed: str,
+    *,
+    stage: str,
+    next_action: str,
+) -> dict:
+    updated = copy.deepcopy(state)
+    if completed not in updated["completed_stages"]:
+        updated["completed_stages"].append(completed)
+    updated["stage"] = stage
+    updated["next_action"] = next_action
+    updated["updated_at_epoch"] = time.time()
+    return _write_state(run_root, updated)
+
+
+def _load_frozen_control(run_root: Path) -> dict:
+    return validate_control_manifest(load_json_object(run_root / "control_manifest.json"))
+
+
+def _normalize_frozen_workload(control: Mapping[str, Any]):
+    try:
+        return _load_workload_module().normalize_workload(
+            workload_manifest=control["workload_manifest"]
+        )
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"workload identity validation failed: {error}") from error
+
+
+def _check_deadline(state: Mapping[str, Any]) -> None:
+    if time.time() > state["deadline_epoch"]:
+        raise ValidationError("workload optimization budget deadline has expired")
+
+
+def start_run(
+    control: Mapping[str, Any], run_dir: os.PathLike[str] | str
+) -> dict:
+    """Initialize evidence, baseline, probes, and diagnosis up to the change boundary."""
+    normalized = validate_control_manifest(control)
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    project_root = Path(normalized["project_root"])
+    if _is_within(run_root, project_root):
+        raise ValidationError("run_dir must be outside project_root")
+    control_digest = _canonical_digest(normalized)
+    state_path = run_root / "state.json"
+    if state_path.exists():
+        state = read_run_state(run_root)
+        if state["control_digest"] != control_digest:
+            raise ValidationError("control manifest drifted after run initialization")
+        if state["next_action"] in {"register_change", "edit_then_evaluate", "done"}:
+            return state
+    else:
+        run_root.mkdir(parents=True, exist_ok=True)
+        workload = _normalize_frozen_workload(normalized)
+        now = time.time()
+        runtime = _BUDGET_RUNTIME[normalized["budget"]]
+        state = {
+            "schema_version": "cuda-workload-optimizer/state-v1",
+            "status": "active",
+            "stage": "baseline",
+            "round": 1,
+            "completed_stages": [],
+            "next_action": "baseline",
+            "control_digest": control_digest,
+            "workload_source_hash": workload.source_hash,
+            "started_at_epoch": now,
+            "updated_at_epoch": now,
+            "deadline_epoch": now + runtime["deadline_seconds"],
+        }
+        _atomic_json(run_root / "control_manifest.json", normalized)
+        (run_root / "host_recommendations.md").write_text(
+            "# Host recommendations\n\nNo host mutation was executed. Add evidence-backed suggestions here for manual review.\n",
+            encoding="utf-8",
+        )
+        state = _write_state(run_root, state)
+
+    _check_deadline(state)
+    workload = _normalize_frozen_workload(normalized)
+    if workload.source_hash != state["workload_source_hash"]:
+        raise ValidationError("workload identity drifted after run initialization")
+    runtime = _BUDGET_RUNTIME[normalized["budget"]]
+
+    if "baseline" not in state["completed_stages"]:
+        timeout = None if workload.kind == "python" else 120
+        baseline = _load_evaluate_module().measure_candidate(
+            workload,
+            normalized["baseline_candidate"],
+            role="baseline",
+            retries=runtime["retries"],
+            timeout=timeout,
+        )
+        _atomic_json(run_root / "baseline" / "observation.json", baseline)
+        if baseline["status"] != "measured":
+            raise ValidationError("baseline workload failed; see baseline/observation.json")
+        state = _advance(
+            run_root, state, "baseline", stage="probes", next_action="probes"
+        )
+    _check_deadline(state)
+    if "probes" not in state["completed_stages"]:
+        run_probes(normalized, run_root)
+        state = _advance(
+            run_root, state, "probes", stage="diagnosis", next_action="diagnosis"
+        )
+    _check_deadline(state)
+    if "diagnosis" not in state["completed_stages"]:
+        diagnose_run(run_root)
+        state = _advance(
+            run_root,
+            state,
+            "diagnosis",
+            stage="change",
+            next_action="register_change",
+        )
+    return state
+
+
+def register_change(
+    control: Mapping[str, Any],
+    run_dir: os.PathLike[str] | str,
+    change_set: Mapping[str, Any],
+) -> dict:
+    normalized = validate_control_manifest(control)
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    state = read_run_state(run_root)
+    if state["control_digest"] != _canonical_digest(normalized):
+        raise ValidationError("control manifest drifted before ChangeSet registration")
+    if state["next_action"] != "register_change":
+        raise ValidationError("run is not ready to register a ChangeSet")
+    _check_deadline(state)
+    change = validate_change_set(change_set, normalized)
+    before = _snapshot_scope(normalized, run_root, change["scope"])
+    _atomic_json(run_root / "change_set.json", change)
+    _atomic_json(run_root / "rounds" / "round-1" / "change_set.json", change)
+    updated = _advance(
+        run_root, state, "change", stage="review", next_action="edit_then_evaluate"
+    )
+    updated["before_identity_digest"] = before["digest"]
+    return _write_state(run_root, updated)
+
+
+def _run_correctness_commands(
+    control: Mapping[str, Any], change: Mapping[str, Any], run_root: Path
+) -> dict:
+    records = []
+    environment, secrets = _probe_environment({})
+    for index, argv in enumerate(change["commands"]):
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=control["project_root"],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=False,
+                timeout=300,
+                check=False,
+                start_new_session=True,
+            )
+            stdout = _redact_log(completed.stdout[-_DEFAULT_LOG_LIMIT:].decode("utf-8", "replace"), secrets)
+            stderr = _redact_log(completed.stderr[-_DEFAULT_LOG_LIMIT:].decode("utf-8", "replace"), secrets)
+            returncode = completed.returncode
+            failure = None
+        except (OSError, subprocess.TimeoutExpired) as error:
+            stdout = ""
+            stderr = ""
+            returncode = None
+            failure = type(error).__name__
+        records.append(
+            {
+                "index": index,
+                "argv_sha256": _canonical_digest(argv),
+                "returncode": returncode,
+                "duration_seconds": time.monotonic() - started,
+                "stdout": stdout,
+                "stderr": stderr,
+                "failure": failure,
+            }
+        )
+        if failure is not None or returncode != 0:
+            break
+    result = {
+        "schema_version": "cuda-workload-optimizer/correctness-v1",
+        "status": (
+            "passed"
+            if len(records) == len(change["commands"])
+            and all(record["returncode"] == 0 for record in records)
+            else "failed"
+        ),
+        "commands": records,
+    }
+    _atomic_json(run_root / "correctness.json", result)
+    return result
+
+
+def _finish_rejected(
+    run_root: Path,
+    state: Mapping[str, Any],
+    control: Mapping[str, Any],
+    *,
+    scope: str,
+    reason: str,
+    primary_status: str | None,
+) -> dict:
+    _restore_snapshot(control, run_root, scope)
+    decision = {
+        "schema_version": "cuda-workload-optimizer/decision-v1",
+        "status": "rejected",
+        "reason": reason,
+        "primary_status": primary_status,
+        "rolled_back": True,
+    }
+    _atomic_json(run_root / "decision.json", decision)
+    updated = copy.deepcopy(state)
+    for stage in ("review", "evaluation", "decision"):
+        if stage not in updated["completed_stages"]:
+            updated["completed_stages"].append(stage)
+    updated.update(
+        {
+            "status": "completed",
+            "stage": "decision",
+            "next_action": "done",
+            "updated_at_epoch": time.time(),
+        }
+    )
+    _write_state(run_root, updated)
+    return decision
+
+
+def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
+    """Verify the bounded diff, review it, run paired evaluation, and decide."""
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    state = read_run_state(run_root)
+    if state["status"] == "completed":
+        return load_json_object(run_root / "decision.json")
+    if state["next_action"] != "edit_then_evaluate":
+        raise ValidationError("run is not ready to evaluate a ChangeSet")
+    control = _load_frozen_control(run_root)
+    change = validate_change_set(load_json_object(run_root / "change_set.json"), control)
+    if time.time() > state["deadline_epoch"]:
+        _atomic_json(
+            run_root / "review.json",
+            {
+                "schema_version": "cuda-workload-optimizer/review-artifact-v1",
+                "status": "skipped",
+                "request_digest": None,
+                "response": None,
+                "execution": {"reason": "budget_expired"},
+            },
+        )
+        _atomic_json(
+            run_root / "evaluation.json",
+            {
+                "schema_version": "cuda-workload-optimizer/evaluation-v1",
+                "status": "budget_expired",
+            },
+        )
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="budget_expired",
+            primary_status=None,
+        )
+    workload = _normalize_frozen_workload(control)
+    if workload.source_hash != state["workload_source_hash"]:
+        _restore_snapshot(control, run_root, change["scope"])
+        raise ValidationError("workload identity drifted before evaluation")
+    before = load_json_object(run_root / "rounds" / "round-1" / "before_identity.json")
+    after = _identity(control, change["scope"])
+    changed = _changed_paths(before, after)
+    if not changed:
+        raise ValidationError("ChangeSet produced no scoped changes")
+    outside = [path for path in changed if not _path_allowed(path, change["paths"])]
+    if outside:
+        _restore_snapshot(control, run_root, change["scope"])
+        raise ValidationError(
+            "actual scoped diff is outside ChangeSet paths: " + ", ".join(outside)
+        )
+    _atomic_json(run_root / "rounds" / "round-1" / "after_identity.json", after)
+    (run_root / "candidate.diff").write_text(
+        _candidate_diff(control, run_root, changed, change["scope"]), encoding="utf-8"
+    )
+
+    correctness = _run_correctness_commands(control, change, run_root)
+    if correctness["status"] != "passed":
+        _atomic_json(
+            run_root / "review.json",
+            {
+                "schema_version": "cuda-workload-optimizer/review-artifact-v1",
+                "status": "skipped",
+                "request_digest": None,
+                "response": None,
+                "execution": {"reason": "correctness_failed"},
+            },
+        )
+        _atomic_json(
+            run_root / "evaluation.json",
+            {
+                "schema_version": "cuda-workload-optimizer/evaluation-v1",
+                "status": "correctness_failed",
+            },
+        )
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="correctness_failed",
+            primary_status=None,
+        )
+
+    review_change(control, run_root, change)
+    if time.time() > state["deadline_epoch"]:
+        _atomic_json(
+            run_root / "evaluation.json",
+            {
+                "schema_version": "cuda-workload-optimizer/evaluation-v1",
+                "status": "budget_expired",
+            },
+        )
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="budget_expired",
+            primary_status=None,
+        )
+    runtime = _BUDGET_RUNTIME[control["budget"]]
+    timeout = None if workload.kind == "python" else 120
+    evaluation = _load_evaluate_module().evaluate_pairs(
+        workload,
+        control["baseline_candidate"],
+        change["candidate"],
+        blocks=runtime["blocks"],
+        retries=runtime["retries"],
+        seed=0,
+        timeout=timeout,
+        bootstrap_samples=runtime["bootstrap"],
+    )
+    _atomic_json(run_root / "evaluation.json", evaluation)
+    if _identity(control, change["scope"])["digest"] != after["digest"]:
+        _restore_snapshot(control, run_root, change["scope"])
+        raise ValidationError("scoped identity drifted during paired evaluation")
+    primary_status = evaluation.get("primary", {}).get("status")
+    constraints = evaluation.get("constraints", [])
+    promoted = (
+        evaluation.get("status") == "evaluated"
+        and primary_status == "confirmed_win"
+        and all(item.get("status") == "passed" for item in constraints)
+    )
+    if not promoted:
+        if evaluation.get("status") != "evaluated":
+            reason = "workload_failed"
+        elif primary_status != "confirmed_win":
+            reason = "primary_not_confirmed"
+        else:
+            reason = "constraint_failed"
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason=reason,
+            primary_status=primary_status,
+        )
+
+    decision = {
+        "schema_version": "cuda-workload-optimizer/decision-v1",
+        "status": "promoted",
+        "reason": "paired_workload_win",
+        "primary_status": primary_status,
+        "rolled_back": False,
+    }
+    _atomic_json(run_root / "decision.json", decision)
+    updated = copy.deepcopy(state)
+    for stage in ("review", "evaluation", "decision"):
+        if stage not in updated["completed_stages"]:
+            updated["completed_stages"].append(stage)
+    updated.update(
+        {
+            "status": "completed",
+            "stage": "decision",
+            "next_action": "done",
+            "updated_at_epoch": time.time(),
+        }
+    )
+    _write_state(run_root, updated)
+    return decision
+
+
+def resume_run(run_dir: os.PathLike[str] | str) -> dict:
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    state = read_run_state(run_root)
+    if state["next_action"] in {"register_change", "edit_then_evaluate", "done"}:
+        return state
+    return start_run(_load_frozen_control(run_root), run_root)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate and run bounded GPU workload optimization rounds."
@@ -750,6 +1413,23 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--control", required=True)
     review.add_argument("--run-dir", required=True)
     review.add_argument("--change-set", required=True)
+    run = subparsers.add_parser("run", help="collect baseline evidence and diagnosis")
+    run.add_argument("--control", required=True)
+    run.add_argument("--run-dir", required=True)
+    status = subparsers.add_parser("status", help="read the current run checkpoint")
+    status.add_argument("--run-dir", required=True)
+    register = subparsers.add_parser(
+        "register-change", help="freeze and register a bounded ChangeSet"
+    )
+    register.add_argument("--control", required=True)
+    register.add_argument("--run-dir", required=True)
+    register.add_argument("--change-set", required=True)
+    evaluate = subparsers.add_parser(
+        "evaluate", help="verify, evaluate, promote, or roll back a candidate"
+    )
+    evaluate.add_argument("--run-dir", required=True)
+    resume = subparsers.add_parser("resume", help="resume from the last checkpoint")
+    resume.add_argument("--run-dir", required=True)
     return parser
 
 
@@ -790,6 +1470,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 load_json_object(args.change_set),
             )
             print(json.dumps(artifact, sort_keys=True))
+            return 0
+        if args.command == "run":
+            print(
+                json.dumps(
+                    start_run(load_json_object(args.control), args.run_dir),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "status":
+            print(json.dumps(read_run_state(args.run_dir), sort_keys=True))
+            return 0
+        if args.command == "register-change":
+            print(
+                json.dumps(
+                    register_change(
+                        load_json_object(args.control),
+                        args.run_dir,
+                        load_json_object(args.change_set),
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "evaluate":
+            print(json.dumps(evaluate_change(args.run_dir), sort_keys=True))
+            return 0
+        if args.command == "resume":
+            print(json.dumps(resume_run(args.run_dir), sort_keys=True))
             return 0
     except ValidationError as error:
         print(f"validation error: {error}", file=sys.stderr)

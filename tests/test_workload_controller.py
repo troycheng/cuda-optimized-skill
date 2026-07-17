@@ -190,7 +190,13 @@ class WorkloadControllerContractTests(unittest.TestCase):
     def test_environment_root_must_be_absolute_and_outside_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            for path in ("environment", str(root / "project" / "env")):
+            for path in (
+                "environment",
+                str(root / "project" / "env"),
+                str(root),
+                "/",
+                "/etc",
+            ):
                 control = _control(root)
                 control["mutation"]["environment_root"] = path
                 with self.subTest(path=path), self.assertRaisesRegex(
@@ -199,6 +205,18 @@ class WorkloadControllerContractTests(unittest.TestCase):
                     self.controller.validate_control_manifest(
                         control, root / "control.json"
                     )
+
+    def test_mutation_roots_must_not_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control = _control(root)
+            control["mutation"]["project_paths"] = ["src", "src/generated"]
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "overlap"
+            ):
+                self.controller.validate_control_manifest(
+                    control, root / "control.json"
+                )
 
     def test_host_scope_and_host_mutation_policy_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -587,6 +605,356 @@ class ReviewerControllerTests(unittest.TestCase):
             artifact = json.loads((run_dir / "review.json").read_text("utf-8"))
             self.assertEqual(artifact["status"], "skipped")
             self.assertIsNone(artifact["response"])
+
+
+class WorkloadRoundTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller = _load_controller()
+
+    def _workspace(self, root: Path) -> tuple[dict, Path, Path]:
+        project = root / "project"
+        project.mkdir()
+        (project / "configs").mkdir()
+        (project / "src").mkdir()
+        (project / "configs" / "value.json").write_text(
+            '{"workers": 4}\n', encoding="utf-8"
+        )
+        adapter = project / "adapter.py"
+        adapter.write_text(
+            textwrap.dedent(
+                """
+                def prepare(candidate):
+                    return None
+
+                def validate(candidate):
+                    return {"valid": isinstance(candidate, dict) and "revision" in candidate}
+
+                def benchmark(candidate):
+                    revision = candidate["revision"]
+                    latency = {
+                        "baseline": 100.0,
+                        "optimized": 80.0,
+                        "slow": 120.0,
+                        "constraint_bad": 80.0,
+                    }[revision]
+                    memory = 120.0 if revision == "constraint_bad" else 100.0
+                    return {"p50_latency_ms": latency, "memory_mb": memory}
+
+                def metrics():
+                    return {
+                        "primary_metric": {"name": "p50_latency_ms", "direction": "lower"},
+                        "min_effect_pct": 1.0,
+                        "constraints": [
+                            {"name": "memory_mb", "max_regression_pct": 5.0}
+                        ],
+                    }
+
+                def cleanup():
+                    return None
+                """
+            ),
+            encoding="utf-8",
+        )
+        manifest = project / "workload.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "kind": "python",
+                    "source": "adapter.py",
+                    "objective": {
+                        "primary_metric": {
+                            "name": "p50_latency_ms",
+                            "direction": "lower",
+                        },
+                        "min_effect_pct": 1.0,
+                        "constraints": [
+                            {"name": "memory_mb", "max_regression_pct": 5.0}
+                        ],
+                    },
+                    "cases": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        probe = project / "probe.py"
+        probe.write_text(
+            textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                Path(os.environ["CUDA_OPTIMIZER_OUTPUT"]).write_text(json.dumps({
+                    "schema_version": "cuda-workload-optimizer/probe-v1",
+                    "probe_id": "timeline",
+                    "kind": "timeline",
+                    "status": "ok",
+                    "metrics": {
+                        "gpu_busy_pct": 42,
+                        "cpu_busy_pct": 91,
+                        "data_wait_pct": 45
+                    },
+                    "issues": [],
+                    "artifacts": []
+                }))
+                """
+            ),
+            encoding="utf-8",
+        )
+        control = _control(root)
+        control["budget"] = "fast"
+        control["baseline_candidate"] = {"name": "baseline", "revision": "baseline"}
+        control["mutation"]["project_paths"] = ["configs", "src"]
+        control["probes"] = [
+            {
+                "id": "timeline",
+                "kind": "timeline",
+                "argv": [sys.executable, str(probe)],
+                "timeout_seconds": 10,
+            }
+        ]
+        del control["reviewer"]
+        return control, root / "run", project
+
+    def _change(self, revision: str = "optimized", **overrides) -> dict:
+        change = _change_set()
+        change["candidate"] = {"name": revision, "revision": revision}
+        change["paths"] = ["configs/value.json"]
+        change["commands"] = []
+        change.update(overrides)
+        return change
+
+    def test_start_run_freezes_inputs_and_reaches_change_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+
+            state = self.controller.start_run(control, run_dir)
+
+            self.assertEqual(state["stage"], "change")
+            self.assertEqual(state["next_action"], "register_change")
+            self.assertEqual(
+                state["completed_stages"], ["baseline", "probes", "diagnosis"]
+            )
+            self.assertEqual(len(state["control_digest"]), 64)
+            self.assertEqual(len(state["workload_source_hash"]), 64)
+            self.assertTrue((run_dir / "control_manifest.json").is_file())
+            self.assertTrue((run_dir / "baseline" / "observation.json").is_file())
+            self.assertTrue((run_dir / "diagnosis.json").is_file())
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(checkpoint, state)
+
+    def test_confirmed_workload_win_is_promoted_and_keeps_project_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            config = project / "configs" / "value.json"
+            config.write_text('{"workers": 8}\n', encoding="utf-8")
+
+            decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "promoted")
+            self.assertEqual(decision["primary_status"], "confirmed_win")
+            self.assertEqual(config.read_text("utf-8"), '{"workers": 8}\n')
+            state = self.controller.read_run_state(run_dir)
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["next_action"], "done")
+            self.assertTrue((run_dir / "evaluation.json").is_file())
+
+    def test_loss_and_constraint_failure_restore_the_frozen_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for revision, expected_primary in (
+                ("slow", "confirmed_loss"),
+                ("constraint_bad", "confirmed_win"),
+            ):
+                with self.subTest(revision=revision):
+                    case_root = root / revision
+                    case_root.mkdir()
+                    control, run_dir, project = self._workspace(case_root)
+                    self.controller.start_run(control, run_dir)
+                    self.controller.register_change(
+                        control, run_dir, self._change(revision)
+                    )
+                    config = project / "configs" / "value.json"
+                    original = config.read_text("utf-8")
+                    config.write_text('{"workers": 99}\n', encoding="utf-8")
+
+                    decision = self.controller.evaluate_change(run_dir)
+
+                    self.assertEqual(decision["status"], "rejected")
+                    self.assertEqual(decision["primary_status"], expected_primary)
+                    self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_diff_outside_change_set_is_rejected_before_workload_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            outside = project / "src" / "unexpected.py"
+            outside.write_text("unsafe = True\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "outside ChangeSet"
+            ):
+                self.controller.evaluate_change(run_dir)
+
+            self.assertFalse(outside.exists())
+            self.assertFalse((run_dir / "evaluation.json").exists())
+
+    def test_correctness_command_failure_rejects_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            change = self._change(
+                commands=[[sys.executable, "-c", "raise SystemExit(3)"]]
+            )
+            self.controller.register_change(control, run_dir, change)
+            config = project / "configs" / "value.json"
+            original = config.read_text("utf-8")
+            config.write_text('{"workers": 12}\n', encoding="utf-8")
+
+            decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "rejected")
+            self.assertEqual(decision["reason"], "correctness_failed")
+            self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_resume_does_not_repeat_completed_stages_or_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            first = self.controller.start_run(control, run_dir)
+            diagnosis_mtime = (run_dir / "diagnosis.json").stat().st_mtime_ns
+            second = self.controller.resume_run(run_dir)
+            self.assertEqual(second, first)
+            self.assertEqual(
+                (run_dir / "diagnosis.json").stat().st_mtime_ns, diagnosis_mtime
+            )
+
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+            first_decision = self.controller.evaluate_change(run_dir)
+            evaluation_mtime = (run_dir / "evaluation.json").stat().st_mtime_ns
+            second_decision = self.controller.evaluate_change(run_dir)
+            self.assertEqual(second_decision, first_decision)
+            self.assertEqual(
+                (run_dir / "evaluation.json").stat().st_mtime_ns,
+                evaluation_mtime,
+            )
+
+    def test_cli_exposes_the_resumable_state_machine_commands(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ("run", "status", "register-change", "evaluate", "resume"):
+            self.assertIn(command, result.stdout)
+
+    def test_isolated_environment_change_is_evaluated_without_host_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            environment = Path(control["mutation"]["environment_root"])
+            environment.mkdir()
+            lock = environment / "requirements.lock"
+            lock.write_text("triton==3.3.0\n", encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            change = self._change(scope="isolated_environment")
+            change["paths"] = ["requirements.lock"]
+            self.controller.register_change(control, run_dir, change)
+            lock.write_text("triton==3.4.0\n", encoding="utf-8")
+
+            decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "promoted")
+            self.assertEqual(lock.read_text("utf-8"), "triton==3.4.0\n")
+            self.assertIn(
+                "No host mutation was executed",
+                (run_dir / "host_recommendations.md").read_text("utf-8"),
+            )
+
+    def test_deadline_is_enforced_before_change_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            state = self.controller.read_run_state(run_dir)
+            state["deadline_epoch"] = time.time() - 1
+            self.controller._write_state(run_dir, state)
+
+            with self.assertRaisesRegex(self.controller.ValidationError, "deadline"):
+                self.controller.register_change(control, run_dir, self._change())
+            self.assertFalse((run_dir / "snapshot").exists())
+
+    def test_workload_identity_drift_is_rejected_before_candidate_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            config = project / "configs" / "value.json"
+            original = config.read_text("utf-8")
+            config.write_text('{"workers": 8}\n', encoding="utf-8")
+            adapter = project / "adapter.py"
+            adapter.write_text(adapter.read_text("utf-8") + "\n# drift\n", "utf-8")
+
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "workload identity drifted"
+            ):
+                self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(config.read_text("utf-8"), original)
+            self.assertFalse((run_dir / "evaluation.json").exists())
+
+    def test_expired_budget_after_edit_rejects_and_restores_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            config = project / "configs" / "value.json"
+            original = config.read_text("utf-8")
+            config.write_text('{"workers": 8}\n', encoding="utf-8")
+            state = self.controller.read_run_state(run_dir)
+            state["deadline_epoch"] = time.time() - 1
+            self.controller._write_state(run_dir, state)
+
+            decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "rejected")
+            self.assertEqual(decision["reason"], "budget_expired")
+            self.assertEqual(config.read_text("utf-8"), original)
+
+    def test_snapshot_rejects_symlinked_mutation_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            outside = root / "outside"
+            outside.mkdir()
+            shutil_target = project / "configs"
+            for child in shutil_target.iterdir():
+                child.unlink()
+            shutil_target.rmdir()
+            try:
+                shutil_target.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "symlink|escapes project_root"
+            ):
+                self.controller.register_change(control, run_dir, self._change())
 
 
 if __name__ == "__main__":
