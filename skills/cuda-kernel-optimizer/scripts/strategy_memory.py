@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import copy
+import argparse
 import ctypes
 import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -24,10 +26,14 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import artifact_store  # noqa: E402
+import decision  # noqa: E402
+import orchestrate  # noqa: E402
+import state  # noqa: E402
 import workload_adapter  # noqa: E402
 
 
 MEMORY_SCHEMA = "cuda-kernel-optimizer/strategy-memory-v1"
+RECORD_SCHEMA = "cuda-kernel-optimizer/strategy-record-v1"
 MAX_SCOPES = 256
 MAX_RUNS_PER_SCOPE = 128
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -47,6 +53,19 @@ _RECORD_FIELDS = {
     "candidate_sha256",
     "decision_sha256",
     "checkpoint_identity",
+}
+_VERIFIED_RECORD_FIELDS = {
+    "schema_version",
+    "input_hash",
+    "candidate_sha256",
+    "decision_sha256",
+    "checkpoint_identity",
+    "scope",
+    "completed_at",
+    "terminal",
+    "bundle",
+    "methods",
+    "evidence",
 }
 
 
@@ -301,9 +320,30 @@ def scope_key(manifest_or_scope: str | os.PathLike | Mapping) -> str:
 
 def _validate_record(value: Any) -> dict:
     record = _strict_copy(value, "strategy run")
-    _exact_fields(record, _RECORD_FIELDS, "strategy run")
+    fields = set(record) if isinstance(record, Mapping) else set()
+    if fields == _RECORD_FIELDS:
+        for field in sorted(_RECORD_FIELDS):
+            _sha(record[field], f"strategy run.{field}")
+        return record
+    _exact_fields(record, _VERIFIED_RECORD_FIELDS, "strategy run")
+    if record["schema_version"] != RECORD_SCHEMA:
+        raise ValueError(f"strategy run.schema_version must be {RECORD_SCHEMA}")
     for field in sorted(_RECORD_FIELDS):
         _sha(record[field], f"strategy run.{field}")
+    clean_scope = _validate_scope_document(record["scope"])
+    if clean_scope["input_hash"] != record["input_hash"]:
+        raise ValueError("strategy run.scope does not match input_hash")
+    if isinstance(record["completed_at"], bool) or not isinstance(
+        record["completed_at"], (int, float)
+    ) or not math.isfinite(float(record["completed_at"])):
+        raise ValueError("strategy run.completed_at must be finite")
+    for field in ("terminal", "bundle", "methods"):
+        if not isinstance(record[field], dict):
+            raise ValueError(f"strategy run.{field} must be a JSON object")
+    if not isinstance(record["evidence"], list) or any(
+        not isinstance(item, dict) for item in record["evidence"]
+    ):
+        raise ValueError("strategy run.evidence must be a JSON array of objects")
     return record
 
 
@@ -347,11 +387,55 @@ def _validate_memory(value: Any) -> dict:
             if identity in identities:
                 raise ValueError("scope entry contains duplicate strategy runs")
             identities.add(identity)
-        for field in ("methods", "bundles"):
-            if not isinstance(entry[field], dict):
-                raise ValueError(f"scope entry.{field} must be a JSON object")
-            if entry[field]:
-                raise ValueError(f"scope entry.{field} is unsupported before record import")
+        methods = entry["methods"]
+        bundles = entry["bundles"]
+        if not isinstance(methods, dict) or not isinstance(bundles, dict):
+            raise ValueError("scope entry methods and bundles must be JSON objects")
+        for method_id, method_entry in methods.items():
+            if not isinstance(method_id, str) or not method_id:
+                raise ValueError("scope method id must be non-empty")
+            _exact_fields(method_entry, {"records"}, "scope method entry")
+            if not isinstance(method_entry["records"], list):
+                raise ValueError("scope method records must be an array")
+            for item in method_entry["records"]:
+                _exact_fields(
+                    item,
+                    {"record_identity", "performance", "implementation", "completed_at"},
+                    "scope method record",
+                )
+                if _sha(item["record_identity"], "scope method record identity") not in identities:
+                    raise ValueError("scope method record references an unknown run")
+                if item["performance"] is None and item["implementation"] is None:
+                    raise ValueError("scope method record contains no evidence")
+                for field in ("performance", "implementation"):
+                    if item[field] is not None and not isinstance(item[field], dict):
+                        raise ValueError(f"scope method record {field} must be an object or null")
+        for bundle_key, bundle_entry in bundles.items():
+            _sha(bundle_key, "scope bundle key")
+            _exact_fields(bundle_entry, {"method_ids", "records"}, "scope bundle entry")
+            method_ids = bundle_entry["method_ids"]
+            if (
+                not isinstance(method_ids, list)
+                or method_ids != sorted(set(method_ids))
+                or any(not isinstance(item, str) or not item for item in method_ids)
+            ):
+                raise ValueError("scope bundle method_ids must be sorted unique strings")
+            if hashlib.sha256(_canonical_bytes(method_ids)).hexdigest() != bundle_key:
+                raise ValueError("scope bundle key does not match method_ids")
+            if not isinstance(bundle_entry["records"], list):
+                raise ValueError("scope bundle records must be an array")
+            for item in bundle_entry["records"]:
+                _exact_fields(
+                    item,
+                    {"record_identity", "outcome", "decision_evidence", "completed_at"},
+                    "scope bundle record",
+                )
+                if _sha(item["record_identity"], "scope bundle record identity") not in identities:
+                    raise ValueError("scope bundle record references an unknown run")
+                if not isinstance(item["outcome"], str) or not item["outcome"]:
+                    raise ValueError("scope bundle outcome must be non-empty")
+                if not isinstance(item["decision_evidence"], dict):
+                    raise ValueError("scope bundle decision evidence must be an object")
     return memory
 
 
@@ -671,8 +755,423 @@ def append_run(
         if len(entry["runs"]) >= MAX_RUNS_PER_SCOPE:
             raise ValueError("strategy memory run capacity reached")
         entry["runs"].append(clean_record)
+        if clean_record.get("schema_version") == RECORD_SCHEMA:
+            method_ids = clean_record["bundle"]["method_ids"]
+            for method_id in method_ids:
+                performance = clean_record["methods"]["performance"].get(method_id)
+                implementation = clean_record["methods"]["implementation"].get(method_id)
+                if performance is None and implementation is None:
+                    continue
+                entry["methods"].setdefault(method_id, {"records": []})["records"].append({
+                    "record_identity": identity,
+                    "performance": performance,
+                    "implementation": implementation,
+                    "completed_at": clean_record["completed_at"],
+                })
+            bundle_key = hashlib.sha256(_canonical_bytes(method_ids)).hexdigest()
+            bundle_entry = entry["bundles"].setdefault(
+                bundle_key, {"method_ids": method_ids, "records": []}
+            )
+            bundle_entry["records"].append({
+                "record_identity": identity,
+                "outcome": clean_record["bundle"]["outcome"],
+                "decision_evidence": clean_record["bundle"]["decision_evidence"],
+                "completed_at": clean_record["completed_at"],
+            })
         inserted = True
         return memory
 
     _locked_memory_update(memory_path, update)
     return inserted
+
+
+def _run_root(path: str | os.PathLike) -> tuple[Path, tuple[int, int]]:
+    root = Path(path).expanduser().absolute()
+    if root.is_symlink():
+        raise ValueError("run directory must not be a symlink")
+    try:
+        info = root.lstat()
+    except OSError as error:
+        raise ValueError("run directory is missing or unsafe") from error
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("run directory must be a real directory")
+    # The safe reader below validates every parent component; opening this
+    # required leaf makes a parent-directory alias fail before any schema work.
+    artifact_store.read_regular_bytes(root / "manifest.json")
+    return root, (info.st_dev, info.st_ino)
+
+
+def _artifact(path: str | os.PathLike, *, root: Path, role: str) -> tuple[dict, bytes]:
+    candidate = Path(path).expanduser().absolute()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{role} escapes the run directory") from error
+    payload = artifact_store.read_regular_bytes(candidate)
+    return {
+        "role": role,
+        "path": str(candidate),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }, payload
+
+
+def _strict_document(path: str | os.PathLike, *, root: Path, role: str) -> tuple[dict, dict]:
+    evidence, payload = _artifact(path, root=root, role=role)
+    value = _strict_json_bytes(payload, role)
+    if not isinstance(value, dict):
+        raise ValueError(f"{role} must contain a JSON object")
+    return value, evidence
+
+
+def _replay_decision(payload: Mapping) -> dict:
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, Mapping) or set(evidence) != {
+        "kernel", "workload", "constraints", "pareto"
+    }:
+        raise ValueError("decision evidence is required for strict replay")
+    replay = decision.decide(
+        mode=payload.get("mode"),
+        kernel=evidence["kernel"],
+        workload=evidence["workload"],
+        constraints=evidence["constraints"],
+        pareto=evidence["pareto"],
+    )
+    for field, expected in replay.items():
+        if payload.get(field) != expected:
+            raise ValueError(f"decision replay mismatch: {field}")
+    return replay
+
+
+def _finite_positive(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _inside_exact(path: Path, parent: Path) -> bool:
+    return path.absolute().parent == parent.absolute()
+
+
+def _method_evidence(
+    root: Path,
+    iteration: int,
+    method_ids: list[str],
+    champion_bench_path: Path,
+) -> tuple[dict, list[dict]]:
+    iter_dir = root / f"iterv{iteration}"
+    performance: dict[str, dict] = {}
+    implementation: dict[str, dict] = {}
+    evidence: list[dict] = []
+
+    sass_path = iter_dir / "sass_check.json"
+    if sass_path.exists() or sass_path.is_symlink():
+        try:
+            sass, sass_identity = _strict_document(
+                sass_path, root=root, role="sass_check"
+            )
+            evidence.append(sass_identity)
+            checks = sass.get("checks", [])
+            if isinstance(checks, list):
+                for check in checks:
+                    if not isinstance(check, Mapping):
+                        continue
+                    method_id = check.get("method_id")
+                    status_value = check.get("status")
+                    if method_id in method_ids and isinstance(status_value, str):
+                        implementation[method_id] = {
+                            "status": status_value,
+                            "evidence": sass_identity,
+                        }
+        except (OSError, ValueError):
+            raise
+
+    attribution_path = iter_dir / "attribution.json"
+    if not attribution_path.exists() and not attribution_path.is_symlink():
+        return {"performance": performance, "implementation": implementation}, evidence
+    attribution, attribution_identity = _strict_document(
+        attribution_path, root=root, role="attribution"
+    )
+    evidence.append(attribution_identity)
+    entries = attribution.get("attributions")
+    if not isinstance(entries, list):
+        return {"performance": performance, "implementation": implementation}, evidence
+    try:
+        champion_identity, champion_bytes = _artifact(
+            champion_bench_path, root=root, role="champion_bench"
+        )
+        champion = _strict_json_bytes(champion_bytes, "champion_bench")
+    except (OSError, ValueError):
+        return {"performance": performance, "implementation": implementation}, evidence
+    for item in entries:
+        if not isinstance(item, Mapping):
+            continue
+        method_id = item.get("method_id")
+        if method_id not in method_ids:
+            continue
+        method_dir = iter_dir / "ablations" / method_id
+        try:
+            ablated_kernel = Path(item["ablated_kernel"]).absolute()
+            ablated_bench_path = Path(item["ablated_bench"]).absolute()
+            if not _inside_exact(ablated_kernel, method_dir) or not _inside_exact(
+                ablated_bench_path, method_dir
+            ):
+                continue
+            kernel_identity, _ = _artifact(
+                ablated_kernel, root=root, role=f"ablation_kernel:{method_id}"
+            )
+            bench_identity, bench_bytes = _artifact(
+                ablated_bench_path, root=root, role=f"ablation_bench:{method_id}"
+            )
+            if item.get("ablated_kernel_sha256") != kernel_identity["sha256"]:
+                continue
+            if item.get("ablated_bench_sha256") != bench_identity["sha256"]:
+                continue
+            if item.get("champion_bench") != champion_identity["path"]:
+                continue
+            if item.get("champion_bench_sha256") != champion_identity["sha256"]:
+                continue
+            ablated = _strict_json_bytes(bench_bytes, "ablated_bench")
+            if not isinstance(champion, Mapping) or not isinstance(ablated, Mapping):
+                continue
+            correctness = ablated.get("correctness")
+            if not isinstance(correctness, Mapping) or correctness.get("passed") is not True:
+                continue
+            champion_ms = _finite_positive((champion.get("kernel") or {}).get("average_ms"))
+            ablated_ms = _finite_positive((ablated.get("kernel") or {}).get("average_ms"))
+            if champion_ms is None or ablated_ms is None:
+                continue
+            delta = ablated_ms - champion_ms
+            percentage = delta / champion_ms * 100.0
+            declared = (
+                item.get("champion_ms"), item.get("ablated_ms"),
+                item.get("attribution_ms"), item.get("attribution_pct"),
+            )
+            expected = (champion_ms, ablated_ms, delta, percentage)
+            if any(
+                isinstance(actual, bool) or not isinstance(actual, (int, float))
+                or not math.isclose(float(actual), wanted, rel_tol=1e-9, abs_tol=1e-9)
+                for actual, wanted in zip(declared, expected)
+            ):
+                continue
+            performance[method_id] = {
+                "outcome": "positive" if delta > 0 else "negative",
+                "attribution_ms": delta,
+                "attribution_pct": percentage,
+                "evidence_quality": "diagnostic_unpaired_ablation",
+                "promotion_authority": False,
+                "evidence": [attribution_identity, champion_identity, kernel_identity, bench_identity],
+            }
+            evidence.extend([champion_identity, kernel_identity, bench_identity])
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+    return {"performance": performance, "implementation": implementation}, evidence
+
+
+def load_completed_run(run_dir: str | os.PathLike) -> dict:
+    """Revalidate one completed v2.2 run and return detached strategy evidence."""
+    root, root_identity = _run_root(run_dir)
+    manifest_path = root / "manifest.json"
+    state_path = root / "state.json"
+    checkpoint_path = root / "checkpoint.json"
+    initial: dict[str, str] = {}
+    for role, path in (
+        ("manifest", manifest_path), ("state", state_path),
+        ("checkpoint", checkpoint_path),
+    ):
+        item, _ = _artifact(path, root=root, role=role)
+        initial[item["path"]] = item["sha256"]
+
+    manifest, input_hash = orchestrate._load_and_verify_manifest(root)
+    state_payload, state_identity = _strict_document(
+        state_path, root=root, role="state"
+    )
+    state.validate_state(state_payload)
+    orchestrate._verify_state_candidates(state_payload)
+    checkpoint, checkpoint_identity = _strict_document(
+        checkpoint_path, root=root, role="checkpoint"
+    )
+    checkpoint = orchestrate._validate_checkpoint(checkpoint, input_hash=input_hash)
+    if checkpoint["stage"] != "complete" or checkpoint["status"] != "complete":
+        raise ValueError("checkpoint must be complete before strategy recording")
+    terminal = state_payload.get("terminal_decision")
+    if not isinstance(terminal, Mapping):
+        raise ValueError("completed state is missing terminal_decision")
+    if state_payload.get("run_dir") != str(root):
+        raise ValueError("state run_dir does not match selected run")
+    if not (
+        state_payload.get("input_hash") == input_hash == terminal.get("input_hash")
+        == checkpoint.get("input_hash")
+    ):
+        raise ValueError("run identity mismatch")
+    if not (
+        manifest.get("mode") == state_payload.get("mode") == terminal.get("mode")
+    ):
+        raise ValueError("manifest, state, and terminal mode mismatch")
+    if checkpoint.get("run_dir") not in {None, str(root)}:
+        raise ValueError("checkpoint run_dir does not match selected run")
+    iteration = terminal.get("iteration")
+    if type(iteration) is not int or checkpoint.get("iteration") != iteration:
+        raise ValueError("terminal and checkpoint iteration mismatch")
+    if checkpoint.get("candidate_id") != terminal.get("candidate_id") or checkpoint.get(
+        "candidate_status"
+    ) != terminal.get("status"):
+        raise ValueError("terminal and checkpoint candidate identity mismatch")
+    resume = terminal.get("resume")
+    if not isinstance(resume, Mapping) or resume.get("stage") != "complete" or resume.get(
+        "status"
+    ) != "complete":
+        raise ValueError("terminal resume is not bound to complete checkpoint")
+
+    decision_path = Path(terminal.get("decision_json", "")).absolute()
+    if decision_path.parent != root / f"iterv{iteration}":
+        raise ValueError("terminal decision escapes its iteration")
+    decision_payload, decision_identity = _strict_document(
+        decision_path, root=root, role="decision"
+    )
+    if decision_identity["sha256"] != terminal.get("decision_sha256"):
+        raise ValueError("terminal decision sha256 drifted")
+    replay = _replay_decision(decision_payload)
+    for field in ("candidate_id", "candidate_file", "candidate_sha256"):
+        if terminal.get(field) != decision_payload.get(field):
+            raise ValueError(f"terminal decision candidate mismatch: {field}")
+    for field in (
+        "status", "mode", "statistics", "workload_status",
+        "workload_statistics", "workload_failure", "constraints", "pareto",
+    ):
+        replay_value = replay.get(field)
+        if field in {"constraints", "pareto"} and field not in replay:
+            replay_value = replay["evidence"][field]
+        if terminal.get(field) != replay_value:
+            raise ValueError(f"terminal decision replay mismatch: {field}")
+    if terminal.get("candidate_sha256") != decision_payload.get("candidate_sha256"):
+        raise ValueError("terminal candidate sha256 mismatch")
+
+    iter_dir = root / f"iterv{iteration}"
+    methods_payload, methods_identity = _strict_document(
+        iter_dir / "methods.json", root=root, role="methods"
+    )
+    methods = methods_payload.get("methods")
+    if not isinstance(methods, list):
+        raise ValueError("terminal methods.json must contain methods list")
+    method_ids = []
+    for item in methods:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str) or not item["id"]:
+            raise ValueError("terminal method id is malformed")
+        method_ids.append(item["id"])
+    if len(set(method_ids)) != len(method_ids):
+        raise ValueError("terminal method ids must be unique")
+    method_evidence, optional_evidence = _method_evidence(
+        root, iteration, method_ids, iter_dir / "bench.json"
+    )
+    scope = scope_document(manifest_path)
+    evidence = [state_identity, checkpoint_identity, decision_identity, methods_identity]
+    for field in ("kernel_paired_samples", "workload_paired_samples"):
+        binding = terminal.get(field)
+        if isinstance(binding, Mapping):
+            item, _ = _artifact(binding["path"], root=root, role=field)
+            if item["sha256"] != binding.get("sha256"):
+                raise ValueError(f"{field} hash drifted")
+            evidence.append(item)
+    candidate_sha = terminal.get("candidate_sha256")
+    if not isinstance(candidate_sha, str):
+        raise ValueError("terminal candidate identity is required")
+    candidate_item, _ = _artifact(
+        terminal["candidate_file"], root=root, role="candidate"
+    )
+    if candidate_item["sha256"] != candidate_sha:
+        raise ValueError("terminal candidate drifted")
+    state_candidates = state_payload.get("candidates", {})
+    if not any(
+        isinstance(item, Mapping)
+        and (item.get("candidate_file") or item.get("path")) == terminal["candidate_file"]
+        and (item.get("candidate_sha256") or item.get("sha256")) == candidate_sha
+        and item.get("status") == terminal.get("status")
+        for item in state_candidates.values()
+    ):
+        raise ValueError("state candidate does not match terminal candidate")
+    evidence.extend([candidate_item, *optional_evidence])
+
+    # Re-open every critical artifact after all expensive validation and replay.
+    if _run_root(root)[1] != root_identity:
+        raise ValueError("run directory identity changed during validation")
+    for path, digest in initial.items():
+        current, _ = _artifact(path, root=root, role="critical_recheck")
+        if current["sha256"] != digest:
+            raise ValueError("critical run artifact changed during validation")
+    for item in evidence:
+        current, _ = _artifact(item["path"], root=root, role=item["role"])
+        if current["sha256"] != item["sha256"]:
+            raise ValueError("run evidence changed during validation")
+
+    record = {
+        "schema_version": RECORD_SCHEMA,
+        "input_hash": input_hash,
+        "candidate_sha256": candidate_sha,
+        "decision_sha256": decision_identity["sha256"],
+        "checkpoint_identity": checkpoint_identity["sha256"],
+        "scope": scope,
+        "completed_at": checkpoint["updated_at"],
+        "terminal": {
+            **{
+                key: replay.get(key)
+                for key in (
+                    "status", "mode", "reason", "statistics", "workload_status",
+                    "workload_statistics", "workload_failure",
+                )
+            },
+            "constraints": replay.get("constraints", replay["evidence"]["constraints"]),
+            "pareto": replay.get("pareto", replay["evidence"]["pareto"]),
+        },
+        "bundle": {
+            "outcome": replay["status"],
+            "method_ids": sorted(method_ids),
+            "promotion_authority": False,
+            "decision_evidence": decision_identity,
+        },
+        "methods": method_evidence,
+        "evidence": sorted(
+            {item["path"]: item for item in evidence}.values(),
+            key=lambda item: (item["role"], item["path"]),
+        ),
+    }
+    return _validate_record(record)
+
+
+def _atomic_write_output(path: str | os.PathLike, payload: Mapping) -> None:
+    artifact_store.atomic_write_json(path, _strict_copy(payload, "strategy record output"))
+
+
+def record_run(
+    memory_path: str | os.PathLike,
+    run_dir: str | os.PathLike,
+    output_path: str | os.PathLike,
+) -> dict:
+    """Validate fully, update memory under lock, then publish the record output."""
+    record = load_completed_run(run_dir)
+    inserted = append_run(memory_path, record["scope"], record)
+    _atomic_write_output(output_path, record)
+    return {"inserted": inserted, "record": record}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage explicit CUDA strategy evidence")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    record_parser = subparsers.add_parser("record", help="record one completed v2.2 run")
+    record_parser.add_argument("--memory", required=True)
+    record_parser.add_argument("--run-dir", required=True)
+    record_parser.add_argument("--out", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "record":
+        result = record_run(args.memory, args.run_dir, args.out)
+        print(json.dumps({"inserted": result["inserted"], "out": args.out}, sort_keys=True))
+        return 0
+    raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

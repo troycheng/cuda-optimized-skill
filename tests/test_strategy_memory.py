@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import copy
+import argparse
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -9,6 +13,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,6 +28,22 @@ MODULE_PATH = (
     / "strategy_memory.py"
 )
 WORKLOAD_ADAPTER_PATH = MODULE_PATH.with_name("workload_adapter.py")
+
+
+def _load_script(name: str):
+    module_name = f"cuda_optimizer_strategy_memory_{name}_test"
+    sys.modules.pop(module_name, None)
+    path = MODULE_PATH.with_name(f"{name}.py")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 def _load_strategy_memory():
@@ -60,6 +81,10 @@ class StrategyMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.memory = _load_strategy_memory()
         self.workloads = _load_workload_adapter()
+        self.orchestrate = _load_script("orchestrate")
+        self.state = _load_script("state")
+        self.decision = _load_script("decision")
+        self.paired_stats = _load_script("paired_stats")
 
     @staticmethod
     def _objective() -> dict:
@@ -182,6 +207,219 @@ class StrategyMemoryTests(unittest.TestCase):
             "ref_sha256": "c" * 64,
             "workload": {"mode": "kernel-only"},
         }
+
+    def _completed_run(
+        self,
+        root: Path,
+        status: str = "kernel_only_win",
+        *,
+        with_ablation: bool = False,
+    ) -> Path:
+        """Build a real terminal snapshot through the production validators."""
+        run = root.resolve() / "run"
+        iteration = run / "iterv1"
+        iteration.mkdir(parents=True)
+        baseline = root / "baseline.py"
+        reference = root / "reference.py"
+        baseline.write_text("# baseline\n", encoding="utf-8")
+        reference.write_text("# reference\n", encoding="utf-8")
+        candidate = iteration / "kernel.py"
+        candidate.write_text("# candidate\n", encoding="utf-8")
+        candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        mode = "full" if status == "end_to_end_win" else "kernel-only"
+        workload = self._python_workload(root, "-run") if mode == "full" else None
+        budget = {"elapsed_seconds": 1.0, "remaining_seconds": 9.0}
+        inputs = {
+            "baseline": {
+                "path": str(baseline.resolve()),
+                "sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
+                "size_bytes": baseline.stat().st_size,
+            },
+            "ref": {
+                "path": str(reference.resolve()),
+                "sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+                "size_bytes": reference.stat().st_size,
+            },
+        }
+        manifest = {
+            "schema_version": 2,
+            "inputs": inputs,
+            "environment": {"primary_sm_arch": "sm_120"},
+            "backend": "triton",
+            "dims": {"M": 128},
+            "ptr_size": 8,
+            "mode": mode,
+            "workload": workload,
+            "budget": budget,
+            "confidence": 0.95,
+            "min_effect_pct": 1.0,
+            "started_at": 1.0,
+        }
+        manifest["input_hash"] = self.orchestrate._frozen_input_hash(
+            {"inputs": inputs}, workload=workload, dims=manifest["dims"],
+            backend=manifest["backend"], budget=budget, confidence=0.95,
+            min_effect_pct=1.0, ptr_size=8,
+        )
+        (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        candidate_value = {
+            "kernel_only_win": 97.0,
+            "end_to_end_win": 97.0,
+            "confirmed_loss": 103.0,
+            "inconclusive": 100.0,
+        }[status]
+        kernel_pairs = [
+            {"block": index, "baseline": 100.0, "candidate": candidate_value, "valid": True}
+            for index in range(3)
+        ]
+        kernel_classifier = {
+            "direction": "lower", "min_effect_pct": 1.0,
+            "confidence": 0.95, "bootstrap_samples": 20, "seed": 0,
+        }
+        kernel_stats = self.paired_stats.classify_pairs(
+            kernel_pairs, direction="lower", min_effect_pct=1.0,
+            confidence=0.95, bootstrap_samples=20, seed=0,
+        )
+        kernel_artifact = self.orchestrate.write_paired_samples(
+            iteration / "kernel" / "paired_samples.jsonl", kernel_pairs,
+            kind="kernel", input_hash=manifest["input_hash"], iteration=1,
+            candidate_id="b1", candidate_file=candidate,
+            classifier_config=kernel_classifier,
+        )
+        kernel_evidence = {"status": kernel_stats["status"], "statistics": kernel_stats}
+        workload_evidence = None
+        workload_artifact = None
+        if mode == "full":
+            raw_workload_pairs = [
+                {"block": index, "order": "AB", "case": None,
+                 "baseline_metrics": {"latency_ms": 100.0},
+                 "candidate_metrics": {"latency_ms": 97.0}, "valid": True,
+                 "attempts": {"baseline": 1, "candidate": 1},
+                 "attempt_records": {"baseline": [], "candidate": []}}
+                for index in range(3)
+            ]
+            workload_stats = self.paired_stats.classify_pairs(
+                [{"baseline": 100.0, "candidate": 97.0, "valid": True}] * 3,
+                direction="lower", min_effect_pct=1.0, confidence=0.95,
+                bootstrap_samples=20, seed=0,
+            )
+            objective = workload["objective"]
+            workload_classifier = {
+                "objective": objective,
+                "objective_sha256": hashlib.sha256(json.dumps(
+                    objective, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest(),
+                "confidence": 0.95, "bootstrap_samples": 20, "seed": 0,
+            }
+            workload_artifact = self.orchestrate.write_paired_samples(
+                iteration / "workload" / "paired_samples.jsonl", raw_workload_pairs,
+                kind="workload", input_hash=manifest["input_hash"], iteration=1,
+                candidate_id="b1", candidate_file=candidate,
+                classifier_config=workload_classifier,
+            )
+            workload_evidence = {
+                "status": "evaluated", "objective": objective,
+                "primary": workload_stats, "constraints": [],
+            }
+        decision = self.decision.decide(
+            mode=mode, kernel=kernel_evidence, workload=workload_evidence,
+            constraints=[], pareto=None,
+        )
+        self.assertEqual(decision["status"], status)
+        decision.update({
+            "candidate_id": "b1", "candidate_file": str(candidate.resolve()),
+            "candidate_sha256": candidate_sha,
+        })
+        if status in {"kernel_only_win", "end_to_end_win"}:
+            decision["kernel_paired_samples"] = kernel_artifact
+        if workload_artifact is not None:
+            decision["workload_paired_samples"] = workload_artifact
+        decision_path = iteration / "decision.json"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+        methods = iteration / "methods.json"
+        methods.write_text(json.dumps({"methods": [{"id": "vectorize"}]}), encoding="utf-8")
+        champion_bench = iteration / "bench.json"
+        champion_bench.write_text(json.dumps({
+            "correctness": {"passed": True}, "kernel": {"average_ms": 10.0},
+            "reference": {"average_ms": 20.0},
+        }), encoding="utf-8")
+        sass = iteration / "sass_check.json"
+        sass.write_text(json.dumps({
+            "status": "passed", "checks": [{
+                "method_id": "vectorize", "status": "passed", "verified": True,
+                "patterns_missing": [],
+            }],
+        }), encoding="utf-8")
+        attribution_path = None
+        if with_ablation:
+            ablation = iteration / "ablations" / "vectorize"
+            ablation.mkdir(parents=True)
+            ablated_kernel = ablation / "kernel.py"
+            ablated_kernel.write_text("# ablated\n", encoding="utf-8")
+            ablated_bench = ablation / "bench.json"
+            ablated_bench.write_text(json.dumps({
+                "correctness": {"passed": True}, "kernel": {"average_ms": 12.0},
+            }), encoding="utf-8")
+            attribution_path = iteration / "attribution.json"
+            attribution_path.write_text(json.dumps({
+                "iter": 1, "attributions": [{
+                    "method_id": "vectorize",
+                    "champion_bench": str(champion_bench.resolve()),
+                    "champion_bench_sha256": hashlib.sha256(champion_bench.read_bytes()).hexdigest(),
+                    "ablated_kernel": str(ablated_kernel.resolve()),
+                    "ablated_kernel_sha256": hashlib.sha256(ablated_kernel.read_bytes()).hexdigest(),
+                    "ablated_bench": str(ablated_bench.resolve()),
+                    "ablated_bench_sha256": hashlib.sha256(ablated_bench.read_bytes()).hexdigest(),
+                    "champion_ms": 10.0, "ablated_ms": 12.0,
+                    "attribution_ms": 2.0, "attribution_pct": 20.0,
+                    "contributed": True,
+                }],
+            }), encoding="utf-8")
+
+        state_payload = {
+            "schema_version": 2, "run_dir": str(run), "input_hash": manifest["input_hash"],
+            "budget": budget, "candidates": {}, "mode": mode, "confidence": 0.95,
+            "min_effect_pct": 1.0, "bootstrap_samples": 20, "seed": 0,
+            "workload": workload, "best_file": str(baseline.resolve()),
+            "best_metric_ms": 20.0, "best_kernel_statistics": None,
+            "best_workload_statistics": None, "noise_threshold_pct": 2.0,
+            "selected_methods": [], "effective_methods": [], "ineffective_methods": [],
+            "implementation_failed_methods": [], "history": [], "roofline_history": [],
+            "frontier": [], "ref_file": str(reference.resolve()), "dims": {"M": 128},
+            "ptr_size": 8,
+        }
+        state_path = run / "state.json"
+        state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+        checkpoint = {
+            "schema_version": 2, "input_hash": manifest["input_hash"], "iteration": 1,
+            "stage": "decision", "stage_index": self.orchestrate.STAGES.index("decision"),
+            "status": "in_progress", "candidate_id": "b1", "candidate_status": status,
+            "candidate_file": str(candidate.resolve()), "candidate_sha256": candidate_sha,
+            "budget": budget, "updated_at": 2.0, "stage_evidence": {},
+            "run_dir": str(run),
+        }
+        checkpoint_path = run / "checkpoint.json"
+        self.orchestrate.ArtifactStore(run).write_checkpoint(checkpoint)
+        args = argparse.Namespace(
+            state=str(state_path), iter=1, kernel=str(candidate), bench=str(champion_bench),
+            methods_json=str(methods), attribution=(str(attribution_path) if attribution_path else None),
+            sass_check=str(sass), retries=0, skip_validation=True,
+            allow_ineffective=False, decision=str(decision_path),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.state.cmd_update(args)
+        current = json.loads(checkpoint_path.read_text("utf-8"))
+        current = self.orchestrate.transition_checkpoint(
+            current, "decision", status="stage_complete", updated_at=3.0,
+        )
+        self.orchestrate.ArtifactStore(run).write_checkpoint(current)
+        self.state.persist_checkpoint_snapshot(state_path, current, checkpoint_path)
+        complete = self.orchestrate.transition_checkpoint(
+            current, "complete", status="complete", updated_at=4.0,
+        )
+        self.orchestrate.ArtifactStore(run).write_checkpoint(complete)
+        self.state.persist_checkpoint_snapshot(state_path, complete, checkpoint_path)
+        return run
 
     def test_scope_is_canonical_and_contains_complete_kernel_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -682,6 +920,180 @@ class StrategyMemoryTests(unittest.TestCase):
             recovery = list(root.glob(f".{memory.name}.*.tmp"))
             self.assertEqual(len(recovery), 1)
             self.assertEqual(recovery[0].read_bytes(), original)
+
+    def test_completed_v22_runs_are_replayed_and_detached(self) -> None:
+        for status in (
+            "kernel_only_win", "end_to_end_win", "confirmed_loss", "inconclusive"
+        ):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                run = self._completed_run(Path(tmp), status)
+                record = self.memory.load_completed_run(run)
+                self.assertEqual(record["schema_version"], self.memory.RECORD_SCHEMA)
+                self.assertEqual(record["bundle"]["outcome"], status)
+                self.assertEqual(record["input_hash"], record["scope"]["input_hash"])
+                self.assertNotIn("environment", json.dumps(record))
+                self.assertNotIn("# candidate", json.dumps(record))
+                self.assertEqual(record["methods"]["performance"], {})
+
+    def test_completed_run_uses_all_authoritative_validators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._completed_run(Path(tmp))
+            with mock.patch.object(
+                self.memory.orchestrate, "_load_and_verify_manifest",
+                wraps=self.memory.orchestrate._load_and_verify_manifest,
+            ) as manifest_validator, mock.patch.object(
+                self.memory.state, "validate_state", wraps=self.memory.state.validate_state,
+            ) as state_validator, mock.patch.object(
+                self.memory.orchestrate, "_validate_checkpoint",
+                wraps=self.memory.orchestrate._validate_checkpoint,
+            ) as checkpoint_validator, mock.patch.object(
+                self.memory.orchestrate, "_verify_state_candidates",
+                wraps=self.memory.orchestrate._verify_state_candidates,
+            ) as candidate_validator, mock.patch.object(
+                self.memory.decision, "decide", wraps=self.memory.decision.decide,
+            ) as replay:
+                self.memory.load_completed_run(run)
+            for called in (
+                manifest_validator, state_validator, checkpoint_validator,
+                candidate_validator, replay,
+            ):
+                self.assertTrue(called.called)
+
+    def test_tamper_incomplete_and_legacy_fail_before_memory_or_output(self) -> None:
+        mutators = {
+            "paired": lambda run: (run / "iterv1" / "kernel" / "paired_samples.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            ),
+            "decision": lambda run: (run / "iterv1" / "decision.json").write_text(
+                "{}", encoding="utf-8"
+            ),
+            "candidate": lambda run: (run / "iterv1" / "kernel.py").write_text(
+                "# drift\n", encoding="utf-8"
+            ),
+            "checkpoint": lambda run: self._mutate_json(
+                run / "checkpoint.json", lambda value: value.update(stage="decision", stage_index=6, status="stage_complete")
+            ),
+            "legacy": lambda run: self._mutate_json(
+                run / "state.json", lambda value: value.update(schema_version=1)
+            ),
+            "missing": lambda run: (run / "checkpoint.json").unlink(),
+            "symlink": self._symlink_decision,
+        }
+        for name, mutate in mutators.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                run = self._completed_run(root)
+                memory = root / "memory.json"
+                output = root / "record.json"
+                mutate(run)
+                with self.assertRaises(ValueError):
+                    self.memory.record_run(memory, run, output)
+                self.assertFalse(memory.exists())
+                self.assertFalse(output.exists())
+
+    @staticmethod
+    def _symlink_decision(run: Path) -> None:
+        path = run / "iterv1" / "decision.json"
+        external = run.parent / "external-decision.json"
+        external.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(external)
+
+    def test_raw_pair_statistic_contradiction_is_recomputed_and_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self._completed_run(root)
+            paired = run / "iterv1" / "kernel" / "paired_samples.jsonl"
+            records = [json.loads(line) for line in paired.read_text("utf-8").splitlines()]
+            records[0]["pair"]["candidate"] = 120.0
+            paired.write_text(
+                "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in records),
+                encoding="utf-8",
+            )
+            new_sha = hashlib.sha256(paired.read_bytes()).hexdigest()
+            self._mutate_json(
+                run / "state.json",
+                lambda value: value["terminal_decision"]["kernel_paired_samples"].update(sha256=new_sha),
+            )
+            with self.assertRaisesRegex(ValueError, "recompute|statistics"):
+                self.memory.record_run(root / "memory.json", run, root / "record.json")
+            self.assertFalse((root / "memory.json").exists())
+
+    @staticmethod
+    def _mutate_json(path: Path, mutate) -> None:
+        value = json.loads(path.read_text("utf-8"))
+        mutate(value)
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_decision_without_replay_evidence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._completed_run(Path(tmp))
+            decision_path = run / "iterv1" / "decision.json"
+            self._mutate_json(decision_path, lambda value: value.pop("evidence"))
+            decision_sha = hashlib.sha256(decision_path.read_bytes()).hexdigest()
+            self._mutate_json(
+                run / "state.json",
+                lambda value: value["terminal_decision"].update(decision_sha256=decision_sha),
+            )
+            with self.assertRaisesRegex(ValueError, "evidence|replay"):
+                self.memory.load_completed_run(run)
+
+    def test_valid_ablation_is_diagnostic_and_sass_is_implementation_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._completed_run(Path(tmp), with_ablation=True)
+            record = self.memory.load_completed_run(run)
+            performance = record["methods"]["performance"]["vectorize"]
+            self.assertEqual(performance["outcome"], "positive")
+            self.assertEqual(performance["evidence_quality"], "diagnostic_unpaired_ablation")
+            self.assertFalse(performance["promotion_authority"])
+            implementation = record["methods"]["implementation"]["vectorize"]
+            self.assertEqual(implementation["status"], "passed")
+            self.assertNotIn("outcome", implementation)
+
+    def test_invalid_ablation_never_creates_performance_evidence(self) -> None:
+        for field in ("ablated_bench_sha256", "attribution_pct", "correctness"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                run = self._completed_run(Path(tmp), with_ablation=True)
+                attribution = run / "iterv1" / "attribution.json"
+                if field == "correctness":
+                    bench = run / "iterv1" / "ablations" / "vectorize" / "bench.json"
+                    self._mutate_json(bench, lambda value: value["correctness"].update(passed=False))
+                    self._mutate_json(
+                        attribution,
+                        lambda value: value["attributions"][0].update(
+                            ablated_bench_sha256=hashlib.sha256(bench.read_bytes()).hexdigest()
+                        ),
+                    )
+                elif field == "ablated_bench_sha256":
+                    self._mutate_json(
+                        attribution,
+                        lambda value: value["attributions"][0].pop(field),
+                    )
+                else:
+                    self._mutate_json(
+                        attribution,
+                        lambda value: value["attributions"][0].update(attribution_pct=99.0),
+                    )
+                record = self.memory.load_completed_run(run)
+                self.assertEqual(record["methods"]["performance"], {})
+
+    def test_record_writes_memory_before_output_and_retry_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self._completed_run(root)
+            memory = root / "memory.json"
+            output = root / "record.json"
+            with mock.patch.object(
+                self.memory, "_atomic_write_output", side_effect=OSError("output failed")
+            ), self.assertRaisesRegex(OSError, "output failed"):
+                self.memory.record_run(memory, run, output)
+            stored = self.memory.load_memory(memory)
+            entry = next(iter(stored["scopes"].values()))
+            self.assertEqual(len(entry["runs"]), 1)
+            result = self.memory.record_run(memory, run, output)
+            self.assertFalse(result["inserted"])
+            self.assertEqual(len(next(iter(self.memory.load_memory(memory)["scopes"].values()))["runs"]), 1)
+            self.assertEqual(json.loads(output.read_text("utf-8"))["schema_version"], self.memory.RECORD_SCHEMA)
 
 
 if __name__ == "__main__":
