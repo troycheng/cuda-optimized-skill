@@ -59,6 +59,10 @@ class LogoAssetTests(unittest.TestCase):
 
         self.assertEqual(light.attrib["viewBox"], "0 0 96 96")
         self.assertEqual(dark.attrib["viewBox"], "0 0 96 96")
+        self.assertNotIn("width", light.attrib)
+        self.assertNotIn("height", light.attrib)
+        self.assertNotIn("width", dark.attrib)
+        self.assertNotIn("height", dark.attrib)
         self.assertEqual(geometry(light), geometry(dark))
         self.assertEqual(fills(light), Counter({"#172033": 8, "#16B8A6": 1}))
         self.assertEqual(fills(dark), Counter({"#F5F7FA": 8, "#28D6C2": 1}))

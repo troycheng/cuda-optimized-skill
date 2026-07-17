@@ -1,5 +1,9 @@
 # cuda-kernel-optimizer
 
+<p align="center">
+  <img src="asset/logo.svg" width="88" alt="cuda-kernel-optimizer Thread Tile logo">
+</p>
+
 **English** | [简体中文](README.zh-CN.md)
 
 `cuda-kernel-optimizer` is a CUDA performance optimization project for Codex,
@@ -165,7 +169,7 @@ a promise that unrelated projects will see the same speedup.
 
 | Validation | Environment and result | What it demonstrates |
 |---|---|---|
-| Automated tests | 690 total; 685 passed, five RTX 5090 opt-in tests skipped outside a GPU environment, zero failed | State recovery, evidence binding, timeouts, restoration, and input validation |
+| Automated tests | 691 total; 686 passed, five RTX 5090 opt-in tests skipped outside a GPU environment, zero failed | State recovery, evidence binding, timeouts, restoration, and input validation |
 | Full RTX 5090 run | The current test environment passed 13/13 checks in 34.302 seconds; target-side NCU profiling returned `ERR_NVGPUCTRPERM` | CUDA, CUTLASS, Triton, and the complete GPU workload optimization flow; no privilege or driver policy was changed |
 | Reproducible workload fixture | End-to-end latency improved 60.4616%, with constraints passing | The full path from bottleneck analysis to keeping a verified change |
 | User-supplied vLLM workload | The kernel metric improved 26.3287%, while the real workload changed -0.0097% | End-to-end evidence was insufficient, so the original was kept; a faster kernel does not guarantee a faster product workload |

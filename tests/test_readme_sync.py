@@ -215,8 +215,8 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_readmes_keep_concise_current_validation_facts(self) -> None:
         facts = (
-            "690",
-            "685",
+            "691",
+            "686",
             "13/13",
             "34.302",
             "60.4616%",
