@@ -401,6 +401,54 @@ class AnalyzeNcuRepBoundedRunTests(unittest.TestCase):
 
 
 class AnalyzeNcuRepImportTests(unittest.TestCase):
+    def test_invalid_report_or_source_removes_stale_marker_before_ncu(self) -> None:
+        module = _load()
+        for invalid_field in ("REPORT", "SOURCE"):
+            with self.subTest(field=invalid_field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                report = root / "input.ncu-rep"
+                report.write_bytes(b"report")
+                source = root / "source.py"
+                source.write_text("kernel", encoding="utf-8")
+                output = root / "analysis"
+                output.mkdir()
+                marker = output / "analysis.json"
+                marker.write_text('{"old": true}', encoding="utf-8")
+                ncu = _fake_ncu(root)
+                argv = [str(report), "--out-dir", str(output), "--ncu-bin", str(ncu)]
+                if invalid_field == "REPORT":
+                    report.unlink()
+                else:
+                    source_link = root / "source-link.py"
+                    source_link.symlink_to(source)
+                    argv.extend(["--source", str(source_link)])
+                with mock.patch.object(module, "_run_bounded") as run:
+                    returncode = module.main(argv)
+                self.assertEqual(returncode, 1)
+                self.assertFalse(marker.exists())
+                run.assert_not_called()
+
+    def test_unsafe_output_is_not_touched_before_validation(self) -> None:
+        module = _load()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "input.ncu-rep"
+            report.write_bytes(b"report")
+            real_output = root / "real-output"
+            real_output.mkdir()
+            marker = real_output / "analysis.json"
+            marker.write_text('{"old": true}', encoding="utf-8")
+            output_link = root / "output-link"
+            output_link.symlink_to(real_output, target_is_directory=True)
+            ncu = _fake_ncu(root)
+            with mock.patch.object(module, "_run_bounded") as run:
+                returncode = module.main(
+                    [str(report), "--out-dir", str(output_link), "--ncu-bin", str(ncu)]
+                )
+            self.assertEqual(returncode, 1)
+            self.assertTrue(marker.exists())
+            run.assert_not_called()
+
     def test_imports_report_with_exact_resolved_ncu_argv_order(self) -> None:
         module = _load()
         with tempfile.TemporaryDirectory() as tmp:

@@ -344,12 +344,12 @@ def _same_identity(before: dict[str, Any], after: dict[str, Any]) -> bool:
 
 
 def _run_analysis(args: argparse.Namespace) -> int:
-    report = capture_regular_file(args.report, "REPORT")
-    source = capture_regular_file(args.source, "SOURCE") if args.source is not None else None
     output = validate_output_directory(args.out_dir)
     marker = os.path.join(output, "analysis.json")
     artifact_store.remove_regular_file(marker, missing_ok=True)
 
+    report = capture_regular_file(args.report, "REPORT")
+    source = capture_regular_file(args.source, "SOURCE") if args.source is not None else None
     ncu = resolve_executable(args.ncu_bin)
     executable = ncu["resolved"]
     report_path = report["path"]
