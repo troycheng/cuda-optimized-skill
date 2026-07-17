@@ -167,6 +167,50 @@ class AnalyzeNcuRepInputTests(unittest.TestCase):
 
 
 class AnalyzeNcuRepBoundedRunTests(unittest.TestCase):
+    def test_bounded_run_latches_group_disappearance_before_reader_completion(self) -> None:
+        module = _load()
+
+        class Process:
+            pid = 43210
+            stdout = None
+            stderr = None
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+            def kill(self):
+                self.returncode = -signal.SIGKILL
+
+        class Reader:
+            ident = 1
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                pass
+
+        calls = []
+
+        def killpg(pgid, signum):
+            calls.append((pgid, signum))
+            raise ProcessLookupError()
+
+        with mock.patch.object(module.subprocess, "Popen", return_value=Process()), mock.patch.object(module.threading, "Thread", Reader), mock.patch.object(module.os, "killpg", side_effect=killpg):
+            result = module._run_bounded(["ignored"], timeout=0.02, output_limit=4)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(calls, [(43210, 0)])
+
     def test_bounded_run_drains_more_than_one_mib_but_only_retains_limit(self) -> None:
         module = _load()
         code = "import sys; sys.stdout.buffer.write(b'x' * (1024 * 1024 + 1))"

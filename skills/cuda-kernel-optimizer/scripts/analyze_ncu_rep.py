@@ -178,7 +178,8 @@ def _run_bounded(argv: list[str], timeout: float, output_limit: int) -> dict[str
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 process.wait()
-                if not any(reader.is_alive() for reader in readers) and not group_exists():
+                group_still_exists = group_exists()
+                if not any(reader.is_alive() for reader in readers) and not group_still_exists:
                     break
             time.sleep(0.01)
         else:
