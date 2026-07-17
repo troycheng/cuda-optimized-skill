@@ -127,10 +127,7 @@ def _run_bounded(argv: list[str], timeout: float, output_limit: int) -> dict[str
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    readers = [
-        threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True),
-    ]
+    readers = []
     group_gone = False
 
     def signal_group(signum: int) -> None:
@@ -172,6 +169,12 @@ def _run_bounded(argv: list[str], timeout: float, output_limit: int) -> dict[str
 
     timed_out = False
     try:
+        readers.extend(
+            [
+                threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True),
+                threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True),
+            ]
+        )
         for reader in readers:
             reader.start()
         deadline = time.monotonic() + timeout

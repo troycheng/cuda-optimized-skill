@@ -297,6 +297,46 @@ class AnalyzeNcuRepBoundedRunTests(unittest.TestCase):
                 time.sleep(0.02)
             self.assertTrue(_gone(pid), pid)
 
+    def test_bounded_run_cleans_process_if_reader_construction_fails(self) -> None:
+        module = _load()
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "pid"
+            real_popen = module.subprocess.Popen
+            launched = []
+
+            def launch(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                launched.append(process)
+                for _ in range(100):
+                    if pid_file.exists():
+                        return process
+                    time.sleep(0.01)
+                self.fail("child did not record its PID")
+
+            code = "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)"
+            try:
+                with mock.patch.object(module.subprocess, "Popen", side_effect=launch), mock.patch.object(module.threading, "Thread", side_effect=RuntimeError("reader construction")):
+                    with self.assertRaisesRegex(RuntimeError, "reader construction"):
+                        module._run_bounded([sys.executable, "-c", code, str(pid_file)], timeout=2, output_limit=1024)
+                pid = int(pid_file.read_text())
+                for _ in range(50):
+                    if _gone(pid):
+                        break
+                    time.sleep(0.02)
+                gone_before_cleanup = _gone(pid)
+                streams_closed_before_cleanup = launched[0].stdout.closed and launched[0].stderr.closed
+            finally:
+                if launched:
+                    process = launched[0]
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None and not stream.closed:
+                            stream.close()
+            self.assertTrue(gone_before_cleanup, pid)
+            self.assertTrue(streams_closed_before_cleanup)
+
     def test_bounded_run_rejects_non_list_argv(self) -> None:
         module = _load()
         with self.assertRaises((TypeError, ValueError)):
