@@ -2,15 +2,18 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A Codex skill for evidence-driven optimization of CUDA, CUTLASS, and Triton
-kernels. V2.2 uses a dual-loop workflow: it first establishes a kernel result,
-then checks that result on a user-owned workload when one is provided. Every
-promotion remains tied to inspectable artifacts.
+A Codex skill for evidence-driven optimization of CUDA, CUTLASS, and Triton.
+V2.4 adds a workload controller for cases where the bottleneck may sit outside
+the kernel. The V2.2 dual-loop kernel workflow remains available: it establishes
+a kernel result, then checks that result on a user-owned workload when one is
+provided. Every promotion remains tied to inspectable artifacts.
 
 ## Start by task
 
 - **Optimize a kernel** — run the controlled candidate loop from a baseline and
   Python reference.
+- **Optimize a GPU workload** — profile a user-provided runnable workload,
+  classify the bottleneck, make one bounded change, and evaluate it end to end.
 - **Validate a real workload** — add an explicit workload and objective when an
   end-to-end claim matters.
 - **Analyze an existing NCU report** — import a `.ncu-rep` without launching its
@@ -108,6 +111,44 @@ Start with the first-run commands above. For later rounds, increment `--iter` an
 follow `checkpoint.json`. Read the method catalog and available profiler
 evidence before writing each budgeted branch.
 
+### Optimize a GPU workload
+
+The workload controller starts from the workload and its business objective,
+not from an assumed kernel bottleneck. Create `control.json` from the full
+example, then collect the baseline, probes, and diagnosis:
+
+```bash
+python3 scripts/workload_controller.py run \
+  --control /path/to/control.json \
+  --run-dir /path/to/workload_run
+```
+
+Read `diagnosis.json`, write a bounded ChangeSet, and register it before Codex
+edits the declared files:
+
+```bash
+python3 scripts/workload_controller.py register-change \
+  --control /path/to/control.json \
+  --run-dir /path/to/workload_run \
+  --change-set /path/to/change.json
+
+python3 scripts/workload_controller.py evaluate \
+  --run-dir /path/to/workload_run
+```
+
+After interruption, inspect or resume the exact checkpoint:
+
+```bash
+python3 scripts/workload_controller.py status --run-dir /path/to/workload_run
+python3 scripts/workload_controller.py resume --run-dir /path/to/workload_run
+```
+
+The deterministic classes are `kernel`, `framework`, `cpu_data`, `transfer`,
+`communication`, `io`, `environment`, and `mixed`. External profilers and
+internal tools supply a normalized probe instead of forcing one profiler format.
+The complete runnable contracts are in
+[`examples/workload-controller.md`](skills/cuda-kernel-optimizer/examples/workload-controller.md).
+
 ### Validate a real workload
 
 ```bash
@@ -170,6 +211,43 @@ exact manifest scope. Suggestions are detached search hints. They cannot remove
 branches, change profiler or budget policy, overwrite evidence, or connect to
 `decision.json` and promotion.
 
+### Workload controller boundary
+
+```mermaid
+flowchart LR
+    runtime["User workload and environment"] --> baseline["Frozen baseline"]
+    baseline --> probes["Normalized probes"]
+    probes --> diagnosis["Deterministic diagnosis"]
+    diagnosis --> change["Bounded ChangeSet"]
+    change --> review["Optional advisory review"]
+    review --> evaluation["Paired workload evaluation"]
+    evaluation --> workload_decision["Deterministic decision"]
+    workload_decision --> promote_or_rollback["Promote or rollback"]
+```
+
+Codex remains the primary optimizer. A local third-party reviewer uses JSON stdin/stdout
+and is advisory only: it has no command callback and no promotion
+handle. Running it as the same user is not an OS sandbox; use a read-only
+container or system sandbox when stronger isolation is required. Source diff
+content is withheld unless `reviewer.include_diff` is explicitly enabled.
+
+ChangeSet `commands` must be empty. Correctness is checked by the frozen
+workload adapter's `validate()` contract, so the controller does not expose an
+additional same-user command runner. The candidate descriptor is bound to the
+post-change identity digest in a separate artifact before paired evaluation;
+the workload adapter's `validate()` remains responsible for confirming that
+the descriptor selects the implementation being measured.
+
+| Scope | Automatic action | Boundary |
+|---|---|---|
+| Declared project paths | Allowed | Actual diff must match the ChangeSet |
+| User-owned `isolated_environment` | Allowed | Must be outside the project and host system roots |
+| Host OS, driver, clocks, power, permissions | Never | Host changes are recommendations only |
+
+The control contract fixes `host_policy` to `recommend_only`. A failed
+correctness check, escaped diff, workload drift, expired budget, primary-metric
+loss, or constraint failure restores the frozen snapshot.
+
 ## Inputs, budgets, and statuses
 
 ### Inputs
@@ -212,8 +290,11 @@ match the adapter's `metrics()` contract.
 | `thorough` | 36000 | 16 | 8 | 30 | 200 | 3 | unlimited | full |
 
 Use `--budget custom` only with every required limit. The deadline stops new
-stage admission and leaves a resumable checkpoint; partial evidence never
-becomes a win.
+stage admission, caps external probe, reviewer, and command-workload timeouts,
+and leaves a resumable checkpoint; partial or late evidence never becomes a
+win. A Python adapter runs in process and therefore cannot be forcibly stopped
+inside a blocking native call. Give it its own bounded operations, or use the
+command-workload form when a killable wall-clock boundary is required.
 
 ### Terminal statuses
 
@@ -269,8 +350,8 @@ systems. Its storage must honor file locking and atomic rename semantics.
 
 The skill does not redistribute CUDA, CUTLASS, Triton, or Nsight Compute.
 
-Current CPU acceptance contains 611 tests: 607 passed, four opt-in RTX 5090
-tests skipped, and zero failed. All 25/25 scripts pass `py_compile` and `--help`
+Current CPU acceptance contains 690 tests: 685 passed, five opt-in RTX 5090
+tests skipped, and zero failed. All 28/28 scripts pass `py_compile` and `--help`
 smoke checks, and the skill validator reports valid.
 
 V2.2 was validated on physical RTX 5090 hardware on 2026-07-17. The current and
@@ -278,6 +359,17 @@ compatibility containers each passed 11/11 checks. Their NCU versions were
 2026.2.1 and 2025.3.1. Capability-dropped lanes returned
 `ERR_NVGPUCTRPERM`; acceptance permits only that exact result or a successful
 profile with real metrics. No privilege, capability, or driver policy changed.
+
+V2.4 workload controller was validated on the same physical RTX 5090 host. The
+current lane passed 13/13 checks in 34.302 seconds with image
+`sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`.
+The real probe recorded `gpu_busy_pct=0.0`; with only that metric, diagnosis
+correctly remained `inconclusive`. A bounded ChangeSet removed two redundant
+Triton launches. Paired workload evaluation measured a **60.4616%** latency
+improvement, 95% CI **[60.0894%, 61.4941%]**, over 3 valid pairs; the output
+checksum constraint passed. With reviewer skipped, the deterministic decision
+promoted the change and resume returned `done`. NCU returned
+`ERR_NVGPUCTRPERM`; no host permission or driver setting was changed.
 
 An isolated user-provided vLLM binary workload used `balanced`: one round, two
 branches, and a 10,800-second cap. Kernel paired A/B improved **26.3287%** with
@@ -319,8 +411,8 @@ Run the publisher without `--execute` first. It verifies repository identity,
 fast-forward safety, the full CPU suite, and both exact refs without writing:
 
 ```bash
-python3 tools/publish_dual_remote.py --tag v2.3.0
-python3 tools/publish_dual_remote.py --tag v2.3.0 --execute
+python3 tools/publish_dual_remote.py --tag v2.4.0
+python3 tools/publish_dual_remote.py --tag v2.4.0 --execute
 ```
 
 The second command publishes GitHub first, verifies it, then publishes and

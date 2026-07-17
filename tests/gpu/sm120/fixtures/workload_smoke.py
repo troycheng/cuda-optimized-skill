@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 WORKLOAD_DEPENDENCIES = ["objective.json"]
@@ -31,12 +32,24 @@ def _load_candidate(path: Path):
     return module
 
 
+def _candidate_path(candidate) -> Path:
+    if isinstance(candidate, Mapping):
+        if "path" not in candidate:
+            raise ValueError("workload candidate mapping requires path")
+        supplied = candidate["path"]
+    else:
+        supplied = candidate
+    if not isinstance(supplied, (str, Path)):
+        raise ValueError("workload candidate path must be a string or Path")
+    return Path(supplied).expanduser().absolute()
+
+
 def prepare(candidate):
     """Load one candidate and allocate deterministic real CUDA inputs."""
     global _active
     if _active is not None:
         raise RuntimeError("workload candidate is already prepared")
-    supplied = Path(candidate).expanduser().absolute()
+    supplied = _candidate_path(candidate)
     if supplied.is_symlink() or not supplied.is_file():
         raise ValueError("workload smoke accepts a regular Python kernel")
     path = supplied.resolve(strict=True)
@@ -56,7 +69,7 @@ def prepare(candidate):
 def _require_active(candidate):
     if _active is None:
         raise RuntimeError("workload candidate is not prepared")
-    path = Path(candidate).expanduser().resolve(strict=True)
+    path = _candidate_path(candidate).resolve(strict=True)
     if path != _active["path"]:
         raise ValueError("prepared workload candidate changed")
     return _active

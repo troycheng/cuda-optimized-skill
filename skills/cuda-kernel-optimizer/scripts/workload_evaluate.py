@@ -8,6 +8,7 @@ import math
 import random
 import statistics
 import sys
+import time
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
@@ -135,6 +136,7 @@ def measure_candidate(
     case=None,
     retries=2,
     timeout=DEFAULT_TIMEOUT,
+    deadline_epoch=None,
     runner=None,
 ) -> dict:
     """Measure one role, retrying ordinary exceptions under one safe contract."""
@@ -144,16 +146,42 @@ def measure_candidate(
     selected_runner = run_spec_once if runner is None else runner
     if not callable(selected_runner):
         raise ValueError("runner must be callable")
+    deadline = (
+        None
+        if deadline_epoch is None
+        else _finite_real(deadline_epoch, "deadline_epoch")
+    )
 
     records = []
     for attempt in range(1, retry_count + 2):
+        effective_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0.0:
+                error = TimeoutError("workload evaluation deadline expired")
+                records.append(_attempt_record(attempt, "failed", error))
+                return {
+                    "status": "failed",
+                    "role": role,
+                    "case": _json_copy(case, "case"),
+                    "metrics": None,
+                    "validation": None,
+                    "attempts": attempt,
+                    "attempt_records": records,
+                    "failure": {
+                        "error_type": "TimeoutError",
+                        "error": "workload attempt failed",
+                    },
+                }
+            if timeout is not None:
+                effective_timeout = min(float(timeout), remaining)
         try:
             raw = selected_runner(
                 workload,
                 candidate=copy.deepcopy(candidate),
                 role=role,
                 case=copy.deepcopy(case),
-                timeout=timeout,
+                timeout=effective_timeout,
             )
             metrics, validation = _validated_observation(raw, role=role)
         except Exception as error:
@@ -274,6 +302,7 @@ def evaluate_pairs(
     retries=2,
     seed=0,
     timeout=DEFAULT_TIMEOUT,
+    deadline_epoch=None,
     confidence=0.95,
     bootstrap_samples=DEFAULT_BOOTSTRAP_SAMPLES,
     runner=None,
@@ -312,6 +341,7 @@ def evaluate_pairs(
                 case=case,
                 retries=retry_count,
                 timeout=timeout,
+                deadline_epoch=deadline_epoch,
                 runner=runner,
             )
         baseline_result = measurements["baseline"]

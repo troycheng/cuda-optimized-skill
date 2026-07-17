@@ -12,6 +12,10 @@ set. It covers:
   GPU through the production outer evaluator, persists its automatic
   `workload_paired_samples` evidence, and verifies that an inconclusive outer
   result cannot be promoted globally;
+- a V2.4 workload-controller round that freezes a deliberately slow real Triton
+  workload, collects a normalized GPU probe, registers a project-scoped
+  ChangeSet, replaces redundant launches, runs paired workload evaluation, and
+  requires a deterministic promotion with no host mutation;
 - a target-bounded Nsight Compute attempt. It must either collect real metrics
   with readable counters or record exactly `ERR_NVGPUCTRPERM`; no other
   degraded result is accepted. The test never adds capabilities or changes
@@ -24,7 +28,7 @@ The no-op check uses the production `run_paired`, `classify_pairs`, and
 
 ## Local and current-lane execution
 
-Without opt-in, seven CPU helper regressions pass and all four GPU tests are
+Without opt-in, eight CPU helper regressions pass and all five GPU tests are
 reported as skipped:
 
 ```bash
@@ -105,6 +109,15 @@ artifacts/<lane>/
 │   └── iterv1/
 │       ├── workspace/...
 │       └── workload/<candidate-sha-prefix>/paired_samples.jsonl
+├── workload_controller/
+│   ├── workspace/...
+│   └── run/
+│       ├── probes/timeline.json
+│       ├── diagnosis.json
+│       ├── change_set.json
+│       ├── review.json
+│       ├── evaluation.json
+│       └── decision.json
 └── ncu_target/
     ├── workspace/...
     └── iterv1/
@@ -114,3 +127,16 @@ artifacts/<lane>/
 
 Large profiler reports remain in the isolated artifact tree. `ncu
 --query-metrics` is not treated as proof that hardware counters are readable.
+
+## V2.4 validation result
+
+The V2.4 controller lane ran on a physical RTX 5090 on 2026-07-17. The current
+container passed 13/13 checks in 34.302 seconds using immutable image
+`sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`.
+Its normalized probe recorded `gpu_busy_pct=0.0`; one metric was not enough to
+assign a bottleneck, so diagnosis remained `inconclusive`. A fixture ChangeSet
+removed two redundant Triton launches. Three paired A/B runs all passed the
+checksum constraint and measured a 60.4616% latency improvement with a 95% CI
+of [60.0894%, 61.4941%]. The optional reviewer was not configured, and the
+deterministic controller promoted the change. NCU returned
+`ERR_NVGPUCTRPERM`; the test did not change host permissions or driver policy.
