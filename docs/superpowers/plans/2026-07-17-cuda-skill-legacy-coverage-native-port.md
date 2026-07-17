@@ -8,7 +8,8 @@
 
 **目标：** 在不合并旧分支、不改变 v2.2 双环决策语义的前提下，补齐
 现有 `.ncu-rep` 的安全分析、显式选择的跨 run 策略记忆，以及 serving、
-systems、CUTLASS 和 Triton IR 的证据指南。
+systems、CUTLASS 和 Triton IR 的证据指南，并用任务优先、自然双语的 README
+让 fork 易懂、易用。
 
 **架构：** 两个新增 CLI 都是核心 orchestrator 之外的独立工具。
 `analyze_ncu_rep.py` 只读取既有 report，复用当前 NCU 指标分类，并以
@@ -37,6 +38,10 @@ systems、CUTLASS 和 Triton IR 的证据指南。
 - 远端 5090 只允许写独立测试根目录，只复制既有 `.ncu-rep`；不修改驱动、
   NCU counter 权限、用户源码或其他 worktree。
 - 所有变更先保留在本地分支；用户确认前不合并到 fork `main`、不 push。
+- README 只能在实现和 5090 验证完成后重写，必须描述实测行为而非计划行为。
+- GitHub About 只能在用户批准、fork `main` 推送成功后更新；必须先后验证目标
+  是 `troycheng/cuda-optimized-skill`，且 parent 仍为
+  `KernelFlow-ops/cuda-optimized-skill`。
 - 每个任务遵循 RED → GREEN → focused regression → commit；禁止先写生产代码
   再补测试。
 
@@ -62,7 +67,8 @@ systems、CUTLASS 和 Triton IR 的证据指南。
   链接；继续保持 500 行以内。
 - `skills/cuda-kernel-optimizer/agents/openai.yaml`：仅补充触发面，不改变
   workload 和 reference 的现有约束。
-- `README.md`、`README.zh-CN.md`：同步可执行示例、advisory 限制和 reference。
+- `README.md`、`README.zh-CN.md`：任务优先的独立自然写作版本；事实、命令、
+  Mermaid 拓扑、advisory 限制和 reference 保持一致。
 - `tests/test_skill_metadata.py`、`tests/test_readme_sync.py`：锁定文档发现性与
   中英文同步。
 
@@ -504,16 +510,13 @@ git add tests/test_skill_metadata.py \
 git commit -m "docs: add serving and ir evidence protocols"
 ```
 
-### 任务 7：接入 skill 发现入口并同步中英文 README
+### 任务 7：接入 skill 与 agent 发现入口
 
 **文件：**
 
 - 修改：`skills/cuda-kernel-optimizer/SKILL.md`
 - 修改：`skills/cuda-kernel-optimizer/agents/openai.yaml`
-- 修改：`README.md`
-- 修改：`README.zh-CN.md`
 - 修改：`tests/test_skill_metadata.py`
-- 修改：`tests/test_readme_sync.py`
 
 - [ ] **步骤 1：写发现性 RED 测试。** `SKILL.md` 必须出现两个 CLI 的准确命令
   和两个 reference；仍不超过 500 行；必须同时出现 `advisory`、
@@ -521,38 +524,33 @@ git commit -m "docs: add serving and ir evidence protocols"
   能触发“分析既有 ncu report”以及“runtime/serving evidence”，但继续要求
   user-provided workload 才能作端到端结论。
 
-- [ ] **步骤 2：写 README 同步 RED 测试。** 中英文都必须有相同 analyzer/
-  record/suggest options、`counter_access: not_probed`、memory optional/advisory、
-  两份 reference 路径；不能出现 legacy median/noise promotion、pending V2.1、
-  自动 memory、自动 serving claim。
-
-- [ ] **步骤 3：运行 RED。**
+- [ ] **步骤 2：运行 RED。**
 
 ```bash
-python3 -m unittest tests.test_skill_metadata tests.test_readme_sync -v
+python3 -m unittest tests.test_skill_metadata -v
 ```
 
-- [ ] **步骤 4：最小修改文档。** 在 profiler 入口旁放 standalone analyzer；
-  在 finalize 后放 opt-in record/suggest；systems/IR 或 serving 任务才指向新
-  reference。README 示例从已安装 skill 根目录执行，使用占位的用户路径，
-  不写真实机器路径或账号。
+预期：新增 analyzer、memory 和 reference 的发现性断言失败；原有 v2.2 约束
+继续通过。
 
-- [ ] **步骤 5：验证 CLI/README 一致。** 从 parser help 提取 option 名，与
-  README 静态断言相互校验；不硬编码易漂移的整段 help。
+- [ ] **步骤 3：最小修改 skill 文档。** 在 profiler 入口旁放 standalone
+  analyzer；在 finalize 后放 opt-in record/suggest；systems/IR 或 serving 任务
+  才指向新 reference。参数细节交给 `--help`，不把 `SKILL.md` 写成长 README。
+
+- [ ] **步骤 4：运行 GREEN。**
 
 ```bash
-python3 -m unittest tests.test_skill_metadata tests.test_readme_sync -v
+python3 -m unittest tests.test_skill_metadata -v
 python3 skills/cuda-kernel-optimizer/scripts/analyze_ncu_rep.py --help
 python3 skills/cuda-kernel-optimizer/scripts/strategy_memory.py --help
 git diff --check
 ```
 
-- [ ] **步骤 6：提交。**
+- [ ] **步骤 5：提交。**
 
 ```bash
 git add skills/cuda-kernel-optimizer/SKILL.md \
-  skills/cuda-kernel-optimizer/agents/openai.yaml README.md README.zh-CN.md \
-  tests/test_skill_metadata.py tests/test_readme_sync.py
+  skills/cuda-kernel-optimizer/agents/openai.yaml tests/test_skill_metadata.py
 git commit -m "docs: expose report analysis and advisory memory workflows"
 ```
 
@@ -641,15 +639,117 @@ python3 scripts/analyze_ncu_rep.py copied-report.ncu-rep \
   dedupe，再 suggest，最后对 run 目录做前后 hash 清单比较，证明 advisory
   工具未修改 run。
 
-### 任务 10：最终证据、版本建议与用户确认点
+### 任务 10：按最终实现重写英文与中文 README
 
 **文件：**
 
-- 必要时修改：`README.md`、`README.zh-CN.md`（仅当 5090 实测事实与预期不同）
-- 必要时修改：本计划列出的测试/实现文件（只修复实测发现的问题）
+- 修改：`README.md`
+- 修改：`README.zh-CN.md`
+- 修改：`tests/test_readme_sync.py`
+
+- [ ] **步骤 1：从最终证据冻结 README 事实表。** 先采集但不改文档：两个新增
+  CLI 的 `--help`、预算 preset、terminal status、当前 CPU test 总数和 skip、
+  5090 analyzer exit status、NCU 版本、report/artifact SHA-256、
+  `counter_access: not_probed`，以及既有 v2.2 真实 workload 结论。任何没有最新
+  证据的数字不写入 README。
+
+```bash
+python3 skills/cuda-kernel-optimizer/scripts/analyze_ncu_rep.py --help
+python3 skills/cuda-kernel-optimizer/scripts/strategy_memory.py --help
+python3 skills/cuda-kernel-optimizer/scripts/orchestrate.py setup --help
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+- [ ] **步骤 2：写信息架构 RED 测试。** 在 `tests/test_readme_sync.py` 固定两个
+  README 都使用以下语义顺序：项目定位 → 按任务开始 → 安装 → 5 分钟首跑 →
+  可信晋级路径 → 各任务命令 → 独立工具边界 → 输入/预算/状态 → 产物/恢复 →
+  兼容性/验证 → 参考/许可证。标题可以自然本地化，但索引顺序必须严格递增。
+
+```python
+def assert_in_order(testcase, text, markers):
+    positions = [text.index(marker) for marker in markers]
+    testcase.assertEqual(positions, sorted(positions))
+```
+
+- [ ] **步骤 3：写 Mermaid 拓扑 RED 测试。** 每份 README 必须恰好有两个
+  `mermaid` block。节点 ID 和 edge operator 保持一致，label 可以本地化；第一
+  张图只有 `decision.json` 能连到 promotion，compiler/SASS 只用虚线连到
+  evidence；第二张图中 memory suggestion 只使用虚线且没有到 `decision.json`
+  的边。
+
+```python
+EDGE = re.compile(
+    r"^\s*([a-z][a-z0-9_]*)[^-\n]*?\s*(-->|-\.->)\s*"
+    r"([a-z][a-z0-9_]*)",
+    re.MULTILINE,
+)
+
+def mermaid_topology(block):
+    return sorted(EDGE.findall(block))
+```
+
+- [ ] **步骤 4：写事实同步与文风 RED 测试。** 两份文档必须同时出现 analyzer
+  的全部公开 options、record/suggest 的全部公开 options、四种用户任务、
+  `balanced` default、`kernel_only_win`、`end_to_end_win`、
+  `counter_access: not_probed`、两个新增 reference 和相同验证数字。禁止遗留
+  planned/pending V2.1 文案、自动 memory、自动 serving claim，以及下列空泛
+  词语：中文“旨在/赋能/无缝/强大/全面/通过……从而……”，英文
+  “powerful/seamless/revolutionary/comprehensive”。
+
+- [ ] **步骤 5：运行 RED。**
+
+```bash
+python3 -m unittest tests.test_readme_sync -v
+```
+
+预期：当前 release-first README 缺少 task-first 顺序、两个新 CLI、两张 Mermaid
+图和新 reference；确认失败不来自既有预算或 workload 断言。
+
+- [ ] **步骤 6：先独立重写英文 README。** 标题只写项目名，不把易过期版本号
+  放进 H1。开头一句直接说明项目解决什么问题；紧接四个任务入口和可执行安装/
+  首跑。用第一张 Mermaid 解释权威晋级路径，再给各任务的最短命令。保留简短
+  artifact tree、预算表和可核验的 5090 摘要；长测试叙述放入 `<details>` 或
+  链接到 `tests/gpu/sm120/README.md`。
+
+- [ ] **步骤 7：基于同一事实独立写中文 README。** 不逐句翻译英文。保留
+  CUDA、CUTLASS、Triton、kernel、workload、paired A/B、NCU、SASS、manifest、
+  checkpoint 和 decision 等业界术语；中文使用短句、主动语态和自然标点。命令、
+  默认值、状态语义、限制、hash 与英文完全一致。
+
+- [ ] **步骤 8：加入两张同拓扑 Mermaid。** 第一张的实线主路径是 candidate →
+  correctness → paired kernel evidence → sanitizer hard gate → optional
+  workload → `decision.json` → conditional promotion；compiler/SASS 仅用虚线
+  汇入 evidence side path。明确 full mode 的 `kernel_only_win` 不推进 global
+  best。第二张展示 existing `.ncu-rep` → analysis bundle，以及 completed run →
+  memory → advisory suggestion；不画 memory 到 `decision.json` 的边。
+
+- [ ] **步骤 9：运行 GREEN 和逐行编辑审查。**
+
+```bash
+python3 -m unittest tests.test_readme_sync tests.test_skill_metadata -v
+python3 skills/cuda-kernel-optimizer/scripts/analyze_ncu_rep.py --help
+python3 skills/cuda-kernel-optimizer/scripts/strategy_memory.py --help
+git diff --check
+```
+
+逐段检查：每段只讲一个意思；命令先于长解释；删除重复；没有营销语；中文不是
+英文句法换词；英文没有中文式省略；术语、数字、链接和结论逐项对照事实表。
+
+- [ ] **步骤 10：提交 README。**
+
+```bash
+git add README.md README.zh-CN.md tests/test_readme_sync.py
+git commit -m "docs: rewrite task first bilingual project guide"
+```
+
+### 任务 11：最终证据、版本建议与集成确认点
+
+**文件：**
+
+- 必要时修改：本计划已列出的测试、实现或 README 文件（只修复实测问题）
 
 - [ ] **步骤 1：若 5090 暴露问题，先本地添加 RED 测试，再最小修复并重复任务
-  8、9。** 不把机器特例写成通用成功判断。
+  8、9、10。** 不把机器特例写成通用成功判断。
 
 - [ ] **步骤 2：做最后一次 fresh verification。**
 
@@ -672,9 +772,85 @@ git status --short
 ```
 
 - [ ] **步骤 4：交付给用户审查。** 汇报：新增测试/总测试数、5090 analyzer
-  exit status 与 report/artifact hashes、已知限制、commit 列表、未 push/未 merge
-  的事实。建议版本号为 `v2.3` 还是保持 v2.2 patch，由用户确认；未经确认不改
-  tag、不 merge `main`、不 push fork。
+  exit status 与 report/artifact hashes、README 结构和 Mermaid 数、已知限制、
+  commit 列表、未 push/未 merge/未改 About 的事实。建议版本号为 `v2.3` 还是
+  保持 v2.2 patch，由用户确认；未经确认不改 tag、不 merge `main`、不 push
+  fork、不更新 GitHub About。
+
+### 任务 12：获批后合并 fork、推送并更新 GitHub About
+
+**文件：**
+
+- 不再修改源码或文档；只执行获批的 Git/GitHub 集成操作。
+
+- [ ] **步骤 1：重新验证目标与权限边界。** 必须同时满足：主 checkout 干净、
+  `main == origin/main`、当前 feature branch 是预期 HEAD、origin 是用户 fork、
+  upstream push URL 为 `DISABLED`、GitHub 仓库是 fork 且 parent 精确匹配。
+
+```bash
+git -C /Users/tcheng/Documents/Codex/2026-07-15-triton-skill/cuda-optimized-skill status --short
+git fetch origin
+git rev-parse main
+git rev-parse origin/main
+git remote -v
+git config --get remote.upstream.pushurl
+gh api repos/troycheng/cuda-optimized-skill \
+  --jq '{full_name, fork, parent: .parent.full_name, default_branch}'
+```
+
+预期：`full_name == troycheng/cuda-optimized-skill`、`fork == true`、
+`parent == KernelFlow-ops/cuda-optimized-skill`、`default_branch == main`。任一
+不符立即停止，不执行 merge、push 或 About mutation。
+
+- [ ] **步骤 2：在用户明确批准的版本策略下 fast-forward main。** 如果
+  `origin/main` 已前进，先停下重新审查差异；禁止强推。
+
+```bash
+git -C /Users/tcheng/Documents/Codex/2026-07-15-triton-skill/cuda-optimized-skill \
+  merge --ff-only agent/legacy-coverage-v2-2
+git -C /Users/tcheng/Documents/Codex/2026-07-15-triton-skill/cuda-optimized-skill \
+  push origin main
+```
+
+- [ ] **步骤 3：读回 fork main。** 本地 main、origin/main 和 GitHub API 的
+  default branch commit 必须等于 feature HEAD，再允许更新 About。
+
+```bash
+git rev-parse agent/legacy-coverage-v2-2
+git rev-parse main
+git rev-parse origin/main
+gh api repos/troycheng/cuda-optimized-skill/commits/main --jq '.sha'
+```
+
+- [ ] **步骤 4：更新双语 About description 和精确 topics。** 不触碰 upstream，
+  homepage 保持空字符串。
+
+```bash
+ABOUT='Evidence-driven CUDA, CUTLASS and Triton kernel optimization with paired benchmarks, real-workload validation and NCU analysis. / 用成对基准、真实负载验证与 NCU 分析优化 CUDA、CUTLASS 和 Triton kernel。'
+gh api --method PATCH repos/troycheng/cuda-optimized-skill \
+  -f description="$ABOUT" -f homepage=''
+gh api --method PUT repos/troycheng/cuda-optimized-skill/topics \
+  -H 'Accept: application/vnd.github+json' \
+  -f 'names[]=cuda' -f 'names[]=triton' -f 'names[]=cutlass' \
+  -f 'names[]=gpu' -f 'names[]=kernel-optimization' \
+  -f 'names[]=nsight-compute' -f 'names[]=performance' \
+  -f 'names[]=codex-skills'
+```
+
+- [ ] **步骤 5：读回并逐字段验证。** description 必须逐字匹配；homepage 必须
+  为空；topics 集合必须恰好是 8 项；fork/parent/default branch 不变。然后再次
+  确认 upstream 无 push 能力。
+
+```bash
+gh api repos/troycheng/cuda-optimized-skill \
+  --jq '{full_name, fork, parent: .parent.full_name, default_branch, description, homepage}'
+gh api repos/troycheng/cuda-optimized-skill/topics --jq '.names | sort'
+git config --get remote.upstream.pushurl
+git status --short
+```
+
+- [ ] **步骤 6：最终交付。** 报告 fork main commit、GitHub API read-back、
+  topics、README/测试结果和 installed skill 是否同步；明确 upstream 未修改。
 
 ## 完成判据
 
@@ -686,7 +862,11 @@ git status --short
 - Strategy suggestion 不修改 run，不影响 branch/budget/gate/promotion；无合法
   ablation 时不伪造 method performance。
 - SASS 只表达 implementation status。
-- 两份 reference 与中英文 README 可从 `SKILL.md` 找到。
+- 两份 reference 与四个任务入口可从 `SKILL.md` 和中英文 README 找到。
+- 两份 README 使用任务优先顺序，各包含恰好两张同拓扑 Mermaid；命令、事实、
+  数字和边界一致，中文自然、英文直接，没有翻译腔或营销式套话。
 - 完整 CPU suite、skill validator、py_compile、CLI help、diff check 全绿。
 - RTX 5090 只读 report 验证完成，未修改权限、驱动或用户源码。
-- 分支仍为本地 `agent/legacy-coverage-v2-2`，等待用户确认集成方式。
+- 用户批准前分支保持本地；批准后仅 fast-forward 并推送用户 fork。
+- GitHub About 只在 fork main 推送后更新，description/topics/homepage/fork/parent
+  已读回验证，upstream 未修改。

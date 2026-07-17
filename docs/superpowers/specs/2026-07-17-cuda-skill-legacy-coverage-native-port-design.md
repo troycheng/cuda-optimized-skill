@@ -303,8 +303,9 @@ Use exactly two focused GitHub-native Mermaid diagrams in each README. The
 English and Chinese diagrams have the same topology with localized labels:
 
 1. the authoritative path from candidate correctness through paired kernel
-   evidence, sanitizer/SASS evidence, the optional workload loop,
-   `decision.json`, and promotion; and
+   evidence and the sanitizer hard gate, then the optional workload loop,
+   `decision.json`, and promotion; compiler/SASS enter through a dashed
+   evidence-only side path because they are not hard promotion gates; and
 2. the independent-tool boundary: an existing `.ncu-rep` can produce a
    standalone analysis bundle, while a completed v2.2 run can feed advisory
    strategy memory, but neither tool owns promotion.
