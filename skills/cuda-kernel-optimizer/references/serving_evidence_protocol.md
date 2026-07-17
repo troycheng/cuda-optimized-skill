@@ -35,7 +35,11 @@ kernel benchmark cannot replace it.
 Collect baseline and candidate measurements as paired A/B observations. Keep
 model weights, request replay, admission control, batching, cache state,
 warm-up, concurrency, and measurement boundaries identical. Randomize or
-interleave pair order when time drift could bias one side.
+interleave pair order when time drift could bias one side. Freeze the complete
+position-balanced schedule before the run. For fresh-process comparisons,
+balance both variant order and ordinal position; when more than one physical GPU
+is unavoidable, cross over physical labels instead of binding one version to one
+device.
 
 A serving result also needs:
 
@@ -51,16 +55,82 @@ inconclusive or repeat it in a clean window. Do not average away interference.
 Retain raw request and environment evidence with the summary so another person
 can reproduce the pairing and check the claim.
 
+### Shared-host clean-window gate
+
+Promotion-grade evidence requires continuous, phase-bounded guard coverage, not
+only a before/after snapshot. Freeze the target GPU UUID/PCI address, peer and
+sibling GPUs, CPU/NUMA allocation, allowed PIDs or containers, sampling interval,
+maximum sample gap, clock/power policy, and limits for temperature, power/thermal
+braking, swap, memory pressure, and foreign CPU/GPU load.
+
+Use separate `correctness`, `sanitizer`, `diagnostic`, and `timing` phases. A
+watcher must acknowledge readiness before each phase starts. Clear only this
+attempt's marker between phases and wait for a fresh joint clean window. Heavy
+CPU work owned by correctness must not poison a later timing phase. During a
+promotion timing phase, unknown telemetry, a sampling gap, an untrusted process,
+or a contamination marker invalidates the attempt; do not analyze its timing.
+
+### Attempt lifecycle and evidence seal
+
+Assign every run an immutable attempt ID and one terminal state:
+`valid`, `invalid_contaminated`, `invalid_identity`, `partial`, or `superseded`.
+Never merge rows across attempts or turn a partial/invalid attempt into a result.
+Before analysis, seal hashes for the schedule and analysis code; runner and guard
+scripts; source and binaries; plugin, engine, backend, and server; image digest
+(not only a tag); workload/request corpus; raw samples; phase markers; and guard
+telemetry. The final audit must distinguish `evidence_integrity=PASS` from the
+performance verdict.
+
+### Execution-path proof
+
+Emitted SASS is not evidence that real inputs used the candidate path. If a
+dispatch guard, fallback, tactic, graph, cache, or shape specialization can bypass
+the mechanism, require a pre-timing coverage gate. Record expected cases and a
+dispatch counter or trace proving the candidate symbol/topology executed. A
+diagnostic binary cannot supply performance evidence: remove diagnostics,
+rebuild, rehash, verify no diagnostic residue, and bind the timed plugin/engine
+to the same source and configuration.
+
+### Serving-stack identity
+
+For TensorRT/Triton/CUDA comparisons, bind image digests, server and backend ABI
+and hashes, plugin source and binary hashes, engine hash, builder parameters and
+logs, tactics, runtime/model configuration, and request corpus. State the causal
+scope precisely: same source is not same binary; a rebuilt engine is not the
+same engine; changing server, TensorRT, CUDA, plugin compiler, and tactics is a
+stack comparison, not a TensorRT-only result. Treat timing caches as
+version-local unless compatibility is explicitly proven.
+
+### Frozen statistics and retry policy
+
+Predeclare the experimental unit (for example a fresh process, not each of
+30,000 correlated requests), aggregation (`mean`, `median`, or ratio of sums),
+resampling unit and method, confidence, minimum effect, wins requirement, and
+relative plus absolute guardrails per concurrency/stratum. Do not add a new
+bootstrap or exclusion rule after seeing results. Quick exact-runtime pairs are
+reject-only; formal promotion uses an independent schedule and samples.
+
+Once timed work begins, retain every uncontaminated row. Do not retry one role
+independently, remove a slow startup mode, or select a favorable subset. A whole
+pair may be retried only for a frozen, pre-measurement infrastructure failure;
+otherwise retain or invalidate it according to the frozen rule.
+
 ## Decision checklist
 
 - [ ] The claim stops at the highest completed layer in the claim ladder.
 - [ ] Correctness passed before any performance claim.
 - [ ] The comparison used paired A/B samples with identical policies.
+- [ ] The complete schedule is frozen and position-balanced.
+- [ ] The minimum valid pair count and formal statistical plan were frozen.
+- [ ] Any bypassable candidate path has execution-path coverage evidence.
 - [ ] The user-provided workload matches the intended serving objective and
       request distribution.
 - [ ] A clean window and shared-host contamination check were recorded.
+- [ ] Continuous guard coverage spans every formal timing phase without gaps.
 - [ ] Raw request evidence and environment evidence are durable and linked from
       the result.
 - [ ] Tail latency, throughput, error rate, and resource cost were checked when
       they can trade off against the primary objective.
 - [ ] `kernel_only_win` is not described as `end_to_end_win`.
+- [ ] The sealed evidence digest covers the runner, guards, analysis, artifacts,
+      raw data, and final audit.

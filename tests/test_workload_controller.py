@@ -127,6 +127,20 @@ class WorkloadControllerContractTests(unittest.TestCase):
             self.assertNotIn("later", normalized["mutation"]["project_paths"])
             self.assertNotIn("src/later.py", normalized_change["paths"])
 
+    def test_reject_only_gate_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control = _control(root)
+            control["evaluation_gate"] = "reject_only"
+            normalized = self.controller.validate_control_manifest(control)
+            self.assertEqual(normalized["evaluation_gate"], "reject_only")
+
+            control["evaluation_gate"] = "rank_only"
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "evaluation_gate"
+            ):
+                self.controller.validate_control_manifest(control)
+
     def test_unknown_keys_are_rejected_at_every_object_layer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -844,6 +858,26 @@ class WorkloadRoundTests(unittest.TestCase):
             self.assertEqual(state["status"], "completed")
             self.assertEqual(state["next_action"], "done")
             self.assertTrue((run_dir / "evaluation.json").is_file())
+
+    def test_reject_only_positive_screen_is_rolled_back_and_never_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            control["evaluation_gate"] = "reject_only"
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            config = project / "configs" / "value.json"
+            original = config.read_text("utf-8")
+            config.write_text('{"workers": 8}\n', encoding="utf-8")
+
+            decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "rejected")
+            self.assertEqual(
+                decision["reason"], "reject_only_stage_cannot_promote"
+            )
+            self.assertEqual(decision["primary_status"], "confirmed_win")
+            self.assertEqual(config.read_text("utf-8"), original)
 
     def test_loss_and_constraint_failure_restore_the_frozen_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

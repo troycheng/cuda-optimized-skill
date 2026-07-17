@@ -274,6 +274,32 @@ class ClassifyPairsTests(unittest.TestCase):
         self.assertEqual(result["valid_pairs"], 1)
         self.assertEqual(result["invalid_pairs"], 2)
         self.assertEqual(result["improvements_pct"], [2.0])
+        self.assertEqual(result["status"], "inconclusive")
+
+    def test_one_pair_can_never_confirm_a_win(self) -> None:
+        paired_stats = _load_paired_stats()
+        result = paired_stats.classify_pairs(
+            [{"baseline": 100.0, "candidate": 90.0}],
+            direction="lower",
+            min_effect_pct=1.0,
+            bootstrap_samples=10,
+        )
+
+        self.assertEqual(result["valid_pairs"], 1)
+        self.assertEqual(result["ci_low_pct"], 10.0)
+        self.assertEqual(result["status"], "inconclusive")
+
+    def test_configured_minimum_valid_pairs_is_enforced(self) -> None:
+        paired_stats = _load_paired_stats()
+        result = paired_stats.classify_pairs(
+            [{"baseline": 100.0, "candidate": 90.0}] * 3,
+            direction="lower",
+            min_effect_pct=1.0,
+            min_valid_pairs=4,
+            bootstrap_samples=10,
+        )
+
+        self.assertEqual(result["status"], "inconclusive")
 
     def test_valid_field_must_be_a_literal_boolean(self) -> None:
         paired_stats = _load_paired_stats()
@@ -424,6 +450,8 @@ class ClassifyPairsTests(unittest.TestCase):
             ("confidence", math.nan),
             ("bootstrap_samples", 0),
             ("bootstrap_samples", True),
+            ("min_valid_pairs", 0),
+            ("min_valid_pairs", True),
         ):
             with self.subTest(keyword=keyword, value=value), self.assertRaises(
                 ValueError

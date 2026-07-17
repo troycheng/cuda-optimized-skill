@@ -32,6 +32,10 @@
     "budget": {
       "enum": ["fast", "balanced", "thorough"]
     },
+    "evaluation_gate": {
+      "enum": ["promotion", "reject_only"],
+      "default": "promotion"
+    },
     "mutation": {
       "type": "object",
       "additionalProperties": false,

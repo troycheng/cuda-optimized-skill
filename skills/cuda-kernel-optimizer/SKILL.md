@@ -3,7 +3,7 @@ name: cuda-kernel-optimizer
 description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.4)
+# CUDA Kernel and Workload Optimizer (V2.4.1)
 
 ## Principle
 
@@ -19,17 +19,23 @@ decision backed by durable evidence, not the lowest observed sample.
 
 ## Required and optional inputs
 
-Require these before setup:
+Choose one execution mode before setup. Do not invent a dummy kernel, reference,
+or ChangeSet merely to fit a controller:
 
-- baseline CUDA/CUTLASS `.cu` or Triton `.py` kernel;
-- Python reference exposing `reference(**kwargs)`;
-- kernel dimensions as a JSON object;
-- optional user-provided workload owned by the user.
+- `kernel-loop`: require a baseline CUDA/CUTLASS `.cu` or Triton `.py` kernel,
+  a Python `reference(**kwargs)`, and dimensions as a JSON object;
+- `workload-only`: require a user-owned runnable workload, frozen baseline and
+  candidate identities, and an objective. Use this for framework, CPU/data,
+  transfer, communication, I/O, or runtime changes that have no kernel mutation;
+- `serving-stack`: require a frozen deployment comparison, correctness policy,
+  request replay, endpoint objective, and environment protocol. TensorRT,
+  Triton, CUDA, engine, backend, container, or compiler upgrades belong here.
 
-The reference is always required for correctness. A user-provided workload is
+The Python reference is mandatory only for `kernel-loop`. Every mode requires a
+correctness oracle appropriate to its claim layer. A user-provided workload is
 required for any `end_to_end_win` claim. Never infer, download, or manufacture a
-representative workload. Without one, run in kernel-only mode and state that
-scope explicitly.
+representative workload. Without one, stop at the highest lower evidence layer
+and state that scope explicitly.
 
 Accept exactly one workload form:
 
@@ -48,7 +54,7 @@ budget, confidence, and minimum effect as frozen run inputs.
 
 ## Workload controller
 
-Use the V2.4 controller when the user has a user-provided runnable workload and
+Use the V2.4.1 controller when the user has a user-provided runnable workload and
 the bottleneck is not known to be inside one kernel. Codex is the primary optimizer:
 it reads the evidence, writes a bounded ChangeSet, edits only the declared scope,
 and interprets the result. An optional local reviewer can challenge the diagnosis
@@ -101,10 +107,52 @@ ChangeSet that escapes its paths, changes the frozen workload, exceeds its
 deadline, or asks for host scope. See `examples/workload-controller.md` for the
 complete control, probe, ChangeSet, and reviewer contracts.
 
-## Compute budget
+The ChangeSet controller is not the entry point for an already-built external
+serving stack. Use `references/serving_evidence_protocol.md` and freeze a
+deployment experiment directly; compare exact runtime artifacts rather than
+creating a meaningless filesystem diff.
+
+## Layered experiment funnel
+
+For expensive GPU or serving work, freeze a funnel before measurement. Every
+stage declares one authority:
+
+| Gate | May do | Must not do |
+|---|---|---|
+| `static_reject` | reject impossible or unsafe variants from source, ABI, SASS, registers, spills, barriers, or topology | claim runtime speed |
+| `rank_only` | rank correct variants with an identical Event or standalone harness | promote a winner |
+| `reject_only` | reject candidates with short fresh-process exact-runtime pairs | promote a winner |
+| `promotion` | accept or reject using the frozen formal objective and guardrails | reuse diagnostics or quick samples as formal rows |
+
+Generate 3-5 variants for one new mechanism when useful, batch compile them,
+and apply declared static invariants before spending GPU time. Run correctness
+before timing. Only the direction champion reaches formal exact-runtime testing;
+only a formal exact-runtime winner reaches matched runtime and endpoint tests.
+Profiler rows, diagnostic binaries, partial attempts, contaminated windows, and
+quick-screen rows are never promotion evidence.
+
+For controller-based screening, set `evaluation_gate: "reject_only"` in the
+control manifest. The controller will roll back even a positive candidate and
+record `reject_only_stage_cannot_promote`. Use a new, independent promotion run
+with its own frozen schedule and samples for advancement.
+
+Freeze the complete position-balanced schedule, experimental unit, estimator,
+resampling unit, minimum valid pair count, no-exclusion rule, retries, and stage
+authority. Independent `random.choice(AB, BA)` is not position balance. A single
+valid pair can never produce `confirmed_win`. Once formal timed work starts,
+do not retry one role independently or discard a slow valid row; retry only a
+whole pair for a predeclared pre-measurement infrastructure failure.
+
+## Kernel-loop compute budget
 
 Ask the user for a preset when it materially affects cost. If they do not choose,
 use `balanced` by default.
+
+The workload controller has a separate workload budget namespace:
+`fast`/`balanced`/`thorough` mean 3/5/9 paired workload blocks and are not the
+kernel-loop `quick`/`balanced`/`thorough` pair counts below. Always write which
+namespace is being used. A short workload budget must use `evaluation_gate:
+"reject_only"` when it is part of a funnel.
 
 | Preset | Max time | Branches | Rounds | Pairs min-max | Outer candidates | Cases | Sanitizer |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -193,15 +241,18 @@ For each admitted round:
      --run-dir ./run_YYYYMMDD_HHMMSS --iter N
    ```
 
-6. `close-iter` follows the real lifecycle: reference correctness first, then
-   telemetry-gated randomized paired AB/BA timing. The sanitizer policy is
-   applied to the statistically confirmed shortlist, and SASS is checked only
-   for the final eligible candidate. In short: correctness → paired → sanitizer → SASS.
-   Candidate profiling occurs before sanitizer and may be repeated if
-   sanitizer selection changes the finalist.
+6. `close-iter` follows the generic lifecycle: reference correctness first,
+   telemetry-gated position-balanced paired timing, sanitizer, then final SASS.
+   In short: correctness → paired → sanitizer → SASS.
+   For a mechanism with declared ABI, resource, barrier, spill, opcode, or
+   topology invariants, add a pre-GPU static screen; failure is a hard reject.
+   Candidate profiling may be repeated if sanitizer selection changes the
+   finalist, but profiler measurements remain explanatory only.
 7. Compiler provenance and SASS results are evidence and method-classification
-   inputs, not hard promotion gates. Source/artifact identity drift still fails
-   closed because the evidence would no longer describe the tested candidate.
+   inputs and, by default, are not hard promotion gates. Generic heuristics such
+   as an arbitrary register threshold cannot reject a candidate; explicitly
+   declared mechanism invariants may be hard static rejection gates.
+   Source/artifact identity drift always fails closed.
 8. In full mode, evaluate eligible candidates with paired baseline/candidate
    observations on the frozen user workload. Enforce the primary metric's
    `min_effect_pct` and every constraint's `max_regression_pct`.
@@ -232,10 +283,11 @@ They never alter run state: `decision.json` owns promotion. Run
 
 ## Paired verdict and promotion rules
 
-Use randomized AB/BA pairs and confidence intervals. A valid promotion requires
-finite statistics, enough valid pairs, the configured confidence, and a lower
-confidence bound meeting the minimum practical effect. Invalid telemetry blocks
-remain recorded but do not count as valid pairs.
+Use a frozen, position-balanced AB/BA schedule and confidence intervals. A valid
+promotion requires finite statistics, the predeclared minimum valid pairs, the
+configured confidence, and a lower confidence bound meeting the minimum
+practical effect. Invalid telemetry blocks remain recorded but do not count as
+valid pairs.
 
 - `confirmed_win`: candidate clears correctness and statistical gates.
 - `confirmed_loss`: evidence supports no acceptable win.

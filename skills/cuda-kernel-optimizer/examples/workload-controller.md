@@ -15,6 +15,7 @@ with the user's real environment; keep the schemas and boundaries unchanged.
   "workload_manifest": "/workspace/service/workload.json",
   "baseline_candidate": {"name": "baseline", "revision": "abc123"},
   "budget": "balanced",
+  "evaluation_gate": "promotion",
   "mutation": {
     "project_paths": ["src", "configs"],
     "environment_root": "/workspace/service-env-copy",
@@ -39,7 +40,9 @@ with the user's real environment; keep the schemas and boundaries unchanged.
 The budget is explicit in the file. Use `balanced` when the user has not chosen
 between `fast`, `balanced`, and `thorough`. `project_paths` must not overlap.
 `environment_root` is a user-owned isolated copy, not a host Python, CUDA, or
-driver directory.
+driver directory. Set `evaluation_gate` to `reject_only` for a quick screening
+stage; even a statistically positive result is then rolled back and cannot be
+promoted. Omit it only for backward-compatible promotion behavior.
 
 Start the controller:
 

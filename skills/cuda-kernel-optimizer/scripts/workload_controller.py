@@ -245,11 +245,12 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         "workload_manifest",
         "baseline_candidate",
         "budget",
+        "evaluation_gate",
         "mutation",
         "probes",
         "reviewer",
     }
-    required = allowed - {"reviewer"}
+    required = allowed - {"reviewer", "evaluation_gate"}
     _closed(control, allowed, "control")
     _required(control, required, "control")
     if control["schema_version"] != CONTROL_SCHEMA:
@@ -267,6 +268,13 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
     _json_copy(baseline, "baseline_candidate", reject_sensitive=True)
     if control["budget"] not in _BUDGETS:
         raise ValidationError("budget must be fast, balanced, or thorough")
+    if control.get("evaluation_gate", "promotion") not in {
+        "promotion",
+        "reject_only",
+    }:
+        raise ValidationError(
+            "evaluation_gate must be promotion or reject_only"
+        )
 
     mutation = _object(control["mutation"], "mutation")
     mutation_fields = {"project_paths", "environment_root", "host_policy"}
@@ -1750,12 +1758,15 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
         evaluation.get("status") == "evaluated"
         and primary_status == "confirmed_win"
         and all(item.get("status") == "passed" for item in constraints)
+        and control.get("evaluation_gate", "promotion") == "promotion"
     )
     if not promoted:
         if evaluation.get("status") != "evaluated":
             reason = "workload_failed"
         elif primary_status != "confirmed_win":
             reason = "primary_not_confirmed"
+        elif control.get("evaluation_gate", "promotion") == "reject_only":
+            reason = "reject_only_stage_cannot_promote"
         else:
             reason = "constraint_failed"
         return _finish_rejected(

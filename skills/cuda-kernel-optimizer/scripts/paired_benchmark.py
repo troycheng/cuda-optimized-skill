@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import math
-import random
 import sys
 from collections.abc import Mapping
 from numbers import Real
@@ -23,6 +22,7 @@ from benchmark import (  # noqa: E402
     warm_solution,
 )
 from telemetry import read_gpu_telemetry, validate_block  # noqa: E402
+from experiment_design import balanced_pair_orders  # noqa: E402
 
 
 def _positive_int(value, name: str) -> int:
@@ -116,7 +116,7 @@ def _run_paired_impl(
     block_validator=None,
     _created_states=None,
 ) -> dict:
-    """Prepare two solutions once and collect randomized paired observations."""
+    """Prepare two solutions once and collect position-balanced observations."""
     _nonempty_string(baseline_file, "baseline_file")
     _nonempty_string(candidate_file, "candidate_file")
     _nonempty_string(backend, "backend")
@@ -171,11 +171,10 @@ def _run_paired_impl(
     warm(baseline_state, warmup_count)
     warm(candidate_state, warmup_count)
 
-    rng = random.Random(seed)
     pairs = []
-    for _block_index in range(block_count):
+    schedule = balanced_pair_orders(block_count, seed=seed)
+    for _block_index, order in enumerate(schedule):
         before = read_telemetry()
-        order = rng.choice(("AB", "BA"))
         if order == "AB":
             baseline_timing = _positive_timing(
                 measure(baseline_state), "baseline timing"

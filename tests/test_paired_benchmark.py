@@ -96,6 +96,7 @@ class PairedBenchmarkTests(unittest.TestCase):
         second_orders = [item["order"] for item in second["pairs"]]
         self.assertEqual(first_orders, second_orders)
         self.assertEqual(set(first_orders), {"AB", "BA"})
+        self.assertEqual(first_orders.count("AB"), first_orders.count("BA"))
 
     def test_pair_order_rng_does_not_change_global_random_state(self) -> None:
         paired = _load_paired_benchmark()

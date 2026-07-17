@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import math
-import random
 import statistics
 import sys
 import time
@@ -20,6 +19,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import paired_stats  # noqa: E402
+from experiment_design import balanced_pair_orders  # noqa: E402
 from workload_adapter import (  # noqa: E402
     WorkloadSpec,
     run_spec_once,
@@ -307,7 +307,7 @@ def evaluate_pairs(
     bootstrap_samples=DEFAULT_BOOTSTRAP_SAMPLES,
     runner=None,
 ) -> dict:
-    """Measure randomized AB/BA blocks and evaluate the frozen objective."""
+    """Measure position-balanced AB/BA blocks and evaluate the frozen objective."""
     block_count = _positive_int(blocks, "blocks")
     retry_count = _nonnegative_int(retries, "retries")
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -321,11 +321,10 @@ def evaluate_pairs(
     objective = validate_objective(workload.objective)
     objective_snapshot = _json_copy(objective, "objective")
     cases = tuple(workload.cases)
-    rng = random.Random(seed)
     pairs = []
+    schedule = balanced_pair_orders(block_count, seed=seed)
 
-    for block in range(block_count):
-        order = rng.choice(("AB", "BA"))
+    for block, order in enumerate(schedule):
         case = None if not cases else _json_copy(cases[block % len(cases)], "case")
         sequence = (
             (("baseline", baseline), ("candidate", candidate))

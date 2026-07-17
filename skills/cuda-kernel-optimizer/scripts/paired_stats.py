@@ -107,6 +107,7 @@ def classify_pairs(
     min_effect_pct: float,
     confidence: float = 0.95,
     bootstrap_samples: int = 10000,
+    min_valid_pairs: int = 2,
     seed=0,
 ) -> dict:
     """Classify paired observations using their median improvement and CI."""
@@ -116,6 +117,7 @@ def classify_pairs(
         raise ValueError("min_effect_pct must be greater than or equal to zero")
     confidence_value = _validate_confidence(confidence)
     sample_count = _validate_samples(bootstrap_samples, "bootstrap_samples")
+    minimum_pairs = _validate_samples(min_valid_pairs, "min_valid_pairs")
 
     if isinstance(pairs, (str, bytes, bytearray)):
         raise ValueError("pairs must be a non-string iterable of mappings")
@@ -165,7 +167,9 @@ def classify_pairs(
         samples=sample_count,
         seed=seed,
     )
-    if (min_effect == 0.0 and ci_low > 0.0) or (
+    if len(improvements) < minimum_pairs:
+        status = "inconclusive"
+    elif (min_effect == 0.0 and ci_low > 0.0) or (
         min_effect > 0.0 and ci_low >= min_effect
     ):
         status = "confirmed_win"
