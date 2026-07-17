@@ -11,6 +11,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -545,12 +546,16 @@ class StrategyMemoryTests(unittest.TestCase):
             for index in range(self.memory.MAX_SCOPES):
                 scope = self._scope(f"{index:064x}"[-1])
                 scope["input_hash"] = f"{index:064x}"
-                self.memory.append_run(memory, scope, record)
+                scoped_record = copy.deepcopy(record)
+                scoped_record["input_hash"] = scope["input_hash"]
+                self.memory.append_run(memory, scope, scoped_record)
             before = memory.read_bytes()
             overflow = self._scope("f")
             overflow["input_hash"] = "f" * 64
+            overflow_record = copy.deepcopy(record)
+            overflow_record["input_hash"] = overflow["input_hash"]
             with self.assertRaisesRegex(ValueError, "scope capacity"):
-                self.memory.append_run(memory, overflow, record)
+                self.memory.append_run(memory, overflow, overflow_record)
             self.assertEqual(memory.read_bytes(), before)
 
             run_memory = root / "run-cap.json"
@@ -581,6 +586,102 @@ class StrategyMemoryTests(unittest.TestCase):
                 with self.subTest(bad=bad):
                     with self.assertRaises(ValueError):
                         self.memory.append_run(memory, self._scope(), bad)
+
+    def test_record_input_hash_must_match_scope_on_append_and_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            memory = root / "memory.json"
+            scope = self._scope()
+            self.memory.append_run(memory, scope, self._record())
+            original = memory.read_bytes()
+            mismatch = self._record("2")
+            mismatch["input_hash"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "input_hash.*scope"):
+                self.memory.append_run(memory, scope, mismatch)
+            self.assertEqual(memory.read_bytes(), original)
+
+            corrupt = json.loads(original)
+            entry = next(iter(corrupt["scopes"].values()))
+            entry["runs"][0]["input_hash"] = "f" * 64
+            memory.write_text(json.dumps(corrupt), encoding="utf-8")
+            corrupt_bytes = memory.read_bytes()
+            with self.assertRaisesRegex(ValueError, "input_hash.*scope"):
+                self.memory.load_memory(memory)
+            self.assertEqual(memory.read_bytes(), corrupt_bytes)
+
+    def test_last_boundary_replacement_is_restored_without_overwrite_or_temp_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            memory = root / "memory.json"
+            scope = self._scope()
+            self.memory.append_run(memory, scope, self._record())
+            original = memory.read_bytes()
+            unexpected = root / "unexpected.json"
+            unexpected_payload = b'{"unexpected":true}\n'
+            unexpected.write_bytes(unexpected_payload)
+            saved_old = root / "saved-old.json"
+            real_exchange = self.memory._atomic_exchange
+            raced = False
+
+            def race_then_exchange(directory_fd, source_leaf, target_leaf):
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    os.rename(memory, saved_old)
+                    os.rename(unexpected, memory)
+                return real_exchange(directory_fd, source_leaf, target_leaf)
+
+            with mock.patch.object(
+                self.memory, "_atomic_exchange", side_effect=race_then_exchange
+            ), self.assertRaisesRegex(ValueError, "replaced|changed|compare"):
+                self.memory.append_run(memory, scope, self._record("2"))
+
+            self.assertTrue(raced)
+            self.assertEqual(memory.read_bytes(), unexpected_payload)
+            self.assertEqual(saved_old.read_bytes(), original)
+            self.assertEqual(list(root.glob(f".{memory.name}.*.tmp")), [])
+
+    def test_publication_exception_preserves_old_store_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            memory = root / "memory.json"
+            scope = self._scope()
+            self.memory.append_run(memory, scope, self._record())
+            original = memory.read_bytes()
+            with mock.patch.object(
+                self.memory,
+                "_atomic_exchange",
+                side_effect=OSError("injected exchange failure"),
+            ), self.assertRaisesRegex(OSError, "injected"):
+                self.memory.append_run(memory, scope, self._record("2"))
+            self.assertEqual(memory.read_bytes(), original)
+            self.assertEqual(list(root.glob(f".{memory.name}.*.tmp")), [])
+
+    def test_interruption_after_exchange_leaves_complete_new_and_recoverable_old_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            memory = root / "memory.json"
+            scope = self._scope()
+            self.memory.append_run(memory, scope, self._record())
+            original = memory.read_bytes()
+            real_exchange = self.memory._atomic_exchange
+
+            def exchange_then_interrupt(directory_fd, source_leaf, target_leaf):
+                real_exchange(directory_fd, source_leaf, target_leaf)
+                raise SystemExit("simulated crash after atomic exchange")
+
+            with mock.patch.object(
+                self.memory,
+                "_atomic_exchange",
+                side_effect=exchange_then_interrupt,
+            ), self.assertRaisesRegex(SystemExit, "simulated crash"):
+                self.memory.append_run(memory, scope, self._record("2"))
+
+            stored = self.memory.load_memory(memory)
+            self.assertEqual(len(next(iter(stored["scopes"].values()))["runs"]), 2)
+            recovery = list(root.glob(f".{memory.name}.*.tmp"))
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0].read_bytes(), original)
 
 
 if __name__ == "__main__":

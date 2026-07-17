@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -337,7 +338,12 @@ def _validate_memory(value: Any) -> dict:
             raise ValueError("scope entry exceeds run capacity")
         identities = set()
         for record in entry["runs"]:
-            identity = _record_key(_validate_record(record))
+            clean_record = _validate_record(record)
+            if clean_record["input_hash"] != clean_scope["input_hash"]:
+                raise ValueError(
+                    "strategy run.input_hash does not match its scope.input_hash"
+                )
+            identity = _record_key(clean_record)
             if identity in identities:
                 raise ValueError("scope entry contains duplicate strategy runs")
             identities.add(identity)
@@ -362,6 +368,15 @@ def _leaf_identity(directory_fd: int, leaf: str) -> tuple[int, int] | None:
         return None
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"strategy memory path is a symlink or unsafe: {leaf}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _path_identity(directory_fd: int, leaf: str) -> tuple[int, int] | None:
+    """Return a no-follow identity without requiring a regular file."""
+    try:
+        metadata = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
     return metadata.st_dev, metadata.st_ino
 
 
@@ -441,6 +456,110 @@ def _check_identity(
         raise ValueError(f"{field} path was replaced or changed during update")
 
 
+def _rename_with_flags(
+    directory_fd: int, source_leaf: str, target_leaf: str, *, operation: str
+) -> None:
+    """Perform a dirfd-bound atomic rename operation supported by the kernel."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = getattr(libc, "renameatx_np", None)
+        flag = 0x00000002 if operation == "exchange" else 0x00000004
+    elif sys.platform.startswith("linux"):
+        function = getattr(libc, "renameat2", None)
+        flag = 0x00000002 if operation == "exchange" else 0x00000001
+    else:
+        function = None
+        flag = 0
+    if function is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "strategy memory requires renameatx_np or renameat2 for safe publication",
+        )
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = function(
+        directory_fd,
+        os.fsencode(source_leaf),
+        directory_fd,
+        os.fsencode(target_leaf),
+        flag,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            f"{source_leaf} -> {target_leaf}",
+        )
+
+
+def _atomic_exchange(directory_fd: int, source_leaf: str, target_leaf: str) -> None:
+    _rename_with_flags(
+        directory_fd, source_leaf, target_leaf, operation="exchange"
+    )
+
+
+def _atomic_install_noreplace(
+    directory_fd: int, source_leaf: str, target_leaf: str
+) -> None:
+    _rename_with_flags(
+        directory_fd, source_leaf, target_leaf, operation="noreplace"
+    )
+
+
+def _publish_compare_exchange(
+    directory_fd: int,
+    temporary_leaf: str,
+    target_leaf: str,
+    *,
+    expected_identity: tuple[int, int] | None,
+    new_identity: tuple[int, int],
+) -> None:
+    """Publish only if target still has the identity observed under the lock."""
+    if expected_identity is None:
+        try:
+            _atomic_install_noreplace(directory_fd, temporary_leaf, target_leaf)
+        except FileExistsError as error:
+            raise ValueError(
+                "strategy memory path was replaced or changed during compare-install"
+            ) from error
+        _check_identity(directory_fd, target_leaf, new_identity, "strategy memory")
+        os.fsync(directory_fd)
+        return
+
+    _atomic_exchange(directory_fd, temporary_leaf, target_leaf)
+    displaced_identity = _path_identity(directory_fd, temporary_leaf)
+    if displaced_identity == expected_identity:
+        _check_identity(directory_fd, target_leaf, new_identity, "strategy memory")
+        os.fsync(directory_fd)
+        os.unlink(temporary_leaf, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        return
+
+    # The exchange preserved the unexpected replacement under temporary_leaf.
+    # Swap it back before reporting the failed compare operation.
+    _check_identity(directory_fd, target_leaf, new_identity, "strategy memory")
+    _atomic_exchange(directory_fd, temporary_leaf, target_leaf)
+    if _path_identity(directory_fd, target_leaf) != displaced_identity:
+        raise ValueError(
+            "strategy memory unexpected replacement changed during restore"
+        )
+    _check_identity(directory_fd, temporary_leaf, new_identity, "strategy memory temp")
+    os.fsync(directory_fd)
+    os.unlink(temporary_leaf, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+    raise ValueError(
+        "strategy memory path was replaced or changed during compare-exchange"
+    )
+
+
 def _locked_memory_update(
     path: str | os.PathLike, updater: Callable[[dict], dict]
 ) -> dict:
@@ -449,6 +568,7 @@ def _locked_memory_update(
     lock_leaf = leaf + ".lock"
     lock_fd = None
     temporary_leaf = None
+    temporary_identity = None
     try:
         lock_fd, lock_identity = _open_lock(directory_fd, lock_leaf)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -479,6 +599,8 @@ def _locked_memory_update(
         )
         try:
             os.fchmod(temp_fd, 0o600)
+            temp_metadata = os.fstat(temp_fd)
+            temporary_identity = (temp_metadata.st_dev, temp_metadata.st_ino)
             offset = 0
             while offset < len(payload):
                 written = os.write(temp_fd, payload[offset:])
@@ -489,22 +611,25 @@ def _locked_memory_update(
         finally:
             os.close(temp_fd)
         _check_identity(directory_fd, lock_leaf, lock_identity, "strategy memory lock")
-        _check_identity(directory_fd, leaf, memory_identity, "strategy memory")
-        os.replace(
+        _publish_compare_exchange(
+            directory_fd,
             temporary_leaf,
             leaf,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
+            expected_identity=memory_identity,
+            new_identity=temporary_identity,
         )
         temporary_leaf = None
-        os.fsync(directory_fd)
         return clean
     finally:
         if temporary_leaf is not None:
-            try:
-                os.unlink(temporary_leaf, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+            # Only delete the file we created.  After an exchange failure the
+            # temporary name can hold an unexpected replacement that must be
+            # preserved for fail-closed recovery.
+            if _path_identity(directory_fd, temporary_leaf) == temporary_identity:
+                try:
+                    os.unlink(temporary_leaf, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
         if lock_fd is not None:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -520,6 +645,8 @@ def append_run(
     clean_scope = _validate_scope_document(scope)
     key = _scope_key_from_document(clean_scope)
     clean_record = _validate_record(record)
+    if clean_record["input_hash"] != clean_scope["input_hash"]:
+        raise ValueError("strategy run.input_hash does not match scope.input_hash")
     identity = _record_key(clean_record)
     inserted = False
 
