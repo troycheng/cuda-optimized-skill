@@ -266,7 +266,7 @@ git add docs/superpowers/plans/2026-07-17-dual-remote-release.md
 git commit -m "docs(发布): 记录双远端验证结果"
 ```
 
-- [ ] **步骤 6：合并并发布工具**
+- [x] **步骤 6：合并并发布工具**
 
 确认 feature branch 只包含设计、计划、工具、测试和双语 README。快进合并到本地 `main`，
 在 `main` 重跑 focused tests，然后使用新工具把更新后的 `main` 依次推到 GitHub 与 GitLab；
@@ -277,6 +277,7 @@ git commit -m "docs(发布): 记录双远端验证结果"
 - 新增测试进入完整回归后共运行 623 项：619 项通过，4 项 opt-in GPU 测试跳过，
   失败为 0，用时 52.521 秒。
 - `compileall`、skill validator、CLI help 和 `git diff --check` 全部通过。
+- 快进合并后的主干 focused tests 共 29 项，全部通过。
 - `internal` 使用 SSH 地址 `git@git.yukework.com:mlsys/cuda-optimized-skill.git`；
   `upstream` push URL 保持 `DISABLED`。
 - 首次同步只创建内网 `main` 和 `v2.3.0`，没有推送任何开发分支。
