@@ -10,7 +10,7 @@ Architecture and toolchain routing remain in
 
 | Surface | First evidence | Confirmation |
 |---|---|---|
-| Host/device copies | Timeline with copy direction, bytes, stream, and dependency; allocator and transfer logs | End-to-end paired timing shows that removed or overlapped copies reduce the target objective without changing results. |
+| Host/device copies | Timeline with copy direction, bytes, stream, and dependency; allocator and transfer logs | End-to-end paired timing shows that removed or overlapped copies improve the target objective according to its configured direction without changing results. |
 | Allocation | Allocation count, size, lifetime, pool behavior, and synchronization caused by allocation or release | The same workload shows lower allocator time or memory pressure with no leak or capacity regression. |
 | Synchronization | Timeline and source correlation for device, stream, event, barrier, and implicit synchronization | The dependency is unnecessary or can be narrowed, and paired timing plus correctness confirm the change. |
 | CUDA Graphs | Captured graph topology, replay eligibility, update behavior, and launch trace | Replay reduces host or launch overhead for the same operation sequence and input contract. |

@@ -166,6 +166,8 @@ class SkillMetadataTests(unittest.TestCase):
             "serving_evidence_protocol.md",
         ):
             self.assertIn(reference, text)
+        self.assertIn("configured direction", lower)
+        self.assertNotIn("reduce the target objective", lower)
 
     def test_skill_artifacts_are_agent_neutral(self) -> None:
         suffixes = {".md", ".py", ".json", ".yaml", ".yml"}
