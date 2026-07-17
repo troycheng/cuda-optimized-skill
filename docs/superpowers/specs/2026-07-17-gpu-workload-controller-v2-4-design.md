@@ -203,6 +203,7 @@ Codex 写入严格 JSON：
   "hypothesis": "data wait dominates GPU idle time",
   "diagnosis_ids": ["cpu_data:data_wait"],
   "scope": "project",
+  "candidate": {"name": "dataloader-workers-8", "revision": "worktree"},
   "paths": ["configs/serve.yaml"],
   "commands": [["python3", "-m", "pytest", "tests/test_config.py"]],
   "rollback": "restore_frozen_snapshot",
@@ -212,7 +213,8 @@ Codex 写入严格 JSON：
 
 `scope` 只接受 `project` 或 `isolated_environment`。所有 path 必须落在 manifest 允许根目录；
 `host` scope 直接拒绝。控制器冻结修改前身份，修改后验证实际 diff 未越界。Codex 执行编辑
-和允许命令，控制器不接收任意 shell 文本。
+和允许命令，控制器不接收任意 shell 文本。`candidate` 是交给现有 WorkloadSpec adapter 的
+JSON 描述，必须与实际修改后的候选身份一致，并与评测 artifact 一起冻结。
 
 宿主机建议单独写入 `host_recommendations.md`，包含证据、预期影响、风险和人工验证命令，
 永远不进入 ChangeSet 执行队列。
