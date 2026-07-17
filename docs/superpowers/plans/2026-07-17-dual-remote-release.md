@@ -211,7 +211,7 @@ git commit -m "feat(发布): 支持 GitHub 与 GitLab 受控双发布"
 **文件：**
 - 修改：仅在验证发现真实缺陷时修改任务 1 或任务 2 已列文件。
 
-- [ ] **步骤 1：运行完整本地验证**
+- [x] **步骤 1：运行完整本地验证**
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -q
@@ -224,7 +224,7 @@ git status --short --branch
 
 预期：全部测试通过，skill 有效，工作区只包含计划执行记录或为空。
 
-- [ ] **步骤 2：配置并只读检查内网 remote**
+- [x] **步骤 2：配置并只读检查内网 remote**
 
 ```bash
 git remote add internal git@git.yukework.com:mlsys/cuda-optimized-skill.git
@@ -235,7 +235,7 @@ GIT_TERMINAL_PROMPT=0 git ls-remote internal \
 
 如果 `internal` 已存在，必须先确认 URL 完全一致，不能覆盖现有配置。
 
-- [ ] **步骤 3：首次同步既有正式 refs**
+- [x] **步骤 3：首次同步既有正式 refs**
 
 从主 checkout 的干净 `main` 执行 dry-run 检查后，只把已经发布的 refs 推到内网：
 
@@ -247,7 +247,7 @@ git push --atomic internal \
 
 不得推送 `agent/dual-remote-release` 或其他开发分支。
 
-- [ ] **步骤 4：回读两个平台并比较**
+- [x] **步骤 4：回读两个平台并比较**
 
 ```bash
 git ls-remote origin refs/heads/main refs/tags/v2.3.0 'refs/tags/v2.3.0^{}'
@@ -257,7 +257,7 @@ git ls-remote internal refs/heads/main refs/tags/v2.3.0 'refs/tags/v2.3.0^{}'
 预期：两边三项 ref 完全一致，`main` 和 peeled tag commit 都是
 `416f416fe37a3834a92c8849c3fe7dd79c8a7c3a`。
 
-- [ ] **步骤 5：更新计划执行记录并提交**
+- [x] **步骤 5：更新计划执行记录并提交**
 
 把实测测试数、首次同步 commit/tag 和两个远端回读结果写到本计划末尾，再提交：
 
@@ -271,3 +271,15 @@ git commit -m "docs(发布): 记录双远端验证结果"
 确认 feature branch 只包含设计、计划、工具、测试和双语 README。快进合并到本地 `main`，
 在 `main` 重跑 focused tests，然后使用新工具把更新后的 `main` 依次推到 GitHub 与 GitLab；
 `v2.3.0` 标签保持不变。最终回读两个远端 `main`，不得向 `upstream` 推送。
+
+### 执行记录（2026-07-17）
+
+- 新增测试进入完整回归后共运行 623 项：619 项通过，4 项 opt-in GPU 测试跳过，
+  失败为 0，用时 52.521 秒。
+- `compileall`、skill validator、CLI help 和 `git diff --check` 全部通过。
+- `internal` 使用 SSH 地址 `git@git.yukework.com:mlsys/cuda-optimized-skill.git`；
+  `upstream` push URL 保持 `DISABLED`。
+- 首次同步只创建内网 `main` 和 `v2.3.0`，没有推送任何开发分支。
+- GitHub 与内网 GitLab 回读结果完全一致：`main` 和 peeled tag commit 均为
+  `416f416fe37a3834a92c8849c3fe7dd79c8a7c3a`，annotated tag object 均为
+  `d64835607ee86bdd29cb56b37616197def73cdd2`。
