@@ -215,8 +215,8 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_readmes_keep_concise_current_validation_facts(self) -> None:
         facts = (
-            "691",
-            "686",
+            "746",
+            "741",
             "13/13",
             "34.302",
             "60.4616%",
@@ -245,6 +245,8 @@ class ReadmeSyncTests(unittest.TestCase):
             "skills/cuda-kernel-optimizer/examples/workload-controller.md",
             "skills/cuda-kernel-optimizer/references/compatibility.md",
             "skills/cuda-kernel-optimizer/references/optimization_catalog.md",
+            "skills/cuda-kernel-optimizer/references/evidence_automation.md",
+            "skills/cuda-kernel-optimizer/references/migration_v2_5.md",
             "tests/gpu/sm120/README.md",
             "LICENSE",
             "troycheng/cuda-optimized-skill",
@@ -252,6 +254,20 @@ class ReadmeSyncTests(unittest.TestCase):
         for text in (self.english, self.chinese):
             for marker in links:
                 self.assertIn(marker, text)
+
+    def test_readmes_expose_v2_5_evidence_integrity_without_gpu_claims(self) -> None:
+        for text in (self.english, self.chinese):
+            for marker in (
+                "shared-host",
+                "evidence_integrity",
+                "self_check",
+                "c1/c2/c4/c8/c12",
+            ):
+                self.assertIn(marker, text)
+        self.assertIn("CPU/static", self.english)
+        self.assertIn("CPU/static", self.chinese)
+        self.assertIn("does not claim a new GPU validation", self.english)
+        self.assertIn("不代表新增 GPU 验证", self.chinese)
 
     def test_readmes_avoid_internal_and_marketing_language(self) -> None:
         for text in (self.english, self.chinese):

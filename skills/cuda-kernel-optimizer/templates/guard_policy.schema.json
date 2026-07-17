@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/guard-policy.json",
+  "title": "CUDA optimizer V2.5 shared-host guard policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "formal", "sample_interval_ms", "max_sample_gap_ms", "joint_clean_window_ms", "gpus", "cpu", "allowlist", "limits", "phase_requirements", "not_applicable_reasons"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/guard-policy-v1"},
+    "formal": {"const": true},
+    "sample_interval_ms": {"type": "number", "exclusiveMinimum": 0},
+    "max_sample_gap_ms": {"type": "number", "exclusiveMinimum": 0},
+    "joint_clean_window_ms": {"type": "number", "exclusiveMinimum": 0},
+    "gpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "peers", "siblings"],
+      "properties": {
+        "target": {"$ref": "#/$defs/gpuIdentity"},
+        "peers": {"type": "array", "items": {"$ref": "#/$defs/gpuIdentity"}},
+        "siblings": {"type": "array", "items": {"$ref": "#/$defs/gpuIdentity"}}
+      }
+    },
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpus", "numa_nodes"],
+      "properties": {
+        "cpus": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+        "numa_nodes": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "allowlist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pids", "containers"],
+      "properties": {
+        "pids": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "containers": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min_sm_clock_mhz", "max_temperature_c", "max_power_w", "forbidden_throttle_reasons", "max_swap_used_bytes", "max_memory_pressure_pct", "max_foreign_cpu_pct", "max_foreign_gpu_pct"],
+      "properties": {
+        "min_sm_clock_mhz": {"type": "number", "minimum": 0},
+        "max_temperature_c": {"type": "number", "minimum": 0},
+        "max_power_w": {"type": "number", "minimum": 0},
+        "forbidden_throttle_reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "max_swap_used_bytes": {"type": "number", "minimum": 0},
+        "max_memory_pressure_pct": {"type": "number", "minimum": 0},
+        "max_foreign_cpu_pct": {"type": "number", "minimum": 0},
+        "max_foreign_gpu_pct": {"type": "number", "minimum": 0}
+      }
+    },
+    "phase_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["correctness", "sanitizer", "diagnostic", "timing"],
+      "properties": {
+        "correctness": {"enum": ["required", "not_applicable"]},
+        "sanitizer": {"enum": ["required", "not_applicable"]},
+        "diagnostic": {"enum": ["required", "not_applicable"]},
+        "timing": {"const": "required"}
+      }
+    },
+    "not_applicable_reasons": {"type": "object"}
+  },
+  "$defs": {
+    "gpuIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "pci_bus_id"],
+      "properties": {
+        "uuid": {"type": "string", "minLength": 1},
+        "pci_bus_id": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

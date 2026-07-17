@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/profiler-bundle.json",
+  "title": "CUDA optimizer V2.5 non-promotional Nsys and NCU bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "authority", "target_binary_sha256", "reports", "observations", "limitations"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/profiler-bundle-v1"},
+    "authority": {"const": "non_promotional"},
+    "target_binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reports": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool", "version", "status", "report_sha256", "command", "target_binary_sha256"],
+        "properties": {
+          "tool": {"enum": ["nsys", "ncu"]},
+          "version": {"type": "string", "minLength": 1},
+          "status": {"enum": ["available", "unavailable"]},
+          "report_sha256": {"type": ["string", "null"]},
+          "command": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "target_binary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "observations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "limitations": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+  }
+}

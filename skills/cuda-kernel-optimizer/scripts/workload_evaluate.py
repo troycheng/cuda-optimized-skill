@@ -19,7 +19,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import paired_stats  # noqa: E402
-from experiment_design import balanced_pair_orders  # noqa: E402
+from experiment_design import balanced_pair_orders, validate_frozen_design  # noqa: E402
 from workload_adapter import (  # noqa: E402
     WorkloadSpec,
     run_spec_once,
@@ -305,24 +305,48 @@ def evaluate_pairs(
     deadline_epoch=None,
     confidence=0.95,
     bootstrap_samples=DEFAULT_BOOTSTRAP_SAMPLES,
+    experiment_design=None,
     runner=None,
 ) -> dict:
     """Measure position-balanced AB/BA blocks and evaluate the frozen objective."""
     block_count = _positive_int(blocks, "blocks")
     retry_count = _nonnegative_int(retries, "retries")
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError("seed must be an integer")
-    confidence_value = _finite_real(confidence, "confidence")
-    if not 0.0 < confidence_value < 1.0:
-        raise ValueError("confidence must be between 0 and 1")
-    bootstrap_count = _positive_int(bootstrap_samples, "bootstrap_samples")
+    frozen_design = None
+    if experiment_design is not None:
+        frozen_design = validate_frozen_design(experiment_design)
+        if retry_count != 0:
+            raise ValueError("formal timed work forbids per-role retries")
+        if len(frozen_design["schedule"]) != block_count:
+            raise ValueError("formal schedule length must match blocks")
+        if frozen_design["aggregation"] != "median_paired_improvement":
+            raise ValueError(
+                "formal workload evaluator supports only median_paired_improvement aggregation"
+            )
+        confidence_value = frozen_design["ci"]["confidence"]
+        bootstrap_count = frozen_design["ci"]["samples"]
+        statistics_seed = frozen_design["ci"]["seed"]
+    else:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
+        confidence_value = _finite_real(confidence, "confidence")
+        if not 0.0 < confidence_value < 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+        bootstrap_count = _positive_int(bootstrap_samples, "bootstrap_samples")
+        statistics_seed = seed
     if not hasattr(workload, "objective") or not hasattr(workload, "cases"):
         raise ValueError("workload must provide objective and cases")
     objective = validate_objective(workload.objective)
     objective_snapshot = _json_copy(objective, "objective")
     cases = tuple(workload.cases)
     pairs = []
-    schedule = balanced_pair_orders(block_count, seed=seed)
+    schedule_rows = (
+        None if frozen_design is None else frozen_design["schedule"]
+    )
+    schedule = (
+        balanced_pair_orders(block_count, seed=seed)
+        if schedule_rows is None
+        else [row["order"] for row in schedule_rows]
+    )
 
     for block, order in enumerate(schedule):
         case = None if not cases else _json_copy(cases[block % len(cases)], "case")
@@ -365,6 +389,8 @@ def evaluate_pairs(
                 "candidate": copy.deepcopy(candidate_result["attempt_records"]),
             },
         }
+        if schedule_rows is not None:
+            pair["pair_id"] = schedule_rows[block]["pair_id"]
         failures = {
             role: copy.deepcopy(result.get("failure"))
             for role, result in measurements.items()
@@ -379,9 +405,17 @@ def evaluate_pairs(
         pairs,
         confidence=confidence_value,
         bootstrap_samples=bootstrap_count,
-        seed=seed,
+        seed=statistics_seed,
+        min_valid_pairs=(
+            2 if frozen_design is None else frozen_design["min_valid_pairs"]
+        ),
+        wins_required=(
+            None if frozen_design is None else frozen_design["wins_required"]
+        ),
     )
     classified["blocks"] = block_count
+    if frozen_design is not None:
+        classified["experiment_design"] = copy.deepcopy(frozen_design)
     return classified
 
 
@@ -392,6 +426,8 @@ def classify_recorded_pairs(
     confidence=0.95,
     bootstrap_samples=DEFAULT_BOOTSTRAP_SAMPLES,
     seed=0,
+    min_valid_pairs=2,
+    wins_required=None,
 ) -> dict:
     """Recompute workload statistics from frozen raw paired observations."""
     objective = validate_objective(objective)
@@ -402,6 +438,9 @@ def classify_recorded_pairs(
     bootstrap_count = _positive_int(bootstrap_samples, "bootstrap_samples")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
+    minimum_pair_count = _positive_int(min_valid_pairs, "min_valid_pairs")
+    if wins_required is not None:
+        wins_required = _positive_int(wins_required, "wins_required")
     if isinstance(pairs, (str, bytes, bytearray, Mapping)):
         raise ValueError("pairs must be a sequence")
     try:
@@ -501,8 +540,27 @@ def classify_recorded_pairs(
             min_effect_pct=objective["min_effect_pct"],
             confidence=confidence_value,
             bootstrap_samples=bootstrap_count,
+            min_valid_pairs=minimum_pair_count,
             seed=seed,
         )
+        if wins_required is not None:
+            minimum_effect = objective["min_effect_pct"]
+            wins_observed = sum(
+                improvement >= minimum_effect
+                if minimum_effect > 0.0
+                else improvement > 0.0
+                for improvement in primary_statistics["improvements_pct"]
+            )
+            primary_statistics["wins_required"] = wins_required
+            primary_statistics["wins_observed"] = wins_observed
+            primary_statistics["wins_status"] = (
+                "passed" if wins_observed >= wins_required else "failed"
+            )
+            if (
+                primary_statistics["status"] == "confirmed_win"
+                and wins_observed < wins_required
+            ):
+                primary_statistics["status"] = "inconclusive"
         constraint_statistics = []
         for index, constraint in enumerate(objective["constraints"]):
             name = constraint["name"]

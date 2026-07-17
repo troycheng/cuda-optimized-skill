@@ -3,7 +3,7 @@ name: cuda-kernel-optimizer
 description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.4.1)
+# CUDA Kernel and Workload Optimizer (V2.5)
 
 ## Principle
 
@@ -111,6 +111,55 @@ The ChangeSet controller is not the entry point for an already-built external
 serving stack. Use `references/serving_evidence_protocol.md` and freeze a
 deployment experiment directly; compare exact runtime artifacts rather than
 creating a meaningless filesystem diff.
+
+## Formal evidence automation
+
+Use the V2.5 evidence CLI for promotion-grade shared-host, matched-runtime, or
+serving attempts. Read `references/evidence_automation.md` before creating its
+schemas or artifacts. Site-owned collectors produce normalized continuous
+samples; the generic skill validates them but does not claim universal GPU or
+container telemetry collection.
+
+Audit target/peer/sibling GPU identities, CPU/NUMA scope, PID/container
+allowlists, memory/swap pressure, clocks, temperature, power, thermal state,
+watcher-ready handshake, maximum gap, and joint clean window for each required
+correctness, sanitizer, diagnostic, and timing phase:
+
+```bash
+python3 <skill>/scripts/evidence.py guard-audit \
+  --policy guard-policy.json --samples guard-samples.jsonl \
+  --markers phase-markers.json --out guard-audit.json
+```
+
+Freeze the complete formal schedule and statistics before timing. Formal
+workload evaluation uses that exact schedule, frozen CI/pair/win settings, and
+zero single-role retries; its automated aggregation is currently median-only.
+Require execution-path hits for every expected case, then remove diagnostics,
+rebuild, rehash, and bind the residue-free timed binary.
+
+End every attempt in exactly one immutable state: `valid`,
+`invalid_contaminated`, `invalid_identity`, `partial`, or `superseded`. Close the
+evidence in order:
+
+```bash
+python3 <skill>/scripts/evidence.py seal --attempt attempt.json --out seal.json
+python3 <skill>/scripts/evidence.py audit --seal seal.json --out audit.json
+python3 <skill>/scripts/evidence.py decide \
+  --seal seal.json --audit audit.json --out decision.json \
+  --manifest evidence-manifest.json
+```
+
+Keep the performance verdict separate from `evidence_integrity`. A confirmed
+win with failed integrity retains the baseline. Nsys/NCU bundles are explanatory
+and `non_promotional`. Audit an imported serving run only with `audit-imported`;
+write output outside its source tree. See `references/migration_v2_5.md` before
+using V2.4.1 manifests, which remain compatible but legacy and unsealed.
+
+After installation, run the CPU/static check without CUDA or network access:
+
+```bash
+python3 <skill>/scripts/self_check.py --skill-dir <skill>
+```
 
 ## Layered experiment funnel
 
@@ -381,9 +430,20 @@ status.
   CUTLASS/CuTe, or Triton IR evidence tasks.
 - `references/serving_evidence_protocol.md`: read only for runtime or serving
   evidence and claims.
+- `references/evidence_automation.md`: V2.5 guard, frozen design,
+  execution-path, identity, seal/audit/decision, import, and profiler contracts.
+- `references/migration_v2_5.md`: V2.4.1 compatibility and non-mutating
+  migration notes.
 - `references/sanitizer_policy.json`: targeted/full sanitizer routing.
 - `references/sass_signatures.json`: instruction signatures.
 - `templates/objective.schema.json`: strict workload objective schema.
+- `templates/guard_policy.schema.json`, `templates/experiment_design.schema.json`,
+  `templates/attempt.schema.json`, `templates/execution_path.schema.json`,
+  `templates/serving_experiment.schema.json`,
+  `templates/artifact_identities.schema.json`,
+  `templates/profiler_bundle.schema.json`,
+  `templates/performance_verdict.schema.json`, and
+  `templates/evidence_manifest.schema.json`: V2.5 formal evidence schemas.
 - `templates/workload.py`: user-owned Python workload starter.
 - `templates/iteration_report.md`: per-round decision record.
 - `examples/walkthrough.md`: annotated kernel-only and full-mode walkthrough.

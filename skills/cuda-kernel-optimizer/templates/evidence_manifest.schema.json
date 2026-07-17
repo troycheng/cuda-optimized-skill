@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.5/evidence-manifest.json",
+  "title": "CUDA optimizer V2.5 seal-audit-decision closure",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "attempt_id", "evidence_refs"],
+  "properties": {
+    "schema_version": {"const": "cuda-evidence/manifest-v1"},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "evidence_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seal", "audit", "decision"],
+      "properties": {
+        "seal": {"$ref": "#/$defs/ref"},
+        "audit": {"$ref": "#/$defs/ref"},
+        "decision": {"$ref": "#/$defs/ref"}
+      }
+    }
+  },
+  "$defs": {
+    "ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}
