@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/change_set.schema.json",
+  "title": "CUDA Workload Optimizer ChangeSet v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "hypothesis",
+    "diagnosis_ids",
+    "scope",
+    "candidate",
+    "paths",
+    "commands",
+    "rollback",
+    "expected_metrics"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "cuda-workload-optimizer/change-v1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 1
+    },
+    "diagnosis_ids": {
+      "$ref": "#/$defs/stringList"
+    },
+    "scope": {
+      "enum": ["project", "isolated_environment"]
+    },
+    "candidate": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "paths": {
+      "$ref": "#/$defs/stringList"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/argv"
+      }
+    },
+    "rollback": {
+      "const": "restore_frozen_snapshot"
+    },
+    "expected_metrics": {
+      "$ref": "#/$defs/stringList"
+    }
+  },
+  "$defs": {
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "stringList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/workload_control.schema.json",
+  "title": "CUDA Workload Optimizer Control Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_root",
+    "workload_manifest",
+    "baseline_candidate",
+    "budget",
+    "mutation",
+    "probes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "cuda-workload-optimizer/control-v1"
+    },
+    "project_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workload_manifest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "baseline_candidate": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "budget": {
+      "enum": ["fast", "balanced", "thorough"]
+    },
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_paths", "environment_root", "host_policy"],
+      "properties": {
+        "project_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "environment_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host_policy": {
+          "const": "recommend_only"
+        }
+      }
+    },
+    "probes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "argv", "timeout_seconds"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          },
+          "kind": {
+            "enum": [
+              "environment",
+              "timeline",
+              "framework",
+              "cpu_data",
+              "transfer",
+              "communication",
+              "io",
+              "custom"
+            ]
+          },
+          "argv": {
+            "$ref": "#/$defs/argv"
+          },
+          "timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 3600
+          }
+        }
+      }
+    },
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "timeout_seconds"],
+      "properties": {
+        "argv": {
+          "$ref": "#/$defs/argv"
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 3600
+        }
+      }
+    }
+  },
+  "$defs": {
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
