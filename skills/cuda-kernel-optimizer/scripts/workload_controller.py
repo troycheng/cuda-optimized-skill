@@ -56,6 +56,7 @@ _SAFE_ENV = {
     "NVIDIA_VISIBLE_DEVICES",
 }
 _DIAGNOSIS_MODULE = None
+_REVIEWER_MODULE = None
 
 
 class ValidationError(ValueError):
@@ -374,6 +375,27 @@ def _load_diagnosis_module():
     return module
 
 
+def _load_reviewer_module():
+    global _REVIEWER_MODULE
+    if _REVIEWER_MODULE is not None:
+        return _REVIEWER_MODULE
+    path = Path(__file__).with_name("workload_reviewer.py")
+    spec = importlib.util.spec_from_file_location(
+        "cuda_optimizer_workload_reviewer_runtime", path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load workload reviewer module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    _REVIEWER_MODULE = module
+    return module
+
+
 def _canonical_digest(value: Any) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -655,6 +677,60 @@ def diagnose_run(run_dir: os.PathLike[str] | str) -> dict:
     return result
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as error:
+        raise ValidationError(f"cannot hash artifact {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def review_change(
+    control: Mapping[str, Any],
+    run_dir: os.PathLike[str] | str,
+    change_set: Mapping[str, Any],
+) -> dict:
+    normalized = validate_control_manifest(control)
+    change = validate_change_set(change_set, normalized)
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    diagnosis_path = run_root / "diagnosis.json"
+    diagnosis = load_json_object(diagnosis_path)
+    diff_path = run_root / "candidate.diff"
+    redacted_diff = ""
+    if diff_path.exists():
+        if diff_path.stat().st_size > 256 * 1024:
+            raise ValidationError("candidate.diff exceeds reviewer request limit")
+        redacted_diff = _redact_log(diff_path.read_text("utf-8"), ())
+    change_path = run_root / "change_set.json"
+    _atomic_json(change_path, change)
+    reviewer = _load_reviewer_module()
+    blocks = {"fast": 3, "balanced": 5, "thorough": 9}[normalized["budget"]]
+    request = reviewer.build_review_request(
+        diagnosis=diagnosis,
+        change_set=change,
+        redacted_diff=redacted_diff,
+        experiment={
+            "blocks": blocks,
+            "evaluation": "paired_ab_ba",
+            "expected_metrics": change["expected_metrics"],
+        },
+        artifact_hashes={
+            "diagnosis.json": _sha256_path(diagnosis_path),
+            "change_set.json": _sha256_path(change_path),
+        },
+    )
+    _atomic_json(run_root / "review_request.json", request)
+    if "reviewer" not in normalized:
+        return reviewer.write_skipped_review(request, run_root)
+    return reviewer.run_reviewer(normalized["reviewer"], request, run_root)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate and run bounded GPU workload optimization rounds."
@@ -670,6 +746,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "diagnose", help="classify stored normalized probe evidence"
     )
     diagnose_parser.add_argument("--run-dir", required=True)
+    review = subparsers.add_parser("review", help="request optional advisory review")
+    review.add_argument("--control", required=True)
+    review.add_argument("--run-dir", required=True)
+    review.add_argument("--change-set", required=True)
     return parser
 
 
@@ -702,6 +782,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "diagnose":
             print(json.dumps(diagnose_run(args.run_dir), sort_keys=True))
+            return 0
+        if args.command == "review":
+            artifact = review_change(
+                load_json_object(args.control),
+                args.run_dir,
+                load_json_object(args.change_set),
+            )
+            print(json.dumps(artifact, sort_keys=True))
             return 0
     except ValidationError as error:
         print(f"validation error: {error}", file=sys.stderr)

@@ -534,5 +534,60 @@ class ProbeRunnerTests(unittest.TestCase):
             self.assertTrue((run_dir / "diagnosis.json").is_file())
 
 
+class ReviewerControllerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller = _load_controller()
+
+    def test_review_cli_records_skipped_when_no_reviewer_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            project = root / "project"
+            project.mkdir()
+            (project / "configs").mkdir()
+            (project / "src").mkdir()
+            (project / "workload.json").write_text("{}", encoding="utf-8")
+            control = _control(root)
+            del control["reviewer"]
+            control_path = root / "control.json"
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+            change_path = root / "change.json"
+            change_path.write_text(json.dumps(_change_set()), encoding="utf-8")
+            run_dir = root / "run"
+            run_dir.mkdir()
+            (run_dir / "diagnosis.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "cuda-workload-optimizer/diagnosis-v1",
+                        "primary_category": "cpu_data",
+                        "confidence": "medium",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "review",
+                    "--control",
+                    str(control_path),
+                    "--run-dir",
+                    str(run_dir),
+                    "--change-set",
+                    str(change_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "skipped")
+            artifact = json.loads((run_dir / "review.json").read_text("utf-8"))
+            self.assertEqual(artifact["status"], "skipped")
+            self.assertIsNone(artifact["response"])
+
+
 if __name__ == "__main__":
     unittest.main()
