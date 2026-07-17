@@ -60,6 +60,7 @@ _VERIFIED_RECORD_FIELDS = {
     "candidate_sha256",
     "decision_sha256",
     "checkpoint_identity",
+    "run_root",
     "scope",
     "completed_at",
     "terminal",
@@ -67,6 +68,11 @@ _VERIFIED_RECORD_FIELDS = {
     "methods",
     "evidence",
 }
+_TERMINAL_FIELDS = {
+    "status", "mode", "reason", "statistics", "workload_status",
+    "workload_statistics", "workload_failure", "constraints", "pareto",
+}
+_EVIDENCE_FIELDS = {"role", "path", "sha256"}
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -337,19 +343,240 @@ def _validate_record(value: Any) -> dict:
         record["completed_at"], (int, float)
     ) or not math.isfinite(float(record["completed_at"])):
         raise ValueError("strategy run.completed_at must be finite")
-    for field in ("terminal", "bundle", "methods"):
-        if not isinstance(record[field], dict):
-            raise ValueError(f"strategy run.{field} must be a JSON object")
-    if not isinstance(record["evidence"], list) or any(
-        not isinstance(item, dict) for item in record["evidence"]
+    run_root = _exact_fields(
+        record["run_root"], {"path", "device", "inode"}, "strategy run.run_root"
+    )
+    if not isinstance(run_root["path"], str) or not os.path.isabs(run_root["path"]):
+        raise ValueError("strategy run.run_root.path must be absolute")
+    if run_root["path"] != os.path.abspath(run_root["path"]):
+        raise ValueError("strategy run.run_root.path must be normalized")
+    for field in ("device", "inode"):
+        if type(run_root[field]) is not int or run_root[field] < 0:
+            raise ValueError(f"strategy run.run_root.{field} must be non-negative")
+
+    def evidence_identity(value: Any, field: str) -> dict:
+        clean = _exact_fields(value, _EVIDENCE_FIELDS, field)
+        if not isinstance(clean["role"], str) or not clean["role"]:
+            raise ValueError(f"{field}.role must be non-empty")
+        if not isinstance(clean["path"], str) or not os.path.isabs(clean["path"]):
+            raise ValueError(f"{field}.path must be absolute")
+        if clean["path"] != os.path.abspath(clean["path"]):
+            raise ValueError(f"{field}.path must be normalized")
+        try:
+            Path(clean["path"]).absolute().relative_to(Path(run_root["path"]))
+        except ValueError as error:
+            raise ValueError(f"{field}.path escapes run_root") from error
+        _sha(clean["sha256"], f"{field}.sha256")
+        return dict(clean)
+
+    raw_evidence = record["evidence"]
+    if not isinstance(raw_evidence, list):
+        raise ValueError("strategy run.evidence must be a JSON array")
+    evidence = [
+        evidence_identity(item, f"strategy run.evidence[{index}]")
+        for index, item in enumerate(raw_evidence)
+    ]
+    evidence_keys = {
+        _canonical_bytes(item) for item in evidence
+    }
+    if len(evidence_keys) != len(evidence):
+        raise ValueError("strategy run.evidence contains duplicates")
+
+    terminal = _exact_fields(record["terminal"], _TERMINAL_FIELDS, "strategy run.terminal")
+    if terminal["status"] not in decision.TERMINAL_STATUSES:
+        raise ValueError("strategy run.terminal.status is invalid")
+    if terminal["mode"] not in {"kernel-only", "full"}:
+        raise ValueError("strategy run.terminal.mode is invalid")
+    if not isinstance(terminal["reason"], str) or not terminal["reason"]:
+        raise ValueError("strategy run.terminal.reason must be non-empty")
+    for field in ("statistics", "workload_statistics", "workload_failure", "pareto"):
+        if terminal[field] is not None and not isinstance(terminal[field], dict):
+            raise ValueError(f"strategy run.terminal.{field} must be an object or null")
+    if terminal["workload_status"] not in {None, "evaluated", "workload_failed"}:
+        raise ValueError("strategy run.terminal.workload_status is invalid")
+    if not isinstance(terminal["constraints"], list) or any(
+        not isinstance(item, dict) for item in terminal["constraints"]
     ):
-        raise ValueError("strategy run.evidence must be a JSON array of objects")
+        raise ValueError("strategy run.terminal.constraints must be an array of objects")
+    normalized_constraints = decision._validate_constraints(terminal["constraints"])
+    if normalized_constraints != terminal["constraints"]:
+        raise ValueError("strategy run terminal constraints are not normalized")
+    normalized_pareto = decision._validate_pareto(terminal["pareto"])
+    if normalized_pareto != terminal["pareto"]:
+        raise ValueError("strategy run terminal pareto is not normalized")
+    for field in ("statistics", "workload_statistics"):
+        statistics = terminal[field]
+        if statistics is not None:
+            normalized = decision.validate_paired_statistics(
+                statistics, f"strategy run.terminal.{field}"
+            )
+            if normalized != statistics:
+                raise ValueError(f"strategy run terminal {field} is not normalized")
+    expected_statistic_status = {
+        "kernel_only_win": "confirmed_win",
+        "end_to_end_win": "confirmed_win",
+        "confirmed_loss": "confirmed_loss",
+        "inconclusive": "inconclusive",
+    }.get(terminal["status"])
+    if expected_statistic_status is not None:
+        if not isinstance(terminal["statistics"], Mapping) or terminal["statistics"].get(
+            "status"
+        ) != expected_statistic_status:
+            raise ValueError("strategy run terminal statistics contradict outcome")
+    if terminal["workload_status"] == "evaluated":
+        if not isinstance(terminal["workload_statistics"], Mapping):
+            raise ValueError("evaluated strategy workload requires statistics")
+        if terminal["workload_failure"] is not None:
+            raise ValueError("evaluated strategy workload cannot contain failure")
+    elif terminal["workload_status"] == "workload_failed":
+        if terminal["workload_statistics"] is not None:
+            raise ValueError("failed strategy workload cannot contain statistics")
+        failure = decision._validate_workload(terminal["workload_failure"])
+        if failure != terminal["workload_failure"]:
+            raise ValueError("strategy workload failure is not normalized")
+    elif terminal["workload_statistics"] is not None or terminal["workload_failure"] is not None:
+        raise ValueError("strategy workload evidence requires workload_status")
+
+    bundle = _exact_fields(
+        record["bundle"],
+        {"outcome", "method_ids", "promotion_authority", "decision_evidence"},
+        "strategy run.bundle",
+    )
+    if bundle["outcome"] != terminal["status"]:
+        raise ValueError("strategy run bundle outcome does not match terminal status")
+    method_ids = bundle["method_ids"]
+    if (
+        not isinstance(method_ids, list)
+        or method_ids != sorted(set(method_ids))
+        or any(not isinstance(item, str) or not item for item in method_ids)
+    ):
+        raise ValueError("strategy run bundle method_ids must be sorted unique strings")
+    if bundle["promotion_authority"] is not False:
+        raise ValueError("strategy run bundle promotion_authority must be false")
+    allowed_roles = {
+        "state", "checkpoint", "decision", "methods", "candidate",
+        "kernel_paired_samples", "workload_paired_samples", "sass_check",
+        "attribution", "champion_bench",
+        *{f"ablation_kernel:{method_id}" for method_id in method_ids},
+        *{f"ablation_bench:{method_id}" for method_id in method_ids},
+    }
+    if any(item["role"] not in allowed_roles for item in evidence):
+        raise ValueError("strategy run evidence contains an unknown role")
+    decision_evidence = evidence_identity(
+        bundle["decision_evidence"], "strategy run.bundle.decision_evidence"
+    )
+    if decision_evidence["role"] != "decision" or decision_evidence["sha256"] != record["decision_sha256"]:
+        raise ValueError("strategy run bundle decision evidence is inconsistent")
+    if _canonical_bytes(decision_evidence) not in evidence_keys:
+        raise ValueError("strategy run bundle decision evidence is absent from evidence")
+
+    methods = _exact_fields(
+        record["methods"], {"performance", "implementation"}, "strategy run.methods"
+    )
+    for field in ("performance", "implementation"):
+        if not isinstance(methods[field], dict):
+            raise ValueError(f"strategy run methods.{field} must be an object")
+        if not set(methods[field]).issubset(method_ids):
+            raise ValueError(f"strategy run methods.{field} contains a non-bundle method")
+    for method_id, item in methods["performance"].items():
+        item = _exact_fields(
+            item,
+            {"outcome", "champion_ms", "ablated_ms", "attribution_ms", "attribution_pct", "evidence_quality", "promotion_authority", "evidence"},
+            f"strategy run methods.performance.{method_id}",
+        )
+        if item["outcome"] not in {"positive", "negative"}:
+            raise ValueError("strategy method performance outcome is invalid")
+        numbers = []
+        for field in ("champion_ms", "ablated_ms", "attribution_ms", "attribution_pct"):
+            value = item[field]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"strategy method performance {field} must be finite")
+            numbers.append(float(value))
+        champion_ms, ablated_ms, attribution_ms, attribution_pct = numbers
+        if champion_ms <= 0.0 or ablated_ms <= 0.0:
+            raise ValueError("strategy method performance timings must be positive")
+        if not math.isclose(ablated_ms - champion_ms, attribution_ms, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError("strategy method performance attribution_ms is inconsistent")
+        if not math.isclose(attribution_ms / champion_ms * 100.0, attribution_pct, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError("strategy method performance attribution_pct is inconsistent")
+        if attribution_ms == 0.0 or (attribution_ms > 0) != (item["outcome"] == "positive"):
+            raise ValueError("strategy method performance outcome contradicts attribution")
+        if attribution_pct == 0.0 or (attribution_pct > 0) != (item["outcome"] == "positive"):
+            raise ValueError("strategy method performance percent contradicts outcome")
+        if item["evidence_quality"] != "diagnostic_unpaired_ablation":
+            raise ValueError("strategy method performance evidence_quality is invalid")
+        if item["promotion_authority"] is not False:
+            raise ValueError("strategy method performance cannot authorize promotion")
+        if not isinstance(item["evidence"], list):
+            raise ValueError("strategy method performance evidence must be an array")
+        method_evidence = [
+            evidence_identity(value, f"strategy method {method_id} evidence")
+            for value in item["evidence"]
+        ]
+        required_roles = {
+            "attribution", "champion_bench", f"ablation_kernel:{method_id}",
+            f"ablation_bench:{method_id}",
+        }
+        if {value["role"] for value in method_evidence} != required_roles:
+            raise ValueError("strategy method performance evidence roles are incomplete")
+        if any(_canonical_bytes(value) not in evidence_keys for value in method_evidence):
+            raise ValueError("strategy method performance evidence is absent from run evidence")
+    for method_id, item in methods["implementation"].items():
+        item = _exact_fields(
+            item, {"status", "evidence"},
+            f"strategy run methods.implementation.{method_id}",
+        )
+        if item["status"] not in {"passed", "failed", "unavailable", "not_applicable"}:
+            raise ValueError("strategy method implementation status is invalid")
+        identity = evidence_identity(item["evidence"], f"strategy implementation {method_id}")
+        if identity["role"] != "sass_check" or _canonical_bytes(identity) not in evidence_keys:
+            raise ValueError("strategy method implementation evidence is inconsistent")
+    roles = {item["role"] for item in evidence}
+    for required in ("state", "checkpoint", "decision", "methods", "candidate", "kernel_paired_samples"):
+        if required not in roles:
+            raise ValueError(f"strategy run evidence is missing {required}")
+    if terminal["workload_status"] == "evaluated" and "workload_paired_samples" not in roles:
+        raise ValueError("evaluated workload is missing workload paired evidence")
+    checkpoint_items = [item for item in evidence if item["role"] == "checkpoint"]
+    if len(checkpoint_items) != 1 or checkpoint_items[0]["sha256"] != record["checkpoint_identity"]:
+        raise ValueError("strategy run checkpoint evidence is inconsistent")
     return record
 
 
 def _record_key(record: Mapping) -> str:
     identity = {field: record[field] for field in sorted(_RECORD_FIELDS)}
     return hashlib.sha256(_canonical_bytes(identity)).hexdigest()
+
+
+def _derived_indices(records: list[dict]) -> tuple[dict, dict]:
+    methods: dict[str, dict] = {}
+    bundles: dict[str, dict] = {}
+    for record in records:
+        if record.get("schema_version") != RECORD_SCHEMA:
+            continue
+        identity = _record_key(record)
+        method_ids = record["bundle"]["method_ids"]
+        for method_id in method_ids:
+            performance = record["methods"]["performance"].get(method_id)
+            implementation = record["methods"]["implementation"].get(method_id)
+            if performance is None and implementation is None:
+                continue
+            methods.setdefault(method_id, {"records": []})["records"].append({
+                "record_identity": identity,
+                "performance": performance,
+                "implementation": implementation,
+                "completed_at": record["completed_at"],
+            })
+        bundle_key = hashlib.sha256(_canonical_bytes(method_ids)).hexdigest()
+        bundles.setdefault(
+            bundle_key, {"method_ids": method_ids, "records": []}
+        )["records"].append({
+            "record_identity": identity,
+            "outcome": record["bundle"]["outcome"],
+            "decision_evidence": record["bundle"]["decision_evidence"],
+            "completed_at": record["completed_at"],
+        })
+    return methods, bundles
 
 
 def _new_memory() -> dict:
@@ -377,8 +604,10 @@ def _validate_memory(value: Any) -> dict:
         if len(entry["runs"]) > MAX_RUNS_PER_SCOPE:
             raise ValueError("scope entry exceeds run capacity")
         identities = set()
+        clean_records = []
         for record in entry["runs"]:
             clean_record = _validate_record(record)
+            clean_records.append(clean_record)
             if clean_record["input_hash"] != clean_scope["input_hash"]:
                 raise ValueError(
                     "strategy run.input_hash does not match its scope.input_hash"
@@ -436,6 +665,11 @@ def _validate_memory(value: Any) -> dict:
                     raise ValueError("scope bundle outcome must be non-empty")
                 if not isinstance(item["decision_evidence"], dict):
                     raise ValueError("scope bundle decision evidence must be an object")
+        expected_methods, expected_bundles = _derived_indices(clean_records)
+        if methods != expected_methods:
+            raise ValueError("scope method index does not match verified run records")
+        if bundles != expected_bundles:
+            raise ValueError("scope bundle index does not match verified run records")
     return memory
 
 
@@ -755,29 +989,7 @@ def append_run(
         if len(entry["runs"]) >= MAX_RUNS_PER_SCOPE:
             raise ValueError("strategy memory run capacity reached")
         entry["runs"].append(clean_record)
-        if clean_record.get("schema_version") == RECORD_SCHEMA:
-            method_ids = clean_record["bundle"]["method_ids"]
-            for method_id in method_ids:
-                performance = clean_record["methods"]["performance"].get(method_id)
-                implementation = clean_record["methods"]["implementation"].get(method_id)
-                if performance is None and implementation is None:
-                    continue
-                entry["methods"].setdefault(method_id, {"records": []})["records"].append({
-                    "record_identity": identity,
-                    "performance": performance,
-                    "implementation": implementation,
-                    "completed_at": clean_record["completed_at"],
-                })
-            bundle_key = hashlib.sha256(_canonical_bytes(method_ids)).hexdigest()
-            bundle_entry = entry["bundles"].setdefault(
-                bundle_key, {"method_ids": method_ids, "records": []}
-            )
-            bundle_entry["records"].append({
-                "record_identity": identity,
-                "outcome": clean_record["bundle"]["outcome"],
-                "decision_evidence": clean_record["bundle"]["decision_evidence"],
-                "completed_at": clean_record["completed_at"],
-            })
+        entry["methods"], entry["bundles"] = _derived_indices(entry["runs"])
         inserted = True
         return memory
 
@@ -839,6 +1051,13 @@ def _replay_decision(payload: Mapping) -> dict:
     for field, expected in replay.items():
         if payload.get(field) != expected:
             raise ValueError(f"decision replay mismatch: {field}")
+    kernel = evidence["kernel"]
+    if "statistics" not in replay and isinstance(kernel, Mapping) and isinstance(
+        kernel.get("statistics"), Mapping
+    ):
+        if payload.get("statistics") != kernel["statistics"]:
+            raise ValueError("decision replay mismatch: statistics")
+        replay["statistics"] = _strict_copy(kernel["statistics"], "replayed statistics")
     return replay
 
 
@@ -934,6 +1153,12 @@ def _method_evidence(
             ablated = _strict_json_bytes(bench_bytes, "ablated_bench")
             if not isinstance(champion, Mapping) or not isinstance(ablated, Mapping):
                 continue
+            champion_correctness = champion.get("correctness")
+            if (
+                not isinstance(champion_correctness, Mapping)
+                or champion_correctness.get("passed") is not True
+            ):
+                continue
             correctness = ablated.get("correctness")
             if not isinstance(correctness, Mapping) or correctness.get("passed") is not True:
                 continue
@@ -943,6 +1168,8 @@ def _method_evidence(
                 continue
             delta = ablated_ms - champion_ms
             percentage = delta / champion_ms * 100.0
+            if delta == 0.0 or percentage == 0.0:
+                continue
             declared = (
                 item.get("champion_ms"), item.get("ablated_ms"),
                 item.get("attribution_ms"), item.get("attribution_pct"),
@@ -956,6 +1183,8 @@ def _method_evidence(
                 continue
             performance[method_id] = {
                 "outcome": "positive" if delta > 0 else "negative",
+                "champion_ms": champion_ms,
+                "ablated_ms": ablated_ms,
                 "attribution_ms": delta,
                 "attribution_pct": percentage,
                 "evidence_quality": "diagnostic_unpaired_ablation",
@@ -1017,6 +1246,10 @@ def load_completed_run(run_dir: str | os.PathLike) -> dict:
         "candidate_status"
     ) != terminal.get("status"):
         raise ValueError("terminal and checkpoint candidate identity mismatch")
+    if checkpoint.get("candidate_file") != terminal.get("candidate_file") or checkpoint.get(
+        "candidate_sha256"
+    ) != terminal.get("candidate_sha256"):
+        raise ValueError("checkpoint candidate file/hash does not match terminal candidate")
     resume = terminal.get("resume")
     if not isinstance(resume, Mapping) or resume.get("stage") != "complete" or resume.get(
         "status"
@@ -1066,6 +1299,17 @@ def load_completed_run(run_dir: str | os.PathLike) -> dict:
     )
     scope = scope_document(manifest_path)
     evidence = [state_identity, checkpoint_identity, decision_identity, methods_identity]
+    evaluated_outcomes = {
+        "kernel_only_win", "end_to_end_win", "confirmed_loss", "inconclusive"
+    }
+    if replay["status"] in evaluated_outcomes and not isinstance(
+        terminal.get("kernel_paired_samples"), Mapping
+    ):
+        raise ValueError("evaluated terminal outcome requires kernel paired samples")
+    if replay.get("workload_status") == "evaluated" and not isinstance(
+        terminal.get("workload_paired_samples"), Mapping
+    ):
+        raise ValueError("evaluated workload requires workload paired samples")
     for field in ("kernel_paired_samples", "workload_paired_samples"):
         binding = terminal.get(field)
         if isinstance(binding, Mapping):
@@ -1110,6 +1354,9 @@ def load_completed_run(run_dir: str | os.PathLike) -> dict:
         "candidate_sha256": candidate_sha,
         "decision_sha256": decision_identity["sha256"],
         "checkpoint_identity": checkpoint_identity["sha256"],
+        "run_root": {
+            "path": str(root), "device": root_identity[0], "inode": root_identity[1],
+        },
         "scope": scope,
         "completed_at": checkpoint["updated_at"],
         "terminal": {

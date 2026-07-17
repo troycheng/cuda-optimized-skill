@@ -330,8 +330,9 @@ class StrategyMemoryTests(unittest.TestCase):
             "candidate_id": "b1", "candidate_file": str(candidate.resolve()),
             "candidate_sha256": candidate_sha,
         })
-        if status in {"kernel_only_win", "end_to_end_win"}:
-            decision["kernel_paired_samples"] = kernel_artifact
+        decision["kernel_paired_samples"] = kernel_artifact
+        if status in {"confirmed_loss", "inconclusive"}:
+            decision["statistics"] = kernel_stats
         if workload_artifact is not None:
             decision["workload_paired_samples"] = workload_artifact
         decision_path = iteration / "decision.json"
@@ -935,6 +936,44 @@ class StrategyMemoryTests(unittest.TestCase):
                 self.assertNotIn("# candidate", json.dumps(record))
                 self.assertEqual(record["methods"]["performance"], {})
 
+    def test_checkpoint_candidate_file_and_hash_must_match_terminal(self) -> None:
+        for field in ("candidate_file", "candidate_sha256"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                run = self._completed_run(root)
+                alternate = run / "iterv1" / "alternate.py"
+                alternate.write_text("# alternate valid candidate\n", encoding="utf-8")
+                alternate_sha = hashlib.sha256(alternate.read_bytes()).hexdigest()
+                checkpoint = run / "checkpoint.json"
+                self._mutate_json(
+                    checkpoint,
+                    lambda value: value.update(**{
+                        "candidate_file": str(alternate.resolve()),
+                        "candidate_sha256": alternate_sha,
+                    }),
+                )
+                # Keep the terminal resume binding valid: state intentionally does
+                # not snapshot checkpoint file/hash, which is the gap under test.
+                with self.assertRaisesRegex(ValueError, "checkpoint.*candidate"):
+                    self.memory.record_run(root / "memory.json", run, root / "record.json")
+                self.assertFalse((root / "memory.json").exists())
+
+    def test_loss_and_inconclusive_require_bound_raw_kernel_pairs(self) -> None:
+        for status in ("confirmed_loss", "inconclusive"):
+            for mutation in ("missing", "tampered"):
+                with self.subTest(status=status, mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    run = self._completed_run(root, status)
+                    paired = run / "iterv1" / "kernel" / "paired_samples.jsonl"
+                    if mutation == "missing":
+                        paired.unlink()
+                    else:
+                        paired.write_text("{}\n", encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        self.memory.record_run(root / "memory.json", run, root / "record.json")
+                    self.assertFalse((root / "memory.json").exists())
+                    self.assertFalse((root / "record.json").exists())
+
     def test_completed_run_uses_all_authoritative_validators(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = self._completed_run(Path(tmp))
@@ -1051,7 +1090,10 @@ class StrategyMemoryTests(unittest.TestCase):
             self.assertNotIn("outcome", implementation)
 
     def test_invalid_ablation_never_creates_performance_evidence(self) -> None:
-        for field in ("ablated_bench_sha256", "attribution_pct", "correctness"):
+        for field in (
+            "ablated_bench_sha256", "attribution_pct", "correctness",
+            "champion_correctness_false", "champion_correctness_missing",
+        ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 run = self._completed_run(Path(tmp), with_ablation=True)
                 attribution = run / "iterv1" / "attribution.json"
@@ -1062,6 +1104,22 @@ class StrategyMemoryTests(unittest.TestCase):
                         attribution,
                         lambda value: value["attributions"][0].update(
                             ablated_bench_sha256=hashlib.sha256(bench.read_bytes()).hexdigest()
+                        ),
+                    )
+                elif field.startswith("champion_correctness"):
+                    bench = run / "iterv1" / "bench.json"
+                    if field.endswith("false"):
+                        self._mutate_json(
+                            bench, lambda value: value["correctness"].update(passed=False)
+                        )
+                    else:
+                        self._mutate_json(
+                            bench, lambda value: value.pop("correctness")
+                        )
+                    self._mutate_json(
+                        attribution,
+                        lambda value: value["attributions"][0].update(
+                            champion_bench_sha256=hashlib.sha256(bench.read_bytes()).hexdigest()
                         ),
                     )
                 elif field == "ablated_bench_sha256":
@@ -1076,6 +1134,43 @@ class StrategyMemoryTests(unittest.TestCase):
                     )
                 record = self.memory.load_completed_run(run)
                 self.assertEqual(record["methods"]["performance"], {})
+
+    def test_verified_record_and_store_indices_reject_fabricated_evidence(self) -> None:
+        mutations = {
+            "bundle-outcome": lambda value: value["bundle"].update(outcome="confirmed_loss"),
+            "promotion": lambda value: value["bundle"].update(promotion_authority=True),
+            "method-order": lambda value: value["bundle"].update(method_ids=["z", "a"]),
+            "decision-hash": lambda value: value["bundle"]["decision_evidence"].update(sha256="0" * 64),
+            "evidence-extra": lambda value: value["evidence"][0].update(extra=True),
+            "performance-zero": lambda value: value["methods"]["performance"]["vectorize"].update(
+                attribution_ms=0.0, attribution_pct=0.0
+            ),
+            "performance-quality": lambda value: value["methods"]["performance"]["vectorize"].update(
+                evidence_quality="claimed"
+            ),
+            "implementation-performance": lambda value: value["methods"]["implementation"]["vectorize"].update(
+                outcome="positive"
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                run = self._completed_run(Path(tmp), with_ablation=True)
+                record = self.memory.load_completed_run(run)
+                mutate(record)
+                with self.assertRaises(ValueError):
+                    self.memory._validate_record(record)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self._completed_run(root, with_ablation=True)
+            memory = root / "memory.json"
+            self.memory.record_run(memory, run, root / "record.json")
+            payload = json.loads(memory.read_text("utf-8"))
+            entry = next(iter(payload["scopes"].values()))
+            next(iter(entry["bundles"].values()))["records"][0]["outcome"] = "inconclusive"
+            memory.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "index|bundle"):
+                self.memory.load_memory(memory)
 
     def test_record_writes_memory_before_output_and_retry_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
