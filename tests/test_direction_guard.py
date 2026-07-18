@@ -317,6 +317,31 @@ class DirectionCliTests(unittest.TestCase):
         )
         self.assertEqual(stale.returncode, 2)
 
+    def test_status_rejects_malformed_records_and_changed_external_tail(self) -> None:
+        self.assertEqual(self.run_cli(
+            "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
+        ).returncode, 0)
+        first = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        decision_path = self.run_dir / "direction-decisions" / "decision-0001.json"
+        original_tail = hashlib.sha256(decision_path.read_bytes()).hexdigest()
+        payload = json.loads(decision_path.read_text())
+        payload["unexpected"] = True
+        decision_path.write_text(json.dumps(payload), encoding="utf-8")
+        malformed = self.run_cli("status", "--run-dir", str(self.run_dir))
+        self.assertEqual(malformed.returncode, 2)
+        payload.pop("unexpected")
+        decision_path.write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
+        changed = self.run_cli(
+            "status", "--run-dir", str(self.run_dir),
+            "--expected-tail-sha256", original_tail
+        )
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn("expected tail", changed.stderr)
+
     def test_cli_rejects_second_init_chain_gaps_and_symlinked_ledger(self) -> None:
         self.assertEqual(self.run_cli(
             "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)

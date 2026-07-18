@@ -30,6 +30,13 @@ BOTTLENECK_CLASSES = {
 METRIC_DIRECTIONS = {"lower", "higher"}
 METRIC_KINDS = {"additive_time", "throughput", "composite"}
 REQUESTS = {"admit", "close", "reopen"}
+ACTIONS = {
+    "admit_direction",
+    "switch_to_higher_impact",
+    "close_direction",
+    "direction_closed",
+    "unrankable",
+}
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _DECISION_NAME = re.compile(r"decision-([0-9]{4})\.json\Z")
@@ -116,6 +123,24 @@ def _optional_positive(value: object, field: str) -> float | None:
     if result <= 0:
         raise ValueError(f"{field} must be positive when present")
     return result
+
+
+def _integer(value: object, field: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{field} must be an integer at least {minimum}")
+    return value
+
+
+def _optional_sha256(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return _sha256(value, field)
+
+
+def _optional_nonnegative(value: object, field: str) -> float | None:
+    if value is None:
+        return None
+    return _finite(value, field, minimum=0)
 
 
 def _canonical_digest(value: object) -> str:
@@ -405,6 +430,8 @@ def _effect_reachable(
     direction: Mapping, objective: Mapping, baseline_total_metric: float
 ) -> tuple[float, float, bool]:
     absolute = float(direction["component_metric"])
+    if absolute > baseline_total_metric:
+        raise ValueError("component_metric cannot exceed its frozen baseline total")
     percent = 100.0 * absolute / baseline_total_metric
     thresholds = (
         objective["minimum_effect_absolute"],
@@ -590,7 +617,7 @@ def _load_ledger(run_dir: Path, lineage: Mapping) -> list[dict]:
     records = []
     prior_sha = None
     for index, path in enumerate(_decision_files(run_dir), start=1):
-        record = load_json_strict(path)
+        record = _validate_decision_record(load_json_strict(path), lineage)
         if record.get("decision_index") != index:
             raise ValueError("direction decision index does not match its canonical filename")
         if record.get("lineage_sha256") != lineage_sha:
@@ -600,6 +627,89 @@ def _load_ledger(run_dir: Path, lineage: Mapping) -> list[dict]:
         records.append(record)
         prior_sha = artifact_store.sha256_file(path)
     return records
+
+
+def _validate_decision_record(value: object, lineage: Mapping) -> dict:
+    record = _closed(
+        value,
+        keys={
+            "schema_version",
+            "direction_id",
+            "direction_family_key",
+            "direction_key",
+            "claim_layer",
+            "measurement_window_sha256",
+            "evidence_sha256",
+            "portfolio_sha256",
+            "performance_gain_claimed",
+            "admitted",
+            "state",
+            "action",
+            "transition",
+            "reason",
+            "upper_bound_absolute",
+            "upper_bound_percent",
+            "recommended_direction_id",
+            "decision_index",
+            "lineage_sha256",
+            "previous_decision_sha256",
+        },
+        field="direction decision",
+    )
+    if record["schema_version"] != 1:
+        raise ValueError("direction decision schema_version must be 1")
+    family_key = _sha256(record["direction_family_key"], "decision.direction_family_key")
+    _family_entry(lineage, family_key)
+    action = _string(record["action"], "decision.action")
+    if action not in ACTIONS:
+        raise ValueError("decision.action is not supported")
+    state = _string(record["state"], "decision.state")
+    if state not in {"open", "closed"}:
+        raise ValueError("decision.state is not supported")
+    transition = _string(record["transition"], "decision.transition")
+    if transition not in REQUESTS | {"blocked"}:
+        raise ValueError("decision.transition is not supported")
+    admitted = record["admitted"]
+    if type(admitted) is not bool:
+        raise ValueError("decision.admitted must be boolean")
+    if admitted != (action == "admit_direction"):
+        raise ValueError("decision.admitted conflicts with its action")
+    if (state == "closed") != (action in {"close_direction", "direction_closed"}):
+        raise ValueError("decision.state conflicts with its action")
+    claim_layer = _string(record["claim_layer"], "decision.claim_layer")
+    if claim_layer not in CLAIM_LAYERS:
+        raise ValueError("decision.claim_layer is not supported")
+    recommended = record["recommended_direction_id"]
+    if recommended is not None:
+        recommended = _string(recommended, "decision.recommended_direction_id", safe_id=True)
+    if action in {"admit_direction", "switch_to_higher_impact"} and recommended is None:
+        raise ValueError("decision action requires a recommended direction")
+    if record["performance_gain_claimed"] is not False:
+        raise ValueError("direction decision cannot claim a performance gain")
+    percent = _optional_nonnegative(record["upper_bound_percent"], "decision.upper_bound_percent")
+    if percent is not None and percent > 100:
+        raise ValueError("decision.upper_bound_percent cannot exceed 100")
+    return {
+        **record,
+        "direction_id": _string(record["direction_id"], "decision.direction_id", safe_id=True),
+        "direction_family_key": family_key,
+        "direction_key": _sha256(record["direction_key"], "decision.direction_key"),
+        "claim_layer": claim_layer,
+        "measurement_window_sha256": _sha256(record["measurement_window_sha256"], "decision.measurement_window_sha256"),
+        "evidence_sha256": _sha256(record["evidence_sha256"], "decision.evidence_sha256"),
+        "portfolio_sha256": _sha256(record["portfolio_sha256"], "decision.portfolio_sha256"),
+        "admitted": admitted,
+        "state": state,
+        "action": action,
+        "transition": transition,
+        "reason": _string(record["reason"], "decision.reason"),
+        "upper_bound_absolute": _optional_nonnegative(record["upper_bound_absolute"], "decision.upper_bound_absolute"),
+        "upper_bound_percent": percent,
+        "recommended_direction_id": recommended,
+        "decision_index": _integer(record["decision_index"], "decision.decision_index", minimum=1),
+        "lineage_sha256": _sha256(record["lineage_sha256"], "decision.lineage_sha256"),
+        "previous_decision_sha256": _optional_sha256(record["previous_decision_sha256"], "decision.previous_decision_sha256"),
+    }
 
 
 def _latest_family(records: list[dict], family_key: str) -> dict | None:
@@ -625,6 +735,7 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--expected-tail-sha256")
     status = commands.add_parser("status", help="validate and summarize the ledger")
     status.add_argument("--run-dir", required=True)
+    status.add_argument("--expected-tail-sha256")
     return parser
 
 
@@ -647,6 +758,11 @@ def main(argv=None) -> int:
                 if records
                 else None
             )
+            expected_tail_argument = getattr(args, "expected_tail_sha256", None)
+            if expected_tail_argument is not None:
+                expected_tail = _sha256(expected_tail_argument, "expected_tail_sha256")
+                if current_tail != expected_tail:
+                    raise ValueError("expected tail SHA-256 does not match the ledger")
             if args.command == "status":
                 result = {
                     "schema_version": 1,
@@ -658,12 +774,6 @@ def main(argv=None) -> int:
             else:
                 if records and args.expected_tail_sha256 is None:
                     raise ValueError("expected tail SHA-256 is required before appending")
-                if args.expected_tail_sha256 is not None:
-                    expected_tail = _sha256(
-                        args.expected_tail_sha256, "expected_tail_sha256"
-                    )
-                    if current_tail != expected_tail:
-                        raise ValueError("expected tail SHA-256 does not match the ledger")
                 snapshot_raw = load_json_strict(args.portfolio)
                 verify_portfolio_artifacts(snapshot_raw, args.portfolio)
                 snapshot = _validate_portfolio(snapshot_raw)
