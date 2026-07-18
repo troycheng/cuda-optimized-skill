@@ -143,7 +143,7 @@ versions; they do not imply that every historical version has a matching Git tag
 
 ### V2.7
 
-Added direction-level admission, conservative impact ceilings, and an append-only stop/reopen ledger. The initial direction set is frozen, portfolio values are bound to normalized evidence and its raw measurement source, closed directions leave the recommendation pool, equal ceilings cannot be reordered by display names, and reopening requires an exact closed-record reference plus new window or target evidence. AI agents now decide whether a direction is still worth a candidate round before spending V2.6 budget.
+Added direction-level admission, conservative impact ceilings, and an append-only stop/reopen ledger. The initial direction set is frozen, normalized evidence is byte-bound to its raw measurement source, closed directions leave the recommendation pool, equal ceilings cannot be reordered by display names, and reopening requires an exact closed-record reference plus a new window or target, normalized evidence, and raw source. AI agents now decide whether a direction is still worth a candidate round before spending V2.6 budget.
 
 ### V2.6
 

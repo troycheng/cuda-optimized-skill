@@ -47,6 +47,7 @@ def portfolio() -> dict:
                 "bottleneck_class": "kernel",
                 "target_artifact": {"path": "target.json", "sha256": SHA_C},
                 "component_artifact": {"path": "selector-component.json", "sha256": SHA_D},
+                "source_artifact": {"path": "selector-profile.json", "sha256": SHA_A},
                 "component_id": "selector",
                 "metric_name": "latency",
                 "metric_unit": "us",
@@ -62,6 +63,7 @@ def portfolio() -> dict:
                 "bottleneck_class": "framework",
                 "target_artifact": {"path": "target.json", "sha256": SHA_C},
                 "component_artifact": {"path": "gather-component.json", "sha256": SHA_E},
+                "source_artifact": {"path": "gather-profile.json", "sha256": SHA_B},
                 "component_id": "gather",
                 "metric_name": "latency",
                 "metric_unit": "us",
@@ -193,10 +195,22 @@ class DirectionModelTests(unittest.TestCase):
             direction_guard.decide_direction(
                 snapshot, lineage, "selector", previous=closed, request="reopen"
             )
-        changed = copy.deepcopy(snapshot)
-        changed["measurement_window_artifact"]["sha256"] = SHA_E
-        changed["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
-        changed["directions"][0]["component_metric"] = 33.0
+        stale_source = copy.deepcopy(snapshot)
+        stale_source["measurement_window_artifact"]["sha256"] = SHA_E
+        stale_source["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
+        stale_source["directions"][0]["component_metric"] = 33.0
+        with self.assertRaisesRegex(ValueError, "new raw source"):
+            direction_guard.decide_direction(
+                stale_source,
+                lineage,
+                "selector",
+                previous=closed,
+                family_history=[closed],
+                closed_decision_sha256=SHA_C,
+                request="reopen",
+            )
+        changed = copy.deepcopy(stale_source)
+        changed["directions"][0]["source_artifact"]["sha256"] = SHA_F
         reopened = direction_guard.decide_direction(
             changed,
             lineage,
@@ -209,6 +223,7 @@ class DirectionModelTests(unittest.TestCase):
         self.assertEqual(reopened["transition"], "reopen")
         self.assertEqual(reopened["reopen_reason"], "new_measurement_window")
         self.assertEqual(reopened["closed_decision_sha256"], SHA_C)
+        self.assertEqual(reopened["source_sha256"], SHA_F)
         self.assertNotEqual(reopened["action"], "direction_closed")
 
     def test_reopen_cannot_reuse_any_evidence_from_the_family_history(self) -> None:
@@ -220,6 +235,7 @@ class DirectionModelTests(unittest.TestCase):
         changed = copy.deepcopy(snapshot)
         changed["measurement_window_artifact"]["sha256"] = SHA_E
         changed["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
+        changed["directions"][0]["source_artifact"]["sha256"] = SHA_F
         changed["directions"][0]["component_metric"] = 33.0
         reopened = direction_guard.decide_direction(
             changed,
@@ -236,6 +252,7 @@ class DirectionModelTests(unittest.TestCase):
         replayed = copy.deepcopy(changed)
         replayed["measurement_window_artifact"]["sha256"] = SHA_C
         replayed["directions"][0]["evidence_artifact"]["sha256"] = SHA_D
+        replayed["directions"][0]["source_artifact"]["sha256"] = SHA_C
         replayed["directions"][0]["component_metric"] = 40.0
         with self.assertRaisesRegex(ValueError, "used earlier"):
             direction_guard.decide_direction(
@@ -255,6 +272,7 @@ class DirectionModelTests(unittest.TestCase):
         changed = copy.deepcopy(snapshot)
         changed["measurement_window_artifact"]["sha256"] = SHA_E
         changed["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
+        changed["directions"][0]["source_artifact"]["sha256"] = SHA_F
         changed["directions"][0]["total_metric"] = 250.0
         changed["directions"][1]["total_metric"] = 250.0
         unchanged = direction_guard.decide_direction(changed, lineage, "selector")
@@ -325,14 +343,14 @@ class DirectionCliTests(unittest.TestCase):
             item["target_artifact"]["sha256"] = hashlib.sha256(artifacts["target.json"]).hexdigest()
             component_raw = artifacts[item["component_artifact"]["path"]]
             item["component_artifact"]["sha256"] = hashlib.sha256(component_raw).hexdigest()
+            source_path = item["evidence_artifact"]["path"].replace("evidence", "profile")
+            item["source_artifact"] = {
+                "path": source_path,
+                "sha256": hashlib.sha256(artifacts[source_path]).hexdigest(),
+            }
             evidence = {
                 "schema_version": 1,
-                "source_artifact": {
-                    "path": item["evidence_artifact"]["path"].replace("evidence", "profile"),
-                    "sha256": hashlib.sha256(
-                        artifacts[item["evidence_artifact"]["path"].replace("evidence", "profile")]
-                    ).hexdigest(),
-                },
+                "source_artifact": item["source_artifact"],
                 "component_artifact_sha256": item["component_artifact"]["sha256"],
                 "target_artifact_sha256": item["target_artifact"]["sha256"],
                 "measurement_window_sha256": payload["measurement_window_artifact"]["sha256"],
@@ -448,8 +466,12 @@ class DirectionCliTests(unittest.TestCase):
         payload["measurement_window_artifact"]["sha256"] = window_sha
         payload["directions"][0]["component_metric"] = 33.0
         for item in payload["directions"]:
+            source_path = self.root / item["source_artifact"]["path"]
+            source_path.write_bytes(f"new-{item['id']}-profile\n".encode())
+            item["source_artifact"]["sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
             evidence_path = self.root / item["evidence_artifact"]["path"]
             evidence = json.loads(evidence_path.read_text())
+            evidence["source_artifact"] = item["source_artifact"]
             evidence["measurement_window_sha256"] = window_sha
             evidence["component_metric"] = item["component_metric"]
             raw = (json.dumps(evidence, sort_keys=True) + "\n").encode()
@@ -508,8 +530,12 @@ class DirectionCliTests(unittest.TestCase):
         payload["measurement_window_artifact"]["sha256"] = window_sha
         payload["directions"][0]["component_metric"] = 33.0
         for item in payload["directions"]:
+            source_path = self.root / item["source_artifact"]["path"]
+            source_path.write_bytes(f"new-{item['id']}-profile\n".encode())
+            item["source_artifact"]["sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
             evidence_path = self.root / item["evidence_artifact"]["path"]
             evidence = json.loads(evidence_path.read_text())
+            evidence["source_artifact"] = item["source_artifact"]
             evidence["measurement_window_sha256"] = window_sha
             evidence["component_metric"] = item["component_metric"]
             raw = (json.dumps(evidence, sort_keys=True) + "\n").encode()

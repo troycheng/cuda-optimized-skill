@@ -49,13 +49,14 @@
     "direction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "claim_layer", "bottleneck_class", "target_artifact", "component_artifact", "component_id", "metric_name", "metric_unit", "metric_direction", "metric_kind", "total_metric", "component_metric", "evidence_artifact"],
+      "required": ["id", "claim_layer", "bottleneck_class", "target_artifact", "component_artifact", "source_artifact", "component_id", "metric_name", "metric_unit", "metric_direction", "metric_kind", "total_metric", "component_metric", "evidence_artifact"],
       "properties": {
         "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "claim_layer": {"enum": ["kernel", "runtime", "workload", "serving"]},
         "bottleneck_class": {"enum": ["kernel", "framework", "cpu_data", "transfer", "communication", "io", "environment"]},
         "target_artifact": {"$ref": "#/$defs/artifactRef"},
         "component_artifact": {"$ref": "#/$defs/artifactRef"},
+        "source_artifact": {"$ref": "#/$defs/artifactRef"},
         "component_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "metric_name": {"type": "string", "minLength": 1},
         "metric_unit": {"type": "string", "minLength": 1},

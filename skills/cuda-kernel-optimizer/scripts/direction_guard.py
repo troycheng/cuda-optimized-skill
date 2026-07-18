@@ -205,6 +205,7 @@ def _validate_direction(value: object, index: int) -> dict:
             "bottleneck_class",
             "target_artifact",
             "component_artifact",
+            "source_artifact",
             "component_id",
             "metric_name",
             "metric_unit",
@@ -243,6 +244,9 @@ def _validate_direction(value: object, index: int) -> dict:
         "target_artifact": _artifact_ref(direction["target_artifact"], f"{field}.target_artifact"),
         "component_artifact": _artifact_ref(
             direction["component_artifact"], f"{field}.component_artifact"
+        ),
+        "source_artifact": _artifact_ref(
+            direction["source_artifact"], f"{field}.source_artifact"
         ),
         "component_id": _string(
             direction["component_id"], f"{field}.component_id", safe_id=True
@@ -369,6 +373,8 @@ def verify_portfolio_artifacts(portfolio: object, portfolio_path: Path | str) ->
                 if evidence[key] != expected_value or type(evidence[key]) is bool:
                     raise ValueError(f"{field} evidence field {key} does not match the portfolio")
             source = _artifact_ref(evidence["source_artifact"], f"{field}.source_artifact")
+            if source != direction["source_artifact"]:
+                raise ValueError(f"{field} source artifact does not match the portfolio")
             source_raw = artifact_store.read_regular_bytes(base / source["path"])
             if hashlib.sha256(source_raw).hexdigest() != source["sha256"]:
                 raise ValueError(f"{field} source artifact digest does not match its bound file")
@@ -531,6 +537,7 @@ def decide_direction(
         "claim_layer": selected["claim_layer"],
         "measurement_window_sha256": validated["measurement_window_artifact"]["sha256"],
         "evidence_sha256": selected["evidence_artifact"]["sha256"],
+        "source_sha256": selected["source_artifact"]["sha256"],
         "portfolio_sha256": _canonical_digest(validated),
         "performance_gain_claimed": False,
         "reopen_reason": None,
@@ -556,6 +563,12 @@ def decide_direction(
             and previous_value.get("evidence_sha256") == selected["evidence_artifact"]["sha256"]
         ):
             raise ValueError("reopen requires new evidence not used earlier in the family chain")
+        used_sources = {item.get("source_sha256") for item in history_values}
+        if selected["source_artifact"]["sha256"] in used_sources or (
+            not history_values
+            and previous_value.get("source_sha256") == selected["source_artifact"]["sha256"]
+        ):
+            raise ValueError("reopen requires a new raw source not used earlier in the family chain")
         closed_sha = _sha256(closed_decision_sha256, "closed_decision_sha256")
         target_changed = previous_value.get("direction_key") != selected["direction_key"]
         window_changed = (
@@ -723,6 +736,9 @@ def _validate_reopen_history(
     used_evidence = {records[index]["evidence_sha256"] for index in family_indices}
     if record["evidence_sha256"] in used_evidence:
         raise ValueError("reopen evidence was used earlier in the family chain")
+    used_sources = {records[index]["source_sha256"] for index in family_indices}
+    if record["source_sha256"] in used_sources:
+        raise ValueError("reopen raw source was used earlier in the family chain")
     objective = lineage["objective"]
     minimum_absolute = objective["minimum_effect_absolute"] or 0.0
     minimum_percent = objective["minimum_effect_percent"] or 0.0
@@ -748,6 +764,7 @@ def _validate_decision_record(value: object, lineage: Mapping) -> dict:
             "claim_layer",
             "measurement_window_sha256",
             "evidence_sha256",
+            "source_sha256",
             "portfolio_sha256",
             "performance_gain_claimed",
             "admitted",
@@ -818,6 +835,7 @@ def _validate_decision_record(value: object, lineage: Mapping) -> dict:
         "claim_layer": claim_layer,
         "measurement_window_sha256": _sha256(record["measurement_window_sha256"], "decision.measurement_window_sha256"),
         "evidence_sha256": _sha256(record["evidence_sha256"], "decision.evidence_sha256"),
+        "source_sha256": _sha256(record["source_sha256"], "decision.source_sha256"),
         "portfolio_sha256": _sha256(record["portfolio_sha256"], "decision.portfolio_sha256"),
         "admitted": admitted,
         "state": state,

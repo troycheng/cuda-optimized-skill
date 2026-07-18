@@ -22,10 +22,14 @@ artifact without following symlinks before it admits or reopens anything. The
 evidence artifact is normalized JSON: it repeats the target, component, window,
 metric taxonomy, total, and component value. The CLI reads it once, hashes and
 parses the same bytes, requires every field to match the portfolio, then rehashes
-the raw profile or application artifact named by `source_artifact`. Site-owned
-collectors are responsible for deriving normalized values from that source; the
-generic guard does not parse arbitrary profiler formats. A bare AI-generated
-digest without the bound files is not evidence. The guard does not collect artifacts.
+the raw profile or application artifact named by `source_artifact`. Both its
+path and digest are repeated in the portfolio. Site-owned collectors or the user
+are responsible for deriving normalized values from that source; the generic
+guard does not parse arbitrary profiler formats and cannot prove that semantic
+derivation from hashes alone. Treat the normalized evidence/source pair as
+trusted input. The AI must not author or alter it. When the producer is
+adversarial, require a site-verified or signed sealed manifest outside this
+generic guard. The guard does not collect artifacts.
 
 ## Direction identity
 
@@ -131,7 +135,9 @@ Reopen only when all of the following are true:
    closure by at least their corresponding minimum effect.
 
 The reopened record stores a closed-set reason (`new_measurement_window` or
-`new_target_identity`) and the exact digest of the closed decision it reopens.
+`new_target_identity`), the exact digest of the closed decision it reopens, and
+the raw source digest. Evidence and raw source digests must both be new across
+that family history.
 
 A prose rewrite, new mechanism name, caller-invented component ID, unbound
 digest, new iteration number, or changed minimum effect is not reopen evidence.

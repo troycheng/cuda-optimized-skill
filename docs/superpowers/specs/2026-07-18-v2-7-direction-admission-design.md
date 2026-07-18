@@ -141,6 +141,12 @@ lineage file once. Timing claims are input evidence; the generic tool does not
 parse arbitrary Nsys or application formats. Site-owned collectors must
 normalize their values and bind the source artifact.
 
+The collector output and its source are trusted inputs. The generic guard
+proves byte identity, consistency, and history; hashes alone cannot prove that
+the normalized values were semantically derived from the named source. An
+adversarial producer requires a site-verified or signed sealed manifest outside
+this generic contract. The AI must not create or edit collector evidence.
+
 ## State machine
 
 ```mermaid

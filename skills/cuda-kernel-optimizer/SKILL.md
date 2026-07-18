@@ -26,7 +26,7 @@ For same-layer additive time it uses a full-elimination upper bound and returns 
 
 The guard never runs the target and never claims a gain. Its CLI rehashes bound environment, window, target,
 component, normalized evidence, and its raw source artifact. Only `admitted: true` enters V2.6; `unrankable` is hard non-admission. Record every
-reported stop with `--request close` before more candidate work. Reopen requires verified new evidence, a
+reported stop with `--request close` before more candidate work. Reopen requires verified new evidence, a new raw source, and a
 materially larger frozen-baseline envelope. Pass the last status tail on every append. `host_policy` stays `recommend_only`. Read
 `references/direction_admission.md`; contracts include `templates/direction_portfolio.schema.json`, `templates/direction_evidence.schema.json`,
 `templates/direction_lineage.schema.json`, and `templates/direction_decision.schema.json`.
