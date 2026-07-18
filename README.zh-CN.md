@@ -1,187 +1,123 @@
-# cuda-kernel-optimizer
-
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="asset/logo-dark.svg">
-    <img src="asset/logo.svg" width="88" alt="cuda-kernel-optimizer Thread Tile logo">
+    <source media="(prefers-color-scheme: dark)" srcset="asset/logo-wordmark-dark.svg">
+    <img src="asset/logo-wordmark.svg" width="640" alt="CUDA Kernel Optimizer">
   </picture>
 </p>
 
-[English](README.md) | **简体中文**
+<p align="center"><strong>以证据驱动 Codex 优化 CUDA、CUTLASS 与 Triton</strong></p>
 
-`cuda-kernel-optimizer` 是一个面向 Codex 的 CUDA 性能优化项目，核心能力以
-skill 形式提供。它既能优化单个 CUDA、CUTLASS 或 Triton kernel，也能分析和
-优化用户提供的完整 GPU workload。
+<p align="center">
+  <a href="docs/getting-started.md">快速开始</a> ·
+  <a href="docs/workflows.md">工作流</a> ·
+  <a href="docs/evidence-and-safety.md">证据与安全</a> ·
+  <a href="skills/cuda-kernel-optimizer/examples/walkthrough.md">示例</a> ·
+  <a href="README.md">English</a>
+</p>
 
-用户提供可运行代码、测试环境和性能目标后，AI 会完成环境检查、性能分析
-（profiling）、瓶颈定位、代码修改和成对 A/B 测试。修改只有在结果正确、性能提升
-达到目标且所有约束满足时才会保留。
+## 项目简介
 
-项目可以修改授权范围内的 kernel、运行参数和项目代码。涉及驱动、权限、频率、
-功耗或其他宿主机配置时，只给出建议，不会自动执行。
+`cuda-kernel-optimizer` 是一个供 Codex 使用的可复用性能优化 skill。它可以优化单个
+CUDA、CUTLASS 或 Triton kernel，诊断完整 GPU workload，验证 kernel 改动能否改善
+serving 目标，也可以在不启动原程序的情况下分析已有 Nsight Compute report。
 
-## 项目是什么
+它把环境检查、profiling、限定范围的代码修改、正确性验证和成对性能测量组织成一个
+可恢复的工作流。提供完整 workload 后，诊断范围不局限于 GPU kernel，还包括框架调度、
+CPU 处理、数据传输、多卡通信、I/O 和运行环境。
 
-这是一个由 AI 执行的性能优化工作流。它把环境检查、基准结果（baseline）、profiling、候选修改、
-正确性校验和性能评测串成可恢复的过程，并把每次判断所依据的数据保存下来。
+Skill 只会修改已声明的项目路径和隔离项目环境，不会自动修改宿主机配置。驱动、权限、
+频率、功耗限制和系统设置只提供建议。
 
-项目不会预设瓶颈一定在 kernel 内。面对完整 GPU workload 时，分析范围还包括
-深度学习框架调度（framework scheduling）、CPU 数据处理、主机与设备间传输、多 GPU 通信、
-I/O 和运行环境。
-如果证据指向宿主机配置，结果中会给出建议，但不会直接改动机器。
+## 快速开始
 
-## 可以解决哪些问题
+安装由 Codex 完成。让 Codex 从
+[troycheng/cuda-optimized-skill](https://github.com/troycheng/cuda-optimized-skill)
+仓库的 `skills/cuda-kernel-optimizer` 路径安装或更新 skill，然后开启新会话以重新加载
+指令。
 
-| 任务 | 适用场景 | AI 会做什么 | 主要结果 |
-|---|---|---|---|
-| **优化单个 kernel** | 已有 CUDA、CUTLASS 或 Triton 实现，并有可比较的参考实现（reference） | 检查正确性，分析编译与 profiling 数据，迭代实现并做成对性能测试 | 修改后的 kernel 和可复核的性能收益 |
-| **优化完整 GPU workload** | 延迟、吞吐或成本不达标，但瓶颈位置尚不确定 | 运行 workload，区分 kernel、framework、CPU、传输、通信、I/O 与环境问题，再修改授权范围内的代码或参数 | 瓶颈结论、修改方案和端到端结果 |
-| **在真实 workload 上验证优化** | kernel 跑分快了，需要确认业务指标是否同步改善 | 在用户提供的真实输入上比较修改前后结果，同时检查精度、显存、输出等约束 | 可以采用的端到端结果，或不采用修改的明确原因 |
-| **分析已有 NCU report** | 已经有 `.ncu-rep`，不希望重新启动被测程序 | 读取 report，整理热点 kernel、关键指标和可能的限制因素 | 独立的 NCU 分析结果，不触发新的 GPU workload |
+请提供可运行目标、正确性 reference、测试环境、性能目标、业务约束和允许修改的范围。
+真实 workload 必须由用户提供；skill 不会自行下载或编造。
 
-## 需要提供什么
+`quick` 最长 45 分钟；`balanced` 是默认的 3 小时预算；`thorough` 最长 10 小时，
+用于更广的搜索和验证。
 
-项目能否给出可靠结论，取决于输入是否能代表真实目标。通常需要：
+> 使用 cuda-kernel-optimizer 优化当前目录中的 Triton kernel。先确认 reference 和输入，保持宿主机设置不变，只有正确性与成对性能证据都通过时才保留改动。
 
-- **可运行对象**：原始 kernel（baseline）、完整 workload，或已有的 NCU report；
-- **正确性标准**：Python 参考实现（reference）、测试用例、校验函数或可比较的输出；
-- **测试环境**：目标 GPU、驱动和依赖已经可用，或者允许 AI 在隔离环境中补齐依赖；
-- **性能目标**：例如延迟、吞吐、显存、成本或某个业务 KPI；
-- **约束条件**：精度、输出一致性、显存上限、允许修改的文件和不能触碰的配置；
-- **计算预算**：允许使用的时间和搜索规模。
+输入清单和第一次任务边界见[快速开始](docs/getting-started.md)。
 
-真实 workload 必须由用户提供。项目不会自行下载、编造或用微基准替代真实业务输入。
-如果只有 kernel 和 reference，可以确认 kernel 级结果，但不能把它表述为端到端收益。
+## 选择工作流
 
-用户未指定预算时，默认使用 `balanced`。
+| 工作流 | 适用场景 | 结论边界 |
+|---|---|---|
+| **Kernel 优化** | 已有 CUDA、CUTLASS 或 Triton 实现及可比较 reference | 产出 kernel 级结论，包括正确性、编译器/profiler 证据、成对样本和置信度结果 |
+| **完整 workload** | 延迟、吞吐或成本未达目标，但瓶颈未知 | 覆盖 kernel、框架、CPU、传输、通信、I/O 和环境的诊断，并进行限定范围的端到端评测 |
+| **Serving 验证** | Kernel benchmark 已提升，需要验证产品 KPI | 冻结 c1/c2/c4/c8/c12 分层、serving-stack identity、逐层约束，并分别判定性能和证据完整性 |
+| **已有 NCU report** | 已有 `.ncu-rep`，且不能重新运行被 profile 的 workload | 只读分析 report；导入结果不能证明当前 counter 权限或当前目标 identity |
 
-| 预算 | 最长时间 | 适用情况 |
-|---|---:|---|
-| `quick` | 45 分钟 | 快速检查思路，缩小候选范围 |
-| `balanced` | 3 小时 | 默认选择，在搜索范围和耗时之间取平衡 |
-| `thorough` | 10 小时 | 候选较多、需要更完整 profiling 和验证 |
+[工作流说明](docs/workflows.md)列出每条路径需要的输入、允许修改的范围以及能够支持的结论。
 
-最长时间是上限，不是固定耗时。达到明确结论、没有可行候选或证据不足时，任务可以提前结束。
-
-## AI 会如何执行
+## 工作方式
 
 ```mermaid
 flowchart LR
-    goal["目标、代码与约束"] --> environment["检查测试环境"]
+    goal["目标、代码和约束"] --> environment["检查测试环境"]
     environment --> baseline["建立可复现 baseline"]
-    baseline --> profiling["profiling 与瓶颈分析"]
-    profiling --> change["生成边界明确的修改"]
-    change --> evaluation["正确性与成对性能评测"]
+    baseline --> profiling["Profiling 并定位瓶颈"]
+    profiling --> change["创建限定范围的修改"]
+    change --> evaluation["检查正确性和成对性能"]
     evaluation --> keep["证据充分：保留修改"]
     evaluation --> restore["证据不足：恢复原实现"]
 ```
 
-AI 会先确认任务目标和允许修改的范围，再检查环境与输入。baseline 可复现后才开始
-profiling 和候选修改。每次修改都绑定到明确的文件范围，并在相同测试条件下与原实现
-比较。任务中断时可以从已保存的检查点继续，不需要重跑已经完成且身份未变化的阶段。
+工作流在正式计时前冻结目标和授权范围。每个候选方案都绑定 source、binary、输入、
+schedule、raw rows 和运行时 identity。被拒绝或中断的尝试会留下记录，但不会覆盖之前
+有效的结果。
 
-外部模型可以作为可选 reviewer 检查分析和修改理由。reviewer 只提供意见，最终是否
-保留修改仍由本地正确性和性能证据决定。
+## 以证据为准，而不是选择最快样本
 
-## 如何确认优化结果
+性能结论只有在证据闭合后才能成立：
 
-项目使用成对 A/B 测试比较修改前后的性能。相同输入会按交错顺序反复运行，降低机器
-波动、缓存状态和运行顺序对结论的影响。
+- 正确性和所有声明约束通过；
+- 成对 A/B 样本使用冻结的 schedule 和 aggregation 规则；
+- 默认 95% 置信区间支持相对与绝对提升门槛，并且有效 pair 数量足够；
+- continuous shared-host guard 完整覆盖正式计时阶段，不存在 unknown、缺采样、过期或
+  污染样本；
+- 正式 serving run 覆盖全部 c1/c2/c4/c8/c12 分层，并把 timed binary 绑定到已证明的
+  execution path。
 
-一项修改需要同时满足以下条件：
+正式证据出现不确定、必需字段缺失、identity 漂移或环境污染时必须 fail closed。冻结的
+实验开始后，不能排除不利样本，也不能只重试一侧 role 来补救结果。
 
-1. **正确性通过**：输出与 reference 或 workload 的校验规则一致；
-2. **收益达到门槛**：性能提升不只是单次偶然值；
-3. **统计证据支持结论**：默认检查 95% 置信区间（confidence interval）；
-4. **约束全部满足**：精度、显存、校验和（checksum）或业务指标没有越界；
-5. **测试对象没有漂移**：比较期间使用同一份输入、代码身份和环境定义。
+`performance_verdict` 与 `evidence_integrity` 分开判定：更快的数字不能补偿无效 attempt。
+安装后的 `self_check` 只执行 CPU/static 检查，不验证 GPU 环境。Claim ladder 和宿主机
+边界见[证据与安全](docs/evidence-and-safety.md)。
 
-结果变差、置信区间无法确认收益、正确性失败或任一约束越界时，项目会恢复原实现，
-并记录失败发生在哪个环节。缺少 NCU counter 权限等可选信息时，会明确标注证据降级，
-不会把缺失数据写成成功结论。
+## 已测试范围
 
-V2.5 的正式 serving attempt 只有在 continuous shared-host guard 与冻结的
-c1/c2/c4/c8/c12 serving strata 均通过校验后，才能以 `valid` 状态封存。结果会把
-`evidence_integrity` 与性能结论分开记录。安装后的 `self_check` 只运行
-CPU/static 检查，不代表新增 GPU 验证。
+以下数字是历史验收证据，不代表任意项目都能获得相同提升。本次文档修改不会从
+CPU/static 检查推断出新的 GPU 结果。
 
-## 最终会得到什么
-
-一次完整任务会交付：
-
-- **修改后的代码**：仅包含已通过验证并在授权范围内的改动；
-- **瓶颈分析**：说明限制因素位于 kernel、framework、CPU、传输、通信、I/O 还是环境；
-- **性能对比**：基准结果（baseline）、候选结果、成对样本、提升比例和置信区间；
-- **正确性与约束结果**：列出每项检查是否通过；
-- **未采用方案**：说明哪些尝试无效、退化或证据不足，避免重复试错；
-- **宿主机建议**：需要驱动、权限、频率或系统调整时给出操作建议和依据；
-- **可恢复记录**：保存任务状态和关键结果，便于中断后继续或独立复核。
-
-如果没有找到可靠收益，最终结果会明确写成「保留原实现」，而不是选择跑分最好但证据
-不足的候选。
-
-## 修改范围与安全限制
-
-| 范围 | AI 可以做什么 | 限制 |
+| 验证路径 | 已记录结果 | 含义 |
 |---|---|---|
-| 项目代码 | 修改用户明确授权的 kernel、调用代码和运行参数 | 实际改动必须与声明范围一致 |
-| 隔离环境 | 在用户提供的隔离环境中安装或调整项目依赖 | 必须与项目目录和宿主机系统目录分开 |
-| 宿主机配置 | 收集信息并提出建议 | 驱动、权限、频率、功耗和系统配置不会自动执行 |
-| 第三方 reviewer | 接收分析摘要并返回审阅意见 | 不能运行回调命令，也不能决定是否保留修改 |
+| CPU/static 验收 | 746 项测试：741 通过，5 项 RTX 5090 opt-in 测试跳过，0 失败 | 覆盖状态恢复、证据绑定、shared-host guard、超时、恢复和输入验证 |
+| 物理 RTX 5090 路径 | 13/13 项检查耗时 34.302 秒；目标侧 NCU 返回 `ERR_NVGPUCTRPERM` | GPU 工作流已运行，且未修改权限或驱动策略 |
+| 可复现 workload fixture | 端到端延迟提升 60.4616%，约束通过 | 只证明该 fixture 上的完整工作流 |
+| 用户提供的 vLLM workload | Kernel 指标提升 26.3287%，真实 workload 变化 -0.0097% | 更快的 kernel 没有改善产品 workload，因此保留原实现 |
+| 导入 NCU report | 未启动原程序并解析 140 项指标 | 不代表当前 counter 权限或当前 runtime identity 有效 |
 
-超出授权范围的文件变化、workload 漂移、预算过期或验证失败都会停止当前候选。回滚失败
-时任务会标记为需要人工恢复，不会继续覆盖现场。
+详细版本和 opt-in 条件见[兼容性](docs/compatibility.md)。历史性能数字不是通用性能承诺。
 
-## 使用示例
+## 文档
 
-> 优化当前目录里的 Triton kernel，目标机器是 RTX 5090。先确认 reference 和测试输入可用，再分析瓶颈；只有正确性和成对性能结果都通过时才保留修改。
-
-> 分析这个 GPU workload 的延迟瓶颈。测试环境已经准备好，允许修改项目代码和运行参数；涉及宿主机配置时只给建议。
-
-> 分析这个 NCU report，找出最值得处理的 kernel 和主要限制因素。不要重新运行原 workload，也不要修改驱动或 counter 权限。
-
-> 使用 balanced 预算验证这次 CUDA 优化在真实 workload 上是否有效。主指标是 p95 延迟，显存不能增加超过 5%。
-
-## 测试情况与兼容性
-
-项目在 CPU 测试和物理 RTX 5090 环境中都做过验收。下面的数据说明工作流本身经过了
-哪些验证，不代表任意项目都能获得相同提升。
-
-| 验证内容 | 环境与结果 | 说明 |
-|---|---|---|
-| 自动化测试 | 共 746 项；741 项通过，5 项需要手动启用的 RTX 5090 测试在非 GPU 环境跳过，0 项失败 | 覆盖状态恢复、证据绑定、shared-host guard、超时、回滚和输入校验 |
-| RTX 5090 完整测试 | 当前测试环境在 34.302 秒内通过 13/13 项检查；目标程序的 NCU profiling 返回 `ERR_NVGPUCTRPERM` | 覆盖 CUDA、CUTLASS、Triton 和完整 GPU workload 优化流程；没有修改权限或驱动策略 |
-| 可复现 workload 样例 | 端到端延迟改善 60.4616%，约束检查通过 | 用于验证从瓶颈分析到保留修改的完整路径 |
-| 用户提供的 vLLM workload | kernel 指标改善 26.3287%，真实 workload 变化 -0.0097% | 端到端收益不足，因此保留原实现，证明 kernel 跑分快不等于业务收益 |
-| 已有 NCU report | 在不启动原程序的情况下解析 140 项性能指标 | 性能计数器权限未重新探测；导入 report 不能说明当前目标程序是否有读取权限 |
-
-优化 kernel 需要 Python 3.10+、可用的 CUDA GPU 与驱动，以及相应工具链。Triton
-任务需要 `triton`；CUDA/CUTLASS 编译需要 `nvcc` 和 CUTLASS headers；SASS 分析
-使用 `cuobjdump`。NCU profiling 是可选能力，无法运行时会明确标记为不可用或证据不完整。
-
-独立 NCU report 分析只需要兼容的 `ncu` 和 report 文件，不会启动被分析的程序。
-项目不重新分发 CUDA、CUTLASS、Triton 或 Nsight Compute。
-
-详细环境、版本和 SM120 验收方式见 [兼容性说明](skills/cuda-kernel-optimizer/references/compatibility.md)
-与 [RTX 5090 测试说明](tests/gpu/sm120/README.md)。
-
-## 安装与进一步文档
-
-安装由 Codex 完成。将 [GitHub 仓库](https://github.com/troycheng/cuda-optimized-skill)
-和 skill 路径 `skills/cuda-kernel-optimizer` 提供给 Codex，要求安装或更新该 skill；
-安装后新建会话，使 Codex 重新加载技能说明。内网只读镜像位于
-[GitLab](https://git.yukework.com/mlsys/cuda-optimized-skill)。
-
-进一步文档：
-
+- [快速开始](docs/getting-started.md)
+- [工作流选择](docs/workflows.md)
+- [证据与安全](docs/evidence-and-safety.md)
+- [兼容性](docs/compatibility.md)
 - [AI 执行协议](skills/cuda-kernel-optimizer/SKILL.md)
-- [完整 workload controller 示例](skills/cuda-kernel-optimizer/examples/workload-controller.md)
-- [Kernel 优化 walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
-- [优化方法目录](skills/cuda-kernel-optimizer/references/optimization_catalog.md)
-- [兼容性说明](skills/cuda-kernel-optimizer/references/compatibility.md)
-- [V2.5 evidence automation](skills/cuda-kernel-optimizer/references/evidence_automation.md)
-- [V2.5 migration notes](skills/cuda-kernel-optimizer/references/migration_v2_5.md)
-- [RTX 5090 测试说明](tests/gpu/sm120/README.md)
+- [Kernel 与 workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
+- [V2.5 正式证据参考](skills/cuda-kernel-optimizer/references/evidence_automation.md)
+- [Canonical 兼容性参考](skills/cuda-kernel-optimizer/references/compatibility.md)
+- [RTX 5090 opt-in 测试说明](tests/gpu/sm120/README.md)
 - [MIT License](LICENSE)
 
-这个项目独立于 CUTLASS、Triton 和 Nsight Compute。相关依赖按各自许可证安装和使用。
+本项目独立于 CUDA、CUTLASS、Triton 和 Nsight Compute。请按照各依赖自身的许可证使用。
