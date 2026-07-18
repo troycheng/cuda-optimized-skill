@@ -36,6 +36,7 @@ _V2_6_SCHEMAS = (
 )
 _V2_7_SCHEMAS = (
     "direction_portfolio.schema.json",
+    "direction_evidence.schema.json",
     "direction_lineage.schema.json",
     "direction_decision.schema.json",
 )

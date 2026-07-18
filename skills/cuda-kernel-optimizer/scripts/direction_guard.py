@@ -30,6 +30,7 @@ BOTTLENECK_CLASSES = {
 METRIC_DIRECTIONS = {"lower", "higher"}
 METRIC_KINDS = {"additive_time", "throughput", "composite"}
 REQUESTS = {"admit", "close", "reopen"}
+REOPEN_REASONS = {"new_measurement_window", "new_target_identity"}
 ACTIONS = {
     "admit_direction",
     "switch_to_higher_impact",
@@ -323,21 +324,54 @@ def verify_portfolio_artifacts(portfolio: object, portfolio_path: Path | str) ->
     validated = _validate_portfolio(portfolio)
     base = Path(portfolio_path).parent
     references = [
-        ("environment_artifact", validated["environment_artifact"]),
-        ("measurement_window_artifact", validated["measurement_window_artifact"]),
+        ("environment_artifact", validated["environment_artifact"], None),
+        ("measurement_window_artifact", validated["measurement_window_artifact"], None),
     ]
     for direction in validated["directions"]:
         references.extend(
             (
-                (f"{direction['id']}.target_artifact", direction["target_artifact"]),
-                (f"{direction['id']}.component_artifact", direction["component_artifact"]),
-                (f"{direction['id']}.evidence_artifact", direction["evidence_artifact"]),
+                (f"{direction['id']}.target_artifact", direction["target_artifact"], None),
+                (f"{direction['id']}.component_artifact", direction["component_artifact"], None),
+                (f"{direction['id']}.evidence_artifact", direction["evidence_artifact"], direction),
             )
         )
-    for field, reference in references:
-        actual = artifact_store.sha256_file(base / reference["path"])
+    for field, reference, direction in references:
+        raw = artifact_store.read_regular_bytes(base / reference["path"])
+        actual = hashlib.sha256(raw).hexdigest()
         if actual != reference["sha256"]:
             raise ValueError(f"{field} artifact digest does not match its bound file")
+        if direction is not None:
+            evidence = _closed(
+                load_json_bytes(raw, field),
+                keys={
+                    "schema_version", "source_artifact", "component_artifact_sha256",
+                    "target_artifact_sha256", "measurement_window_sha256",
+                    "claim_layer", "bottleneck_class", "metric_name", "metric_unit",
+                    "metric_direction", "metric_kind", "total_metric", "component_metric",
+                },
+                field=field,
+            )
+            expected = {
+                "schema_version": 1,
+                "component_artifact_sha256": direction["component_artifact"]["sha256"],
+                "target_artifact_sha256": direction["target_artifact"]["sha256"],
+                "measurement_window_sha256": validated["measurement_window_artifact"]["sha256"],
+                "claim_layer": direction["claim_layer"],
+                "bottleneck_class": direction["bottleneck_class"],
+                "metric_name": direction["metric_name"],
+                "metric_unit": direction["metric_unit"],
+                "metric_direction": direction["metric_direction"],
+                "metric_kind": direction["metric_kind"],
+                "total_metric": direction["total_metric"],
+                "component_metric": direction["component_metric"],
+            }
+            for key, expected_value in expected.items():
+                if evidence[key] != expected_value or type(evidence[key]) is bool:
+                    raise ValueError(f"{field} evidence field {key} does not match the portfolio")
+            source = _artifact_ref(evidence["source_artifact"], f"{field}.source_artifact")
+            source_raw = artifact_store.read_regular_bytes(base / source["path"])
+            if hashlib.sha256(source_raw).hexdigest() != source["sha256"]:
+                raise ValueError(f"{field} source artifact digest does not match its bound file")
     return validated
 
 
@@ -459,6 +493,9 @@ def decide_direction(
     direction_id: str,
     *,
     previous: Mapping | None = None,
+    family_history: list[Mapping] | None = None,
+    latest_by_family: Mapping[str, Mapping] | None = None,
+    closed_decision_sha256: str | None = None,
     request: str = "admit",
 ) -> dict:
     validated = _validate_portfolio(portfolio)
@@ -470,15 +507,21 @@ def decide_direction(
         raise ValueError("portfolio objective drifted from the frozen lineage")
     if validated["environment_artifact"]["sha256"] != frozen["environment_sha256"]:
         raise ValueError("portfolio environment drifted from the frozen lineage")
-    for item in validated["directions"]:
-        _family_entry(frozen, item["direction_family_key"])
+    current_families = sorted(item["direction_family_key"] for item in validated["directions"])
+    frozen_families = [item["direction_family_key"] for item in frozen["direction_families"]]
+    if current_families != frozen_families:
+        raise ValueError("portfolio must preserve frozen direction family set")
     matches = [item for item in validated["directions"] if item["id"] == direction_id]
     if len(matches) != 1:
         raise ValueError("direction_id is not a unique portfolio direction")
     selected = matches[0]
     previous_value = dict(previous) if previous is not None else None
+    history_values = [dict(item) for item in (family_history or [])]
+    latest_values = {key: dict(value) for key, value in (latest_by_family or {}).items()}
     if previous_value is not None and previous_value.get("direction_family_key") != selected["direction_family_key"]:
         raise ValueError("previous decision belongs to a different direction family")
+    if any(item.get("direction_family_key") != selected["direction_family_key"] for item in history_values):
+        raise ValueError("family history contains another direction family")
 
     base = {
         "schema_version": 1,
@@ -490,6 +533,8 @@ def decide_direction(
         "evidence_sha256": selected["evidence_artifact"]["sha256"],
         "portfolio_sha256": _canonical_digest(validated),
         "performance_gain_claimed": False,
+        "reopen_reason": None,
+        "closed_decision_sha256": None,
     }
     comparable = _comparable(selected, frozen["objective"])
     absolute = percent = None
@@ -505,16 +550,24 @@ def decide_direction(
             raise ValueError("reopen requires the latest closed family decision")
         if not comparable or not reachable:
             raise ValueError("reopen evidence does not meet the frozen admission floor")
-        if previous_value.get("evidence_sha256") == selected["evidence_artifact"]["sha256"]:
-            raise ValueError("reopen requires new evidence")
-        material_change = (
+        used_evidence = {item.get("evidence_sha256") for item in history_values}
+        if selected["evidence_artifact"]["sha256"] in used_evidence or (
+            not history_values
+            and previous_value.get("evidence_sha256") == selected["evidence_artifact"]["sha256"]
+        ):
+            raise ValueError("reopen requires new evidence not used earlier in the family chain")
+        closed_sha = _sha256(closed_decision_sha256, "closed_decision_sha256")
+        target_changed = previous_value.get("direction_key") != selected["direction_key"]
+        window_changed = (
             previous_value.get("measurement_window_sha256")
             != validated["measurement_window_artifact"]["sha256"]
-            or previous_value.get("direction_key") != selected["direction_key"]
-            or previous_value.get("upper_bound_absolute") != absolute
         )
-        if not material_change:
-            raise ValueError("reopen requires a new window, target, or impact envelope")
+        if not target_changed and not window_changed:
+            raise ValueError("reopen requires a new measurement window or target identity")
+        base["reopen_reason"] = (
+            "new_target_identity" if target_changed else "new_measurement_window"
+        )
+        base["closed_decision_sha256"] = closed_sha
         minimum_absolute = frozen["objective"]["minimum_effect_absolute"] or 0.0
         minimum_percent = frozen["objective"]["minimum_effect_percent"] or 0.0
         previous_absolute = previous_value.get("upper_bound_absolute")
@@ -558,13 +611,26 @@ def decide_direction(
         recommended = None
         admitted = False
     else:
+        closed_families = {
+            key for key, value in latest_values.items() if value.get("state") == "closed"
+        }
+        if request == "reopen":
+            closed_families.discard(selected["direction_family_key"])
         candidates = [
             item
             for item in validated["directions"]
             if _comparable(item, frozen["objective"])
+            and item["direction_family_key"] not in closed_families
         ]
-        leader = max(candidates, key=lambda item: (item["component_metric"], item["id"]))
-        if leader["direction_family_key"] != selected["direction_family_key"]:
+        higher = [
+            item for item in candidates
+            if item["component_metric"] > selected["component_metric"]
+        ]
+        if higher:
+            leader = max(
+                higher,
+                key=lambda item: (item["component_metric"], item["direction_key"]),
+            )
             action = "switch_to_higher_impact"
             state = "open"
             reason = "another same-layer direction has a larger full-elimination upper bound"
@@ -612,21 +678,63 @@ def _decision_files(run_dir: Path) -> list[Path]:
     return [path for _, path in files]
 
 
-def _load_ledger(run_dir: Path, lineage: Mapping) -> list[dict]:
+def _load_ledger(run_dir: Path, lineage: Mapping) -> tuple[list[dict], list[str]]:
     lineage_sha = _canonical_digest(lineage)
     records = []
+    hashes = []
     prior_sha = None
     for index, path in enumerate(_decision_files(run_dir), start=1):
-        record = _validate_decision_record(load_json_strict(path), lineage)
+        raw = artifact_store.read_regular_bytes(path)
+        file_sha = hashlib.sha256(raw).hexdigest()
+        record = _validate_decision_record(load_json_bytes(raw, str(path)), lineage)
         if record.get("decision_index") != index:
             raise ValueError("direction decision index does not match its canonical filename")
         if record.get("lineage_sha256") != lineage_sha:
             raise ValueError("direction decision is bound to another lineage")
         if record.get("previous_decision_sha256") != prior_sha:
             raise ValueError("direction decision hash chain is broken")
+        _validate_reopen_history(record, records, hashes, lineage)
         records.append(record)
-        prior_sha = artifact_store.sha256_file(path)
-    return records
+        hashes.append(file_sha)
+        prior_sha = file_sha
+    return records, hashes
+
+
+def _validate_reopen_history(
+    record: Mapping, records: list[dict], hashes: list[str], lineage: Mapping
+) -> None:
+    if record["transition"] != "reopen":
+        return
+    family_indices = [
+        index for index, prior in enumerate(records)
+        if prior["direction_family_key"] == record["direction_family_key"]
+    ]
+    if not family_indices:
+        raise ValueError("reopen has no earlier family decision")
+    closed_index = family_indices[-1]
+    closed = records[closed_index]
+    if closed["state"] != "closed" or record["closed_decision_sha256"] != hashes[closed_index]:
+        raise ValueError("reopen must reference the latest closed family decision")
+    target_changed = record["direction_key"] != closed["direction_key"]
+    window_changed = record["measurement_window_sha256"] != closed["measurement_window_sha256"]
+    expected_reason = "new_target_identity" if target_changed else "new_measurement_window"
+    if record["reopen_reason"] != expected_reason or (not target_changed and not window_changed):
+        raise ValueError("reopen reason does not match the target or measurement-window change")
+    used_evidence = {records[index]["evidence_sha256"] for index in family_indices}
+    if record["evidence_sha256"] in used_evidence:
+        raise ValueError("reopen evidence was used earlier in the family chain")
+    objective = lineage["objective"]
+    minimum_absolute = objective["minimum_effect_absolute"] or 0.0
+    minimum_percent = objective["minimum_effect_percent"] or 0.0
+    if (
+        record["upper_bound_absolute"] is None
+        or record["upper_bound_percent"] is None
+        or closed["upper_bound_absolute"] is None
+        or closed["upper_bound_percent"] is None
+        or record["upper_bound_absolute"] < closed["upper_bound_absolute"] + minimum_absolute
+        or record["upper_bound_percent"] < closed["upper_bound_percent"] + minimum_percent
+    ):
+        raise ValueError("reopen does not satisfy the frozen material-increase rule")
 
 
 def _validate_decision_record(value: object, lineage: Mapping) -> dict:
@@ -653,6 +761,8 @@ def _validate_decision_record(value: object, lineage: Mapping) -> dict:
             "decision_index",
             "lineage_sha256",
             "previous_decision_sha256",
+            "reopen_reason",
+            "closed_decision_sha256",
         },
         field="direction decision",
     )
@@ -669,6 +779,15 @@ def _validate_decision_record(value: object, lineage: Mapping) -> dict:
     transition = _string(record["transition"], "decision.transition")
     if transition not in REQUESTS | {"blocked"}:
         raise ValueError("decision.transition is not supported")
+    reopen_reason = record["reopen_reason"]
+    closed_decision_sha = _optional_sha256(
+        record["closed_decision_sha256"], "decision.closed_decision_sha256"
+    )
+    if transition == "reopen":
+        if reopen_reason not in REOPEN_REASONS or closed_decision_sha is None:
+            raise ValueError("reopen decision requires its reason and closed decision digest")
+    elif reopen_reason is not None or closed_decision_sha is not None:
+        raise ValueError("non-reopen decision cannot carry reopen metadata")
     admitted = record["admitted"]
     if type(admitted) is not bool:
         raise ValueError("decision.admitted must be boolean")
@@ -676,6 +795,8 @@ def _validate_decision_record(value: object, lineage: Mapping) -> dict:
         raise ValueError("decision.admitted conflicts with its action")
     if (state == "closed") != (action in {"close_direction", "direction_closed"}):
         raise ValueError("decision.state conflicts with its action")
+    if transition == "reopen" and action not in {"admit_direction", "switch_to_higher_impact"}:
+        raise ValueError("reopen decision must return to an open admitted or switched state")
     claim_layer = _string(record["claim_layer"], "decision.claim_layer")
     if claim_layer not in CLAIM_LAYERS:
         raise ValueError("decision.claim_layer is not supported")
@@ -709,6 +830,8 @@ def _validate_decision_record(value: object, lineage: Mapping) -> dict:
         "decision_index": _integer(record["decision_index"], "decision.decision_index", minimum=1),
         "lineage_sha256": _sha256(record["lineage_sha256"], "decision.lineage_sha256"),
         "previous_decision_sha256": _optional_sha256(record["previous_decision_sha256"], "decision.previous_decision_sha256"),
+        "reopen_reason": reopen_reason,
+        "closed_decision_sha256": closed_decision_sha,
     }
 
 
@@ -752,12 +875,8 @@ def main(argv=None) -> int:
             result = lineage
         else:
             lineage = _validate_lineage(load_json_strict(lineage_path))
-            records = _load_ledger(run_dir, lineage)
-            current_tail = (
-                artifact_store.sha256_file(_decision_files(run_dir)[-1])
-                if records
-                else None
-            )
+            records, decision_hashes = _load_ledger(run_dir, lineage)
+            current_tail = decision_hashes[-1] if decision_hashes else None
             expected_tail_argument = getattr(args, "expected_tail_sha256", None)
             if expected_tail_argument is not None:
                 expected_tail = _sha256(expected_tail_argument, "expected_tail_sha256")
@@ -784,11 +903,28 @@ def main(argv=None) -> int:
                 if selected is None:
                     raise ValueError("direction_id is not present in the portfolio")
                 previous_family = _latest_family(records, selected["direction_family_key"])
+                family_history = [
+                    record for record in records
+                    if record["direction_family_key"] == selected["direction_family_key"]
+                ]
+                latest_by_family = {}
+                for record in records:
+                    latest_by_family[record["direction_family_key"]] = record
+                previous_family_sha = None
+                if previous_family is not None:
+                    previous_family_index = max(
+                        index for index, record in enumerate(records)
+                        if record["direction_family_key"] == selected["direction_family_key"]
+                    )
+                    previous_family_sha = decision_hashes[previous_family_index]
                 decision = decide_direction(
                     snapshot_raw,
                     lineage,
                     args.direction_id,
                     previous=previous_family,
+                    family_history=family_history,
+                    latest_by_family=latest_by_family,
+                    closed_decision_sha256=previous_family_sha,
                     request=args.request,
                 )
                 index = len(records) + 1
@@ -796,13 +932,7 @@ def main(argv=None) -> int:
                     {
                         "decision_index": index,
                         "lineage_sha256": _canonical_digest(lineage),
-                        "previous_decision_sha256": (
-                            artifact_store.sha256_file(
-                                run_dir / "direction-decisions" / f"decision-{index - 1:04d}.json"
-                            )
-                            if records
-                            else None
-                        ),
+                        "previous_decision_sha256": current_tail,
                     }
                 )
                 output = run_dir / "direction-decisions" / f"decision-{index:04d}.json"

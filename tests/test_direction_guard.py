@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ SHA_B = "b" * 64
 SHA_C = "c" * 64
 SHA_D = "d" * 64
 SHA_E = "e" * 64
+SHA_F = "f" * 64
 
 
 def portfolio() -> dict:
@@ -118,6 +120,40 @@ class DirectionModelTests(unittest.TestCase):
         self.assertFalse(decision["admitted"])
         self.assertFalse(decision["performance_gain_claimed"])
 
+    def test_rejects_a_snapshot_that_removes_a_frozen_direction_family(self) -> None:
+        snapshot = portfolio()
+        lineage = direction_guard.freeze_lineage(snapshot)
+        snapshot["directions"] = snapshot["directions"][:1]
+        with self.assertRaisesRegex(ValueError, "preserve frozen direction family set"):
+            direction_guard.decide_direction(snapshot, lineage, "selector")
+
+    def test_closed_families_are_not_recommended_as_leaders(self) -> None:
+        snapshot = portfolio()
+        lineage = direction_guard.freeze_lineage(snapshot)
+        gather = direction_guard._validate_portfolio(snapshot)["directions"][1]
+        closed = direction_guard.decide_direction(
+            snapshot, lineage, "gather", request="close"
+        )
+        decision = direction_guard.decide_direction(
+            snapshot,
+            lineage,
+            "selector",
+            latest_by_family={gather["direction_family_key"]: closed},
+        )
+        self.assertEqual(decision["action"], "admit_direction")
+        self.assertEqual(decision["recommended_direction_id"], "selector")
+
+    def test_equal_ceiling_does_not_switch_by_mutable_display_id(self) -> None:
+        snapshot = portfolio()
+        snapshot["directions"][0]["component_metric"] = 90.0
+        lineage = direction_guard.freeze_lineage(snapshot)
+        original = direction_guard.decide_direction(snapshot, lineage, "selector")
+        renamed = copy.deepcopy(snapshot)
+        renamed["directions"][0]["id"] = "aaaa"
+        changed = direction_guard.decide_direction(renamed, lineage, "aaaa")
+        self.assertEqual(original["action"], "admit_direction")
+        self.assertEqual(changed["action"], "admit_direction")
+
     def test_closes_direction_when_even_full_elimination_misses_frozen_floor(self) -> None:
         snapshot = portfolio()
         snapshot["objective"]["minimum_effect_absolute"] = 30.0
@@ -162,10 +198,55 @@ class DirectionModelTests(unittest.TestCase):
         changed["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
         changed["directions"][0]["component_metric"] = 33.0
         reopened = direction_guard.decide_direction(
-            changed, lineage, "selector", previous=closed, request="reopen"
+            changed,
+            lineage,
+            "selector",
+            previous=closed,
+            family_history=[closed],
+            closed_decision_sha256=SHA_C,
+            request="reopen",
         )
         self.assertEqual(reopened["transition"], "reopen")
+        self.assertEqual(reopened["reopen_reason"], "new_measurement_window")
+        self.assertEqual(reopened["closed_decision_sha256"], SHA_C)
         self.assertNotEqual(reopened["action"], "direction_closed")
+
+    def test_reopen_cannot_reuse_any_evidence_from_the_family_history(self) -> None:
+        snapshot = portfolio()
+        lineage = direction_guard.freeze_lineage(snapshot)
+        first_closed = direction_guard.decide_direction(
+            snapshot, lineage, "selector", request="close"
+        )
+        changed = copy.deepcopy(snapshot)
+        changed["measurement_window_artifact"]["sha256"] = SHA_E
+        changed["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
+        changed["directions"][0]["component_metric"] = 33.0
+        reopened = direction_guard.decide_direction(
+            changed,
+            lineage,
+            "selector",
+            previous=first_closed,
+            family_history=[first_closed],
+            closed_decision_sha256=SHA_C,
+            request="reopen",
+        )
+        second_closed = direction_guard.decide_direction(
+            changed, lineage, "selector", previous=reopened, request="close"
+        )
+        replayed = copy.deepcopy(changed)
+        replayed["measurement_window_artifact"]["sha256"] = SHA_C
+        replayed["directions"][0]["evidence_artifact"]["sha256"] = SHA_D
+        replayed["directions"][0]["component_metric"] = 40.0
+        with self.assertRaisesRegex(ValueError, "used earlier"):
+            direction_guard.decide_direction(
+                replayed,
+                lineage,
+                "selector",
+                previous=second_closed,
+                family_history=[first_closed, reopened, second_closed],
+                closed_decision_sha256=SHA_E,
+                request="reopen",
+            )
 
     def test_reopen_requires_material_upper_bound_increase_and_frozen_total(self) -> None:
         snapshot = portfolio()
@@ -180,11 +261,23 @@ class DirectionModelTests(unittest.TestCase):
         self.assertEqual(unchanged["upper_bound_percent"], 5.5)
         with self.assertRaisesRegex(ValueError, "material upper-bound increase"):
             direction_guard.decide_direction(
-                changed, lineage, "selector", previous=closed, request="reopen"
+                changed,
+                lineage,
+                "selector",
+                previous=closed,
+                family_history=[closed],
+                closed_decision_sha256=SHA_C,
+                request="reopen",
             )
         changed["directions"][0]["component_metric"] = 33.0
         reopened = direction_guard.decide_direction(
-            changed, lineage, "selector", previous=closed, request="reopen"
+            changed,
+            lineage,
+            "selector",
+            previous=closed,
+            family_history=[closed],
+            closed_decision_sha256=SHA_C,
+            request="reopen",
         )
         self.assertGreater(reopened["upper_bound_absolute"], closed["upper_bound_absolute"])
 
@@ -223,19 +316,40 @@ class DirectionCliTests(unittest.TestCase):
             "target.json": b"target\n",
             "selector-component.json": b"selector-component\n",
             "gather-component.json": b"gather-component\n",
-            "selector-evidence.json": b"selector\n",
-            "gather-evidence.json": b"gather\n",
+            "selector-profile.json": b"selector-profile\n",
+            "gather-profile.json": b"gather-profile\n",
         }
-        for name, raw in artifacts.items():
-            (self.root / name).write_bytes(raw)
         payload["environment_artifact"]["sha256"] = hashlib.sha256(artifacts["environment.json"]).hexdigest()
         payload["measurement_window_artifact"]["sha256"] = hashlib.sha256(artifacts["window.json"]).hexdigest()
         for item in payload["directions"]:
             item["target_artifact"]["sha256"] = hashlib.sha256(artifacts["target.json"]).hexdigest()
             component_raw = artifacts[item["component_artifact"]["path"]]
             item["component_artifact"]["sha256"] = hashlib.sha256(component_raw).hexdigest()
-            raw = artifacts[item["evidence_artifact"]["path"]]
+            evidence = {
+                "schema_version": 1,
+                "source_artifact": {
+                    "path": item["evidence_artifact"]["path"].replace("evidence", "profile"),
+                    "sha256": hashlib.sha256(
+                        artifacts[item["evidence_artifact"]["path"].replace("evidence", "profile")]
+                    ).hexdigest(),
+                },
+                "component_artifact_sha256": item["component_artifact"]["sha256"],
+                "target_artifact_sha256": item["target_artifact"]["sha256"],
+                "measurement_window_sha256": payload["measurement_window_artifact"]["sha256"],
+                "claim_layer": item["claim_layer"],
+                "bottleneck_class": item["bottleneck_class"],
+                "metric_name": item["metric_name"],
+                "metric_unit": item["metric_unit"],
+                "metric_direction": item["metric_direction"],
+                "metric_kind": item["metric_kind"],
+                "total_metric": item["total_metric"],
+                "component_metric": item["component_metric"],
+            }
+            raw = (json.dumps(evidence, sort_keys=True) + "\n").encode()
+            artifacts[item["evidence_artifact"]["path"]] = raw
             item["evidence_artifact"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        for name, raw in artifacts.items():
+            (self.root / name).write_bytes(raw)
         self.portfolio = self.root / "portfolio.json"
         self.portfolio.write_text(json.dumps(payload), encoding="utf-8")
         self.run_dir = self.root / "run"
@@ -317,6 +431,41 @@ class DirectionCliTests(unittest.TestCase):
         )
         self.assertEqual(stale.returncode, 2)
 
+    def test_cli_reopen_records_reason_and_exact_closed_decision(self) -> None:
+        self.assertEqual(self.run_cli(
+            "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
+        ).returncode, 0)
+        closed = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector", "--request", "close",
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        closed_path = self.run_dir / "direction-decisions" / "decision-0001.json"
+        closed_sha = hashlib.sha256(closed_path.read_bytes()).hexdigest()
+        (self.root / "window.json").write_bytes(b"new-window\n")
+        payload = json.loads(self.portfolio.read_text())
+        window_sha = hashlib.sha256((self.root / "window.json").read_bytes()).hexdigest()
+        payload["measurement_window_artifact"]["sha256"] = window_sha
+        payload["directions"][0]["component_metric"] = 33.0
+        for item in payload["directions"]:
+            evidence_path = self.root / item["evidence_artifact"]["path"]
+            evidence = json.loads(evidence_path.read_text())
+            evidence["measurement_window_sha256"] = window_sha
+            evidence["component_metric"] = item["component_metric"]
+            raw = (json.dumps(evidence, sort_keys=True) + "\n").encode()
+            evidence_path.write_bytes(raw)
+            item["evidence_artifact"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        self.portfolio.write_text(json.dumps(payload), encoding="utf-8")
+        reopened = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector", "--request", "reopen",
+            "--expected-tail-sha256", closed_sha,
+        )
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+        decision = json.loads(reopened.stdout)
+        self.assertEqual(decision["reopen_reason"], "new_measurement_window")
+        self.assertEqual(decision["closed_decision_sha256"], closed_sha)
+
     def test_status_rejects_malformed_records_and_changed_external_tail(self) -> None:
         self.assertEqual(self.run_cli(
             "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
@@ -341,6 +490,51 @@ class DirectionCliTests(unittest.TestCase):
         )
         self.assertEqual(changed.returncode, 2)
         self.assertIn("expected tail", changed.stderr)
+
+    def test_status_rejects_forged_reopen_reference_and_reason(self) -> None:
+        self.assertEqual(self.run_cli(
+            "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
+        ).returncode, 0)
+        closed = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector", "--request", "close",
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        closed_path = self.run_dir / "direction-decisions" / "decision-0001.json"
+        closed_sha = hashlib.sha256(closed_path.read_bytes()).hexdigest()
+        (self.root / "window.json").write_bytes(b"new-window\n")
+        payload = json.loads(self.portfolio.read_text())
+        window_sha = hashlib.sha256((self.root / "window.json").read_bytes()).hexdigest()
+        payload["measurement_window_artifact"]["sha256"] = window_sha
+        payload["directions"][0]["component_metric"] = 33.0
+        for item in payload["directions"]:
+            evidence_path = self.root / item["evidence_artifact"]["path"]
+            evidence = json.loads(evidence_path.read_text())
+            evidence["measurement_window_sha256"] = window_sha
+            evidence["component_metric"] = item["component_metric"]
+            raw = (json.dumps(evidence, sort_keys=True) + "\n").encode()
+            evidence_path.write_bytes(raw)
+            item["evidence_artifact"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        self.portfolio.write_text(json.dumps(payload), encoding="utf-8")
+        reopened = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector", "--request", "reopen",
+            "--expected-tail-sha256", closed_sha,
+        )
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+        decision_path = self.run_dir / "direction-decisions" / "decision-0002.json"
+        decision = json.loads(decision_path.read_text())
+        decision["closed_decision_sha256"] = SHA_F
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+        forged = self.run_cli("status", "--run-dir", str(self.run_dir))
+        self.assertEqual(forged.returncode, 2)
+        self.assertIn("latest closed family decision", forged.stderr)
+        decision["closed_decision_sha256"] = closed_sha
+        decision["reopen_reason"] = "new_target_identity"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+        wrong_reason = self.run_cli("status", "--run-dir", str(self.run_dir))
+        self.assertEqual(wrong_reason.returncode, 2)
+        self.assertIn("reopen reason", wrong_reason.stderr)
 
     def test_cli_rejects_second_init_chain_gaps_and_symlinked_ledger(self) -> None:
         self.assertEqual(self.run_cli(
@@ -387,6 +581,55 @@ class DirectionCliTests(unittest.TestCase):
         )
         self.assertEqual(failed.returncode, 2)
         self.assertIn("artifact digest", failed.stderr)
+
+    def test_cli_rejects_portfolio_metrics_not_bound_by_evidence(self) -> None:
+        init = self.run_cli(
+            "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        payload = json.loads(self.portfolio.read_text())
+        payload["directions"][0]["component_metric"] = 100.0
+        self.portfolio.write_text(json.dumps(payload), encoding="utf-8")
+        failed = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector",
+        )
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("evidence field component_metric", failed.stderr)
+
+    def test_cli_rehashes_the_raw_source_bound_by_normalized_evidence(self) -> None:
+        init = self.run_cli(
+            "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        (self.root / "selector-profile.json").write_bytes(b"changed-profile\n")
+        failed = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector",
+        )
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("source artifact digest", failed.stderr)
+
+    def test_ledger_hashes_the_same_bytes_it_parses_without_rescanning(self) -> None:
+        self.assertEqual(self.run_cli(
+            "init", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir)
+        ).returncode, 0)
+        first = self.run_cli(
+            "check", "--portfolio", str(self.portfolio), "--run-dir", str(self.run_dir),
+            "--direction-id", "selector",
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        lineage = direction_guard._validate_lineage(
+            direction_guard.load_json_strict(self.run_dir / "direction-lineage.json")
+        )
+        with mock.patch.object(
+            direction_guard.artifact_store,
+            "sha256_file",
+            side_effect=AssertionError("ledger files must not be rescanned"),
+        ):
+            records, hashes = direction_guard._load_ledger(self.run_dir, lineage)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(hashes), 1)
 
 
 if __name__ == "__main__":

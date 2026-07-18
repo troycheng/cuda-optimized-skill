@@ -114,8 +114,10 @@ declared minimum effect.
 
 Automatic ordering is allowed only when directions have the same claim layer,
 metric name, unit, direction, environment identity, and measurement-window
-identity. Comparable directions are ordered by upper bound, then by their
-stable direction key. V2.7 does not divide by an estimated experiment cost.
+identity. A switch occurs only for a strictly larger upper bound; equal ceilings
+cannot be reordered by a display ID. When several strictly larger directions
+share the maximum, their stable direction key selects the recommendation.
+V2.7 does not divide by an estimated experiment cost.
 Measured elapsed seconds are retained as historical evidence but never turn a
 small impact into a larger one.
 
@@ -129,7 +131,7 @@ The create-once portfolio binds:
 
 - frozen objective identity and minimum effect;
 - environment and measurement-window identities;
-- every direction's target, component, and timing artifact SHA-256;
+- every direction's target, component, normalized evidence, and raw source artifact SHA-256;
 - the canonical comparison group;
 - optional V2.6 iteration decision references.
 

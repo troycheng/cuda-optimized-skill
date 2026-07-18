@@ -18,8 +18,14 @@ Inputs are supplied by the user or existing measurement tools. The portfolio
 references regular environment, measurement-window, target, component artifact,
 and evidence files
 by safe relative path and expected digest. The CLI rehashes every referenced
-artifact without following symlinks before it admits or reopens anything. A
-bare AI-generated digest is not evidence. The guard does not collect artifacts.
+artifact without following symlinks before it admits or reopens anything. The
+evidence artifact is normalized JSON: it repeats the target, component, window,
+metric taxonomy, total, and component value. The CLI reads it once, hashes and
+parses the same bytes, requires every field to match the portfolio, then rehashes
+the raw profile or application artifact named by `source_artifact`. Site-owned
+collectors are responsible for deriving normalized values from that source; the
+generic guard does not parse arbitrary profiler formats. A bare AI-generated
+digest without the bound files is not evidence. The guard does not collect artifacts.
 
 ## Direction identity
 
@@ -57,7 +63,10 @@ not a forecast. The guard does not ask an AI to estimate an eliminable fraction.
 
 The minimum absolute and/or percentage effect is frozen in the objective. A
 direction closes when even full elimination cannot meet every declared floor.
-Among eligible same-layer directions, the largest ceiling is recommended.
+Among eligible same-layer directions that are still open, another direction is
+recommended only when its ceiling is strictly larger. Equal ceilings admit the
+selected direction and cannot be reordered by a display ID. A closed family
+cannot be returned as the next direction.
 
 Throughput, composite objectives, higher-is-better objectives, and cross-layer
 comparisons return `unrankable`. They require a separately designed experiment;
@@ -70,8 +79,9 @@ environment, registered direction families, and initial portfolio digest.
 The initial digest is the first snapshot anchor, not a rule that all later
 measurements must be byte-identical. A later portfolio snapshot may update the
 window, target, evidence, and measured component values within the same ledger;
-the objective, environment, and registered family taxonomy remain frozen. Each
-decision records the current portfolio digest.
+the objective, environment, and exact registered family set remain frozen. A
+snapshot cannot add or remove a family to change the ranking. Each decision
+records the current portfolio digest.
 
 `check` validates the whole decision directory, derives the next decision, and
 appends `direction-decisions/decision-NNNN.json` with create-once semantics.
@@ -79,7 +89,8 @@ Every record binds the lineage and previous file digest, forming one hash chain.
 Unknown files, gaps, broken hashes, symlinks, drift, or concurrent duplicate
 writes fail closed. After the first decision, every `check` must pass the last
 value returned by `status` as `--expected-tail-sha256`; stale or missing caller
-state cannot append. `status` validates the chain and returns its current tail.
+state cannot append. `status` also revalidates reopen evidence history, reason,
+material increase, and exact closed-record reference before returning its tail.
 
 The actions are:
 
@@ -113,10 +124,14 @@ alone are not machine state and must never be used as permission to continue.
 Reopen only when all of the following are true:
 
 1. the latest decision for the same family is closed;
-2. a new evidence artifact is present and its digest is reverified by the CLI;
-3. the measurement window, target identity, or measured impact envelope changed;
+2. a new evidence artifact is present, its digest has never appeared earlier in
+   that family chain, and the CLI revalidates its normalized fields;
+3. the measurement window or target identity changed;
 4. the absolute and frozen-baseline percentage ceilings each increase over the
    closure by at least their corresponding minimum effect.
+
+The reopened record stores a closed-set reason (`new_measurement_window` or
+`new_target_identity`) and the exact digest of the closed decision it reopens.
 
 A prose rewrite, new mechanism name, caller-invented component ID, unbound
 digest, new iteration number, or changed minimum effect is not reopen evidence.
@@ -139,6 +154,7 @@ python3 <skill>/scripts/direction_guard.py status --run-dir direction-run
 Use `--request close` to record a deliberate stop and `--request reopen` only
 with the qualified evidence above. The JSON contracts are
 `templates/direction_portfolio.schema.json`,
+`templates/direction_evidence.schema.json`,
 `templates/direction_lineage.schema.json`, and
 `templates/direction_decision.schema.json`.
 

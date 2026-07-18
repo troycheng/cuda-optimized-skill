@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.7/direction_evidence.schema.json",
+  "title": "CUDA optimizer normalized direction evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_artifact", "component_artifact_sha256", "target_artifact_sha256", "measurement_window_sha256", "claim_layer", "bottleneck_class", "metric_name", "metric_unit", "metric_direction", "metric_kind", "total_metric", "component_metric"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source_artifact": {"$ref": "direction_portfolio.schema.json#/$defs/artifactRef"},
+    "component_artifact_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "target_artifact_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "measurement_window_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "claim_layer": {"enum": ["kernel", "runtime", "workload", "serving"]},
+    "bottleneck_class": {"enum": ["kernel", "framework", "cpu_data", "transfer", "communication", "io", "environment"]},
+    "metric_name": {"type": "string", "minLength": 1},
+    "metric_unit": {"type": "string", "minLength": 1},
+    "metric_direction": {"enum": ["lower", "higher"]},
+    "metric_kind": {"enum": ["additive_time", "throughput", "composite"]},
+    "total_metric": {"type": "number", "exclusiveMinimum": 0},
+    "component_metric": {"type": "number", "minimum": 0}
+  }
+}

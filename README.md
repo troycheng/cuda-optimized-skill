@@ -126,7 +126,7 @@ the CPU/static checks in this documentation change.
 
 | Validation lane | Recorded result | Interpretation |
 |---|---|---|
-| CPU/static acceptance | 788 tests: 783 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
+| CPU/static acceptance | 797 tests: 792 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
 | Physical RTX 5090 lane | 13/13 checks in 34.302 seconds; target-side NCU returned `ERR_NVGPUCTRPERM` | The GPU workflow ran without changing privilege or driver policy |
 | Reproducible workload fixture | End-to-end latency improved 60.4616% with constraints passing | Demonstrates the workflow on that fixture only |
 | User-supplied vLLM workload | Kernel metric improved 26.3287%; real workload changed -0.0097% | The original was kept because a faster kernel did not improve the product workload |
@@ -143,7 +143,7 @@ versions; they do not imply that every historical version has a matching Git tag
 
 ### V2.7
 
-Added direction-level admission, conservative impact ceilings, and an append-only stop/reopen ledger. AI agents now decide whether a direction is still worth a candidate round before spending V2.6 budget.
+Added direction-level admission, conservative impact ceilings, and an append-only stop/reopen ledger. The initial direction set is frozen, portfolio values are bound to normalized evidence and its raw measurement source, closed directions leave the recommendation pool, equal ceilings cannot be reordered by display names, and reopening requires an exact closed-record reference plus new window or target evidence. AI agents now decide whether a direction is still worth a candidate round before spending V2.6 budget.
 
 ### V2.6
 

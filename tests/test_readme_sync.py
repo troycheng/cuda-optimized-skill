@@ -213,8 +213,8 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_tested_scope_is_historical_and_not_a_speedup_promise(self) -> None:
         facts = (
-            "788",
-            "783",
+            "797",
+            "792",
             "13/13",
             "34.302",
             "60.4616%",

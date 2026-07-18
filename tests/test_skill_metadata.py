@@ -38,6 +38,7 @@ class SkillMetadataTests(unittest.TestCase):
             "recommend_only",
             "references/direction_admission.md",
             "templates/direction_portfolio.schema.json",
+            "templates/direction_evidence.schema.json",
             "templates/direction_lineage.schema.json",
             "templates/direction_decision.schema.json",
         ):
