@@ -144,6 +144,55 @@ class LogoAssetTests(unittest.TestCase):
             )
             self.assertIn('<img src="asset/logo.svg" width="88"', readme)
 
+    def test_wordmark_asset_contract(self) -> None:
+        expected = {
+            "logo-wordmark.svg": ("#172033", "#16B8A6"),
+            "logo-wordmark-dark.svg": ("#F5F7FA", "#28D6C2"),
+        }
+        for name, (foreground, accent) in expected.items():
+            root = parse_svg(name)
+            self.assertEqual(root.attrib["viewBox"], "0 0 720 152")
+            self.assertNotIn("width", root.attrib)
+            self.assertNotIn("height", root.attrib)
+            self.assertEqual(root.attrib["role"], "img")
+            self.assertEqual(root.attrib["aria-labelledby"], "title")
+
+            titles = [
+                element
+                for element in root.iter()
+                if local_name(element.tag) == "title"
+            ]
+            self.assertEqual(len(titles), 1)
+            self.assertIn("CUDA Kernel Optimizer", titles[0].text or "")
+
+            full_backgrounds = [
+                element
+                for element in root.iter()
+                if local_name(element.tag) == "rect"
+                and element.attrib.get("width") == "720"
+                and element.attrib.get("height") == "152"
+            ]
+            self.assertEqual(full_backgrounds, [])
+
+            icon_groups = [
+                element
+                for element in root.iter()
+                if element.attrib.get("data-role") == "thread-tile"
+            ]
+            self.assertEqual(len(icon_groups), 1)
+            self.assertEqual(geometry(icon_groups[0]), expected_geometry()[1:])
+
+            labels = [
+                " ".join((element.text or "").split())
+                for element in root.iter()
+                if local_name(element.tag) == "text"
+            ]
+            self.assertEqual(labels, ["CUDA KERNEL", "OPTIMIZER"])
+            source = (ASSET_DIR / name).read_text(encoding="utf-8")
+            self.assertIn(foreground, source)
+            self.assertIn(accent, source)
+            self.assertIn("ui-sans-serif", source)
+
 
 if __name__ == "__main__":
     unittest.main()
