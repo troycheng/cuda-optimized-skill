@@ -102,6 +102,10 @@ class DirectionModelTests(unittest.TestCase):
         bad["directions"][0]["bottleneck_class"] = "magic"
         with self.assertRaisesRegex(ValueError, "bottleneck_class"):
             direction_guard.freeze_lineage(bad)
+        bad = portfolio()
+        bad["directions"][1]["total_metric"] = 501.0
+        with self.assertRaisesRegex(ValueError, "same total_metric"):
+            direction_guard.freeze_lineage(bad)
 
     def test_uses_full_elimination_upper_bound_and_switches_to_larger_direction(self) -> None:
         snapshot = portfolio()
@@ -171,6 +175,7 @@ class DirectionModelTests(unittest.TestCase):
         changed["measurement_window_artifact"]["sha256"] = SHA_E
         changed["directions"][0]["evidence_artifact"]["sha256"] = SHA_A
         changed["directions"][0]["total_metric"] = 250.0
+        changed["directions"][1]["total_metric"] = 250.0
         unchanged = direction_guard.decide_direction(changed, lineage, "selector")
         self.assertEqual(unchanged["upper_bound_percent"], 5.5)
         with self.assertRaisesRegex(ValueError, "material upper-bound increase"):

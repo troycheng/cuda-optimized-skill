@@ -274,9 +274,15 @@ def _validate_portfolio(value: object) -> dict:
         raise ValueError("portfolio direction ids must be unique")
     if len(families) != len(set(families)):
         raise ValueError("portfolio direction families must be unique")
+    objective = _validate_objective(portfolio["objective"])
+    comparable_totals = {
+        item["total_metric"] for item in directions if _comparable(item, objective)
+    }
+    if len(comparable_totals) > 1:
+        raise ValueError("comparable directions must use the same total_metric")
     return {
         "schema_version": 1,
-        "objective": _validate_objective(portfolio["objective"]),
+        "objective": objective,
         "environment_artifact": _artifact_ref(
             portfolio["environment_artifact"], "portfolio.environment_artifact"
         ),
