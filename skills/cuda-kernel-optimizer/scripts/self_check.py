@@ -24,7 +24,12 @@ _SCRIPTS = (
     "evidence.py",
     "evidence_protocol.py",
     "experiment_design.py",
+    "iteration_guard.py",
     "workload_evaluate.py",
+)
+_V2_6_SCHEMAS = (
+    "measurement_path_registry.schema.json",
+    "performance_iteration.schema.json",
 )
 
 
@@ -55,6 +60,17 @@ def check_installation(skill_dir: Path | str) -> dict:
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"schema root must be closed: {name}")
     checks.append("v2_5_schemas")
+
+    for name in _V2_6_SCHEMAS:
+        path = root / "templates" / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"missing script: {name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "v2.6" not in payload.get("$id", ""):
+            raise ValueError(f"schema does not declare V2.6 identity: {name}")
+        if payload.get("additionalProperties") is not False:
+            raise ValueError(f"schema root must be closed: {name}")
+    checks.append("v2_6_iteration_guard")
 
     return {
         "schema_version": "cuda-evidence/self-check-v1",

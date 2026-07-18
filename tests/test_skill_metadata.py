@@ -14,9 +14,66 @@ SERVING_EVIDENCE = SKILL_DIR / "references" / "serving_evidence_protocol.md"
 SYSTEMS_IR_COVERAGE = SKILL_DIR / "references" / "systems_and_ir_coverage.md"
 EVIDENCE_AUTOMATION = SKILL_DIR / "references" / "evidence_automation.md"
 MIGRATION_V2_5 = SKILL_DIR / "references" / "migration_v2_5.md"
+PERFORMANCE_ITERATION = SKILL_DIR / "references" / "performance_iteration.md"
+ITERATION_REPORT = SKILL_DIR / "templates" / "iteration_report.md"
 
 
 class SkillMetadataTests(unittest.TestCase):
+    def test_skill_routes_v2_6_performance_first_iterations(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for marker in (
+            "V2.6",
+            "performance hypothesis",
+            "scripts/iteration_guard.py check",
+            "candidate_evaluated",
+            "measurement_blocked",
+            "infrastructure_only",
+            "performance_gain",
+            "15%",
+            "20 minutes",
+            "one infrastructure repair",
+            "two consecutive",
+            "prevalidated",
+            "stop the direction",
+            "references/performance_iteration.md",
+            "templates/performance_iteration.schema.json",
+            "templates/measurement_path_registry.schema.json",
+        ):
+            self.assertIn(marker, text)
+
+    def test_performance_iteration_reference_is_minimal_and_machine_verifiable(self) -> None:
+        self.assertTrue(PERFORMANCE_ITERATION.is_file())
+        text = PERFORMANCE_ITERATION.read_text(encoding="utf-8")
+        lower = text.lower()
+        for marker in (
+            "falsifiable",
+            "candidate_evaluated",
+            "measurement_blocked",
+            "infrastructure_only",
+            "performance_gain",
+            "registry_sha256",
+            "definition_sha256",
+            "min(1200",
+            "one repair",
+            "two consecutive",
+            "prevalidated fallback",
+            "stop_direction",
+            "does not run",
+            "does not promote",
+        ):
+            self.assertIn(marker, lower)
+
+    def test_iteration_report_leads_with_performance_work_not_tool_chores(self) -> None:
+        text = ITERATION_REPORT.read_text(encoding="utf-8")
+        markers = (
+            "## Performance hypothesis",
+            "## Candidate and result",
+            "## Decision and next performance action",
+            "## Measurement blocker, if any",
+        )
+        positions = [text.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("not an optimization result", text)
     def test_skill_routes_formal_v2_5_evidence_automation(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         for marker in (

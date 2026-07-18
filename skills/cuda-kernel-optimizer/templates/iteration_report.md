@@ -1,4 +1,41 @@
-# Iteration {{iter}} — V2.2 decision record
+# Iteration {{iter}} — V2.6 performance decision record
+
+## Performance hypothesis
+
+- **Statement**: {{hypothesis_statement}}
+- **Mechanism**: {{hypothesis_mechanism}}
+- **Target / direction / minimum effect**: {{target_metric}} /
+  {{target_direction}} / {{minimum_effect_pct}}%
+- **Authorized mutation scope**: {{mutation_scope}}
+- **Prevalidated measurement path**: {{measurement_path_id}}@
+  {{measurement_path_version}}
+
+## Candidate and result
+
+- **Candidate / changed paths**: {{candidate_id}} / {{changed_paths}}
+- **Correctness**: {{correctness_result}}
+- **Performance result**: {{performance_result}}
+- **Work class**: {{candidate_evaluated_or_other}}
+
+`candidate_evaluated` means a real candidate completed its applicable gates. A
+loss, inconclusive result, or correctness failure is not a performance gain.
+
+## Decision and next performance action
+
+- **Keep or reject**: {{keep_or_reject}}
+- **Reason**: {{decision_reason}}
+- **Next performance action**: {{next_performance_action}}
+
+## Measurement blocker, if any
+
+- **Blocker**: {{measurement_blocker_or_none}}
+- **Infrastructure time / cap**: {{infrastructure_seconds}} /
+  {{infrastructure_cap_seconds}} seconds
+- **Repairs / cap**: {{infrastructure_repairs}} / 1
+- **Fallback or stop**: {{fallback_or_stop}}
+
+Infrastructure work is not an optimization result. Report this section only
+when it blocks candidate evaluation.
 
 ## Frozen context
 

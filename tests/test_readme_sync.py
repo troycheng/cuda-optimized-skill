@@ -156,6 +156,29 @@ class ReadmeSyncTests(unittest.TestCase):
         self.assertIn("never changes host-level settings automatically", self.english)
         self.assertIn("不会自动修改宿主机配置", self.chinese)
 
+    def test_readmes_explain_the_performance_first_iteration_loop(self) -> None:
+        english = " ".join(self.english.split())
+        chinese = "".join(self.chinese.split())
+        for marker in (
+            "falsifiable performance hypothesis",
+            "real candidate",
+            "hard time and repair limit",
+            "Tool work is not a performance improvement",
+        ):
+            self.assertIn(marker, english)
+        for marker in (
+            "能被实测推翻的性能假设",
+            "真实候选",
+            "时间和次数上限",
+            "修工具不等于性能提升",
+        ):
+            self.assertIn(marker, chinese)
+        reference = (
+            "skills/cuda-kernel-optimizer/references/performance_iteration.md"
+        )
+        self.assertIn(reference, self.english)
+        self.assertIn(reference, self.chinese)
+
     def test_tested_scope_is_historical_and_not_a_speedup_promise(self) -> None:
         facts = (
             "746",
@@ -186,6 +209,7 @@ class ReadmeSyncTests(unittest.TestCase):
             "skills/cuda-kernel-optimizer/SKILL.md",
             "skills/cuda-kernel-optimizer/examples/walkthrough.md",
             "skills/cuda-kernel-optimizer/references/evidence_automation.md",
+            "skills/cuda-kernel-optimizer/references/performance_iteration.md",
             "skills/cuda-kernel-optimizer/references/compatibility.md",
             "tests/gpu/sm120/README.md",
             "LICENSE",

@@ -69,6 +69,11 @@ flowchart LR
     evaluation --> restore["证据不足：恢复原实现"]
 ```
 
+每轮优化先提出一个能被实测推翻的性能假设，再用真实候选给出正确性结果；正确性通过后，
+还要给出可比较的性能结果。测量工具的修复有明确的时间和次数上限；超限后只切换到预先
+验证的测量路径，没有可用路径就停止该方向。修工具不等于性能提升，也不会作为优化成果
+汇报。具体规则见[性能优先的迭代约束](skills/cuda-kernel-optimizer/references/performance_iteration.md)。
+
 工作流在正式计时前冻结目标和授权范围。每个候选方案都绑定 source、binary、输入、
 schedule、raw rows 和运行时 identity。被拒绝或中断的尝试会留下记录，但不会覆盖之前
 有效的结果。
@@ -115,6 +120,7 @@ CPU/static 检查推断出新的 GPU 结果。
 - [兼容性](docs/compatibility.md)
 - [AI 执行协议](skills/cuda-kernel-optimizer/SKILL.md)
 - [Kernel 与 workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
+- [性能优先的迭代约束](skills/cuda-kernel-optimizer/references/performance_iteration.md)
 - [V2.5 正式证据参考](skills/cuda-kernel-optimizer/references/evidence_automation.md)
 - [Canonical 兼容性参考](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in 测试说明](tests/gpu/sm120/README.md)

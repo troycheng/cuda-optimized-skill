@@ -76,6 +76,14 @@ flowchart LR
     evaluation --> restore["Evidence is insufficient: restore the original"]
 ```
 
+Each optimization round starts with a falsifiable performance hypothesis and
+must produce a real candidate with a correctness result and, when correctness
+passes, a comparable performance result. Measurement tooling has a hard time
+and repair limit; after that, the AI switches to a prevalidated path or stops
+the direction. Tool work is not a performance improvement and is not reported
+as one. The detailed rules are in the
+[performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md).
+
 The workflow freezes the objective and authorized scope before timed work. Each
 candidate is tied to its source, binary, inputs, schedule, raw rows, and runtime
 identity. A rejected or interrupted candidate is recorded without overwriting a
@@ -130,6 +138,7 @@ performance guarantees.
 - [Compatibility](docs/compatibility.md)
 - [Agent execution protocol](skills/cuda-kernel-optimizer/SKILL.md)
 - [Kernel and workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
+- [Performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md)
 - [Formal V2.5 evidence reference](skills/cuda-kernel-optimizer/references/evidence_automation.md)
 - [Canonical compatibility reference](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in test guide](tests/gpu/sm120/README.md)

@@ -79,6 +79,18 @@ class PublicDocsTests(unittest.TestCase):
         ):
             self.assertIn(marker, text)
 
+    def test_workflows_keep_ai_iterations_on_performance_work(self) -> None:
+        text = (ROOT / "docs/workflows.md").read_text(encoding="utf-8")
+        for marker in (
+            "Performance-first iteration",
+            "falsifiable hypothesis",
+            "candidate_evaluated",
+            "measurement_blocked",
+            "infrastructure_only",
+            "performance_iteration.md",
+        ):
+            self.assertIn(marker, text)
+
     def test_evidence_page_preserves_formal_boundaries(self) -> None:
         text = (ROOT / "docs/evidence-and-safety.md").read_text(encoding="utf-8")
         for marker in (

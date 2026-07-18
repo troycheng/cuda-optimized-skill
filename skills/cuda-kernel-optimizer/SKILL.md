@@ -3,7 +3,7 @@ name: cuda-kernel-optimizer
 description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.5)
+# CUDA Kernel and Workload Optimizer (V2.6)
 
 ## Principle
 
@@ -16,6 +16,44 @@ Optimize in two evidence layers:
 
 A faster microbenchmark is not automatically an end-to-end win. Promotion is a
 decision backed by durable evidence, not the lowest observed sample.
+
+## Performance-first iteration gate
+
+V2.6 keeps measurement infrastructure subordinate to performance work. Before
+each optimization round, bind one falsifiable performance hypothesis: mechanism,
+target metric and direction, minimum effect, mutation scope, baseline and
+environment identities, round budget, and a prevalidated measurement path.
+
+After the round, classify its structured record mechanically; do not choose the
+class in prose:
+
+```bash
+python3 <skill>/scripts/iteration_guard.py check \
+  --record iteration.json --registry measurement-paths.json \
+  --history iteration-decisions.jsonl --out iteration-decision.json
+```
+
+- `candidate_evaluated` requires a content-addressed in-scope change and bound
+  correctness. Failed correctness completes the experiment without timing;
+  passed correctness also requires comparable performance evidence.
+- `measurement_blocked` means a real candidate exists but correctness or timing
+  could not complete.
+- `infrastructure_only` means no valid candidate was evaluated. It is not an
+  optimization result.
+- The guard never claims `performance_gain`. It forwards a consistent
+  `confirmed_win` to the existing paired-evidence and promotion gate, which
+  remains the only authority for a gain. A loss or inconclusive candidate is
+  useful search evidence, not a gain.
+
+Infrastructure is capped at 15% of the round and never more than 20 minutes,
+with one infrastructure repair. Exceed either cap, or complete two consecutive
+`measurement_blocked`/`infrastructure_only` rounds in the same `lineage_id`, and
+switch only to another prevalidated path. If none exists, stop the direction; do not build another
+runner inside the optimization round. A registry change is a separate
+maintenance task. Read `references/performance_iteration.md` for the record,
+identity, fallback, and reporting contracts. Validate inputs against
+`templates/performance_iteration.schema.json` and
+`templates/measurement_path_registry.schema.json`.
 
 ## Required and optional inputs
 
@@ -421,6 +459,8 @@ status.
 
 ## References to read on demand
 
+- `references/performance_iteration.md`: V2.6 performance hypothesis, derived
+  work class, infrastructure budget, prevalidated fallback, and stop rules.
 - `references/compatibility.md`: supported versions, public APIs, architecture
   routing, and RTX 5090/SM120 facts.
 - `references/optimization_catalog.md`: method triggers, skip rules, and

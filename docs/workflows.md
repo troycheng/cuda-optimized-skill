@@ -3,6 +3,19 @@
 Choose the workflow from the strongest claim your inputs can support. A faster
 kernel does not automatically establish a faster product workload.
 
+## Performance-first iteration
+
+Every optimization round begins with a falsifiable hypothesis and a bounded
+candidate scope. The AI must produce a real candidate and correctness result;
+when correctness passes, it must also produce comparable timing. The derived
+classes `candidate_evaluated`, `measurement_blocked`, and
+`infrastructure_only` keep completed experiments separate from tool work.
+
+Measurement support has a fixed time and repair budget. Once exhausted, the AI
+may use only a prevalidated fallback or stop that direction; it does not turn
+the optimization round into runner development. See the
+[performance-first iteration contract](../skills/cuda-kernel-optimizer/references/performance_iteration.md).
+
 ## Kernel optimization
 
 Use this path for a CUDA, CUTLASS, or Triton implementation with a runnable
