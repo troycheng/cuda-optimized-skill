@@ -29,6 +29,19 @@ clean-window requirement.
 Unknown state, missing samples, stale samples, or contamination cannot be treated
 as clean timing evidence.
 
+## Nonstationary comparisons
+
+Shared-host cleanliness alone does not make two serving windows comparable.
+Queue depth, offered load, cache state, or another declared state can move
+between roles or between burn-in and timing. For these runs, the V2.8 gate
+requires a predeclared balanced AB/BA plan, fixed-duration windows, and separate
+pair and phase tolerances. Rows remain in chronological order and stay bound to
+their raw source; no post-hoc deletion or regrouping is accepted.
+
+This gate answers only whether paired state is comparable. It never turns metric
+values into a speedup claim. See the
+[nonstationary serving-evidence contract](../skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md).
+
 ## Attempt and identity
 
 An immutable attempt binds the runner, guard, analysis, schedule, source,
@@ -51,8 +64,8 @@ and image boundaries. Same source does not imply same binary.
 and auditable. A performance win with invalid evidence cannot be adopted.
 
 The installed `self_check` is CPU/static only and does not validate a GPU environment.
-It checks package metadata, Python scripts, and V2.5 schemas without running GPU
-or network work.
+It checks package metadata, Python scripts, and the bundled V2.5-V2.8 schemas
+without running GPU or network work.
 
 ## Modification boundary
 

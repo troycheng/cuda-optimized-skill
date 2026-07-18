@@ -16,10 +16,57 @@ EVIDENCE_AUTOMATION = SKILL_DIR / "references" / "evidence_automation.md"
 MIGRATION_V2_5 = SKILL_DIR / "references" / "migration_v2_5.md"
 PERFORMANCE_ITERATION = SKILL_DIR / "references" / "performance_iteration.md"
 DIRECTION_ADMISSION = SKILL_DIR / "references" / "direction_admission.md"
+NONSTATIONARY_EVIDENCE = SKILL_DIR / "references" / "nonstationary_serving_evidence.md"
 ITERATION_REPORT = SKILL_DIR / "templates" / "iteration_report.md"
 
 
 class SkillMetadataTests(unittest.TestCase):
+    def test_skill_routes_v2_8_nonstationarity_before_direction_admission(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for marker in (
+            "V2.8",
+            "scripts/nonstationarity_guard.py init",
+            "scripts/nonstationarity_guard.py check",
+            "create-once",
+            "comparable_paired_state",
+            "inconclusive_nonstationary",
+            "site_randomized_balanced",
+            "fixed-duration",
+            "pair tolerance",
+            "phase tolerance",
+            "performance_gain_claimed",
+            "recommend_only",
+            "references/nonstationary_serving_evidence.md",
+            "templates/nonstationarity_anchor.schema.json",
+            "templates/nonstationarity_design.schema.json",
+            "templates/nonstationarity_series.schema.json",
+            "templates/nonstationarity_verdict.schema.json",
+        ):
+            self.assertIn(marker, text)
+        self.assertLess(text.index("## Nonstationary serving evidence"), text.index("## Direction admission"))
+
+    def test_nonstationarity_reference_explains_comparability_not_speedup(self) -> None:
+        self.assertTrue(NONSTATIONARY_EVIDENCE.is_file())
+        text = NONSTATIONARY_EVIDENCE.read_text(encoding="utf-8").lower()
+        for marker in (
+            "already-collected",
+            "create-once",
+            "four blocks",
+            "ab/ba",
+            "fixed-duration",
+            "burn-in",
+            "pair tolerance",
+            "phase tolerance",
+            "post-hoc",
+            "raw source",
+            "storage rollback",
+            "comparable_paired_state",
+            "inconclusive_nonstationary",
+            "does not claim",
+            "recommend_only",
+        ):
+            self.assertIn(marker, text)
+
     def test_skill_routes_v2_7_direction_admission_before_candidate_iterations(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         for marker in (

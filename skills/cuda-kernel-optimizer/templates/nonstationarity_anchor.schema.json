@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernel-flow.dev/cuda-kernel-optimizer/v2.8/nonstationarity_anchor.schema.json",
+  "title": "Create-once nonstationarity design anchor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "design_sha256", "design_artifact"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "design_sha256": {"$ref": "#/$defs/sha256"},
+    "design_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

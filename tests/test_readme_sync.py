@@ -184,7 +184,7 @@ class ReadmeSyncTests(unittest.TestCase):
     def test_readmes_publish_matching_release_notes_from_v2_2(self) -> None:
         english = self.english[self.english.index("## Release notes"):]
         chinese = self.chinese[self.chinese.index("## 版本记录"):]
-        versions = tuple(f"### V2.{minor}" for minor in range(7, 1, -1))
+        versions = tuple(f"### V2.{minor}" for minor in range(8, 1, -1))
         assert_in_order(self, english, versions)
         assert_in_order(self, chinese, versions)
         for version in versions:
@@ -193,6 +193,7 @@ class ReadmeSyncTests(unittest.TestCase):
         self.assertIn("maintained release history starts with V2.2", english)
         self.assertIn("从 V2.2 开始维护", chinese)
         for marker in (
+            "nonstationary",
             "direction-level",
             "performance-first",
             "formal evidence",
@@ -202,6 +203,7 @@ class ReadmeSyncTests(unittest.TestCase):
         ):
             self.assertIn(marker, english)
         for marker in (
+            "非平稳",
             "方向级",
             "性能优先",
             "正式证据",
@@ -213,8 +215,8 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_tested_scope_is_historical_and_not_a_speedup_promise(self) -> None:
         facts = (
-            "797",
-            "792",
+            "811",
+            "806",
             "13/13",
             "34.302",
             "60.4616%",

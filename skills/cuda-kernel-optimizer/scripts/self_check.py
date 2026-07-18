@@ -26,6 +26,7 @@ _SCRIPTS = (
     "evidence_protocol.py",
     "experiment_design.py",
     "iteration_guard.py",
+    "nonstationarity_guard.py",
     "workload_evaluate.py",
 )
 _V2_6_SCHEMAS = (
@@ -39,6 +40,12 @@ _V2_7_SCHEMAS = (
     "direction_evidence.schema.json",
     "direction_lineage.schema.json",
     "direction_decision.schema.json",
+)
+_V2_8_SCHEMAS = (
+    "nonstationarity_anchor.schema.json",
+    "nonstationarity_design.schema.json",
+    "nonstationarity_series.schema.json",
+    "nonstationarity_verdict.schema.json",
 )
 
 
@@ -94,6 +101,20 @@ def check_installation(skill_dir: Path | str) -> dict:
     if reference.is_symlink() or not reference.is_file():
         raise ValueError("missing reference: direction_admission.md")
     checks.append("v2_7_direction_guard")
+
+    for name in _V2_8_SCHEMAS:
+        path = root / "templates" / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"missing schema: {name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "v2.8" not in payload.get("$id", ""):
+            raise ValueError(f"schema does not declare V2.8 identity: {name}")
+        if payload.get("additionalProperties") is not False:
+            raise ValueError(f"schema root must be closed: {name}")
+    reference = root / "references" / "nonstationary_serving_evidence.md"
+    if reference.is_symlink() or not reference.is_file():
+        raise ValueError("missing reference: nonstationary_serving_evidence.md")
+    checks.append("v2_8_nonstationarity_guard")
 
     return {
         "schema_version": "cuda-evidence/self-check-v1",

@@ -74,6 +74,11 @@ flowchart LR
 只对同一结论层的可比方向排序，不用人为权重把不同层次强行放在一起比较。完整规则见
 [方向准入约束](skills/cuda-kernel-optimizer/references/direction_admission.md)。
 
+Serving 数据还可能随负载、队列深度、缓存状态等运行条件波动。V2.8 会在性能门禁读取结果前，
+先检查预先声明且顺序平衡的 AB/BA 序列，包括定长时间窗口、burn-in 到正式计时的状态变化、
+成对状态、采集顺序和原始数据绑定。通过只代表两组数据可比，不代表 candidate 更快。具体规则见
+[非平稳 serving 证据约束](skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md)。
+
 通过方向准入后，每轮优化都从一个能被实测推翻的性能假设开始；只有重新校验通过的 V2.5 证据闭环，才算真正评估过候选。
 测量工具的修复有明确的时间和次数上限；超限后只切换到实现不同的冻结路径，没有可用路径
 就停止该方向。修工具不等于性能提升，也不会作为优化成果汇报。具体规则见
@@ -109,7 +114,7 @@ CPU/static 检查推断出新的 GPU 结果。
 
 | 验证路径 | 已记录结果 | 含义 |
 |---|---|---|
-| CPU/static 验收 | 797 项测试：792 通过，5 项 RTX 5090 opt-in 测试跳过，0 失败 | 覆盖状态恢复、证据绑定、shared-host guard、超时、恢复和输入验证 |
+| CPU/static 验收 | 811 项测试：806 通过，5 项 RTX 5090 opt-in 测试跳过，0 失败 | 覆盖状态恢复、证据绑定、shared-host guard、超时、恢复和输入验证 |
 | 物理 RTX 5090 路径 | 13/13 项检查耗时 34.302 秒；目标侧 NCU 返回 `ERR_NVGPUCTRPERM` | GPU 工作流已运行，且未修改权限或驱动策略 |
 | 可复现 workload fixture | 端到端延迟提升 60.4616%，约束通过 | 只证明该 fixture 上的完整工作流 |
 | 用户提供的 vLLM workload | Kernel 指标提升 26.3287%，真实 workload 变化 -0.0097% | 更快的 kernel 没有改善产品 workload，因此保留原实现 |
@@ -120,6 +125,12 @@ CPU/static 检查推断出新的 GPU 结果。
 ## 版本记录
 
 本项目从 V2.2 开始维护版本记录。这里记录的是项目版本，不代表每个历史版本都创建了对应的 Git tag。
+
+### V2.8
+
+增加只读的非平稳 serving 证据门禁。测量前先用只写一次的 anchor 绑定设计，再按顺序平衡的 AB/BA 计划检查定长窗口、burn-in、
+成对状态、时间顺序和原始数据身份。无法确认可比性时保留全部证据，
+并给出下一次实验建议；门禁本身不声称性能提升，也不修改宿主机配置。
 
 ### V2.7
 
@@ -155,6 +166,7 @@ CPU/static 检查推断出新的 GPU 结果。
 - [Kernel 与 workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [性能优先的迭代约束](skills/cuda-kernel-optimizer/references/performance_iteration.md)
 - [方向准入约束](skills/cuda-kernel-optimizer/references/direction_admission.md)
+- [非平稳 serving 证据约束](skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md)
 - [V2.5 正式证据参考](skills/cuda-kernel-optimizer/references/evidence_automation.md)
 - [Canonical 兼容性参考](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in 测试说明](tests/gpu/sm120/README.md)

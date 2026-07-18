@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernel-flow.dev/cuda-kernel-optimizer/v2.8/nonstationarity_verdict.schema.json",
+  "title": "Read-only nonstationarity comparability verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "performance_gain_claimed", "anchor_sha256", "design_sha256", "series_sha256", "source_sha256", "total_blocks", "complete_blocks", "reasons", "failed_blocks", "next_experiment"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["comparable_paired_state", "inconclusive_nonstationary"]},
+    "performance_gain_claimed": {"const": false},
+    "anchor_sha256": {"$ref": "#/$defs/sha256"},
+    "design_sha256": {"$ref": "#/$defs/sha256"},
+    "series_sha256": {"$ref": "#/$defs/sha256"},
+    "source_sha256": {"$ref": "#/$defs/sha256"},
+    "total_blocks": {"type": "integer", "minimum": 4},
+    "complete_blocks": {"type": "integer", "minimum": 0},
+    "reasons": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/reason"}},
+    "failed_blocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["block_id", "reasons"],
+        "properties": {
+          "block_id": {"type": "string", "minLength": 1},
+          "reasons": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/reason"}}
+        }
+      }
+    },
+    "next_experiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "recommendations", "host_policy"],
+      "properties": {
+        "action": {"enum": ["proceed_to_performance_gate", "redesign_before_measurement"]},
+        "recommendations": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "host_policy": {"const": "recommend_only"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "reason": {"enum": ["unsupported_measurement_mode", "duration_out_of_bounds", "phase_shift", "state_pair_mismatch", "unusable_observation", "insufficient_complete_blocks"]}
+  }
+}

@@ -76,18 +76,13 @@ flowchart LR
     evaluation --> restore["Evidence is insufficient: restore the original"]
 ```
 
-Before the first candidate, the workflow freezes the baseline, environment, and
-prevalidated measurement paths. It first checks whether the direction's measured
-ceiling can still justify another round and records stop or reopen decisions in
-an append-only ledger. Comparable directions are ranked only within the same
-claim layer; other comparisons remain explicit rather than receiving invented weights.
+Before the first candidate, the workflow freezes the baseline, environment, and prevalidated measurement paths. It first checks whether the direction's measured ceiling can still justify another round and records stop or reopen decisions in an append-only ledger. Comparable directions are ranked only within the same claim layer; other comparisons remain explicit rather than receiving invented weights.
 See the [direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md).
 
-Each admitted round starts with a falsifiable performance
-hypothesis, and only a rehashed V2.5 evidence closure counts as an evaluated
-candidate. Measurement tooling has a hard time and repair limit; after that,
-the AI switches to a different frozen path or stops the direction. Tool work is
-not a performance improvement and is not reported as one. The detailed rules are in the
+Serving measurements can move with load, queue depth, cache state, or another runtime condition. V2.8 checks a predeclared, balanced AB/BA series before those numbers reach the performance gate. It verifies fixed-duration windows, burn-in to timed transitions, paired state, chronology, and the bound raw source. A pass means the rows are comparable; it does not mean the candidate is faster. See
+[nonstationary serving evidence](skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md).
+
+Each admitted round starts with a falsifiable performance hypothesis, and only a rehashed V2.5 evidence closure counts as an evaluated candidate. Measurement tooling has a hard time and repair limit; after that, the AI switches to a different frozen path or stops the direction. Tool work is not a performance improvement and is not reported as one. The detailed rules are in the
 [performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md).
 
 The workflow freezes the objective and authorized scope before timed work. Each
@@ -126,7 +121,7 @@ the CPU/static checks in this documentation change.
 
 | Validation lane | Recorded result | Interpretation |
 |---|---|---|
-| CPU/static acceptance | 797 tests: 792 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
+| CPU/static acceptance | 811 tests: 806 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
 | Physical RTX 5090 lane | 13/13 checks in 34.302 seconds; target-side NCU returned `ERR_NVGPUCTRPERM` | The GPU workflow ran without changing privilege or driver policy |
 | Reproducible workload fixture | End-to-end latency improved 60.4616% with constraints passing | Demonstrates the workflow on that fixture only |
 | User-supplied vLLM workload | Kernel metric improved 26.3287%; real workload changed -0.0097% | The original was kept because a faster kernel did not improve the product workload |
@@ -140,6 +135,10 @@ performance guarantees.
 
 The maintained release history starts with V2.2. These notes describe project
 versions; they do not imply that every historical version has a matching Git tag.
+
+### V2.8
+
+Added a read-only nonstationary serving-evidence gate. A create-once anchor binds the pre-measurement design before a balanced AB/BA plan is checked against fixed-duration, burn-in, paired-state, chronological, and raw-source identity rules. Inconclusive evidence remains visible and is routed to a redesigned experiment; the gate never claims a speedup or changes host settings.
 
 ### V2.7
 
@@ -175,10 +174,10 @@ Established the dual-loop optimizer: paired kernel measurements, user-supplied w
 - [Kernel and workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [Performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md)
 - [Direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md)
+- [Nonstationary serving-evidence contract](skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md)
 - [Formal V2.5 evidence reference](skills/cuda-kernel-optimizer/references/evidence_automation.md)
 - [Canonical compatibility reference](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in test guide](tests/gpu/sm120/README.md)
 - [MIT License](LICENSE)
 
-This project is independent of CUDA, CUTLASS, Triton, and Nsight Compute. Use
-those dependencies under their respective licenses.
+This project is independent of CUDA, CUTLASS, Triton, and Nsight Compute. Use those dependencies under their respective licenses.

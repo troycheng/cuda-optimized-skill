@@ -3,6 +3,7 @@
 ## 1. Freeze the public contract
 
 - Add strict design, series, and verdict schemas.
+- Bind the pre-measurement design in a create-once anchor.
 - Keep baseline/candidate roles, AB/BA block order, burn-in, minimum block count,
   metric taxonomy, and state tolerances closed.
 - Document the trusted collector boundary and the no-performance-claim rule.

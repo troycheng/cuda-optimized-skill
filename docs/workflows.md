@@ -57,6 +57,14 @@ A valid result also needs shared-host cleanliness, serving-stack artifact
 identity, execution-path coverage, raw rows, and a sealed attempt. Performance
 and evidence integrity remain separate decisions.
 
+When load or runtime state may drift during collection, freeze a balanced AB/BA
+block plan and the state tolerances before measurement. The V2.8 read-only gate
+checks fixed-duration windows, burn-in transitions, paired state, chronology,
+and the raw-source digest. `comparable_paired_state` allows the existing
+performance gate to interpret the metric; it does not establish a win.
+`inconclusive_nonstationary` requires a redesigned or recollected experiment.
+See [Nonstationary serving evidence](../skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md).
+
 ## Existing NCU report
 
 Use this path when a `.ncu-rep` already exists and launching the profiled program

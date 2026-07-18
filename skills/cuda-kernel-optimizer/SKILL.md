@@ -3,7 +3,7 @@ name: cuda-kernel-optimizer
 description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.7)
+# CUDA Kernel and Workload Optimizer (V2.8)
 
 ## Principle
 
@@ -16,6 +16,14 @@ Optimize in two evidence layers:
 
 A faster microbenchmark is not automatically an end-to-end win. Promotion is a
 decision backed by durable evidence, not the lowest observed sample.
+
+## Nonstationary serving evidence
+
+V2.8 checks whether already-collected serving rows compare baseline and candidate under comparable state before interpreting their metric. Before measurement, run `scripts/nonstationarity_guard.py init` to bind the design bytes and canonical digest in a create-once anchor. Freeze at least four `site_randomized_balanced` blocks, balanced AB/BA order, fixed-duration bounds, burn-in rows, the minimum complete blocks, and pair tolerance plus phase tolerance for every declared state dimension. Do not delete, reorder, cluster, relabel, or relax the design after seeing results.
+
+Run `scripts/nonstationarity_guard.py check` with a frozen design and chronological normalized series. It rehashes the bound raw source, rejects identity or plan drift, and returns only `comparable_paired_state` or `inconclusive_nonstationary`; `performance_gain_claimed` is always false. Only comparable evidence proceeds to the existing performance gate. The guard never runs a target or changes a host; `host_policy` stays `recommend_only`.
+
+Read `references/nonstationary_serving_evidence.md`; contracts are `templates/nonstationarity_anchor.schema.json`, `templates/nonstationarity_design.schema.json`, `templates/nonstationarity_series.schema.json`, and `templates/nonstationarity_verdict.schema.json`.
 
 ## Direction admission
 
@@ -464,37 +472,24 @@ optional artifact exists without checking it. Raw `paired_samples.jsonl`, the
 frozen objective, candidate hashes, classifier configuration, and
 `decision.json` make the reported confidence result independently recomputable.
 
-The final summary must state, in this order: terminal result and budget; frozen
-inputs/environment; kernel estimate, confidence interval, pairs, correctness,
-and SASS status; real-workload KPI and constraints or the absence of a workload;
-profiler/sanitizer/compiler coverage; candidates; raw artifact paths; resume
-status.
+The final summary must state, in this order: terminal result and budget; frozen inputs/environment; kernel estimate, confidence interval, pairs, correctness, and SASS status; real-workload KPI and constraints or its absence; profiler/sanitizer/compiler coverage; candidates; raw artifact paths; resume status.
 
 ## References to read on demand
 
+- `references/nonstationary_serving_evidence.md`: V2.8 nonstationary serving-state comparability and read-only CLI.
 - `references/direction_admission.md`: V2.7 direction identity, impact envelope, stop ledger, reopening evidence, and read-only CLI.
 - `references/performance_iteration.md`: V2.6 hypothesis, work class, infrastructure budget, fallback, and stop rules.
 - `references/compatibility.md`: versions, public APIs, architecture routing, and RTX 5090/SM120 facts.
 - `references/optimization_catalog.md`: method triggers, skip rules, and combination constraints.
 - `references/ncu_metrics_guide.md`: profiler metric interpretation.
-- `references/systems_and_ir_coverage.md`: read only for systems-path,
-  CUTLASS/CuTe, or Triton IR evidence tasks.
-- `references/serving_evidence_protocol.md`: read only for runtime or serving
-  evidence and claims.
-- `references/evidence_automation.md`: V2.5 guard, frozen design,
-  execution-path, identity, seal/audit/decision, import, and profiler contracts.
-- `references/migration_v2_5.md`: V2.4.1 compatibility and non-mutating
-  migration notes.
+- `references/systems_and_ir_coverage.md`: read only for systems-path, CUTLASS/CuTe, or Triton IR evidence tasks.
+- `references/serving_evidence_protocol.md`: read only for runtime or serving evidence and claims.
+- `references/evidence_automation.md`: V2.5 guard, frozen design, execution-path, identity, seal/audit/decision, import, and profiler contracts.
+- `references/migration_v2_5.md`: V2.4.1 compatibility and non-mutating migration notes.
 - `references/sanitizer_policy.json`: targeted/full sanitizer routing.
 - `references/sass_signatures.json`: instruction signatures.
 - `templates/objective.schema.json`: strict workload objective schema.
-- `templates/guard_policy.schema.json`, `templates/experiment_design.schema.json`,
-  `templates/attempt.schema.json`, `templates/execution_path.schema.json`,
-  `templates/serving_experiment.schema.json`,
-  `templates/artifact_identities.schema.json`,
-  `templates/profiler_bundle.schema.json`,
-  `templates/performance_verdict.schema.json`, and
-  `templates/evidence_manifest.schema.json`: V2.5 formal evidence schemas.
+- `templates/guard_policy.schema.json`, `templates/experiment_design.schema.json`, `templates/attempt.schema.json`, `templates/execution_path.schema.json`, `templates/serving_experiment.schema.json`, `templates/artifact_identities.schema.json`, `templates/profiler_bundle.schema.json`, `templates/performance_verdict.schema.json`, and `templates/evidence_manifest.schema.json`: V2.5 formal evidence schemas.
 - `templates/workload.py`: user-owned Python workload starter.
 - `templates/iteration_report.md`: per-round decision record.
 - `examples/walkthrough.md`: annotated kernel-only and full-mode walkthrough.

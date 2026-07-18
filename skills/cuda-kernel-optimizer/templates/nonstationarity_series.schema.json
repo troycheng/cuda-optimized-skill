@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernel-flow.dev/cuda-kernel-optimizer/v2.8/nonstationarity_series.schema.json",
+  "title": "Chronological nonstationarity observation series",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "design_sha256", "source_artifact", "metric", "measurement_mode", "observations"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "design_sha256": {"$ref": "#/$defs/sha256"},
+    "source_artifact": {"$ref": "#/$defs/artifact"},
+    "metric": {"$ref": "#/$defs/metric"},
+    "measurement_mode": {"enum": ["time_windows", "count_windows"]},
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sequence_index", "block_id", "segment_index", "role", "phase", "duration_ms", "metric_value", "usable", "states"],
+        "properties": {
+          "sequence_index": {"type": "integer", "minimum": 0},
+          "block_id": {"$ref": "#/$defs/identifier"},
+          "segment_index": {"type": "integer", "minimum": 0},
+          "role": {"enum": ["baseline", "candidate"]},
+          "phase": {"enum": ["burn_in", "timed"]},
+          "duration_ms": {"type": "number", "minimum": 0},
+          "metric_value": {"type": ["number", "null"]},
+          "usable": {"type": "boolean"},
+          "states": {"type": "object", "additionalProperties": {"type": "number"}, "minProperties": 1}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "unit", "direction"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "unit": {"$ref": "#/$defs/identifier"},
+        "direction": {"enum": ["lower", "higher"]}
+      }
+    }
+  }
+}

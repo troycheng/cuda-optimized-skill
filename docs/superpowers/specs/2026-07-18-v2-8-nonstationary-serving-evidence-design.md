@@ -27,17 +27,20 @@ the user-supplied workload.
 `nonstationarity_guard.py` is read-only. It consumes:
 
 - one strict design JSON created before measurement;
+- one create-once anchor that binds the design bytes and canonical digest;
 - one strict chronological series JSON from a user or site-owned collector;
 - one raw source artifact referenced by the normalized series.
 
-The CLI rehashes the raw source and requires its path and digest to match the
-series. It proves byte identity, schedule conformance, and deterministic state
+The CLI rehashes the anchored design and raw source and requires their paths and digests to match the
+recorded bindings. It proves byte identity, schedule conformance, and deterministic state
 comparability. It cannot prove that arbitrary normalized values were correctly
 derived from an opaque profiler format. The user or site collector is the
 trusted producer; an adversarial producer requires an external signature or
 sealed manifest.
 
 The tool never changes host settings. Host-level remedies remain recommendations.
+The create-once boundary assumes retained storage; deletion and storage rollback
+require a site-owned immutable artifact store or external seal.
 
 ## Predeclared block design
 
