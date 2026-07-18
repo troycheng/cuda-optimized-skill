@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/direction_decision.schema.json",
+  "title": "CUDA optimizer direction ledger decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "direction_id", "direction_family_key", "direction_key", "claim_layer", "measurement_window_sha256", "evidence_sha256", "performance_gain_claimed", "state", "action", "transition", "reason", "upper_bound_absolute", "upper_bound_percent", "recommended_direction_id", "decision_index", "lineage_sha256", "previous_decision_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "direction_id": {"type": "string", "minLength": 1},
+    "direction_family_key": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "direction_key": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "claim_layer": {"enum": ["kernel", "runtime", "workload", "serving"]},
+    "measurement_window_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "evidence_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "performance_gain_claimed": {"const": false},
+    "state": {"enum": ["open", "closed"]},
+    "action": {"enum": ["admit_direction", "switch_to_higher_impact", "close_direction", "direction_closed", "unrankable"]},
+    "transition": {"enum": ["admit", "close", "reopen", "blocked"]},
+    "reason": {"type": "string", "minLength": 1},
+    "upper_bound_absolute": {"oneOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+    "upper_bound_percent": {"oneOf": [{"type": "number", "minimum": 0, "maximum": 100}, {"type": "null"}]},
+    "recommended_direction_id": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+    "decision_index": {"type": "integer", "minimum": 1},
+    "lineage_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "previous_decision_sha256": {"oneOf": [{"$ref": "direction_portfolio.schema.json#/$defs/sha256"}, {"type": "null"}]}
+  }
+}

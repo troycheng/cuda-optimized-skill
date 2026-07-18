@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/direction_lineage.schema.json",
+  "title": "CUDA optimizer frozen direction lineage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "objective", "environment_sha256", "direction_families", "initial_portfolio_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "objective": {"$ref": "direction_portfolio.schema.json#/$defs/objective"},
+    "environment_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "direction_families": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"}
+    },
+    "initial_portfolio_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"}
+  }
+}
