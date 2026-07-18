@@ -1,0 +1,28 @@
+:root {
+  --cko-carbon: #172033;
+  --cko-cyan: #16b8a6;
+}
+
+.navbar,
+.navbar-default {
+  background-color: var(--cko-carbon);
+}
+
+a,
+.bs-sidebar .nav > .active > a,
+.bs-sidebar .nav > .active:hover > a {
+  color: #087f73;
+}
+
+a:hover,
+a:focus {
+  color: #075e57;
+}
+
+code {
+  color: #096f66;
+}
+
+blockquote {
+  border-left-color: var(--cko-cyan);
+}

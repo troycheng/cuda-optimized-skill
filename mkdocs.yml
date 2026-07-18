@@ -1,0 +1,23 @@
+site_name: CUDA Kernel Optimizer
+site_description: Evidence-driven CUDA, CUTLASS and Triton optimization for Codex
+repo_name: troycheng/cuda-optimized-skill
+repo_url: https://github.com/troycheng/cuda-optimized-skill
+docs_dir: docs
+
+theme:
+  name: mkdocs
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Workflows: workflows.md
+  - Evidence & Safety: evidence-and-safety.md
+  - Compatibility: compatibility.md
+  - Agent Protocol: https://github.com/troycheng/cuda-optimized-skill/blob/main/skills/cuda-kernel-optimizer/SKILL.md
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - tables
+  - fenced_code
