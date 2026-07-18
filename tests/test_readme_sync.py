@@ -35,6 +35,7 @@ class ReadmeSyncTests(unittest.TestCase):
             "## How it works",
             "## Evidence, not best-sample claims",
             "## Tested scope",
+            "## Release notes",
             "## Documentation",
         )
         chinese = (
@@ -44,6 +45,7 @@ class ReadmeSyncTests(unittest.TestCase):
             "## 工作方式",
             "## 以证据为准，而不是选择最快样本",
             "## 已测试范围",
+            "## 版本记录",
             "## 文档",
         )
         assert_in_order(self, self.english, english)
@@ -178,6 +180,36 @@ class ReadmeSyncTests(unittest.TestCase):
         )
         self.assertIn(reference, self.english)
         self.assertIn(reference, self.chinese)
+
+    def test_readmes_publish_matching_release_notes_from_v2_2(self) -> None:
+        english = self.english[self.english.index("## Release notes"):]
+        chinese = self.chinese[self.chinese.index("## 版本记录"):]
+        versions = tuple(f"### V2.{minor}" for minor in range(7, 1, -1))
+        assert_in_order(self, english, versions)
+        assert_in_order(self, chinese, versions)
+        for version in versions:
+            self.assertEqual(english.count(version), 1)
+            self.assertEqual(chinese.count(version), 1)
+        self.assertIn("maintained release history starts with V2.2", english)
+        self.assertIn("从 V2.2 开始维护", chinese)
+        for marker in (
+            "direction-level",
+            "performance-first",
+            "formal evidence",
+            "workload controller",
+            "portable",
+            "dual-loop",
+        ):
+            self.assertIn(marker, english)
+        for marker in (
+            "方向级",
+            "性能优先",
+            "正式证据",
+            "workload controller",
+            "可移植",
+            "双循环",
+        ):
+            self.assertIn(marker, chinese)
 
     def test_tested_scope_is_historical_and_not_a_speedup_promise(self) -> None:
         facts = (

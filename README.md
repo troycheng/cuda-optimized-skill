@@ -77,7 +77,13 @@ flowchart LR
 ```
 
 Before the first candidate, the workflow freezes the baseline, environment, and
-prevalidated measurement paths. Each round starts with a falsifiable performance
+prevalidated measurement paths. It first checks whether the direction's measured
+ceiling can still justify another round and records stop or reopen decisions in
+an append-only ledger. Comparable directions are ranked only within the same
+claim layer; other comparisons remain explicit rather than receiving invented weights.
+See the [direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md).
+
+Each admitted round starts with a falsifiable performance
 hypothesis, and only a rehashed V2.5 evidence closure counts as an evaluated
 candidate. Measurement tooling has a hard time and repair limit; after that,
 the AI switches to a different frozen path or stops the direction. Tool work is
@@ -130,6 +136,35 @@ Detailed versions and opt-in conditions are in
 [Compatibility](docs/compatibility.md). Historical speedups are not general
 performance guarantees.
 
+## Release notes
+
+The maintained release history starts with V2.2. These notes describe project
+versions; they do not imply that every historical version has a matching Git tag.
+
+### V2.7
+
+Added direction-level admission, conservative impact ceilings, and an append-only stop/reopen ledger. AI agents now decide whether a direction is still worth a candidate round before spending V2.6 budget.
+
+### V2.6
+
+Added the performance-first iteration gate: frozen hypotheses, bounded tool repair, prevalidated fallbacks, and machine-readable round outcomes that cannot turn infrastructure work into a speedup claim.
+
+### V2.5
+
+Added formal evidence automation for shared hosts and serving runs: frozen designs, continuous guards, artifact and execution-path identity, sealed attempts, audit, and separate performance and integrity decisions.
+
+### V2.4
+
+Added the complete workload controller, deterministic bottleneck diagnosis, bounded ChangeSets, advisory review, and the recommend-only boundary for host changes.
+
+### V2.3
+
+Expanded portable CUDA, CUTLASS, Triton, native and legacy coverage; added read-only NCU report analysis, strategy memory, and clearer systems, IR, and serving guidance.
+
+### V2.2
+
+Established the dual-loop optimizer: paired kernel measurements, user-supplied workload validation, resumable checkpoints, sanitizer and compiler evidence, separate kernel/end-to-end conclusions, and the RTX 5090 test lane.
+
 ## Documentation
 
 - [Getting Started](docs/getting-started.md)
@@ -139,6 +174,7 @@ performance guarantees.
 - [Agent execution protocol](skills/cuda-kernel-optimizer/SKILL.md)
 - [Kernel and workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [Performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md)
+- [Direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md)
 - [Formal V2.5 evidence reference](skills/cuda-kernel-optimizer/references/evidence_automation.md)
 - [Canonical compatibility reference](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in test guide](tests/gpu/sm120/README.md)

@@ -70,7 +70,11 @@ flowchart LR
 ```
 
 第一个候选开始前，工作流先冻结 baseline、环境和预先验证的测量路径。每轮优化都从一个
-能被实测推翻的性能假设开始；只有重新校验通过的 V2.5 证据闭环，才算真正评估过候选。
+方向是否值得继续开始：根据已有测量计算保守上限，并把停止和重开写入只增不改的账本。
+只对同一结论层的可比方向排序，不用人为权重把不同层次强行放在一起比较。完整规则见
+[方向准入约束](skills/cuda-kernel-optimizer/references/direction_admission.md)。
+
+通过方向准入后，每轮优化都从一个能被实测推翻的性能假设开始；只有重新校验通过的 V2.5 证据闭环，才算真正评估过候选。
 测量工具的修复有明确的时间和次数上限；超限后只切换到实现不同的冻结路径，没有可用路径
 就停止该方向。修工具不等于性能提升，也不会作为优化成果汇报。具体规则见
 [性能优先的迭代约束](skills/cuda-kernel-optimizer/references/performance_iteration.md)。
@@ -113,6 +117,34 @@ CPU/static 检查推断出新的 GPU 结果。
 
 详细版本和 opt-in 条件见[兼容性](docs/compatibility.md)。历史性能数字不是通用性能承诺。
 
+## 版本记录
+
+本项目从 V2.2 开始维护版本记录。这里记录的是项目版本，不代表每个历史版本都创建了对应的 Git tag。
+
+### V2.7
+
+增加方向级准入、保守收益上限和只增不改的停止/重开账本。AI 在进入 V2.6 候选迭代前，先判断这个方向是否还值得继续投入。
+
+### V2.6
+
+增加性能优先的迭代门禁：冻结假设，限制工具修复时间和次数，预先准备 fallback，并用机器可读结果区分候选进展与基础设施工作。
+
+### V2.5
+
+增加 shared host 和 serving 场景的正式证据自动化：冻结实验设计，持续检查环境，绑定 artifact 与 execution path，封存、审计并分别判定性能和证据完整性。
+
+### V2.4
+
+增加完整 workload controller、确定性的瓶颈诊断、限定范围的 ChangeSet、建议型 review，以及宿主机只给建议、不自动修改的边界。
+
+### V2.3
+
+扩展 CUDA、CUTLASS、Triton 的可移植覆盖，兼容 native 与 legacy 路径；增加只读 NCU report 分析、strategy memory，以及 systems、IR 和 serving 指南。
+
+### V2.2
+
+建立双循环优化框架：kernel 成对测量、用户真实 workload 验证、可恢复 checkpoint、sanitizer 与编译器证据、kernel/端到端结论分离，以及 RTX 5090 测试路径。
+
 ## 文档
 
 - [快速开始](docs/getting-started.md)
@@ -122,6 +154,7 @@ CPU/static 检查推断出新的 GPU 结果。
 - [AI 执行协议](skills/cuda-kernel-optimizer/SKILL.md)
 - [Kernel 与 workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [性能优先的迭代约束](skills/cuda-kernel-optimizer/references/performance_iteration.md)
+- [方向准入约束](skills/cuda-kernel-optimizer/references/direction_admission.md)
 - [V2.5 正式证据参考](skills/cuda-kernel-optimizer/references/evidence_automation.md)
 - [Canonical 兼容性参考](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in 测试说明](tests/gpu/sm120/README.md)

@@ -3,6 +3,16 @@
 Choose the workflow from the strongest claim your inputs can support. A faster
 kernel does not automatically establish a faster product workload.
 
+## Direction admission
+
+Before creating candidates, the AI uses `direction_guard.py` to decide whether
+the direction still has enough measured headroom. Automatic ranking is limited
+to same-layer additive time and uses a full-elimination ceiling. Cross-layer,
+throughput, and composite comparisons are `unrankable`; they need a separate
+experiment instead of invented weights. Closed directions stay closed unless
+new evidence meets the frozen reopen rules. See the
+[direction-admission contract](../skills/cuda-kernel-optimizer/references/direction_admission.md).
+
 ## Performance-first iteration
 
 Before the first candidate, freeze the baseline, environment, and prevalidated

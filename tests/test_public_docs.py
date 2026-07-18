@@ -90,6 +90,15 @@ class PublicDocsTests(unittest.TestCase):
             "performance_iteration.md",
         ):
             self.assertIn(marker, text)
+        for marker in (
+            "Direction admission",
+            "direction_guard.py",
+            "same-layer",
+            "full-elimination",
+            "unrankable",
+            "direction_admission.md",
+        ):
+            self.assertIn(marker, text)
 
     def test_evidence_page_preserves_formal_boundaries(self) -> None:
         text = (ROOT / "docs/evidence-and-safety.md").read_text(encoding="utf-8")
