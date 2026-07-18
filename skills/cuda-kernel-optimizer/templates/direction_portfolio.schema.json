@@ -4,12 +4,12 @@
   "title": "CUDA optimizer direction portfolio",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "objective", "environment_sha256", "measurement_window_sha256", "directions"],
+  "required": ["schema_version", "objective", "environment_artifact", "measurement_window_artifact", "directions"],
   "properties": {
     "schema_version": {"const": 1},
     "objective": {"$ref": "#/$defs/objective"},
-    "environment_sha256": {"$ref": "#/$defs/sha256"},
-    "measurement_window_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_artifact": {"$ref": "#/$defs/artifactRef"},
+    "measurement_window_artifact": {"$ref": "#/$defs/artifactRef"},
     "directions": {
       "type": "array",
       "minItems": 1,
@@ -18,6 +18,15 @@
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "positive": {"type": "number", "exclusiveMinimum": 0},
     "objective": {
       "type": "object",
@@ -40,12 +49,13 @@
     "direction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "claim_layer", "bottleneck_class", "target_identity_sha256", "component_id", "metric_name", "metric_unit", "metric_direction", "metric_kind", "total_metric", "component_metric", "evidence_sha256"],
+      "required": ["id", "claim_layer", "bottleneck_class", "target_artifact", "component_artifact", "component_id", "metric_name", "metric_unit", "metric_direction", "metric_kind", "total_metric", "component_metric", "evidence_artifact"],
       "properties": {
         "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "claim_layer": {"enum": ["kernel", "runtime", "workload", "serving"]},
         "bottleneck_class": {"enum": ["kernel", "framework", "cpu_data", "transfer", "communication", "io", "environment"]},
-        "target_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "target_artifact": {"$ref": "#/$defs/artifactRef"},
+        "component_artifact": {"$ref": "#/$defs/artifactRef"},
         "component_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
         "metric_name": {"type": "string", "minLength": 1},
         "metric_unit": {"type": "string", "minLength": 1},
@@ -53,7 +63,7 @@
         "metric_kind": {"enum": ["additive_time", "throughput", "composite"]},
         "total_metric": {"type": "number", "exclusiveMinimum": 0},
         "component_metric": {"type": "number", "minimum": 0},
-        "evidence_sha256": {"$ref": "#/$defs/sha256"}
+        "evidence_artifact": {"$ref": "#/$defs/artifactRef"}
       }
     }
   }

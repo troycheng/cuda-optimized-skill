@@ -24,10 +24,12 @@ V2.7 decides whether a direction is worth another candidate round. Use `scripts/
 For same-layer additive time it uses a full-elimination upper bound and returns `admit_direction`,
 `switch_to_higher_impact`, `close_direction`, `direction_closed`, or `unrankable`. Mechanism prose is not identity.
 
-The guard never runs the target and never claims a gain. Reopen requires new evidence, a changed window,
-target, or envelope, and the original frozen floor. Cross-layer, throughput, and composite comparisons remain
-`unrankable`. `host_policy` stays `recommend_only`. Read `references/direction_admission.md`; the contracts are
-`templates/direction_portfolio.schema.json`, `templates/direction_lineage.schema.json`, and `templates/direction_decision.schema.json`.
+The guard never runs the target and never claims a gain. Its CLI rehashes bound environment, window, target,
+component, and evidence artifacts. Only `admitted: true` enters V2.6; `unrankable` is hard non-admission. Record every
+reported stop with `--request close` before more candidate work. Reopen requires verified new evidence, a
+materially larger frozen-baseline envelope. Pass the last status tail on every append. `host_policy` stays `recommend_only`. Read
+`references/direction_admission.md`; contracts are `templates/direction_portfolio.schema.json`,
+`templates/direction_lineage.schema.json`, and `templates/direction_decision.schema.json`.
 
 ## Performance-first iteration gate
 
@@ -472,10 +474,8 @@ status.
 
 - `references/direction_admission.md`: V2.7 direction identity, impact envelope, stop ledger, reopening evidence, and read-only CLI.
 - `references/performance_iteration.md`: V2.6 hypothesis, work class, infrastructure budget, fallback, and stop rules.
-- `references/compatibility.md`: supported versions, public APIs, architecture
-  routing, and RTX 5090/SM120 facts.
-- `references/optimization_catalog.md`: method triggers, skip rules, and
-  combination constraints.
+- `references/compatibility.md`: versions, public APIs, architecture routing, and RTX 5090/SM120 facts.
+- `references/optimization_catalog.md`: method triggers, skip rules, and combination constraints.
 - `references/ncu_metrics_guide.md`: profiler metric interpretation.
 - `references/systems_and_ir_coverage.md`: read only for systems-path,
   CUTLASS/CuTe, or Triton IR evidence tasks.

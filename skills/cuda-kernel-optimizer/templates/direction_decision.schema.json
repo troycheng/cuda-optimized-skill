@@ -4,7 +4,7 @@
   "title": "CUDA optimizer direction ledger decision",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "direction_id", "direction_family_key", "direction_key", "claim_layer", "measurement_window_sha256", "evidence_sha256", "performance_gain_claimed", "state", "action", "transition", "reason", "upper_bound_absolute", "upper_bound_percent", "recommended_direction_id", "decision_index", "lineage_sha256", "previous_decision_sha256"],
+  "required": ["schema_version", "direction_id", "direction_family_key", "direction_key", "claim_layer", "measurement_window_sha256", "evidence_sha256", "portfolio_sha256", "performance_gain_claimed", "admitted", "state", "action", "transition", "reason", "upper_bound_absolute", "upper_bound_percent", "recommended_direction_id", "decision_index", "lineage_sha256", "previous_decision_sha256"],
   "properties": {
     "schema_version": {"const": 1},
     "direction_id": {"type": "string", "minLength": 1},
@@ -13,7 +13,9 @@
     "claim_layer": {"enum": ["kernel", "runtime", "workload", "serving"]},
     "measurement_window_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
     "evidence_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
+    "portfolio_sha256": {"$ref": "direction_portfolio.schema.json#/$defs/sha256"},
     "performance_gain_claimed": {"const": false},
+    "admitted": {"type": "boolean"},
     "state": {"enum": ["open", "closed"]},
     "action": {"enum": ["admit_direction", "switch_to_higher_impact", "close_direction", "direction_closed", "unrankable"]},
     "transition": {"enum": ["admit", "close", "reopen", "blocked"]},

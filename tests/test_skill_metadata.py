@@ -50,13 +50,17 @@ class SkillMetadataTests(unittest.TestCase):
         for marker in (
             "direction family",
             "mechanism",
-            "component_metric / total_metric",
+            "component_metric / baseline_total_metric",
             "same-layer",
             "additive",
             "create-once",
             "hash chain",
             "reopen",
             "new evidence",
+            "component artifact",
+            "baseline total",
+            "expected-tail-sha256",
+            "storage rollback",
             "never runs",
             "does not claim",
         ):

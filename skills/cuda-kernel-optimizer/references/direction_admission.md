@@ -14,8 +14,12 @@ never edits project code or host configuration. It does not claim a measured
 performance gain; V2.5 evidence and the relevant promotion gate remain the
 authorities for correctness and speed.
 
-Inputs are supplied by the user or by existing measurement tools. The guard
-validates and hashes them but does not collect them.
+Inputs are supplied by the user or existing measurement tools. The portfolio
+references regular environment, measurement-window, target, component artifact,
+and evidence files
+by safe relative path and expected digest. The CLI rehashes every referenced
+artifact without following symlinks before it admits or reopens anything. A
+bare AI-generated digest is not evidence. The guard does not collect artifacts.
 
 ## Direction identity
 
@@ -24,12 +28,14 @@ A direction family is derived from:
 - claim layer: `kernel`, `runtime`, `workload`, or `serving`;
 - bottleneck class: `kernel`, `framework`, `cpu_data`, `transfer`,
   `communication`, `io`, or `environment`;
-- stable component identifier;
+- stable component artifact emitted by the profiler or application evidence;
+- human-readable component identifier, which is not part of family identity;
 - metric name, unit, direction, and kind.
 
-The concrete direction key also binds the target identity. A label, mechanism
-name, candidate hash, or iteration number is deliberately absent. Calling the
-same work a new mechanism cannot create a new direction family.
+The component artifact digest, rather than a caller-chosen component name, is in
+the family key. The concrete direction key also binds the target identity. A
+label, mechanism name, candidate hash, or iteration number is deliberately
+absent. Calling the same work a new mechanism cannot create a new family.
 
 ## Comparable impact envelope
 
@@ -41,10 +47,11 @@ additive, lower-is-better time metric:
 total_metric > 0
 0 <= component_metric <= total_metric
 upper_bound_absolute = component_metric
-upper_bound_percent = 100 * component_metric / total_metric
+upper_bound_percent = 100 * component_metric / baseline_total_metric
 ```
 
-In ratio form, the ceiling is `component_metric / total_metric`. It assumes the
+The baseline total is frozen per family at `init`; later work cannot shrink the
+denominator to manufacture a larger percentage. The ceiling assumes the
 component can be removed completely, so it is a full-elimination upper bound,
 not a forecast. The guard does not ask an AI to estimate an eliminable fraction.
 
@@ -60,12 +67,19 @@ post-hoc weights or automatic serving-state clustering are not substitutes.
 
 `init` writes `direction-lineage.json` exactly once. It freezes the objective,
 environment, registered direction families, and initial portfolio digest.
+The initial digest is the first snapshot anchor, not a rule that all later
+measurements must be byte-identical. A later portfolio snapshot may update the
+window, target, evidence, and measured component values within the same ledger;
+the objective, environment, and registered family taxonomy remain frozen. Each
+decision records the current portfolio digest.
 
 `check` validates the whole decision directory, derives the next decision, and
 appends `direction-decisions/decision-NNNN.json` with create-once semantics.
 Every record binds the lineage and previous file digest, forming one hash chain.
 Unknown files, gaps, broken hashes, symlinks, drift, or concurrent duplicate
-writes fail closed. `status` validates the same chain without writing.
+writes fail closed. After the first decision, every `check` must pass the last
+value returned by `status` as `--expected-tail-sha256`; stale or missing caller
+state cannot append. `status` validates the chain and returns its current tail.
 
 The actions are:
 
@@ -78,21 +92,36 @@ The actions are:
   qualified reopen;
 - `unrankable`: the input is outside the automatic comparison boundary.
 
-After admission, V2.6 still owns candidate budgets, fallback paths, and per-round
-stopping. V2.7 does not authorize a candidate or promotion by itself.
+Only a result with `admitted: true` may enter V2.6. Every other result is a hard
+non-admission, including `switch_to_higher_impact` and `unrankable`. A mixed
+portfolio is allowed: the selected direction is compared only with its
+same-layer, same-metric additive subset. Selecting a throughput, composite, or
+cross-layer direction returns `unrankable` and does not authorize the AI to
+continue on its own.
+
+After admission, V2.6 still owns candidate budgets, fallback paths, and
+per-round stopping. V2.7 does not authorize a promotion by itself.
+
+Whenever the AI reports that a direction should stop, it must append
+`--request close` before generating, editing, compiling, or measuring another
+candidate. If an earlier spoken stop was not recorded, backfill the close
+decision before any other optimization work. Natural-language stop statements
+alone are not machine state and must never be used as permission to continue.
 
 ## Reopening a closed family
 
 Reopen only when all of the following are true:
 
 1. the latest decision for the same family is closed;
-2. a new evidence digest is present;
+2. a new evidence artifact is present and its digest is reverified by the CLI;
 3. the measurement window, target identity, or measured impact envelope changed;
-4. the recomputed full-elimination ceiling still meets the original frozen floor.
+4. the absolute and frozen-baseline percentage ceilings each increase over the
+   closure by at least their corresponding minimum effect.
 
-A prose rewrite, new mechanism name, new iteration number, or a changed minimum
-effect is not reopen evidence. Use `--request reopen`; an ordinary `check`
-against a closed family returns `direction_closed`.
+A prose rewrite, new mechanism name, caller-invented component ID, unbound
+digest, new iteration number, or changed minimum effect is not reopen evidence.
+Use `--request reopen`; an ordinary `check` against a closed family returns
+`direction_closed`.
 
 ## Minimal sequence
 
@@ -112,3 +141,13 @@ with the qualified evidence above. The JSON contracts are
 `templates/direction_portfolio.schema.json`,
 `templates/direction_lineage.schema.json`, and
 `templates/direction_decision.schema.json`.
+
+## Storage trust boundary
+
+The expected-tail handshake detects stale callers, ordinary races, and a tail
+changed since the caller last observed it. The ledger is tool-level append-only,
+not filesystem WORM storage. A process that can delete the entire ledger, forge
+all input artifacts, or rewrite both the tail and the caller's external anchor
+can defeat it. For decisions that must survive storage rollback, retain the
+`ledger_tail_sha256` outside the run directory, for example in the downstream
+sealed evidence or a reviewed Git commit, then supply it on the next check.

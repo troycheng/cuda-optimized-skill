@@ -12,7 +12,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import artifact_store
 
@@ -82,6 +82,22 @@ def _sha256(value: object, field: str) -> str:
     if type(value) is not str or _SHA256.fullmatch(value) is None:
         raise ValueError(f"{field} must be a lowercase SHA-256 digest")
     return value
+
+
+def _artifact_ref(value: object, field: str) -> dict:
+    reference = _closed(value, keys={"path", "sha256"}, field=field)
+    raw_path = _string(reference["path"], f"{field}.path")
+    path = Path(raw_path)
+    windows_path = PureWindowsPath(raw_path)
+    if (
+        path.is_absolute()
+        or windows_path.is_absolute()
+        or raw_path in {".", ".."}
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(part in {"", ".", ".."} for part in windows_path.parts)
+    ):
+        raise ValueError(f"{field}.path must be a safe relative artifact path")
+    return {"path": raw_path, "sha256": _sha256(reference["sha256"], f"{field}.sha256")}
 
 
 def _finite(value: object, field: str, *, minimum: float | None = None) -> float:
@@ -161,7 +177,8 @@ def _validate_direction(value: object, index: int) -> dict:
             "id",
             "claim_layer",
             "bottleneck_class",
-            "target_identity_sha256",
+            "target_artifact",
+            "component_artifact",
             "component_id",
             "metric_name",
             "metric_unit",
@@ -169,7 +186,7 @@ def _validate_direction(value: object, index: int) -> dict:
             "metric_kind",
             "total_metric",
             "component_metric",
-            "evidence_sha256",
+            "evidence_artifact",
         },
         field=field,
     )
@@ -197,8 +214,9 @@ def _validate_direction(value: object, index: int) -> dict:
         "id": _string(direction["id"], f"{field}.id", safe_id=True),
         "claim_layer": claim_layer,
         "bottleneck_class": bottleneck,
-        "target_identity_sha256": _sha256(
-            direction["target_identity_sha256"], f"{field}.target_identity_sha256"
+        "target_artifact": _artifact_ref(direction["target_artifact"], f"{field}.target_artifact"),
+        "component_artifact": _artifact_ref(
+            direction["component_artifact"], f"{field}.component_artifact"
         ),
         "component_id": _string(
             direction["component_id"], f"{field}.component_id", safe_id=True
@@ -209,8 +227,8 @@ def _validate_direction(value: object, index: int) -> dict:
         "metric_kind": metric_kind,
         "total_metric": total,
         "component_metric": component,
-        "evidence_sha256": _sha256(
-            direction["evidence_sha256"], f"{field}.evidence_sha256"
+        "evidence_artifact": _artifact_ref(
+            direction["evidence_artifact"], f"{field}.evidence_artifact"
         ),
     }
     family_fields = {
@@ -218,16 +236,16 @@ def _validate_direction(value: object, index: int) -> dict:
         for key in (
             "claim_layer",
             "bottleneck_class",
-            "component_id",
             "metric_name",
             "metric_unit",
             "metric_direction",
             "metric_kind",
         )
     }
+    family_fields["component_artifact_sha256"] = result["component_artifact"]["sha256"]
     result["direction_family_key"] = _canonical_digest(family_fields)
     result["direction_key"] = _canonical_digest(
-        {**family_fields, "target_identity_sha256": result["target_identity_sha256"]}
+        {**family_fields, "target_identity_sha256": result["target_artifact"]["sha256"]}
     )
     return result
 
@@ -238,8 +256,8 @@ def _validate_portfolio(value: object) -> dict:
         keys={
             "schema_version",
             "objective",
-            "environment_sha256",
-            "measurement_window_sha256",
+            "environment_artifact",
+            "measurement_window_artifact",
             "directions",
         },
         field="portfolio",
@@ -259,14 +277,37 @@ def _validate_portfolio(value: object) -> dict:
     return {
         "schema_version": 1,
         "objective": _validate_objective(portfolio["objective"]),
-        "environment_sha256": _sha256(
-            portfolio["environment_sha256"], "portfolio.environment_sha256"
+        "environment_artifact": _artifact_ref(
+            portfolio["environment_artifact"], "portfolio.environment_artifact"
         ),
-        "measurement_window_sha256": _sha256(
-            portfolio["measurement_window_sha256"], "portfolio.measurement_window_sha256"
+        "measurement_window_artifact": _artifact_ref(
+            portfolio["measurement_window_artifact"], "portfolio.measurement_window_artifact"
         ),
         "directions": directions,
     }
+
+
+def verify_portfolio_artifacts(portfolio: object, portfolio_path: Path | str) -> dict:
+    """Rehash every portfolio artifact relative to the no-follow portfolio path."""
+    validated = _validate_portfolio(portfolio)
+    base = Path(portfolio_path).parent
+    references = [
+        ("environment_artifact", validated["environment_artifact"]),
+        ("measurement_window_artifact", validated["measurement_window_artifact"]),
+    ]
+    for direction in validated["directions"]:
+        references.extend(
+            (
+                (f"{direction['id']}.target_artifact", direction["target_artifact"]),
+                (f"{direction['id']}.component_artifact", direction["component_artifact"]),
+                (f"{direction['id']}.evidence_artifact", direction["evidence_artifact"]),
+            )
+        )
+    for field, reference in references:
+        actual = artifact_store.sha256_file(base / reference["path"])
+        if actual != reference["sha256"]:
+            raise ValueError(f"{field} artifact digest does not match its bound file")
+    return validated
 
 
 def freeze_lineage(portfolio: object) -> dict:
@@ -274,9 +315,16 @@ def freeze_lineage(portfolio: object) -> dict:
     return {
         "schema_version": 1,
         "objective": copy.deepcopy(validated["objective"]),
-        "environment_sha256": validated["environment_sha256"],
+        "environment_sha256": validated["environment_artifact"]["sha256"],
         "direction_families": sorted(
-            item["direction_family_key"] for item in validated["directions"]
+            (
+                {
+                    "direction_family_key": item["direction_family_key"],
+                    "baseline_total_metric": item["total_metric"],
+                }
+                for item in validated["directions"]
+            ),
+            key=lambda item: item["direction_family_key"],
         ),
         "initial_portfolio_sha256": _canonical_digest(validated),
     }
@@ -299,8 +347,30 @@ def _validate_lineage(value: object) -> dict:
     families = lineage["direction_families"]
     if not isinstance(families, list) or not families:
         raise ValueError("lineage.direction_families must be a non-empty array")
-    validated_families = [_sha256(item, "lineage.direction_families[]") for item in families]
-    if validated_families != sorted(set(validated_families)):
+    validated_families = []
+    for index, item in enumerate(families):
+        family = _closed(
+            item,
+            keys={"direction_family_key", "baseline_total_metric"},
+            field=f"lineage.direction_families[{index}]",
+        )
+        total = _finite(
+            family["baseline_total_metric"],
+            f"lineage.direction_families[{index}].baseline_total_metric",
+        )
+        if total <= 0:
+            raise ValueError("lineage baseline_total_metric must be positive")
+        validated_families.append(
+            {
+                "direction_family_key": _sha256(
+                    family["direction_family_key"],
+                    f"lineage.direction_families[{index}].direction_family_key",
+                ),
+                "baseline_total_metric": total,
+            }
+        )
+    keys = [item["direction_family_key"] for item in validated_families]
+    if keys != sorted(set(keys)):
         raise ValueError("lineage.direction_families must be sorted and unique")
     return {
         "schema_version": 1,
@@ -315,9 +385,21 @@ def _validate_lineage(value: object) -> dict:
     }
 
 
-def _effect_reachable(direction: Mapping, objective: Mapping) -> tuple[float, float, bool]:
+def _family_entry(lineage: Mapping, family_key: str) -> dict:
+    matches = [
+        item for item in lineage["direction_families"]
+        if item["direction_family_key"] == family_key
+    ]
+    if len(matches) != 1:
+        raise ValueError("direction family is not frozen in the lineage")
+    return matches[0]
+
+
+def _effect_reachable(
+    direction: Mapping, objective: Mapping, baseline_total_metric: float
+) -> tuple[float, float, bool]:
     absolute = float(direction["component_metric"])
-    percent = 100.0 * absolute / float(direction["total_metric"])
+    percent = 100.0 * absolute / baseline_total_metric
     thresholds = (
         objective["minimum_effect_absolute"],
         objective["minimum_effect_percent"],
@@ -353,11 +435,10 @@ def decide_direction(
         raise ValueError("request must be admit, close, or reopen")
     if validated["objective"] != frozen["objective"]:
         raise ValueError("portfolio objective drifted from the frozen lineage")
-    if validated["environment_sha256"] != frozen["environment_sha256"]:
+    if validated["environment_artifact"]["sha256"] != frozen["environment_sha256"]:
         raise ValueError("portfolio environment drifted from the frozen lineage")
     for item in validated["directions"]:
-        if item["direction_family_key"] not in frozen["direction_families"]:
-            raise ValueError("portfolio introduces an unregistered direction family")
+        _family_entry(frozen, item["direction_family_key"])
     matches = [item for item in validated["directions"] if item["id"] == direction_id]
     if len(matches) != 1:
         raise ValueError("direction_id is not a unique portfolio direction")
@@ -372,31 +453,46 @@ def decide_direction(
         "direction_family_key": selected["direction_family_key"],
         "direction_key": selected["direction_key"],
         "claim_layer": selected["claim_layer"],
-        "measurement_window_sha256": validated["measurement_window_sha256"],
-        "evidence_sha256": selected["evidence_sha256"],
+        "measurement_window_sha256": validated["measurement_window_artifact"]["sha256"],
+        "evidence_sha256": selected["evidence_artifact"]["sha256"],
+        "portfolio_sha256": _canonical_digest(validated),
         "performance_gain_claimed": False,
     }
     comparable = _comparable(selected, frozen["objective"])
     absolute = percent = None
     reachable = False
     if comparable:
-        absolute, percent, reachable = _effect_reachable(selected, frozen["objective"])
+        family = _family_entry(frozen, selected["direction_family_key"])
+        absolute, percent, reachable = _effect_reachable(
+            selected, frozen["objective"], family["baseline_total_metric"]
+        )
 
     if request == "reopen":
         if previous_value is None or previous_value.get("state") != "closed":
             raise ValueError("reopen requires the latest closed family decision")
         if not comparable or not reachable:
             raise ValueError("reopen evidence does not meet the frozen admission floor")
-        if previous_value.get("evidence_sha256") == selected["evidence_sha256"]:
+        if previous_value.get("evidence_sha256") == selected["evidence_artifact"]["sha256"]:
             raise ValueError("reopen requires new evidence")
         material_change = (
             previous_value.get("measurement_window_sha256")
-            != validated["measurement_window_sha256"]
+            != validated["measurement_window_artifact"]["sha256"]
             or previous_value.get("direction_key") != selected["direction_key"]
             or previous_value.get("upper_bound_absolute") != absolute
         )
         if not material_change:
             raise ValueError("reopen requires a new window, target, or impact envelope")
+        minimum_absolute = frozen["objective"]["minimum_effect_absolute"] or 0.0
+        minimum_percent = frozen["objective"]["minimum_effect_percent"] or 0.0
+        previous_absolute = previous_value.get("upper_bound_absolute")
+        previous_percent = previous_value.get("upper_bound_percent")
+        if (
+            type(previous_absolute) not in (int, float)
+            or type(previous_percent) not in (int, float)
+            or absolute < float(previous_absolute) + minimum_absolute
+            or percent < float(previous_percent) + minimum_percent
+        ):
+            raise ValueError("reopen requires a material upper-bound increase over the closure")
     elif previous_value is not None and previous_value.get("state") == "closed":
         return {
             **base,
@@ -407,6 +503,7 @@ def decide_direction(
             "upper_bound_absolute": absolute,
             "upper_bound_percent": percent,
             "recommended_direction_id": None,
+            "admitted": False,
         }
 
     if request == "close":
@@ -414,16 +511,19 @@ def decide_direction(
         state = "closed"
         reason = "direction explicitly closed and bound to this evidence snapshot"
         recommended = None
+        admitted = False
     elif not comparable:
         action = "unrankable"
         state = "open"
         reason = "automatic ranking is limited to same-layer additive lower-is-better time"
         recommended = None
+        admitted = False
     elif not reachable:
         action = "close_direction"
         state = "closed"
         reason = "full-elimination upper bound misses the frozen minimum effect"
         recommended = None
+        admitted = False
     else:
         candidates = [
             item
@@ -436,11 +536,13 @@ def decide_direction(
             state = "open"
             reason = "another same-layer direction has a larger full-elimination upper bound"
             recommended = leader["id"]
+            admitted = False
         else:
             action = "admit_direction"
             state = "open"
             reason = "direction meets the frozen floor and has the largest comparable upper bound"
             recommended = selected["id"]
+            admitted = True
     return {
         **base,
         "state": state,
@@ -450,6 +552,7 @@ def decide_direction(
         "upper_bound_absolute": absolute,
         "upper_bound_percent": percent,
         "recommended_direction_id": recommended,
+        "admitted": admitted,
     }
 
 
@@ -513,6 +616,7 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--run-dir", required=True)
     check.add_argument("--direction-id", required=True)
     check.add_argument("--request", choices=sorted(REQUESTS), default="admit")
+    check.add_argument("--expected-tail-sha256")
     status = commands.add_parser("status", help="validate and summarize the ledger")
     status.add_argument("--run-dir", required=True)
     return parser
@@ -524,21 +628,38 @@ def main(argv=None) -> int:
         run_dir = Path(args.run_dir)
         lineage_path = run_dir / "direction-lineage.json"
         if args.command == "init":
-            lineage = freeze_lineage(load_json_strict(args.portfolio))
+            portfolio_raw = load_json_strict(args.portfolio)
+            verify_portfolio_artifacts(portfolio_raw, args.portfolio)
+            lineage = freeze_lineage(portfolio_raw)
             artifact_store.create_regular_json(lineage_path, lineage)
             result = lineage
         else:
             lineage = _validate_lineage(load_json_strict(lineage_path))
             records = _load_ledger(run_dir, lineage)
+            current_tail = (
+                artifact_store.sha256_file(_decision_files(run_dir)[-1])
+                if records
+                else None
+            )
             if args.command == "status":
                 result = {
                     "schema_version": 1,
                     "lineage_sha256": _canonical_digest(lineage),
                     "decision_count": len(records),
                     "latest_action": records[-1]["action"] if records else None,
+                    "ledger_tail_sha256": current_tail,
                 }
             else:
+                if records and args.expected_tail_sha256 is None:
+                    raise ValueError("expected tail SHA-256 is required before appending")
+                if args.expected_tail_sha256 is not None:
+                    expected_tail = _sha256(
+                        args.expected_tail_sha256, "expected_tail_sha256"
+                    )
+                    if current_tail != expected_tail:
+                        raise ValueError("expected tail SHA-256 does not match the ledger")
                 snapshot_raw = load_json_strict(args.portfolio)
+                verify_portfolio_artifacts(snapshot_raw, args.portfolio)
                 snapshot = _validate_portfolio(snapshot_raw)
                 selected = next(
                     (item for item in snapshot["directions"] if item["id"] == args.direction_id),

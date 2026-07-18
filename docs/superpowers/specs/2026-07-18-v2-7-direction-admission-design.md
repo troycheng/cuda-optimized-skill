@@ -80,14 +80,15 @@ A direction uses a closed taxonomy:
 - `claim_layer`: `kernel`, `runtime`, `workload`, or `serving`;
 - `bottleneck_class`: `kernel`, `framework`, `cpu_data`, `transfer`,
   `communication`, `io`, or `environment`;
-- `target_identity_sha256`: the frozen source, binary, engine, deployment, or
-  workload identity being optimized;
-- `component_id`: a stable profiler or application component identifier;
+- `target_artifact`: the bound source, binary, engine, deployment, or workload;
+- `component_artifact`: a stable profiler or application component descriptor;
+- `component_id`: a human-readable label that does not define identity;
 - `metric_name`, `metric_unit`, and `metric_direction`.
 
-The tool derives `direction_key` from these fields. A prose label, mechanism
-name, candidate hash, or iteration number is not part of the key. Renaming a
-mechanism therefore cannot escape an existing closure.
+The tool derives the family key from the taxonomy, component artifact digest,
+and metric; the concrete direction key additionally binds the target digest. A
+prose label, mechanism name, candidate hash, or iteration number is not part of
+either key. Renaming a mechanism or component label cannot escape a closure.
 
 ## Comparable impact envelope
 
@@ -97,12 +98,14 @@ V2.7 accepts only an additive decomposition for automatic ranking:
 total_metric > 0
 0 <= component_metric <= total_metric
 upper_bound_absolute = component_metric
-upper_bound_percent = 100 * component_metric / total_metric
+upper_bound_percent = 100 * component_metric / baseline_total_metric
 ```
 
 This is the Amdahl-style full-elimination ceiling. It deliberately assumes the
 most favorable possible implementation without asking anyone to estimate an
-eliminable fraction. It is an upper bound, not a prediction.
+eliminable fraction. `baseline_total_metric` is frozen per family at `init`, so
+later total shrinkage cannot inflate the percentage. It is an upper bound, not
+a prediction.
 
 `minimum_effect_absolute` and/or `minimum_effect_percent` come from the frozen
 objective or V2.6 hypothesis. The AI cannot change them during admission. A
@@ -126,7 +129,7 @@ The create-once portfolio binds:
 
 - frozen objective identity and minimum effect;
 - environment and measurement-window identities;
-- every direction and its timing artifact SHA-256;
+- every direction's target, component, and timing artifact SHA-256;
 - the canonical comparison group;
 - optional V2.6 iteration decision references.
 
@@ -150,16 +153,17 @@ stateDiagram-v2
     unrankable --> open: new bound comparison evidence
 ```
 
-Every decision contains the previous decision SHA-256. `closed` is mandatory
-for later checks: a new round for the same `direction_key` is rejected unless a
-valid `reopened` decision exists.
+Every decision contains the previous decision SHA-256. After the first record,
+the caller must also supply the last tail returned by `status`; stale callers
+cannot append. `closed` is mandatory for later checks: a new round for the same
+family is rejected unless a valid `reopened` decision exists.
 
 Reopen requires all of the following:
 
 1. a new timing artifact hash not present in the direction chain;
-2. a changed measurement-window or target identity, or a changed measured
-   component/total envelope;
-3. a recomputed upper bound that reaches the frozen minimum effect;
+2. a changed measurement-window or target identity;
+3. absolute and frozen-baseline percentage ceilings that each exceed the closed
+   ceiling by at least the corresponding frozen minimum effect;
 4. a reason enum: `new_profile`, `new_target_identity`, or
    `new_measurement_window`;
 5. an exact reference to the closed decision.
@@ -182,9 +186,8 @@ The tool derives one of these actions:
 - `direction_closed`: later work is rejected until a valid reopen;
 - `unrankable`: the evidence is valid but cannot support an automatic ranking.
 
-`switch_to_higher_impact` is advisory to the caller but mandatory for the skill:
-the next round must target the returned leader or close the portfolio. The tool
-itself never runs that round.
+Only `admit_direction` sets `admitted: true`. Every other action is a hard
+non-admission. The tool itself never runs a round.
 
 ## Failure behavior
 
@@ -201,7 +204,7 @@ Fail closed on:
 - a closed direction without a valid reopen decision.
 
 Invalid inputs produce no decision artifact. Valid but incomparable evidence
-produces `unrankable`, not an error and not a performance claim.
+produces `unrankable`, not an error, permission to continue, or performance claim.
 
 ## Testing
 
@@ -211,17 +214,21 @@ TDD coverage must prove:
   direction-level machine lock exists;
 - 5.5/100 produces a 5.5% ceiling and cannot be inflated by prose;
 - a below-floor direction closes and later candidate admission is rejected;
-- renaming the mechanism cannot reopen a closed direction;
-- a genuinely new bound profile can reopen only when the recomputed ceiling
-  reaches the unchanged floor;
+- renaming a mechanism or component label cannot create a new family;
+- a genuinely new bound profile can reopen only after a material ceiling
+  increase over the closure using the frozen baseline denominator;
 - cross-layer and unlike-metric directions remain unrankable;
-- decision history is ordered and tamper-evident;
+- decision history is ordered and stale-tail appends are rejected;
 - all file reads are no-follow and all writes are atomic/create-once;
 - the CLI runs without CUDA, third-party packages, or network access.
 
 The full CPU/static suite and local skill self-check must remain green. GPU
 validation is unnecessary because V2.7 only validates normalized existing
 evidence and derives state.
+
+The ledger is tool-level append-only, not WORM storage. Surviving deletion or a
+caller that forges the full filesystem requires retaining the returned tail in
+downstream sealed evidence or another external reviewed anchor.
 
 ## Release boundary
 
