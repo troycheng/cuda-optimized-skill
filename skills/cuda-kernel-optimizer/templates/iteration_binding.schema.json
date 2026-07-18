@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schema/v2.6/iteration-binding.json",
+  "title": "Sealed performance-iteration context binding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "anchor_sha256",
+    "environment_sha256",
+    "measurement_path",
+    "hypothesis_sha256",
+    "source_path"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/iteration-binding-v1"},
+    "anchor_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "measurement_path": {"$ref": "#/$defs/pathIdentity"},
+    "hypothesis_sha256": {"$ref": "#/$defs/sha256"},
+    "source_path": {"$ref": "#/$defs/safePath"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonempty": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+    "safePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*\\\\).+$"
+    },
+    "pathIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "definition_sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/nonempty"},
+        "version": {"$ref": "#/$defs/nonempty"},
+        "definition_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

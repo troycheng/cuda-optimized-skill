@@ -161,14 +161,14 @@ class ReadmeSyncTests(unittest.TestCase):
         chinese = "".join(self.chinese.split())
         for marker in (
             "falsifiable performance hypothesis",
-            "real candidate",
+            "rehashed V2.5 evidence closure",
             "hard time and repair limit",
             "Tool work is not a performance improvement",
         ):
             self.assertIn(marker, english)
         for marker in (
             "能被实测推翻的性能假设",
-            "真实候选",
+            "重新校验通过的V2.5证据闭环",
             "时间和次数上限",
             "修工具不等于性能提升",
         ):
@@ -181,8 +181,8 @@ class ReadmeSyncTests(unittest.TestCase):
 
     def test_tested_scope_is_historical_and_not_a_speedup_promise(self) -> None:
         facts = (
-            "746",
-            "741",
+            "771",
+            "766",
             "13/13",
             "34.302",
             "60.4616%",

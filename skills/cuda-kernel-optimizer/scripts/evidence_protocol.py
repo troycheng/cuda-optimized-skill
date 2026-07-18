@@ -1148,6 +1148,50 @@ def _semantic_gate_results(by_kind: dict[str, dict]) -> tuple[dict, dict]:
     return gates, errors
 
 
+def recompute_sealed_semantics(seal: Mapping, by_kind: dict[str, dict]) -> dict:
+    """Recompute V2.5 semantic gates and promotion eligibility without writes."""
+    gates, errors = _semantic_gate_results(by_kind)
+    verdict_status = "unknown"
+    promotional_eligible = False
+    performance = by_kind.get("performance_verdict")
+    if performance is not None:
+        try:
+            verdict = _validate_performance_verdict(
+                load_json_strict(performance["file_path"])
+            )
+            verdict_status = verdict["status"]
+            promotional_eligible = verdict["promotional_eligible"]
+        except Exception:
+            pass
+    required_gates = {
+        "experiment_design",
+        "schedule_binding",
+        "guard",
+        "execution_path",
+        "raw_rows",
+        "performance_verdict",
+    }
+    if seal.get("claim_layer") == "serving_endpoint":
+        required_gates |= {"serving_experiment", "artifact_identities"}
+    gates_pass = all(
+        isinstance(gates.get(name), Mapping)
+        and gates[name].get("status") == "PASS"
+        for name in required_gates
+    )
+    return {
+        "gate_results": gates,
+        "gate_errors": errors,
+        "performance_verdict": verdict_status,
+        "promotional_eligible": promotional_eligible,
+        "promotion_without_integrity": (
+            seal.get("attempt_state") == "valid"
+            and gates_pass
+            and verdict_status == "confirmed_win"
+            and promotional_eligible
+        ),
+    }
+
+
 def seal_attempt(attempt_manifest_path: Path | str, output_path: Path | str) -> dict:
     """Create one immutable content seal for a terminal V2.5 attempt."""
     manifest_path = Path(attempt_manifest_path)

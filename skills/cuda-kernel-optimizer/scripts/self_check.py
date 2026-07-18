@@ -28,6 +28,8 @@ _SCRIPTS = (
     "workload_evaluate.py",
 )
 _V2_6_SCHEMAS = (
+    "iteration_binding.schema.json",
+    "iteration_lineage.schema.json",
     "measurement_path_registry.schema.json",
     "performance_iteration.schema.json",
 )
@@ -64,7 +66,7 @@ def check_installation(skill_dir: Path | str) -> dict:
     for name in _V2_6_SCHEMAS:
         path = root / "templates" / name
         if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing script: {name}")
+            raise ValueError(f"missing schema: {name}")
         payload = json.loads(path.read_text(encoding="utf-8"))
         if "v2.6" not in payload.get("$id", ""):
             raise ValueError(f"schema does not declare V2.6 identity: {name}")

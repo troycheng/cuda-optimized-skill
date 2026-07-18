@@ -38,6 +38,8 @@ class SkillMetadataTests(unittest.TestCase):
             "references/performance_iteration.md",
             "templates/performance_iteration.schema.json",
             "templates/measurement_path_registry.schema.json",
+            "templates/iteration_binding.schema.json",
+            "templates/iteration_lineage.schema.json",
         ):
             self.assertIn(marker, text)
 
@@ -51,15 +53,17 @@ class SkillMetadataTests(unittest.TestCase):
             "measurement_blocked",
             "infrastructure_only",
             "performance_gain",
-            "registry_sha256",
+            "anchor_sha256",
             "definition_sha256",
+            "v2.5 closure",
+            "hash chain",
             "min(1200",
             "one repair",
             "two consecutive",
-            "prevalidated fallback",
+            "different frozen path",
             "stop_direction",
-            "does not run",
-            "does not promote",
+            "never runs",
+            "never emits",
         ):
             self.assertIn(marker, lower)
 

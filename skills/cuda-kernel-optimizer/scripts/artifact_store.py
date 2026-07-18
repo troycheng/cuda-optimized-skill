@@ -148,6 +148,38 @@ def read_regular_with_optional_sibling(
         os.close(directory_fd)
 
 
+def read_regular_bundle(directory: _PathLike, names) -> dict[str, bytes]:
+    """Read named regular files through one stable, no-follow directory fd."""
+    if isinstance(names, (str, bytes, bytearray, Mapping)):
+        raise ValueError("artifact bundle names must be a sequence")
+    try:
+        clean_names = [_validate_leaf_name(name) for name in names]
+    except TypeError as error:
+        raise ValueError("artifact bundle names must be a sequence") from error
+    if len(clean_names) != len(set(clean_names)):
+        raise ValueError("artifact bundle names must be unique")
+    directory_path = Path(os.path.abspath(os.path.expanduser(os.fspath(directory))))
+    marker = directory_path / ".read-bundle"
+    try:
+        directory_fd, _leaf, _target = _open_parent_directory(marker, create=False)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"artifact bundle directory is missing, a symlink, or unsafe: {directory_path}"
+        ) from error
+    try:
+        return {
+            name: _read_regular_leaf(
+                directory_fd,
+                name,
+                directory_path / name,
+                missing_ok=False,
+            )
+            for name in clean_names
+        }
+    finally:
+        os.close(directory_fd)
+
+
 def _validate_leaf_name(value: str) -> str:
     if type(value) is not str or not value or value in {".", ".."}:
         raise ValueError("artifact bundle names must be non-empty file names")
@@ -253,6 +285,65 @@ def atomic_write_bytes(path: _PathLike, payload: bytes) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def create_regular_bytes(path: _PathLike, payload: bytes) -> None:
+    """Create one durable regular file without following any path component."""
+    if not isinstance(payload, bytes):
+        raise TypeError("create-once payload must be bytes")
+    directory_fd, leaf, target = _open_parent_directory(path, create=True)
+    descriptor = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                leaf,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            created = True
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                raise FileExistsError(f"artifact already exists: {target}") from error
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError(f"artifact target is a symlink or unsafe: {target}") from error
+            raise
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("create-once artifact write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.fsync(directory_fd)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(leaf, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def create_regular_json(path: _PathLike, payload: Any) -> None:
+    """Create one strict, formatted JSON document exactly once."""
+    try:
+        encoded = (
+            json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("JSON document is not serializable") from error
+    create_regular_bytes(path, encoded)
 
 
 def publish_regular_bundle(directory: _PathLike, writes, removals=()) -> dict:

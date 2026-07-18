@@ -76,12 +76,12 @@ flowchart LR
     evaluation --> restore["Evidence is insufficient: restore the original"]
 ```
 
-Each optimization round starts with a falsifiable performance hypothesis and
-must produce a real candidate with a correctness result and, when correctness
-passes, a comparable performance result. Measurement tooling has a hard time
-and repair limit; after that, the AI switches to a prevalidated path or stops
-the direction. Tool work is not a performance improvement and is not reported
-as one. The detailed rules are in the
+Before the first candidate, the workflow freezes the baseline, environment, and
+prevalidated measurement paths. Each round starts with a falsifiable performance
+hypothesis, and only a rehashed V2.5 evidence closure counts as an evaluated
+candidate. Measurement tooling has a hard time and repair limit; after that,
+the AI switches to a different frozen path or stops the direction. Tool work is
+not a performance improvement and is not reported as one. The detailed rules are in the
 [performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md).
 
 The workflow freezes the objective and authorized scope before timed work. Each
@@ -120,7 +120,7 @@ the CPU/static checks in this documentation change.
 
 | Validation lane | Recorded result | Interpretation |
 |---|---|---|
-| CPU/static acceptance | 746 tests: 741 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
+| CPU/static acceptance | 771 tests: 766 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
 | Physical RTX 5090 lane | 13/13 checks in 34.302 seconds; target-side NCU returned `ERR_NVGPUCTRPERM` | The GPU workflow ran without changing privilege or driver policy |
 | Reproducible workload fixture | End-to-end latency improved 60.4616% with constraints passing | Demonstrates the workflow on that fixture only |
 | User-supplied vLLM workload | Kernel metric improved 26.3287%; real workload changed -0.0097% | The original was kept because a faster kernel did not improve the product workload |

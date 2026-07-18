@@ -114,6 +114,38 @@ class ArtifactStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
                 self.artifacts.sha256_file(linked / "value.bin")
 
+    def test_create_regular_json_is_create_once_and_no_follow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            target = root / "decision.json"
+            self.artifacts.create_regular_json(target, {"ok": True})
+            self.assertEqual(json.loads(target.read_text("utf-8")), {"ok": True})
+            with self.assertRaises(FileExistsError):
+                self.artifacts.create_regular_json(target, {"ok": False})
+            self.assertEqual(json.loads(target.read_text("utf-8")), {"ok": True})
+
+            real = root / "real"
+            real.mkdir()
+            linked = root / "linked"
+            try:
+                linked.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+            with self.assertRaisesRegex(ValueError, "parent.*symlink|unsafe"):
+                self.artifacts.create_regular_json(linked / "escaped.json", {})
+
+    def test_read_regular_bundle_uses_one_stable_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "a.json").write_bytes(b"a")
+            (root / "b.json").write_bytes(b"b")
+            self.assertEqual(
+                self.artifacts.read_regular_bundle(root, ["a.json", "b.json"]),
+                {"a.json": b"a", "b.json": b"b"},
+            )
+            with self.assertRaisesRegex(ValueError, "one relative component"):
+                self.artifacts.read_regular_bundle(root, ["../a.json"])
+
     def test_atomic_json_fsyncs_parent_directory_after_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp).resolve() / "result.json"

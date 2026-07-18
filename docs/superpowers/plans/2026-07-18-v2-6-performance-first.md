@@ -4,7 +4,7 @@
 
 **目标：** Add a deterministic, cross-workflow iteration gate that keeps AI optimization rounds centered on real candidates and measured results.
 
-**架构：** A standard-library validator reads one strict round record and a frozen prevalidated measurement-path registry, mechanically derives the work class and next action, and writes one create-once decision. Existing V2.5 correctness, benchmark, evidence, and promotion components remain unchanged.
+**架构：** A standard-library validator freezes a lineage anchor before round one, rehashes an existing V2.5 evidence closure, derives the work class and next action, and writes a canonical create-once decision chain. Existing V2.5 correctness, benchmark, evidence, and promotion components remain unchanged.
 
 **技术栈：** Python 3 standard library, JSON Schema documents, `unittest`, Markdown.
 
@@ -16,10 +16,12 @@
 - 创建：`tests/test_iteration_guard.py`
 - 创建：`skills/cuda-kernel-optimizer/templates/performance_iteration.schema.json`
 - 创建：`skills/cuda-kernel-optimizer/templates/measurement_path_registry.schema.json`
+- 创建：`skills/cuda-kernel-optimizer/templates/iteration_lineage.schema.json`
+- 创建：`skills/cuda-kernel-optimizer/templates/iteration_binding.schema.json`
 
-- [ ] **步骤 1：编写失败的核心分类测试。** Build strict fixtures for a frozen registry and round record. Assert a correctness failure and a correctness-pass plus timing result both derive `candidate_evaluated`, while only a bound `confirmed_win` derives `performance_gain`.
-- [ ] **步骤 2：运行 RED。** Run `python3 -m unittest tests.test_iteration_guard -v`; expect import failure because `iteration_guard.py` does not exist.
-- [ ] **步骤 3：添加严格 schema。** Close every object, require SHA-256 identities, finite positive budgets and minimum effect, safe relative mutation paths, and explicit nullable candidate/evidence fields.
+- [x] **步骤 1：编写失败的核心分类测试。** Build strict fixtures for a frozen registry and round record. Assert a correctness failure and a correctness-pass plus timing result both derive `candidate_evaluated`; the guard must never claim `performance_gain`, which remains owned by the existing paired-evidence and promotion gates.
+- [x] **步骤 2：运行 RED。** Run `python3 -m unittest tests.test_iteration_guard -v`; expect import failure because `iteration_guard.py` does not exist.
+- [x] **步骤 3：添加严格 schema。** Close every object, require SHA-256 identities, finite positive budgets and minimum effect, safe relative mutation paths, and explicit nullable candidate/evidence fields.
 
 ### 任务 2：实现最小分类器和 CLI
 
@@ -27,11 +29,11 @@
 - 创建：`skills/cuda-kernel-optimizer/scripts/iteration_guard.py`
 - 修改：`tests/test_iteration_guard.py`
 
-- [ ] **步骤 1：实现严格 JSON、registry 和 round validation。** Reject duplicate keys, unknown keys, booleans used as numbers, non-finite values, unsafe paths, missing registry entries, and registry digest drift.
-- [ ] **步骤 2：实现身份绑定和分类。** Require candidate/baseline inequality and bind correctness/performance to the same baseline, candidate, environment, metric, direction, and measurement path.
-- [ ] **步骤 3：实现预算与历史停止规则。** Calculate `min(1200, floor(round_seconds * 0.15))`, permit one repair, and treat two consecutive non-candidate rounds as a fallback-or-stop condition.
-- [ ] **步骤 4：实现只读 CLI。** `check --record --registry [--history] --out` reads inputs, performs no subprocess execution, and create-once publishes strict JSON.
-- [ ] **步骤 5：运行 GREEN。** Run `python3 -m unittest tests.test_iteration_guard -v`; expect all focused tests to pass.
+- [x] **步骤 1：实现严格 JSON、anchor 和 round validation。** Reject duplicate keys, unknown keys, booleans used as numbers, non-finite values, unsafe paths, missing frozen entries, and anchor drift.
+- [x] **步骤 2：绑定 V2.5 证据闭环。** Rehash the closure manifest, seal, audit, decision, source, and performance verdict; reject inline or forged progress claims.
+- [x] **步骤 3：实现预算与哈希链停止规则。** Calculate `min(1200, floor(round_seconds * 0.15))`, permit one repair, and bind each round to the preceding canonical decision.
+- [x] **步骤 4：实现只读 CLI。** `init` freezes the lineage; `check` reads existing evidence, performs no target execution, and create-once publishes strict JSON.
+- [x] **步骤 5：运行 GREEN。** Run `python3 -m unittest tests.test_iteration_guard -v`; expect all focused tests to pass.
 
 ### 任务 3：接入 skill 和安装自检
 
@@ -43,7 +45,7 @@
 - 创建：`skills/cuda-kernel-optimizer/references/performance_iteration.md`
 - 修改：`skills/cuda-kernel-optimizer/templates/iteration_report.md`
 
-- [ ] **步骤 1：先写 RED 元数据与 self-check 测试。** Require V2.6 title/routing, the guard command, both schemas, the reference, derived classes, default budget, forced stop, and a static installation check.
+- [x] **步骤 1：先写 RED 元数据与 self-check 测试。** Require V2.6 title/routing, the guard commands, all four schemas, the reference, derived classes, default budget, forced stop, and a static installation check.
 - [ ] **步骤 2：运行 RED。** Run the focused metadata and CLI tests; expect failures for missing V2.6 routing and install checks.
 - [ ] **步骤 3：写最小协议文档。** Put the full record, registry, state rules, fallback boundary, examples, and reporting contract in the on-demand reference; keep `SKILL.md` concise.
 - [ ] **步骤 4：更新 iteration report。** Lead with hypothesis, candidate delta, measured result, decision, and next performance action; infrastructure details appear only when they block measurement.
@@ -72,4 +74,3 @@
 - [ ] **步骤 3：提交并合并。** Commit on `feat/v2-6-performance-first`, fast-forward or merge into `main`, then rerun the full suite on merged main.
 - [ ] **步骤 4：双端发布并验证。** Push the same main SHA to GitHub `origin` and internal GitLab `internal`; never push `upstream`.
 - [ ] **步骤 5：更新本地 skill。** Replace the installed skill from merged main, run installed `self_check`, and compare source and installed hashes.
-

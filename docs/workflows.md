@@ -5,11 +5,11 @@ kernel does not automatically establish a faster product workload.
 
 ## Performance-first iteration
 
-Every optimization round begins with a falsifiable hypothesis and a bounded
-candidate scope. The AI must produce a real candidate and correctness result;
-when correctness passes, it must also produce comparable timing. The derived
-classes `candidate_evaluated`, `measurement_blocked`, and
-`infrastructure_only` keep completed experiments separate from tool work.
+Before the first candidate, freeze the baseline, environment, and prevalidated
+measurement paths in a create-once lineage anchor. Every round then begins with
+a falsifiable hypothesis and bounded candidate scope. Only a rehashed V2.5
+evidence closure can produce `candidate_evaluated`; `measurement_blocked` and
+`infrastructure_only` keep incomplete experiments separate from tool work.
 
 Measurement support has a fixed time and repair budget. Once exhausted, the AI
 may use only a prevalidated fallback or stop that direction; it does not turn

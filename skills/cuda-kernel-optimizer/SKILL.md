@@ -20,24 +20,31 @@ decision backed by durable evidence, not the lowest observed sample.
 ## Performance-first iteration gate
 
 V2.6 keeps measurement infrastructure subordinate to performance work. Before
-each optimization round, bind one falsifiable performance hypothesis: mechanism,
-target metric and direction, minimum effect, mutation scope, baseline and
-environment identities, round budget, and a prevalidated measurement path.
+editing the first candidate, create one immutable lineage anchor that binds the
+baseline source, environment, and prevalidated measurement paths. Each round
+then binds one falsifiable hypothesis: mechanism, target metric and direction,
+minimum effect, mutation scope, and budget.
 
 After the round, classify its structured record mechanically; do not choose the
 class in prose:
 
 ```bash
+python3 <skill>/scripts/iteration_guard.py init \
+  --registry measurement-paths.json \
+  --baseline-source-sha256 <sha256> --environment-sha256 <sha256> \
+  --measurement-path paired-kernel@1 --out iteration-anchor.json
+
 python3 <skill>/scripts/iteration_guard.py check \
-  --record iteration.json --registry measurement-paths.json \
-  --history iteration-decisions.jsonl --out iteration-decision.json
+  --anchor iteration-anchor.json --record round-0001.json \
+  --evidence-manifest evidence/manifest.json \
+  --out round-0001-decision.json
 ```
 
-- `candidate_evaluated` requires a content-addressed in-scope change and bound
-  correctness. Failed correctness completes the experiment without timing;
-  passed correctness also requires comparable performance evidence.
-- `measurement_blocked` means a real candidate exists but correctness or timing
-  could not complete.
+- `candidate_evaluated` requires a source change bound to an integrity-passing
+  V2.5 seal, audit, and decision closure. Inline correctness or timing claims do
+  not count.
+- `measurement_blocked` means a candidate was declared but the sealed closure
+  did not complete.
 - `infrastructure_only` means no valid candidate was evaluated. It is not an
   optimization result.
 - The guard never claims `performance_gain`. It forwards a consistent
@@ -47,12 +54,15 @@ python3 <skill>/scripts/iteration_guard.py check \
 
 Infrastructure is capped at 15% of the round and never more than 20 minutes,
 with one infrastructure repair. Exceed either cap, or complete two consecutive
-`measurement_blocked`/`infrastructure_only` rounds in the same `lineage_id`, and
-switch only to another prevalidated path. If none exists, stop the direction; do not build another
-runner inside the optimization round. A registry change is a separate
-maintenance task. Read `references/performance_iteration.md` for the record,
-identity, fallback, and reporting contracts. Validate inputs against
-`templates/performance_iteration.schema.json` and
+`measurement_blocked`/`infrastructure_only` rounds in the same anchor-derived
+hash chain, and switch only to a frozen path with a different implementation
+digest. If none exists, stop the direction; do not build another runner inside
+the optimization round. A registry change is a separate maintenance task. Read
+`references/performance_iteration.md` for the anchor, record, evidence, fallback,
+and reporting contracts. Validate inputs against
+`templates/iteration_binding.schema.json`,
+`templates/iteration_lineage.schema.json`,
+`templates/performance_iteration.schema.json`, and
 `templates/measurement_path_registry.schema.json`.
 
 ## Required and optional inputs

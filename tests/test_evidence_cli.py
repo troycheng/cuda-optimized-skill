@@ -34,6 +34,8 @@ SCHEMAS = (
     "evidence_manifest.schema.json",
 )
 V2_6_SCHEMAS = (
+    "iteration_binding.schema.json",
+    "iteration_lineage.schema.json",
     "measurement_path_registry.schema.json",
     "performance_iteration.schema.json",
 )

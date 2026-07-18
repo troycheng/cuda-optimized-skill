@@ -12,13 +12,16 @@
 
 ## Candidate and result
 
-- **Candidate / changed paths**: {{candidate_id}} / {{changed_paths}}
-- **Correctness**: {{correctness_result}}
+- **Candidate**: {{candidate_id}}
+- **V2.5 closure manifest**: `{{evidence_manifest_path}}`
+- **Evidence integrity / terminal state**: {{evidence_integrity}} /
+  {{attempt_state}}
 - **Performance result**: {{performance_result}}
 - **Work class**: {{candidate_evaluated_or_other}}
 
-`candidate_evaluated` means a real candidate completed its applicable gates. A
-loss, inconclusive result, or correctness failure is not a performance gain.
+`candidate_evaluated` means the guard rehashed an integrity-passing V2.5 seal,
+audit, decision, source, and performance verdict. A loss, inconclusive result,
+or failed attempt is not a performance gain.
 
 ## Decision and next performance action
 
@@ -39,6 +42,8 @@ when it blocks candidate evaluation.
 
 ## Frozen context
 
+- **Iteration lineage anchor**: `{{iteration_anchor_path}}`
+- **Previous decision**: `{{previous_decision_path_or_none}}`
 - **Run input hash**: `{{input_hash}}`
 - **Mode**: {{mode}} (`kernel-only` / `full`)
 - **Budget preset**: {{budget_name}}
