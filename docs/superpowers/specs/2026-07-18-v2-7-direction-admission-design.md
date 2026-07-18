@@ -172,8 +172,8 @@ Reopen requires all of the following:
 2. a changed measurement-window or target identity;
 3. absolute and frozen-baseline percentage ceilings that each exceed the closed
    ceiling by at least the corresponding frozen minimum effect;
-4. a reason enum: `new_profile`, `new_target_identity`, or
-   `new_measurement_window`;
+4. a reason enum: `new_target_identity` or `new_measurement_window`, plus a
+   normalized evidence digest and raw source digest unused in that family;
 5. an exact reference to the closed decision.
 
 A new mechanism label, candidate, comment, compiler flag, or iteration number
