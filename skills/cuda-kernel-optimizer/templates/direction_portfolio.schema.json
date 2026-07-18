@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/direction_portfolio.schema.json",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.7/direction_portfolio.schema.json",
   "title": "CUDA optimizer direction portfolio",
   "type": "object",
   "additionalProperties": false,

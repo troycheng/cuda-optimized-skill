@@ -15,10 +15,53 @@ SYSTEMS_IR_COVERAGE = SKILL_DIR / "references" / "systems_and_ir_coverage.md"
 EVIDENCE_AUTOMATION = SKILL_DIR / "references" / "evidence_automation.md"
 MIGRATION_V2_5 = SKILL_DIR / "references" / "migration_v2_5.md"
 PERFORMANCE_ITERATION = SKILL_DIR / "references" / "performance_iteration.md"
+DIRECTION_ADMISSION = SKILL_DIR / "references" / "direction_admission.md"
 ITERATION_REPORT = SKILL_DIR / "templates" / "iteration_report.md"
 
 
 class SkillMetadataTests(unittest.TestCase):
+    def test_skill_routes_v2_7_direction_admission_before_candidate_iterations(self) -> None:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for marker in (
+            "V2.7",
+            "scripts/direction_guard.py init",
+            "scripts/direction_guard.py check",
+            "scripts/direction_guard.py status",
+            "admit_direction",
+            "switch_to_higher_impact",
+            "close_direction",
+            "direction_closed",
+            "unrankable",
+            "full-elimination upper bound",
+            "never runs the target",
+            "host_policy",
+            "recommend_only",
+            "references/direction_admission.md",
+            "templates/direction_portfolio.schema.json",
+            "templates/direction_lineage.schema.json",
+            "templates/direction_decision.schema.json",
+        ):
+            self.assertIn(marker, text)
+        self.assertLess(text.index("## Direction admission"), text.index("## Performance-first iteration gate"))
+
+    def test_direction_admission_reference_defines_the_machine_boundary(self) -> None:
+        self.assertTrue(DIRECTION_ADMISSION.is_file())
+        text = DIRECTION_ADMISSION.read_text(encoding="utf-8").lower()
+        for marker in (
+            "direction family",
+            "mechanism",
+            "component_metric / total_metric",
+            "same-layer",
+            "additive",
+            "create-once",
+            "hash chain",
+            "reopen",
+            "new evidence",
+            "never runs",
+            "does not claim",
+        ):
+            self.assertIn(marker, text)
+
     def test_skill_routes_v2_6_performance_first_iterations(self) -> None:
         text = SKILL_MD.read_text(encoding="utf-8")
         for marker in (

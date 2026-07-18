@@ -21,6 +21,7 @@ _SCHEMAS = (
     "evidence_manifest.schema.json",
 )
 _SCRIPTS = (
+    "direction_guard.py",
     "evidence.py",
     "evidence_protocol.py",
     "experiment_design.py",
@@ -32,6 +33,11 @@ _V2_6_SCHEMAS = (
     "iteration_lineage.schema.json",
     "measurement_path_registry.schema.json",
     "performance_iteration.schema.json",
+)
+_V2_7_SCHEMAS = (
+    "direction_portfolio.schema.json",
+    "direction_lineage.schema.json",
+    "direction_decision.schema.json",
 )
 
 
@@ -73,6 +79,20 @@ def check_installation(skill_dir: Path | str) -> dict:
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"schema root must be closed: {name}")
     checks.append("v2_6_iteration_guard")
+
+    for name in _V2_7_SCHEMAS:
+        path = root / "templates" / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"missing schema: {name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "v2.7" not in payload.get("$id", ""):
+            raise ValueError(f"schema does not declare V2.7 identity: {name}")
+        if payload.get("additionalProperties") is not False:
+            raise ValueError(f"schema root must be closed: {name}")
+    reference = root / "references" / "direction_admission.md"
+    if reference.is_symlink() or not reference.is_file():
+        raise ValueError("missing reference: direction_admission.md")
+    checks.append("v2_7_direction_guard")
 
     return {
         "schema_version": "cuda-evidence/self-check-v1",

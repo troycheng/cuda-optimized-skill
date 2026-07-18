@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/direction_lineage.schema.json",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v2.7/direction_lineage.schema.json",
   "title": "CUDA optimizer frozen direction lineage",
   "type": "object",
   "additionalProperties": false,

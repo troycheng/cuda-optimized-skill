@@ -39,6 +39,11 @@ V2_6_SCHEMAS = (
     "measurement_path_registry.schema.json",
     "performance_iteration.schema.json",
 )
+V2_7_SCHEMAS = (
+    "direction_portfolio.schema.json",
+    "direction_lineage.schema.json",
+    "direction_decision.schema.json",
+)
 
 
 def _run(script: Path, *args: str) -> subprocess.CompletedProcess:
@@ -155,6 +160,13 @@ class InstalledSelfCheckTests(unittest.TestCase):
                 self.assertIn("v2.6", payload["$id"])
                 self.assertEqual(payload["additionalProperties"], False)
 
+    def test_repository_direction_schemas_are_closed_and_have_v2_7_ids(self) -> None:
+        for name in V2_7_SCHEMAS:
+            with self.subTest(name=name):
+                payload = json.loads((SKILL / "templates" / name).read_text())
+                self.assertIn("v2.7", payload["$id"])
+                self.assertEqual(payload["additionalProperties"], False)
+
     def test_self_check_passes_installed_skill_without_gpu_or_network(self) -> None:
         result = _run(SELF_CHECK, "--skill-dir", str(SKILL))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -163,6 +175,7 @@ class InstalledSelfCheckTests(unittest.TestCase):
         self.assertEqual(payload["gpu_checks_run"], False)
         self.assertEqual(payload["network_checks_run"], False)
         self.assertIn("v2_6_iteration_guard", payload["checks"])
+        self.assertIn("v2_7_direction_guard", payload["checks"])
 
     def test_self_check_fails_closed_for_missing_installation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

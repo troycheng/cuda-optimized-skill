@@ -3,7 +3,7 @@ name: cuda-kernel-optimizer
 description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.6)
+# CUDA Kernel and Workload Optimizer (V2.7)
 
 ## Principle
 
@@ -17,28 +17,29 @@ Optimize in two evidence layers:
 A faster microbenchmark is not automatically an end-to-end win. Promotion is a
 decision backed by durable evidence, not the lowest observed sample.
 
+## Direction admission
+
+V2.7 decides whether a direction is worth another candidate round. Use `scripts/direction_guard.py init`,
+`scripts/direction_guard.py check`, and `scripts/direction_guard.py status` to maintain one create-once ledger.
+For same-layer additive time it uses a full-elimination upper bound and returns `admit_direction`,
+`switch_to_higher_impact`, `close_direction`, `direction_closed`, or `unrankable`. Mechanism prose is not identity.
+
+The guard never runs the target and never claims a gain. Reopen requires new evidence, a changed window,
+target, or envelope, and the original frozen floor. Cross-layer, throughput, and composite comparisons remain
+`unrankable`. `host_policy` stays `recommend_only`. Read `references/direction_admission.md`; the contracts are
+`templates/direction_portfolio.schema.json`, `templates/direction_lineage.schema.json`, and `templates/direction_decision.schema.json`.
+
 ## Performance-first iteration gate
 
 V2.6 keeps measurement infrastructure subordinate to performance work. Before
 editing the first candidate, create one immutable lineage anchor that binds the
 baseline source, environment, and prevalidated measurement paths. Each round
-then binds one falsifiable hypothesis: mechanism, target metric and direction,
+then binds one falsifiable performance hypothesis: mechanism, target metric and direction,
 minimum effect, mutation scope, and budget.
 
-After the round, classify its structured record mechanically; do not choose the
-class in prose:
-
-```bash
-python3 <skill>/scripts/iteration_guard.py init \
-  --registry measurement-paths.json \
-  --baseline-source-sha256 <sha256> --environment-sha256 <sha256> \
-  --measurement-path paired-kernel@1 --out iteration-anchor.json
-
-python3 <skill>/scripts/iteration_guard.py check \
-  --anchor iteration-anchor.json --record round-0001.json \
-  --evidence-manifest evidence/manifest.json \
-  --out round-0001-decision.json
-```
+After the round, classify its structured record mechanically with
+`scripts/iteration_guard.py check`; initialize the chain first with
+`scripts/iteration_guard.py init`. Do not choose the class in prose.
 
 - `candidate_evaluated` requires a source change bound to an integrity-passing
   V2.5 seal, audit, and decision closure. Inline correctness or timing claims do
@@ -469,8 +470,8 @@ status.
 
 ## References to read on demand
 
-- `references/performance_iteration.md`: V2.6 performance hypothesis, derived
-  work class, infrastructure budget, prevalidated fallback, and stop rules.
+- `references/direction_admission.md`: V2.7 direction identity, impact envelope, stop ledger, reopening evidence, and read-only CLI.
+- `references/performance_iteration.md`: V2.6 hypothesis, work class, infrastructure budget, fallback, and stop rules.
 - `references/compatibility.md`: supported versions, public APIs, architecture
   routing, and RTX 5090/SM120 facts.
 - `references/optimization_catalog.md`: method triggers, skip rules, and
