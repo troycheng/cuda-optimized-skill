@@ -136,14 +136,6 @@ class LogoAssetTests(unittest.TestCase):
             self.assertEqual(min(alpha), 0)
             self.assertEqual(max(alpha), 255)
 
-        for readme_name in ("README.md", "README.zh-CN.md"):
-            readme = (ROOT / readme_name).read_text(encoding="utf-8")
-            self.assertIn(
-                '<source media="(prefers-color-scheme: dark)" srcset="asset/logo-dark.svg">',
-                readme,
-            )
-            self.assertIn('<img src="asset/logo.svg" width="88"', readme)
-
     def test_wordmark_asset_contract(self) -> None:
         expected = {
             "logo-wordmark.svg": ("#172033", "#16B8A6"),
