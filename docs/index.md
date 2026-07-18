@@ -10,10 +10,16 @@ read-only analysis of an existing Nsight Compute report.
 ## Start here
 
 - [Getting Started](getting-started.md) — install the skill and prepare a task.
+- [Environment readiness](environment-readiness.md) — find the strongest result
+  the current workload and test environment can support.
 - [Workflows](workflows.md) — choose the claim that matches your inputs.
 - [Evidence & Safety](evidence-and-safety.md) — understand what must pass before
   a result can be trusted.
 - [Compatibility](compatibility.md) — check toolchain and target requirements.
+- [Validation status](validation.md) — see where the project itself has been tested.
+- [Case studies](case-studies.md) — review workload-specific historical results.
+- [Knowledge and research](knowledge-and-research.md) — understand offline
+  knowledge, current-source search, and independent model challenge.
 - [Agent Protocol](https://github.com/troycheng/cuda-optimized-skill/blob/main/skills/cuda-kernel-optimizer/SKILL.md)
   — read the canonical Codex execution instructions.
 

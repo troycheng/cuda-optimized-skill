@@ -3,6 +3,13 @@
 Choose the workflow from the strongest claim your inputs can support. A faster
 kernel does not automatically establish a faster product workload.
 
+## Environment readiness
+
+Use this path when the workload, correctness reference, reproducible build,
+stable benchmark, or target access is incomplete. The skill reports the current
+claim ceiling and prepares project-local scaffolding rather than inventing
+missing inputs. See [Preparing a workload and test environment](environment-readiness.md).
+
 ## Direction admission
 
 Before creating candidates, the AI uses `direction_guard.py` to decide whether

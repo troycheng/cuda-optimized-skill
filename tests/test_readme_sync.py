@@ -34,7 +34,7 @@ class ReadmeSyncTests(unittest.TestCase):
             "## Choose a workflow",
             "## How it works",
             "## Evidence, not best-sample claims",
-            "## Tested scope",
+            "## Validation status",
             "## Release notes",
             "## Documentation",
         )
@@ -44,14 +44,14 @@ class ReadmeSyncTests(unittest.TestCase):
             "## 选择工作流",
             "## 工作方式",
             "## 以证据为准，而不是选择最快样本",
-            "## 已测试范围",
+            "## 验证情况",
             "## 版本记录",
             "## 文档",
         )
         assert_in_order(self, self.english, english)
         assert_in_order(self, self.chinese, chinese)
-        self.assertLessEqual(len(self.english.splitlines()), 190)
-        self.assertLessEqual(len(self.chinese.splitlines()), 190)
+        self.assertLessEqual(len(self.english.splitlines()), 210)
+        self.assertLessEqual(len(self.chinese.splitlines()), 210)
 
     def test_hero_uses_wordmark_tagline_and_primary_navigation(self) -> None:
         for text in (self.english, self.chinese):
@@ -64,6 +64,7 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("Triton", opening)
             for target in (
                 "docs/getting-started.md",
+                "docs/environment-readiness.md",
                 "docs/workflows.md",
                 "docs/evidence-and-safety.md",
                 "skills/cuda-kernel-optimizer/examples/walkthrough.md",
@@ -92,14 +93,16 @@ class ReadmeSyncTests(unittest.TestCase):
             for budget in ("quick", "balanced", "thorough"):
                 self.assertIn(budget, text)
 
-    def test_readmes_publish_the_same_four_workflows(self) -> None:
+    def test_readmes_publish_the_same_five_workflows(self) -> None:
         english = (
+            "Environment readiness",
             "Kernel optimization",
             "Complete workload",
             "Serving validation",
             "Existing NCU report",
         )
         chinese = (
+            "环境准备",
             "Kernel 优化",
             "完整 workload",
             "Serving 验证",
@@ -184,7 +187,7 @@ class ReadmeSyncTests(unittest.TestCase):
     def test_readmes_publish_matching_release_notes_from_v2_2(self) -> None:
         english = self.english[self.english.index("## Release notes"):]
         chinese = self.chinese[self.chinese.index("## 版本记录"):]
-        versions = tuple(f"### V2.{minor}" for minor in range(8, 1, -1))
+        versions = tuple(f"### V2.{minor}" for minor in range(9, 1, -1))
         assert_in_order(self, english, versions)
         assert_in_order(self, chinese, versions)
         for version in versions:
@@ -213,33 +216,29 @@ class ReadmeSyncTests(unittest.TestCase):
         ):
             self.assertIn(marker, chinese)
 
-    def test_tested_scope_is_historical_and_not_a_speedup_promise(self) -> None:
-        facts = (
-            "811",
-            "806",
-            "13/13",
-            "34.302",
-            "60.4616%",
-            "26.3287%",
-            "-0.0097%",
-            "140",
-            "ERR_NVGPUCTRPERM",
-        )
-        for fact in facts:
-            self.assertIn(fact, self.english)
-            self.assertIn(fact, self.chinese)
-            self.assertEqual(self.english.count(fact), self.chinese.count(fact))
-        self.assertIn("historical acceptance evidence", self.english)
-        self.assertIn("历史验收证据", self.chinese)
-        self.assertRegex(self.english, r"not\s+a promise")
-        self.assertIn("不代表任意项目都能获得相同提升", self.chinese)
+    def test_validation_and_case_studies_are_separate(self) -> None:
+        for text in (self.english, self.chinese):
+            self.assertIn("docs/validation.md", text)
+            self.assertIn("docs/case-studies.md", text)
+        validation = (ROOT / "docs/validation.md").read_text(encoding="utf-8")
+        cases = (ROOT / "docs/case-studies.md").read_text(encoding="utf-8")
+        for fact in ("813", "808", "13 of 13", "34.302", "ERR_NVGPUCTRPERM"):
+            self.assertIn(fact, validation)
+        for fact in ("60.4616%", "26.3287%", "-0.0097%", "140"):
+            self.assertIn(fact, cases)
+        self.assertNotIn("60.4616%", validation)
+        self.assertNotIn("811", cases)
 
     def test_readmes_route_to_public_and_canonical_documents(self) -> None:
         links = (
             "docs/getting-started.md",
+            "docs/environment-readiness.md",
             "docs/workflows.md",
             "docs/evidence-and-safety.md",
             "docs/compatibility.md",
+            "docs/validation.md",
+            "docs/case-studies.md",
+            "docs/knowledge-and-research.md",
             "skills/cuda-kernel-optimizer/SKILL.md",
             "skills/cuda-kernel-optimizer/examples/walkthrough.md",
             "skills/cuda-kernel-optimizer/references/evidence_automation.md",

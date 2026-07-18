@@ -1,495 +1,196 @@
 ---
 name: cuda-kernel-optimizer
-description: "Use when optimizing, tuning, or profiling a CUDA, CUTLASS, Triton, or GPU workload implementation, especially when the bottleneck may be in kernels, framework scheduling, data input, transfers, communication, I/O, or the runtime environment."
+description: "Use when optimizing, tuning, diagnosing, or profiling CUDA, CUTLASS, Triton, PyTorch, vLLM, TensorRT-LLM, or another GPU workload; when assessing an existing NCU report; or when the workload, correctness reference, benchmark, profiler, or target environment is incomplete."
 ---
 
-# CUDA Kernel and Workload Optimizer (V2.8)
+# CUDA Kernel and Workload Optimizer
 
-## Principle
+## Operating rule
 
-Optimize in two evidence layers:
+Optimize the user's real objective against a correctness reference. Measure on
+the target path, keep raw evidence, and retain only verified changes. A faster
+kernel is not an end-to-end win unless the user-provided workload also improves.
 
-1. The inner loop proves that a candidate is correct and faster than the current
-   kernel with paired measurements.
-2. When the user supplies a real workload, the outer loop proves that the kernel
-   improvement survives the user's primary KPI and constraints.
+Do not assume the bottleneck is inside a kernel. Check framework scheduling,
+CPU/data work, transfers, communication, I/O, allocator behavior, serving state,
+and the environment when the supplied workload crosses those layers.
 
-A faster microbenchmark is not automatically an end-to-end win. Promotion is a
-decision backed by durable evidence, not the lowest observed sample.
+## Route before loading details
 
-## Nonstationary serving evidence
+Read only the reference required by the current route. Do not load the whole
+catalog or all evidence protocols.
 
-V2.8 checks whether already-collected serving rows compare baseline and candidate under comparable state before interpreting their metric. Before measurement, run `scripts/nonstationarity_guard.py init` to bind the design bytes and canonical digest in a create-once anchor. Freeze at least four `site_randomized_balanced` blocks, balanced AB/BA order, fixed-duration bounds, burn-in rows, the minimum complete blocks, and pair tolerance plus phase tolerance for every declared state dimension. Do not delete, reorder, cluster, relabel, or relax the design after seeing results.
-
-Run `scripts/nonstationarity_guard.py check` with a frozen design and chronological normalized series. It rehashes the bound raw source, rejects identity or plan drift, and returns only `comparable_paired_state` or `inconclusive_nonstationary`; `performance_gain_claimed` is always false. Only comparable evidence proceeds to the existing performance gate. The guard never runs a target or changes a host; `host_policy` stays `recommend_only`.
-
-Read `references/nonstationary_serving_evidence.md`; contracts are `templates/nonstationarity_anchor.schema.json`, `templates/nonstationarity_design.schema.json`, `templates/nonstationarity_series.schema.json`, and `templates/nonstationarity_verdict.schema.json`.
-
-## Direction admission
-
-V2.7 decides whether a direction is worth another candidate round. Use `scripts/direction_guard.py init`,
-`scripts/direction_guard.py check`, and `scripts/direction_guard.py status` to maintain one create-once ledger.
-For same-layer additive time it uses a full-elimination upper bound and returns `admit_direction`,
-`switch_to_higher_impact`, `close_direction`, `direction_closed`, or `unrankable`. Mechanism prose is not identity.
-
-The guard never runs the target and never claims a gain. Its CLI rehashes bound environment, window, target,
-component, normalized evidence, and its raw source artifact. Only `admitted: true` enters V2.6; `unrankable` is hard non-admission. Record every
-reported stop with `--request close` before more candidate work. Reopen requires verified new evidence, a new raw source, and a
-materially larger frozen-baseline envelope. Pass the last status tail on every append. `host_policy` stays `recommend_only`. Read
-`references/direction_admission.md`; contracts include `templates/direction_portfolio.schema.json`, `templates/direction_evidence.schema.json`,
-`templates/direction_lineage.schema.json`, and `templates/direction_decision.schema.json`.
-
-## Performance-first iteration gate
-
-V2.6 keeps measurement infrastructure subordinate to performance work. Before
-editing the first candidate, create one immutable lineage anchor that binds the
-baseline source, environment, and prevalidated measurement paths. Each round
-then binds one falsifiable performance hypothesis: mechanism, target metric and direction,
-minimum effect, mutation scope, and budget.
-
-After the round, classify its structured record mechanically with
-`scripts/iteration_guard.py check`; initialize the chain first with
-`scripts/iteration_guard.py init`. Do not choose the class in prose.
-
-- `candidate_evaluated` requires a source change bound to an integrity-passing
-  V2.5 seal, audit, and decision closure. Inline correctness or timing claims do
-  not count.
-- `measurement_blocked` means a candidate was declared but the sealed closure
-  did not complete.
-- `infrastructure_only` means no valid candidate was evaluated. It is not an
-  optimization result.
-- The guard never claims `performance_gain`. It forwards a consistent
-  `confirmed_win` to the existing paired-evidence and promotion gate, which
-  remains the only authority for a gain. A loss or inconclusive candidate is
-  useful search evidence, not a gain.
-
-Infrastructure is capped at 15% of the round and never more than 20 minutes,
-with one infrastructure repair. Exceed either cap, or complete two consecutive
-`measurement_blocked`/`infrastructure_only` rounds in the same anchor-derived
-hash chain, and switch only to a frozen path with a different implementation
-digest. If none exists, stop the direction; do not build another runner inside
-the optimization round. A registry change is a separate maintenance task. Read
-`references/performance_iteration.md` for the anchor, record, evidence, fallback,
-and reporting contracts. Validate inputs against
-`templates/iteration_binding.schema.json`,
-`templates/iteration_lineage.schema.json`,
-`templates/performance_iteration.schema.json`, and
-`templates/measurement_path_registry.schema.json`.
-
-## Required and optional inputs
-
-Choose one execution mode before setup. Do not invent a dummy kernel, reference,
-or ChangeSet merely to fit a controller:
-
-- `kernel-loop`: require a baseline CUDA/CUTLASS `.cu` or Triton `.py` kernel,
-  a Python `reference(**kwargs)`, and dimensions as a JSON object;
-- `workload-only`: require a user-owned runnable workload, frozen baseline and
-  candidate identities, and an objective. Use this for framework, CPU/data,
-  transfer, communication, I/O, or runtime changes that have no kernel mutation;
-- `serving-stack`: require a frozen deployment comparison, correctness policy,
-  request replay, endpoint objective, and environment protocol. TensorRT,
-  Triton, CUDA, engine, backend, container, or compiler upgrades belong here.
-
-The Python reference is mandatory only for `kernel-loop`. Every mode requires a
-correctness oracle appropriate to its claim layer. A user-provided workload is
-required for any `end_to_end_win` claim. Never infer, download, or manufacture a
-representative workload. Without one, stop at the highest lower evidence layer
-and state that scope explicitly.
-
-Accept exactly one workload form:
-
-- `--workload PATH`: Python adapter implementing `prepare`, `validate`,
-  `benchmark`, `metrics`, and `cleanup`;
-- `--workload-cmd 'COMMAND ...' --objective objective.json`: command parsed
-  without a shell and an external objective;
-- `--workload-manifest manifest.json`: strict manifest describing a Python or
-  command workload, objective, and cases. It requires `kind`, `source`, and
-  `cases`; use an embedded objective or external `--objective`, never both.
-
-Start a Python adapter from `templates/workload.py`. Validate objectives against
-`templates/objective.schema.json`. Treat adapter source, declared local
-dependencies, objective, cases, baseline, reference, dimensions, backend,
-budget, confidence, and minimum effect as frozen run inputs.
-
-## Workload controller
-
-Use the V2.4.1 controller when the user has a user-provided runnable workload and
-the bottleneck is not known to be inside one kernel. Codex is the primary optimizer:
-it reads the evidence, writes a bounded ChangeSet, edits only the declared scope,
-and interprets the result. An optional local reviewer can challenge the diagnosis
-or experiment over JSON stdin/stdout, but it is advisory only. It cannot execute a
-change or promote a candidate, and the protocol does not provide an OS sandbox.
-
-The deterministic diagnosis classes are `kernel`, `framework`, `cpu_data`,
-`transfer`, `communication`, `io`, `environment`, and `mixed`. Probe commands
-come from the user environment and write a normalized probe artifact. This keeps
-Nsight Systems, framework profilers, internal observability, and application
-metrics usable without binding the skill to one profiler.
-
-The fixed stage order is:
-
-```text
-baseline -> probes -> diagnosis -> change -> review -> evaluation -> decision
-```
-
-Start and inspect the evidence:
-
-```bash
-python3 <skill>/scripts/workload_controller.py run \
-  --control ./control.json --run-dir ./workload_run
-python3 <skill>/scripts/workload_controller.py status --run-dir ./workload_run
-```
-
-After reading `diagnosis.json`, write a ChangeSet, then freeze it before editing:
-
-```bash
-python3 <skill>/scripts/workload_controller.py register-change \
-  --control ./control.json --run-dir ./workload_run \
-  --change-set ./change.json
-```
-
-Codex may edit declared project paths or a user-owned `isolated_environment`.
-The controller verifies the actual diff, binds it to the candidate, optionally
-requests review, and performs paired workload evaluation. ChangeSet `commands`
-must remain empty; correctness uses the workload adapter's `validate()`:
-
-```bash
-python3 <skill>/scripts/workload_controller.py evaluate \
-  --run-dir ./workload_run
-python3 <skill>/scripts/workload_controller.py resume \
-  --run-dir ./workload_run
-```
-
-`host_policy` must be `recommend_only`. Host changes are never executed; write
-them to `host_recommendations.md` with evidence and manual checks. Reject a
-ChangeSet that escapes its paths, changes the frozen workload, exceeds its
-deadline, or asks for host scope. See `examples/workload-controller.md` for the
-complete control, probe, ChangeSet, and reviewer contracts.
-
-The ChangeSet controller is not the entry point for an already-built external
-serving stack. Use `references/serving_evidence_protocol.md` and freeze a
-deployment experiment directly; compare exact runtime artifacts rather than
-creating a meaningless filesystem diff.
-
-## Formal evidence automation
-
-Use the V2.5 evidence CLI for promotion-grade shared-host, matched-runtime, or
-serving attempts. Read `references/evidence_automation.md` before creating its
-schemas or artifacts. Site-owned collectors produce normalized continuous
-samples; the generic skill validates them but does not claim universal GPU or
-container telemetry collection.
-
-Audit target/peer/sibling GPU identities, CPU/NUMA scope, PID/container
-allowlists, memory/swap pressure, clocks, temperature, power, thermal state,
-watcher-ready handshake, maximum gap, and joint clean window for each required
-correctness, sanitizer, diagnostic, and timing phase:
-
-```bash
-python3 <skill>/scripts/evidence.py guard-audit \
-  --policy guard-policy.json --samples guard-samples.jsonl \
-  --markers phase-markers.json --out guard-audit.json
-```
-
-Freeze the complete formal schedule and statistics before timing. Formal
-workload evaluation uses that exact schedule, frozen CI/pair/win settings, and
-zero single-role retries; its automated aggregation is currently median-only.
-Require execution-path hits for every expected case, then remove diagnostics,
-rebuild, rehash, and bind the residue-free timed binary.
-
-End every attempt in exactly one immutable state: `valid`,
-`invalid_contaminated`, `invalid_identity`, `partial`, or `superseded`. Close the
-evidence in order:
-
-```bash
-python3 <skill>/scripts/evidence.py seal --attempt attempt.json --out seal.json
-python3 <skill>/scripts/evidence.py audit --seal seal.json --out audit.json
-python3 <skill>/scripts/evidence.py decide \
-  --seal seal.json --audit audit.json --out decision.json \
-  --manifest evidence-manifest.json
-```
-
-Keep the performance verdict separate from `evidence_integrity`. A confirmed
-win with failed integrity retains the baseline. Nsys/NCU bundles are explanatory
-and `non_promotional`. Audit an imported serving run only with `audit-imported`;
-write output outside its source tree. See `references/migration_v2_5.md` before
-using V2.4.1 manifests, which remain compatible but legacy and unsealed.
-
-After installation, run the CPU/static check without CUDA or network access:
-
-```bash
-python3 <skill>/scripts/self_check.py --skill-dir <skill>
-```
-
-## Layered experiment funnel
-
-For expensive GPU or serving work, freeze a funnel before measurement. Every
-stage declares one authority:
-
-| Gate | May do | Must not do |
+| Situation | First action | Read on demand |
 |---|---|---|
-| `static_reject` | reject impossible or unsafe variants from source, ABI, SASS, registers, spills, barriers, or topology | claim runtime speed |
-| `rank_only` | rank correct variants with an identical Event or standalone harness | promote a winner |
-| `reject_only` | reject candidates with short fresh-process exact-runtime pairs | promote a winner |
-| `promotion` | accept or reject using the frozen formal objective and guardrails | reuse diagnostics or quick samples as formal rows |
+| Missing workload, reference, benchmark, or environment | Run `scripts/readiness.py`; stop at its claim ceiling | `references/environment_readiness.md` |
+| Single CUDA, CUTLASS, or Triton kernel | Establish correctness and paired kernel timing | `references/performance_iteration.md` |
+| Bottleneck unknown across a full workload | Run workload diagnosis before choosing a mutation | `examples/workload-controller.md` |
+| Serving KPI validation | Freeze strata, identities, guards, and experiment design | `references/serving_evidence_protocol.md` |
+| Time-varying serving state | Check comparability before interpreting speed | `references/nonstationary_serving_evidence.md` |
+| Existing `.ncu-rep` only | Analyze read-only; do not launch the original target | `references/ncu_metrics_guide.md` |
+| Architecture, API, or tool version uncertain | Query bundled knowledge, then verify locally or with primary sources | `references/offline_knowledge.md` |
+| Major direction choice or reasoning plateau | Use optional search or independent challenge | `references/research_augmentation.md` |
 
-Generate 3-5 variants for one new mechanism when useful, batch compile them,
-and apply declared static invariants before spending GPU time. Run correctness
-before timing. Only the direction champion reaches formal exact-runtime testing;
-only a formal exact-runtime winner reaches matched runtime and endpoint tests.
-Profiler rows, diagnostic binaries, partial attempts, contaminated windows, and
-quick-screen rows are never promotion evidence.
+## Establish the claim ceiling
 
-For controller-based screening, set `evaluation_gate: "reject_only"` in the
-control manifest. The controller will roll back even a positive candidate and
-record `reject_only_stage_cannot_promote`. Use a new, independent promotion run
-with its own frozen schedule and samples for advancement.
+Inventory these facts before mutation:
 
-Freeze the complete position-balanced schedule, experimental unit, estimator,
-resampling unit, minimum valid pair count, no-exclusion rule, retries, and stage
-authority. Independent `random.choice(AB, BA)` is not position balance. A single
-valid pair can never produce `confirmed_win`. Once formal timed work starts,
-do not retry one role independently or discard a slow valid row; retry only a
-whole pair for a predeclared pre-measurement infrastructure failure.
+- target source or profiler artifact;
+- correctness reference and representative cases;
+- reproducible build/import command and isolated environment;
+- stable kernel benchmark with warmup and paired raw samples;
+- user-approved real workload and objective;
+- serving experiment when a serving claim is required;
+- allowed project paths, constraints, and host boundaries.
 
-## Kernel-loop compute budget
-
-Ask the user for a preset when it materially affects cost. If they do not choose,
-use `balanced` by default.
-
-The workload controller has a separate workload budget namespace:
-`fast`/`balanced`/`thorough` mean 3/5/9 paired workload blocks and are not the
-kernel-loop `quick`/`balanced`/`thorough` pair counts below. Always write which
-namespace is being used. A short workload budget must use `evaluation_gate:
-"reject_only"` when it is part of a funnel.
-
-| Preset | Max time | Branches | Rounds | Pairs min-max | Outer candidates | Cases | Sanitizer |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `quick` | 2700 s | 4 | 2 | 20-50 | 1 | 3 | targeted |
-| `balanced` | 10800 s | 8 | 4 | 20-100 | 2 | 10 | targeted |
-| `thorough` | 36000 s | 16 | 8 | 30-200 | 3 | unlimited | full |
-
-Use `--budget custom` only with all required explicit limits. A budget deadline
-stops admission of new work, caps external-process timeouts to the remaining
-budget, and preserves a resumable checkpoint; partial or late evidence never
-becomes a win. A Python workload adapter runs in process and may return after
-the wall-clock deadline when blocked in native code. It must bound its own
-operations; use a command workload when the controller must be able to kill it.
-
-## Setup, open, and resume
-
-Run setup once:
+Create a small JSON inventory with `requested_claim` set to `kernel`, `workload`,
+or `serving`. `source_available` means the source is accessible to the current
+task, not merely that the user owns it. Pass the inventory by file or stdin:
 
 ```bash
-python3 <skill>/scripts/orchestrate.py setup \
-  --baseline ./kernel.cu \
-  --ref ./ref.py \
-  --dims '{"M":4096,"N":4096,"K":4096}' \
-  --budget balanced \
-  --workload ./workload.py
+python3 <skill>/scripts/readiness.py --input readiness-input.json --out readiness.json
 ```
 
-Omit the workload option for kernel-only mode. Substitute either
-`--workload-cmd ... --objective ...` or `--workload-manifest ...` when that is
-the user's chosen input form.
+Only missing items required by the requested claim should be reported. If only
+source is available, provide static hypotheses and a foundation plan;
+do not call them optimization results. A kernel benchmark supports only a kernel
+claim. A representative workload is required for an end-to-end claim. Never
+download, invent, or silently substitute a workload.
 
-Setup checks the environment and input contracts, freezes a manifest, seeds the
-baseline, and writes `checkpoint.json`. Setup does not profile or create branch directories.
-Do not edit frozen inputs inside a run.
+## Choose the budget
 
-Before generating round N candidates, explicitly open the iteration:
+Use `balanced` by default. Respect a user-selected budget.
 
-```bash
-python3 <skill>/scripts/orchestrate.py open-iter \
-  --run-dir ./run_YYYYMMDD_HHMMSS --iter N
-```
+| Budget | Wall-time ceiling | Intended use |
+|---|---:|---|
+| `quick` | 45 minutes | Triage and narrow candidates |
+| `balanced` | 3 hours | Default optimization and validation |
+| `thorough` | 10 hours | Broader search and deeper evidence |
 
-`open-iter` attempts current-best profiling, writes Roofline evidence, and
-creates the budgeted branch directories. After interruption, validate and
-inspect the next unfinished stage with:
+The ceiling is not a target. Stop earlier when evidence is conclusive, no
+eligible direction remains, or the claim ceiling blocks promotion.
 
-```bash
-python3 <skill>/scripts/orchestrate.py resume --run-dir ./run_YYYYMMDD_HHMMSS
-```
+## Core workflow
 
-Resume never replays a completed stage. Follow the reported `next_stage` and
-`next_iteration`.
-
-### Analyze an existing report
-
-Analyze an existing `.ncu-rep` without launching its target:
-
-```bash
-python3 <skill>/scripts/analyze_ncu_rep.py REPORT --out-dir OUTPUT
-```
-
-The standalone bundle records `counter_access: not_probed`; it does not prove
-current counter permissions, source execution, or an end-to-end result. Source
-binding and other parameters are optional. Run
-`python3 <skill>/scripts/analyze_ncu_rep.py --help` for details.
-
-## Dual-loop workflow
-
-For each admitted round:
-
-1. Run `open-iter --run-dir ... --iter N`. It profiles the current best when
-   counters are readable, computes the Roofline evidence, and prepares branch
-   directories.
-2. Read `state.json`, `checkpoint.json`, the current best source, and available
-   profiler evidence. Read `references/optimization_catalog.md` and
-   `references/ncu_metrics_guide.md` before selecting methods.
-3. Record selected methods and rejected higher-priority alternatives in
-   `methods.json` and `analysis.md`; do not persist hidden reasoning.
-4. Generate the budgeted branch variants under `itervN/branches/`. Keep the
-   method intent constant while varying tiles, stages, warps, or implementation
-   details.
-5. Run the deterministic close step:
+1. Freeze the objective, direction, constraints, representative cases,
+   measurement design, mutation roots, environment identity, and budget.
+2. Confirm the baseline passes correctness and produces stable raw timing.
+3. Profile the full path at the highest available claim layer.
+4. Summarize the observed bottleneck and the evidence that supports it.
+5. Admit only directions with measured headroom. Use
+   `references/direction_admission.md` for stop and reopen rules.
+6. Query at most a few compatible methods instead of loading the full catalog:
 
    ```bash
-   python3 <skill>/scripts/orchestrate.py close-iter \
-     --run-dir ./run_YYYYMMDD_HHMMSS --iter N
+   python3 <skill>/scripts/knowledge_query.py --arch sm_120 --layer kernel --axis memory --metrics profiler-summary.json --limit 5
    ```
 
-6. `close-iter` follows the generic lifecycle: reference correctness first,
-   telemetry-gated position-balanced paired timing, sanitizer, then final SASS.
-   In short: correctness → paired → sanitizer → SASS.
-   For a mechanism with declared ABI, resource, barrier, spill, opcode, or
-   topology invariants, add a pre-GPU static screen; failure is a hard reject.
-   Candidate profiling may be repeated if sanitizer selection changes the
-   finalist, but profiler measurements remain explanatory only.
-7. Compiler provenance and SASS results are evidence and method-classification
-   inputs and, by default, are not hard promotion gates. Generic heuristics such
-   as an arbitrary register threshold cannot reject a candidate; explicitly
-   declared mechanism invariants may be hard static rejection gates.
-   Source/artifact identity drift always fails closed.
-8. In full mode, evaluate eligible candidates with paired baseline/candidate
-   observations on the frozen user workload. Enforce the primary metric's
-   `min_effect_pct` and every constraint's `max_regression_pct`.
-9. Apply the terminal decision atomically. Continue to the next round only when
-   the checkpoint and remaining budget permit it.
+7. State one falsifiable hypothesis, one bounded change, the expected metric
+   movement, and the condition that would reject it.
+8. Evaluate in order: correctness, paired timing, required constraints, then
+   compiler/profiler evidence. Diagnostics explain a result; they do not promote it.
+9. Keep the candidate only when its permitted claim passes. Restore or isolate
+   rejected changes and record why they failed.
+10. Resume from durable state. Do not repeat failed mechanisms unless new
+    evidence changes the bottleneck or applicability.
 
-Finalize only after the decision stage is complete:
+Run script help rather than loading command inventories into context:
 
 ```bash
-python3 <skill>/scripts/orchestrate.py finalize \
-  --run-dir ./run_YYYYMMDD_HHMMSS
+python3 <skill>/scripts/orchestrate.py --help
+python3 <skill>/scripts/workload_controller.py --help
+python3 <skill>/scripts/evidence.py --help
 ```
 
-### Reuse completed-run strategy evidence
+## Workload and kernel decisions
 
-Strategy memory is opt-in. Record a completed v2.2 run, then request hints for
-an exact manifest scope:
+Use `scripts/workload_diagnosis.py` or the workload controller to classify
+`kernel`, `framework`, `cpu_data`, `transfer`, `communication`, `io`,
+`environment`, or `mixed`. Let the measured share and objective determine the
+direction; do not apply a universal method ranking across claim layers.
 
-```bash
-python3 <skill>/scripts/strategy_memory.py record --memory MEMORY --run-dir RUN_DIR --out OUT
-python3 <skill>/scripts/strategy_memory.py suggest --memory MEMORY --manifest MANIFEST --out OUT
-```
+Codex owns analysis, code changes, and decisions. An optional local reviewer is
+advisory only and communicates through JSON stdin/stdout. Reviewers and external
+models never become promotion authorities.
 
-Always provide an explicit `--memory`; there is no default memory, and the
-orchestrator does not call this tool. Suggestions are advisory search hints.
-They never alter run state: `decision.json` owns promotion. Run
-`python3 <skill>/scripts/strategy_memory.py --help` for command details.
+For kernel candidates, use the real stage order documented by `orchestrate.py`.
+Correctness and paired timing are promotion gates; sanitizer, SASS, compiler,
+NCU, and Nsys evidence are required only when the frozen task or claim requires
+them. Report an unavailable profiler exactly, including `ERR_NVGPUCTRPERM`, and
+continue only at a lower valid evidence layer.
 
-## Paired verdict and promotion rules
+## Formal and nonstationary evidence
 
-Use a frozen, position-balanced AB/BA schedule and confidence intervals. A valid
-promotion requires finite statistics, the predeclared minimum valid pairs, the
-configured confidence, and a lower confidence bound meeting the minimum
-practical effect. Invalid telemetry blocks remain recorded but do not count as
-valid pairs.
+For shared-host or formal serving claims, read
+`references/evidence_automation.md` and run the guard, seal, audit, and decision
+workflow. Keep `performance_verdict` separate from `evidence_integrity`; missing,
+stale, contaminated, contradictory, or identity-invalid evidence fails closed.
 
-- `confirmed_win`: candidate clears correctness and statistical gates.
-- `confirmed_loss`: evidence supports no acceptable win.
-- `inconclusive`: evidence is insufficient or the confidence interval crosses a
-  decision boundary. Spend more budget only if admission allows; never promote.
+When load, queue depth, cache state, or another declared condition moves over
+time, read `references/nonstationary_serving_evidence.md`. A
+`comparable_paired_state` verdict permits later performance interpretation; it
+does not claim a win. `inconclusive_nonstationary` requires a new or recollected
+experiment.
 
-Terminal outcomes:
+## Knowledge and external research
 
-- `kernel_only_win`: confirms only a kernel win. It is the expected successful
-  terminal label in kernel-only mode, but can also be terminal in full mode when
-  workload failure/loss/inconclusive evidence prevents an end-to-end claim. It
-  says nothing about application throughput or latency, and it never promotes
-  the global best in full mode.
-- `end_to_end_win`: full mode only; both kernel evidence and the user workload's
-  primary KPI are confirmed wins and all constraints pass. This is the only
-  full-mode outcome that promotes the global best.
-- failure, loss, timeout, or inconclusive outcomes keep the current best.
+Use `scripts/knowledge_query.py` to return only architecture-compatible cards.
+Exact SM capabilities are required; never inherit features by numeric ordering.
+Cards without a matching observed signal remain `unverified`; do not admit a
+direction from registry order alone. Historical speedup ranges are context, not
+expected gain.
 
-Do not update `best_file` from an average, one sample, a profiler estimate, or an
-inner-loop win in full mode. `decision.json` is the promotion authority.
+The bundled snapshot must work offline. Read `references/offline_knowledge.md`
+and `references/compatibility.md` when versions or capabilities matter. Treat
+stale or mismatched facts as unverified and probe locally.
 
-## Degraded and failure behavior
+External search and multi-model challenge are optional. Read
+`references/research_augmentation.md` before sending any evidence outside the
+environment. Use primary sources, redact private material, obtain independent
+answers before cross-critique, preserve disagreement, and adjudicate locally.
+Network or provider failure must fall back to the offline workflow.
 
-- If target profiling reports `ERR_NVGPUCTRPERM`, record the exact command,
-  return code, and log; mark counter coverage unavailable and continue with
-  correctness, paired timing, source, compiler, sanitizer, and SASS evidence.
-  Never add privileges or change driver policy without explicit authorization.
-- `ncu --query-metrics` proves metric metadata exists, not that the target may
-  read hardware counters.
-- Missing profiler metrics remain missing. They cannot prove `near_peak` or a
-  measured Roofline classification.
-- If the sanitizer policy selects no applicable tool, record `not_applicable`.
-  If a selected tool cannot provide full coverage but the policy permits
-  continuation, record `degraded` prominently. Never label degraded coverage as
-  passed. Read `references/sanitizer_policy.json` for the exact routing policy.
-- Failed correctness and sanitizer gates cannot be rescued by good timing.
-  Compiler/SASS evidence must be reported honestly, but an unavailable or
-  negative classification is not by itself a hard promotion veto.
-- Bound retries and retain the failure artifacts. Do not loop indefinitely.
-- Reject non-finite metrics, malformed workload output, changed frozen inputs,
-  unsafe symlinks, and candidate/source hash drift.
+Read `references/optimizer_limits.md` when the target behavior depends on
+undocumented hardware, proprietary semantics, or missing workload facts.
 
-## Output contract
+## Modification and host boundary
 
-Representative durable layout:
+Modify only declared project paths and user-approved isolated environments.
+This skill does not provide an OS sandbox. Treat driver, GPU counter permission,
+clock, power, service, container runtime, kernel module, and other host changes
+as `recommend_only` unless the user separately authorizes them.
 
-```text
-run_YYYYMMDD_HHMMSS/
-├── manifest.json                 # frozen inputs and input_hash
-├── state.json                    # candidates, best evidence, history
-├── checkpoint.json               # resumable stage boundary
-├── env.json                      # toolchain and profiler capability
-├── workload/spec.json            # frozen workload snapshot or null
-├── baseline/
-│   ├── kernel.{cu,py}
-│   └── bench.json
-├── itervN/
-│   ├── analysis.md
-│   ├── methods.json
-│   ├── branches/...
-│   ├── sanitizer.json
-│   ├── sanitizer/*.json
-│   ├── sass_check.json
-│   ├── compiler_evidence/manifest.json
-│   ├── branches/<candidate>/paired_samples.jsonl
-│   ├── workload/<candidate-hash-prefix>/paired_samples.jsonl
-│   ├── decision.json             # authoritative promotion decision
-│   └── *.ncu.log                 # success or exact degraded failure
-└── summary.md                    # separate kernel and workload conclusions
-```
+Do not expose credentials, proprietary source, private inputs, hostnames, or raw
+logs to external services without explicit approval.
 
-Some backend- or outcome-specific artifacts are optional. Never claim an
-optional artifact exists without checking it. Raw `paired_samples.jsonl`, the
-frozen objective, candidate hashes, classifier configuration, and
-`decision.json` make the reported confidence result independently recomputable.
+## Durable output
 
-The final summary must state, in this order: terminal result and budget; frozen inputs/environment; kernel estimate, confidence interval, pairs, correctness, and SASS status; real-workload KPI and constraints or its absence; profiler/sanitizer/compiler coverage; candidates; raw artifact paths; resume status.
+Preserve the applicable artifacts rather than a prose-only conclusion:
 
-## References to read on demand
+- environment and objective identity;
+- readiness report and claim ceiling;
+- manifest, checkpoint, and candidate lineage;
+- profiler or workload diagnosis summary;
+- hypotheses, bounded changes, raw paired samples, and constraints;
+- `decision.json`, evidence integrity, and `summary.md`;
+- research sources, critiques, and unresolved disagreements when used.
 
-- `references/nonstationary_serving_evidence.md`: V2.8 nonstationary serving-state comparability and read-only CLI.
-- `references/direction_admission.md`: V2.7 direction identity, impact envelope, stop ledger, reopening evidence, and read-only CLI.
-- `references/performance_iteration.md`: V2.6 hypothesis, work class, infrastructure budget, fallback, and stop rules.
-- `references/compatibility.md`: versions, public APIs, architecture routing, and RTX 5090/SM120 facts.
-- `references/optimization_catalog.md`: method triggers, skip rules, and combination constraints.
-- `references/ncu_metrics_guide.md`: profiler metric interpretation.
-- `references/systems_and_ir_coverage.md`: read only for systems-path, CUTLASS/CuTe, or Triton IR evidence tasks.
-- `references/serving_evidence_protocol.md`: read only for runtime or serving evidence and claims.
-- `references/evidence_automation.md`: V2.5 guard, frozen design, execution-path, identity, seal/audit/decision, import, and profiler contracts.
-- `references/migration_v2_5.md`: V2.4.1 compatibility and non-mutating migration notes.
-- `references/sanitizer_policy.json`: targeted/full sanitizer routing.
-- `references/sass_signatures.json`: instruction signatures.
-- `templates/objective.schema.json`: strict workload objective schema.
-- `templates/guard_policy.schema.json`, `templates/experiment_design.schema.json`, `templates/attempt.schema.json`, `templates/execution_path.schema.json`, `templates/serving_experiment.schema.json`, `templates/artifact_identities.schema.json`, `templates/profiler_bundle.schema.json`, `templates/performance_verdict.schema.json`, and `templates/evidence_manifest.schema.json`: V2.5 formal evidence schemas.
-- `templates/workload.py`: user-owned Python workload starter.
-- `templates/iteration_report.md`: per-round decision record.
-- `examples/walkthrough.md`: annotated kernel-only and full-mode walkthrough.
+Report separately: verified result, strongest supported claim, rejected
+candidates, missing evidence, unchanged host recommendations, and the next
+highest-value action.
+
+## Reference index
+
+- Compatibility and tools: `references/compatibility.md`
+- Offline sources and query rules: `references/offline_knowledge.md`
+- Environment preparation: `references/environment_readiness.md`
+- Optimization limits: `references/optimizer_limits.md`
+- Kernel method catalog: `references/optimization_catalog.md`
+- NCU metrics: `references/ncu_metrics_guide.md`
+- Systems, CUTLASS/CuTe, and Triton IR: `references/systems_and_ir_coverage.md`
+- Runtime and serving claims: `references/serving_evidence_protocol.md`
+- Formal evidence: `references/evidence_automation.md`
+- Direction admission: `references/direction_admission.md`
+- Performance rounds: `references/performance_iteration.md`
+- Nonstationary serving: `references/nonstationary_serving_evidence.md`
+- External research: `references/research_augmentation.md`

@@ -1,0 +1,86 @@
+{
+  "schema_version": "cuda-optimizer/workload-methods-v1",
+  "as_of": "2026-07-18",
+  "methods": [
+    {
+      "id": "workload.framework.graph-breaks",
+      "layer": "workload",
+      "bottleneck": "framework",
+      "priority": 1,
+      "name": "Find graph breaks and recompilation",
+      "signals": ["torch.compile graph break", "recompile", "small compiled regions"],
+      "actions": ["collect compiler logs", "group by break reason", "stabilize shapes or unsupported operations"],
+      "evidence_required": "matched end-to-end replay plus compile diagnostics"
+    },
+    {
+      "id": "workload.framework.launch-gaps",
+      "layer": "workload",
+      "bottleneck": "framework",
+      "priority": 2,
+      "name": "Reduce CPU launch gaps and synchronization",
+      "signals": ["GPU idle gaps", "CPU launch-bound", "cudaDeviceSynchronize", "many short kernels"],
+      "actions": ["inspect CPU/GPU timeline", "remove avoidable sync", "evaluate fusion or CUDA Graphs"],
+      "evidence_required": "Nsight Systems timeline plus matched workload timing"
+    },
+    {
+      "id": "workload.cpu-data.input-pipeline",
+      "layer": "workload",
+      "bottleneck": "cpu_data",
+      "priority": 1,
+      "name": "Remove input-pipeline starvation",
+      "signals": ["GPU idle between batches", "dataloader wait", "CPU saturation"],
+      "actions": ["separate input and inference timing", "inspect workers and preprocessing", "verify representative data"],
+      "evidence_required": "CPU timeline and end-to-end replay"
+    },
+    {
+      "id": "workload.transfer.h2d-overlap",
+      "layer": "workload",
+      "bottleneck": "transfer",
+      "priority": 1,
+      "name": "Overlap and reduce host-device transfers",
+      "signals": ["large H2D duration", "serialized copies", "pageable memory"],
+      "actions": ["measure transfer share", "check pinned buffers", "test stream overlap without changing semantics"],
+      "evidence_required": "timeline and paired workload timing"
+    },
+    {
+      "id": "workload.communication.collective",
+      "layer": "workload",
+      "bottleneck": "communication",
+      "priority": 1,
+      "name": "Diagnose collective and topology limits",
+      "signals": ["NCCL dominates step", "low overlap", "rank imbalance"],
+      "actions": ["measure per-rank timeline", "check topology and message sizes", "recommend host changes separately"],
+      "evidence_required": "per-rank trace and matched distributed workload"
+    },
+    {
+      "id": "workload.io.request-path",
+      "layer": "workload",
+      "bottleneck": "io",
+      "priority": 1,
+      "name": "Separate request, serialization, and storage time",
+      "signals": ["GPU work is a small latency share", "request queueing", "serialization overhead"],
+      "actions": ["split request/input/infer/output timing", "inspect queue depth", "preserve real request distribution"],
+      "evidence_required": "component timing and endpoint replay"
+    },
+    {
+      "id": "workload.serving.scheduler",
+      "layer": "workload",
+      "bottleneck": "serving",
+      "priority": 1,
+      "name": "Tune serving scheduling against goodput",
+      "signals": ["TTFT/TPOT tradeoff", "queue growth", "unstable batch composition", "goodput miss"],
+      "actions": ["freeze request corpus and load", "measure TTFT TPOT ITL and goodput", "test scheduler settings by stratum"],
+      "evidence_required": "balanced serving experiment with workload-level constraints"
+    },
+    {
+      "id": "workload.environment.nonstationarity",
+      "layer": "workload",
+      "bottleneck": "environment",
+      "priority": 1,
+      "name": "Detect shared-host and serving drift",
+      "signals": ["role drift", "queue or cache state changes", "clock or thermal movement"],
+      "actions": ["freeze AB/BA blocks", "collect continuous guards", "declare state tolerances before timing"],
+      "evidence_required": "clean-window and nonstationarity verdicts"
+    }
+  ]
+}

@@ -9,9 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_PAGES = (
     "docs/index.md",
     "docs/getting-started.md",
+    "docs/environment-readiness.md",
     "docs/workflows.md",
     "docs/evidence-and-safety.md",
     "docs/compatibility.md",
+    "docs/validation.md",
+    "docs/case-studies.md",
+    "docs/knowledge-and-research.md",
 )
 
 
@@ -29,9 +33,13 @@ class PublicDocsTests(unittest.TestCase):
             (
                 "index.md",
                 "getting-started.md",
+                "environment-readiness.md",
                 "workflows.md",
                 "evidence-and-safety.md",
                 "compatibility.md",
+                "validation.md",
+                "case-studies.md",
+                "knowledge-and-research.md",
                 "Agent Protocol",
             ),
         )
@@ -128,10 +136,11 @@ class PublicDocsTests(unittest.TestCase):
             self.assertIn(marker, text)
 
     def test_internal_history_is_explicit_and_not_public_protocol(self) -> None:
-        text = (ROOT / "docs/superpowers/README.md").read_text(encoding="utf-8")
+        text = (ROOT / "maintainers/history/README.md").read_text(encoding="utf-8")
         self.assertIn("internal design and implementation history", text)
         self.assertIn("not the user guide", text)
         self.assertIn("not the agent execution protocol", text)
+        self.assertFalse((ROOT / "docs/superpowers").exists())
 
 
 if __name__ == "__main__":

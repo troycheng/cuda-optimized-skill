@@ -9,7 +9,8 @@ then start a new session so Codex reloads the skill instructions.
 
 ## Prepare the task
 
-Provide all of the following before formal optimization begins:
+Provide as much of the following as currently exists. The skill first reports a
+claim ceiling and helps prepare missing foundations before formal optimization:
 
 1. A **runnable target**: kernel code, a complete workload, or an existing
    `.ncu-rep`.
@@ -27,6 +28,10 @@ Provide all of the following before formal optimization begins:
 A real workload must be supplied by the user. The skill does not download,
 invent, or replace it with a microbenchmark. Without one, the strongest possible
 result is a kernel-level claim.
+
+If the runnable target, correctness reference, or stable benchmark is missing,
+start with [Environment readiness](environment-readiness.md). Source-only work
+may produce useful hypotheses, but not a performance result.
 
 ## Choose a budget
 

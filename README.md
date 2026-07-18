@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="docs/getting-started.md">Get Started</a> ·
+  <a href="docs/environment-readiness.md">Prepare a Workload</a> ·
   <a href="docs/workflows.md">Workflows</a> ·
   <a href="docs/evidence-and-safety.md">Evidence &amp; Safety</a> ·
   <a href="skills/cuda-kernel-optimizer/examples/walkthrough.md">Examples</a> ·
@@ -42,6 +43,8 @@ are reloaded.
 Provide a runnable target, a correctness reference, the test environment, a
 performance goal, constraints, and the allowed modification scope.
 A real workload must be supplied by the user; the skill does not download or invent one.
+If some of these are missing, the skill first reports what can be established
+with the current setup and helps create the missing project-local foundation.
 
 Choose `quick` for a 45-minute search, `balanced` for the default three-hour
 budget, or `thorough` for up to ten hours of broader exploration.
@@ -55,6 +58,7 @@ run boundaries.
 
 | Workflow | Use it when | Result boundary |
 |---|---|---|
+| **Environment readiness** | The workload, reference, stable benchmark, profiler, or target environment is incomplete | A gap report, claim ceiling, and project-local preparation plan; no unsupported speed claim |
 | **Kernel optimization** | A CUDA, CUTLASS, or Triton implementation has a comparable reference | A kernel-level result with correctness, compiler/profiler evidence, paired samples, and a confidence result |
 | **Complete workload** | Latency, throughput, or cost is off target and the bottleneck is unknown | A diagnosis across kernel, framework, CPU, transfer, communication, I/O, and environment paths, followed by a bounded end-to-end evaluation |
 | **Serving validation** | A kernel benchmark improved and the product KPI must be checked | Frozen c1/c2/c4/c8/c12 strata, serving-stack identity, per-stratum constraints, and a separate performance and evidence-integrity decision |
@@ -113,28 +117,27 @@ CPU/static only and does not validate a GPU environment. See
 [Evidence & Safety](docs/evidence-and-safety.md) for the claim ladder and host
 boundaries.
 
-## Tested scope
+## Validation status
 
-The following figures are historical acceptance evidence, not a promise that
-unrelated projects will achieve the same speedup. No GPU result is inferred from
-the CPU/static checks in this documentation change.
+Project checks and workload results are deliberately separate:
 
-| Validation lane | Recorded result | Interpretation |
-|---|---|---|
-| CPU/static acceptance | 811 tests: 806 passed, five RTX 5090 opt-in tests skipped, zero failed | Exercises state recovery, evidence binding, shared-host guards, timeouts, restoration, and input validation |
-| Physical RTX 5090 lane | 13/13 checks in 34.302 seconds; target-side NCU returned `ERR_NVGPUCTRPERM` | The GPU workflow ran without changing privilege or driver policy |
-| Reproducible workload fixture | End-to-end latency improved 60.4616% with constraints passing | Demonstrates the workflow on that fixture only |
-| User-supplied vLLM workload | Kernel metric improved 26.3287%; real workload changed -0.0097% | The original was kept because a faster kernel did not improve the product workload |
-| Imported NCU report | Parsed 140 metrics without launching the profiled program | Does not establish current counter permissions or current runtime identity |
+- [Validation status](docs/validation.md) records automated checks, the physical
+  RTX 5090 lane, tool permissions, and what those checks do and do not establish.
+- [Case studies](docs/case-studies.md) records historical workload outcomes,
+  including rejected kernel wins. Those numbers apply only to their recorded
+  code, inputs, environment, and objective.
 
-Detailed versions and opt-in conditions are in
-[Compatibility](docs/compatibility.md). Historical speedups are not general
-performance guarantees.
+Neither page promises a speedup for a new project. The current task establishes
+its own claim ceiling and must close its own correctness and measurement evidence.
 
 ## Release notes
 
 The maintained release history starts with V2.2. These notes describe project
 versions; they do not imply that every historical version has a matching Git tag.
+
+### V2.9
+
+Reorganized public documentation around user tasks, moved development history out of `docs`, and reduced the skill entrypoint to an on-demand router. Added an environment-readiness claim ceiling, bounded offline knowledge queries, workload-level method cards, a dated primary-source manifest, and optional external search and independent model challenge while keeping local evidence decisive.
 
 ### V2.8
 
@@ -167,9 +170,13 @@ Established the dual-loop optimizer: paired kernel measurements, user-supplied w
 ## Documentation
 
 - [Getting Started](docs/getting-started.md)
+- [Preparing a workload and environment](docs/environment-readiness.md)
 - [Workflow selection](docs/workflows.md)
 - [Evidence and safety](docs/evidence-and-safety.md)
 - [Compatibility](docs/compatibility.md)
+- [Validation status](docs/validation.md)
+- [Case studies](docs/case-studies.md)
+- [Knowledge, search, and independent challenge](docs/knowledge-and-research.md)
 - [Agent execution protocol](skills/cuda-kernel-optimizer/SKILL.md)
 - [Kernel and workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [Performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md)

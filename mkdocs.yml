@@ -10,9 +10,13 @@ theme:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Environment Readiness: environment-readiness.md
   - Workflows: workflows.md
   - Evidence & Safety: evidence-and-safety.md
   - Compatibility: compatibility.md
+  - Validation Status: validation.md
+  - Case Studies: case-studies.md
+  - Knowledge & Research: knowledge-and-research.md
   - Agent Protocol: https://github.com/troycheng/cuda-optimized-skill/blob/main/skills/cuda-kernel-optimizer/SKILL.md
 
 extra_css:

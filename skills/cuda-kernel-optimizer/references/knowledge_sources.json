@@ -1,0 +1,119 @@
+{
+  "schema_version": "cuda-optimizer/knowledge-sources-v1",
+  "as_of": "2026-07-18",
+  "staleness_policy": "Treat versions outside the recorded range and facts older than the target toolchain as unverified. Probe locally or use current primary documentation before acting.",
+  "sources": [
+    {
+      "id": "nvidia-cuda-best-practices",
+      "title": "CUDA C++ Best Practices Guide",
+      "url": "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/",
+      "version": "13.3",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "nvidia-cuda-programming-guide",
+      "title": "CUDA C++ Programming Guide",
+      "url": "https://docs.nvidia.com/cuda/cuda-c-programming-guide/",
+      "version": "13.3 family",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "nvidia-nsight-compute",
+      "title": "Nsight Compute Documentation",
+      "url": "https://docs.nvidia.com/nsight-compute/NsightCompute/index.html",
+      "version": "2026.x",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "nvidia-nsight-systems",
+      "title": "Nsight Systems User Guide",
+      "url": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html",
+      "version": "2026.x",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "triton-tutorials",
+      "title": "Triton Tutorials",
+      "url": "https://triton-lang.org/main/getting-started/tutorials/",
+      "version": "main documentation snapshot",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "triton-language-range",
+      "title": "Triton language range",
+      "url": "https://triton-lang.org/main/python-api/generated/triton.language.range.html",
+      "version": "main documentation snapshot",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "pytorch-profiler",
+      "title": "PyTorch Profiler",
+      "url": "https://docs.pytorch.org/docs/stable/profiler.html",
+      "version": "stable documentation snapshot",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "pytorch-compile-profiling",
+      "title": "Profiling torch.compile",
+      "url": "https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler_profiling_torch_compile.html",
+      "version": "stable documentation snapshot",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "vllm-optimization",
+      "title": "vLLM Optimization and Tuning",
+      "url": "https://docs.vllm.ai/en/stable/configuration/optimization/",
+      "version": "stable documentation snapshot",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "tensorrt-llm-performance",
+      "title": "TensorRT-LLM Performance Tuning Guide",
+      "url": "https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/index.html",
+      "version": "current documentation snapshot",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "nvidia-cutlass",
+      "title": "NVIDIA CUTLASS Documentation",
+      "url": "https://docs.nvidia.com/cutlass/",
+      "version": "4.x family",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "multiagent-debate",
+      "title": "Improving Factuality and Reasoning in Language Models through Multiagent Debate",
+      "url": "https://arxiv.org/abs/2305.14325",
+      "version": "arXiv v1",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "multiagent-debate-critical-evaluation",
+      "title": "Stop Overvaluing Multi-Agent Debate -- We Must Rethink Evaluation and Embrace Model Heterogeneity",
+      "url": "https://arxiv.org/abs/2502.08788",
+      "version": "arXiv v3",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    },
+    {
+      "id": "adaptive-retrieval",
+      "title": "Self-Knowledge Guided Retrieval Augmentation for Large Language Models",
+      "url": "https://arxiv.org/abs/2310.05002",
+      "version": "arXiv v1",
+      "source_kind": "primary",
+      "last_verified": "2026-07-18"
+    }
+  ]
+}
