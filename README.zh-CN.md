@@ -109,7 +109,7 @@ CPU/static 检查推断出新的 GPU 结果。
 
 | 验证路径 | 已记录结果 | 含义 |
 |---|---|---|
-| CPU/static 验收 | 771 项测试：766 通过，5 项 RTX 5090 opt-in 测试跳过，0 失败 | 覆盖状态恢复、证据绑定、shared-host guard、超时、恢复和输入验证 |
+| CPU/static 验收 | 788 项测试：783 通过，5 项 RTX 5090 opt-in 测试跳过，0 失败 | 覆盖状态恢复、证据绑定、shared-host guard、超时、恢复和输入验证 |
 | 物理 RTX 5090 路径 | 13/13 项检查耗时 34.302 秒；目标侧 NCU 返回 `ERR_NVGPUCTRPERM` | GPU 工作流已运行，且未修改权限或驱动策略 |
 | 可复现 workload fixture | 端到端延迟提升 60.4616%，约束通过 | 只证明该 fixture 上的完整工作流 |
 | 用户提供的 vLLM workload | Kernel 指标提升 26.3287%，真实 workload 变化 -0.0097% | 更快的 kernel 没有改善产品 workload，因此保留原实现 |
