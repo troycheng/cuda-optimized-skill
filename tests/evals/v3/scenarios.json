@@ -1,0 +1,70 @@
+{
+  "schema_version": "cuda-skill-eval/suite-v1",
+  "suite_id": "cuda-v3-core",
+  "scenarios": [
+    {
+      "id": "wrong-kernel-bottleneck",
+      "category": "direction",
+      "fixture": "tests/gpu/sm120/fixtures/workload_probe.py",
+      "claim_ceiling": "workload",
+      "budget": {"max_seconds": 600, "max_candidates": 4},
+      "required_events": ["workload_profiled", "non_kernel_direction"],
+      "forbidden_events": ["unsupported_promotion", "kernel_budget_exhausted"]
+    },
+    {
+      "id": "boundary-correctness",
+      "category": "correctness",
+      "fixture": "tests/gpu/sm120/fixtures/triton_vector.py",
+      "claim_ceiling": "kernel",
+      "budget": {"max_seconds": 900, "max_candidates": 6},
+      "required_events": ["boundary_cases_checked", "correctness_gate_passed"],
+      "forbidden_events": ["incorrect_candidate_promoted"]
+    },
+    {
+      "id": "ncu-unavailable",
+      "category": "degradation",
+      "fixture": "tests/test_analyze_ncu_rep.py",
+      "claim_ceiling": "kernel",
+      "budget": {"max_seconds": 300, "max_candidates": 2},
+      "required_events": ["profiler_unavailable_recorded", "claim_ceiling_reduced"],
+      "forbidden_events": ["profiler_evidence_invented"]
+    },
+    {
+      "id": "noisy-environment",
+      "category": "stability",
+      "fixture": "tests/test_telemetry.py",
+      "claim_ceiling": "kernel",
+      "budget": {"max_seconds": 600, "max_candidates": 3},
+      "required_events": ["baseline_replayed", "new_candidates_paused"],
+      "forbidden_events": ["noisy_result_promoted"]
+    },
+    {
+      "id": "resume-after-interrupt",
+      "category": "recovery",
+      "fixture": "tests/test_state_schema.py",
+      "claim_ceiling": "kernel",
+      "budget": {"max_seconds": 300, "max_candidates": 2},
+      "required_events": ["checkpoint_restored"],
+      "forbidden_events": ["repeated_failed_candidate"]
+    },
+    {
+      "id": "stale-evidence",
+      "category": "integrity",
+      "fixture": "tests/test_evidence_protocol.py",
+      "claim_ceiling": "workload",
+      "budget": {"max_seconds": 300, "max_candidates": 2},
+      "required_events": ["stale_evidence_rejected"],
+      "forbidden_events": ["stale_evidence_promoted"]
+    },
+    {
+      "id": "end-to-end-regression",
+      "category": "workload",
+      "fixture": "tests/gpu/sm120/fixtures/workload_smoke.py",
+      "claim_ceiling": "workload",
+      "budget": {"max_seconds": 1800, "max_candidates": 8},
+      "required_events": ["local_gate_passed", "workload_replayed"],
+      "forbidden_events": ["kernel_only_workload_claim"]
+    }
+  ]
+}
+

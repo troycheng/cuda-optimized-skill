@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/workload_contract.schema.json",
+  "title": "CUDA optimizer frozen workload contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "requested_claim",
+    "project_root",
+    "artifacts",
+    "workload",
+    "objective",
+    "budget",
+    "mutation",
+    "evidence",
+    "contract_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/workload-contract-v1"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "requested_claim": {"enum": ["kernel", "workload", "serving"]},
+    "project_root": {"type": "string", "minLength": 1},
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "path", "sha256", "size_bytes"],
+        "properties": {
+          "role": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "size_bytes": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "input_distribution", "representative_cases"],
+      "properties": {
+        "argv": {"$ref": "#/$defs/nonemptyStrings"},
+        "input_distribution": {"type": "string", "minLength": 1},
+        "representative_cases": {"$ref": "#/$defs/nonemptyStrings"}
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "unit", "direction", "aggregation", "minimum_practical_effect_pct", "constraints"],
+      "properties": {
+        "metric": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "direction": {"enum": ["lower", "higher"]},
+        "aggregation": {"type": "string", "minLength": 1},
+        "minimum_practical_effect_pct": {"type": "number", "minimum": 0},
+        "constraints": {"$ref": "#/$defs/nonemptyStrings"}
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preset", "max_seconds", "max_candidates"],
+      "properties": {
+        "preset": {"enum": ["quick", "balanced", "thorough"]},
+        "max_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "max_candidates": {"type": "integer", "minimum": 1}
+      }
+    },
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_paths", "environment_root", "host_policy"],
+      "properties": {
+        "project_paths": {"$ref": "#/$defs/nonemptyStrings"},
+        "environment_root": {"type": "string", "minLength": 1},
+        "host_policy": {"const": "recommend_only"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_age_seconds"],
+      "properties": {
+        "max_age_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "nonemptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  }
+}
