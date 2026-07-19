@@ -14,6 +14,7 @@
     "workload",
     "objective",
     "budget",
+    "stability",
     "mutation",
     "evidence",
     "contract_sha256"
@@ -84,6 +85,19 @@
         "preset": {"enum": ["quick", "balanced", "thorough"]},
         "max_seconds": {"type": "number", "exclusiveMinimum": 0},
         "max_candidates": {"type": "integer", "minimum": 1}
+      }
+    },
+    "stability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["confidence", "power", "bootstrap_samples", "min_valid_pairs", "seed", "audit_every_candidates"],
+      "properties": {
+        "confidence": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+        "power": {"type": "number", "exclusiveMinimum": 0.5, "exclusiveMaximum": 1},
+        "bootstrap_samples": {"type": "integer", "minimum": 1000},
+        "min_valid_pairs": {"type": "integer", "minimum": 4},
+        "seed": {"type": "integer"},
+        "audit_every_candidates": {"type": "integer", "minimum": 1}
       }
     },
     "mutation": {

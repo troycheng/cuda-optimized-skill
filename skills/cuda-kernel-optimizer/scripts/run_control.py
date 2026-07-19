@@ -631,11 +631,15 @@ def _replay_records(
     contract: Mapping[str, Any],
     records: list[Mapping[str, Any]],
     *,
+    contract_path: str | os.PathLike | None = None,
     controller_seal_key: bytes | None = None,
 ) -> dict:
     if not records:
         raise ValidationError("run ledger is empty")
     state = None
+    latest_calibration_sha256 = None
+    candidates_since_stability = 0
+    audit_cadence = contract["stability"]["audit_every_candidates"]
     for index, record in enumerate(records):
         event_type = record["event_type"]
         payload = record["payload"]
@@ -660,6 +664,15 @@ def _replay_records(
             unknown_arguments = sorted(set(payload["arguments"]) - allowed_arguments)
             if unknown_arguments:
                 raise ValidationError("state_transition arguments contain unknown fields")
+            if payload["action"] in {
+                "start_exploration",
+                "audit_pass",
+                "environment_yellow",
+                "environment_red",
+            }:
+                raise ValidationError(
+                    "stability-derived state transition bypasses its evidence artifact"
+                )
             state = advance(
                 state,
                 _identifier(payload["action"], "action"),
@@ -677,6 +690,14 @@ def _replay_records(
                 raise ValidationError(
                     "candidate replay requires the Controller seal key"
                 )
+            if latest_calibration_sha256 is None:
+                raise ValidationError(
+                    "candidate replay requires stability calibration"
+                )
+            if candidates_since_stability >= audit_cadence:
+                raise ValidationError(
+                    "candidate replay exceeds the stability audit cadence"
+                )
             state = register_candidate(
                 state,
                 payload["proposal"],
@@ -684,6 +705,42 @@ def _replay_records(
                 controller_seal_key=controller_seal_key,
                 now=payload["now"],
             )
+            candidates_since_stability += 1
+            recorded_state = _validate_state(payload["state"])
+        elif event_type == "stability_calibrated":
+            payload = _payload_fields(
+                payload, {"calibration", "now", "state"}, event_type
+            )
+            if controller_seal_key is None or contract_path is None:
+                raise ValidationError(
+                    "stability calibration replay requires the Controller seal key and contract"
+                )
+            calibration = _sibling("stability_calibration").validate_calibration(
+                payload["calibration"],
+                contract_path=contract_path,
+                controller_seal_key=controller_seal_key,
+            )
+            state = _apply_calibration_state(state, calibration, now=payload["now"])
+            latest_calibration_sha256 = calibration["calibration_sha256"]
+            candidates_since_stability = 0
+            recorded_state = _validate_state(payload["state"])
+        elif event_type == "stability_audited":
+            payload = _payload_fields(
+                payload, {"audit", "now", "state"}, event_type
+            )
+            if controller_seal_key is None:
+                raise ValidationError(
+                    "stability audit replay requires the Controller seal key"
+                )
+            audit = _sibling("stability_calibration").validate_audit(
+                payload["audit"], controller_seal_key=controller_seal_key
+            )
+            if latest_calibration_sha256 is None or (
+                audit["anchor_calibration_sha256"] != latest_calibration_sha256
+            ):
+                raise ValidationError("stability audit anchor does not match this run")
+            state = _apply_stability_audit_state(state, audit, now=payload["now"])
+            candidates_since_stability = 0
             recorded_state = _validate_state(payload["state"])
         elif event_type == "candidate_resolved":
             payload = _payload_fields(
@@ -726,7 +783,10 @@ def load_run(
         _ledger_path(run_dir), expected_contract_sha256=contract["contract_sha256"]
     )
     state = _replay_records(
-        contract, records, controller_seal_key=controller_seal_key
+        contract,
+        records,
+        contract_path=contract_path,
+        controller_seal_key=controller_seal_key,
     )
     return {
         "state": state,
@@ -777,6 +837,15 @@ def transition_run(
 ) -> dict:
     if action == "refreeze":
         raise ValidationError("refreeze requires a new contract and a new run ledger")
+    if action in {
+        "start_exploration",
+        "audit_pass",
+        "environment_yellow",
+        "environment_red",
+    }:
+        raise ValidationError(
+            "stability-derived transition requires a Controller calibration or audit artifact"
+        )
     loaded = load_run(
         contract_path, run_dir, controller_seal_key=controller_seal_key
     )
@@ -805,6 +874,169 @@ def transition_run(
     }
 
 
+def _artifact_reason(artifact: Mapping[str, Any], fallback: str) -> str:
+    reasons = artifact.get("reasons")
+    if type(reasons) is list and reasons:
+        return _identifier(reasons[0], "stability reason")
+    return fallback
+
+
+def _apply_calibration_state(
+    state: Mapping[str, Any], calibration: Mapping[str, Any], *, now: float
+) -> dict:
+    timestamp = _finite(now, "now")
+    if calibration["recorded_at"] != timestamp:
+        raise ValidationError("calibration recorded_at must equal transition time")
+    if calibration["contract_sha256"] != state["contract_sha256"]:
+        raise ValidationError("calibration contract identity does not match the run")
+    environment_state = calibration["environment_state"]
+    if environment_state == "green":
+        return advance(
+            state,
+            "start_exploration",
+            now=timestamp,
+            environment_state="green",
+            measurable=calibration["measurable"],
+        )
+    if environment_state == "yellow":
+        return advance(
+            state,
+            "environment_yellow",
+            now=timestamp,
+            reason=_artifact_reason(calibration, "stability_inconclusive"),
+        )
+    return advance(
+        state,
+        "environment_red",
+        now=timestamp,
+        reason=_artifact_reason(calibration, "stability_guardrail_failed"),
+    )
+
+
+def apply_run_calibration(
+    contract_path: str | os.PathLike,
+    run_dir: str | os.PathLike,
+    calibration: Mapping[str, Any],
+    *,
+    now: float,
+    controller_seal_key: bytes,
+    expected_tail_sha256: str | None = None,
+) -> dict:
+    """Advance CALIBRATING only from a verified Controller artifact."""
+    loaded = load_run(
+        contract_path, run_dir, controller_seal_key=controller_seal_key
+    )
+    tail = _expected_tail(loaded, expected_tail_sha256)
+    clean = _sibling("stability_calibration").validate_calibration(
+        calibration,
+        contract_path=contract_path,
+        controller_seal_key=controller_seal_key,
+    )
+    state = _apply_calibration_state(loaded["state"], clean, now=now)
+    record = _sibling("evidence_ledger").append_event(
+        _ledger_path(run_dir),
+        event_type="stability_calibrated",
+        contract_sha256=state["contract_sha256"],
+        expected_previous_sha256=tail,
+        payload={"calibration": clean, "now": now, "state": state},
+    )
+    return {
+        "state": state,
+        "tail_sha256": record["record_sha256"],
+        "event_count": loaded["event_count"] + 1,
+    }
+
+
+def _apply_stability_audit_state(
+    state: Mapping[str, Any], audit: Mapping[str, Any], *, now: float
+) -> dict:
+    timestamp = _finite(now, "now")
+    if audit["recorded_at"] != timestamp:
+        raise ValidationError("stability audit recorded_at must equal transition time")
+    if audit["contract_sha256"] != state["contract_sha256"]:
+        raise ValidationError("stability audit contract identity does not match the run")
+    environment_state = audit["environment_state"]
+    if environment_state == "green":
+        return advance(state, "audit_pass", now=timestamp)
+    if environment_state == "yellow":
+        return advance(
+            state,
+            "environment_yellow",
+            now=timestamp,
+            reason=_artifact_reason(audit, "stability_audit_inconclusive"),
+        )
+    return advance(
+        state,
+        "environment_red",
+        now=timestamp,
+        reason=_artifact_reason(audit, "stability_audit_guardrail_failed"),
+    )
+
+
+def apply_run_stability_audit(
+    contract_path: str | os.PathLike,
+    run_dir: str | os.PathLike,
+    audit: Mapping[str, Any],
+    *,
+    now: float,
+    controller_seal_key: bytes,
+    expected_tail_sha256: str | None = None,
+) -> dict:
+    """Resume or stop AUDITING only from a Controller-attested replay."""
+    contract = _sibling("workload_contract").verify_frozen_contract(contract_path)
+    loaded = load_run(
+        contract_path, run_dir, controller_seal_key=controller_seal_key
+    )
+    tail = _expected_tail(loaded, expected_tail_sha256)
+    clean = _sibling("stability_calibration").validate_audit(
+        audit, controller_seal_key=controller_seal_key
+    )
+    if clean["contract_sha256"] != contract["contract_sha256"]:
+        raise ValidationError("stability audit contract identity does not match the run")
+    records = _sibling("evidence_ledger").verify_ledger(
+        _ledger_path(run_dir),
+        expected_contract_sha256=contract["contract_sha256"],
+    )
+    anchors = [
+        record["payload"]["calibration"]["calibration_sha256"]
+        for record in records
+        if record["event_type"] == "stability_calibrated"
+    ]
+    if not anchors or clean["anchor_calibration_sha256"] != anchors[-1]:
+        raise ValidationError("stability audit anchor does not match this run")
+    state = _apply_stability_audit_state(loaded["state"], clean, now=now)
+    record = _sibling("evidence_ledger").append_event(
+        _ledger_path(run_dir),
+        event_type="stability_audited",
+        contract_sha256=state["contract_sha256"],
+        expected_previous_sha256=tail,
+        payload={"audit": clean, "now": now, "state": state},
+    )
+    return {
+        "state": state,
+        "tail_sha256": record["record_sha256"],
+        "event_count": loaded["event_count"] + 1,
+    }
+
+
+def _enforce_audit_cadence(
+    contract: Mapping[str, Any], records: list[Mapping[str, Any]]
+) -> None:
+    cadence = contract["stability"]["audit_every_candidates"]
+    last_stability_index = -1
+    for index, record in enumerate(records):
+        if record["event_type"] in {"stability_calibrated", "stability_audited"}:
+            last_stability_index = index
+    if last_stability_index < 0:
+        raise ValidationError("candidate registration requires stability calibration")
+    candidates_since = sum(
+        record["event_type"] == "candidate_registered"
+        for record in records[last_stability_index + 1 :]
+    )
+    if candidates_since >= cadence:
+        raise ValidationError("stability audit cadence reached before candidate registration")
+
+
 def register_run_candidate(
     contract_path: str | os.PathLike,
     run_dir: str | os.PathLike,
@@ -819,6 +1051,11 @@ def register_run_candidate(
     loaded = load_run(
         contract_path, run_dir, controller_seal_key=controller_seal_key
     )
+    records = _sibling("evidence_ledger").verify_ledger(
+        _ledger_path(run_dir),
+        expected_contract_sha256=contract["contract_sha256"],
+    )
+    _enforce_audit_cadence(contract, records)
     tail = _expected_tail(loaded, expected_tail_sha256)
     state = register_candidate(
         loaded["state"],

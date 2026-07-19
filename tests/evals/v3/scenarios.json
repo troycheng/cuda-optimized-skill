@@ -111,13 +111,15 @@
     {
       "id": "noisy-environment",
       "category": "stability",
-      "fixture": "tests/test_telemetry.py",
+      "fixture": "tests/test_stability_calibration.py",
       "claim_ceiling": "kernel",
       "budget": {
         "max_seconds": 600,
         "max_candidates": 3
       },
       "required_events": [
+        "stability_policy_frozen",
+        "noise_and_mde_calibrated",
         "baseline_replayed",
         "new_candidates_paused"
       ],
@@ -231,6 +233,9 @@
       },
       "required_events": [
         "budget_monotonic",
+        "controller_calibration_replayed",
+        "audit_cadence_enforced",
+        "controller_audit_replayed",
         "old_run_sealed",
         "old_evidence_rejected",
         "pending_write_recovered"
@@ -312,4 +317,3 @@
     }
   ]
 }
-

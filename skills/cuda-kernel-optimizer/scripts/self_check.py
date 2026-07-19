@@ -61,6 +61,7 @@ _V3_SCRIPTS = (
     "evidence_controller.py",
     "planner_admission.py",
     "planner_boundary.py",
+    "stability_calibration.py",
 )
 _V3_SCHEMAS = (
     "workload_contract.schema.json",
@@ -74,6 +75,8 @@ _V3_SCHEMAS = (
     "diagnostic_evidence.schema.json",
     "diagnostic_measurement.schema.json",
     "planner_admission.schema.json",
+    "stability_calibration.schema.json",
+    "stability_audit.schema.json",
 )
 
 
@@ -241,6 +244,56 @@ def _validate_planner_admission_schema_contract(root: Path) -> None:
         raise ValueError("planner admission schema must bind Controller attestation")
 
 
+def _validate_stability_schema_contract(root: Path) -> None:
+    script = root / "scripts" / "stability_calibration.py"
+    module = ModuleType("installed_stability_calibration")
+    module.__file__ = str(script)
+    source = _read_safe_file(root, Path("scripts") / "stability_calibration.py")
+    exec(compile(source, str(script), "exec"), module.__dict__)
+    for filename, fields, schema_version in (
+        ("stability_calibration.schema.json", module._CALIBRATION_FIELDS, module.CALIBRATION_SCHEMA),
+        ("stability_audit.schema.json", module._AUDIT_FIELDS, module.AUDIT_SCHEMA),
+    ):
+        schema = json.loads(_read_safe_file(root, Path("templates") / filename))
+        if set(schema.get("required", [])) != set(fields):
+            raise ValueError(f"{filename} fields differ from runtime")
+        if schema.get("properties", {}).get("schema_version", {}).get("const") != schema_version:
+            raise ValueError(f"{filename} version differs from runtime")
+        if "controller_attestation" not in schema.get("properties", {}):
+            raise ValueError(f"{filename} must bind Controller attestation")
+
+    calibration = json.loads(
+        _read_safe_file(root, Path("templates") / "stability_calibration.schema.json")
+    )
+    properties = calibration.get("properties", {})
+    calibration_reasons = set(
+        properties.get("reasons", {}).get("items", {}).get("enum", [])
+    )
+    if calibration_reasons != set(module._CALIBRATION_REASONS):
+        raise ValueError("stability calibration reason vocabulary differs from runtime")
+    baseline_variants = properties.get("baseline_median", {}).get("oneOf", [])
+    baseline_number = next(
+        (item for item in baseline_variants if item.get("type") == "number"), {}
+    )
+    if baseline_number.get("exclusiveMinimum") != 0:
+        raise ValueError("stability calibration baseline minimum differs from runtime")
+    if properties.get("mde_method", {}).get("const") != module.MDE_METHOD:
+        raise ValueError("stability calibration MDE method differs from runtime")
+    if properties.get("bootstrap_samples", {}).get("minimum") != 1000:
+        raise ValueError("stability calibration bootstrap minimum differs from runtime")
+    if properties.get("min_valid_pairs", {}).get("minimum") != 4:
+        raise ValueError("stability calibration pair minimum differs from runtime")
+
+    audit = json.loads(
+        _read_safe_file(root, Path("templates") / "stability_audit.schema.json")
+    )
+    audit_reasons = set(
+        audit.get("properties", {}).get("reasons", {}).get("items", {}).get("enum", [])
+    )
+    if audit_reasons != set(module._AUDIT_REASONS):
+        raise ValueError("stability audit reason vocabulary differs from runtime")
+
+
 def check_installation(skill_dir: Path | str) -> dict:
     root = Path(skill_dir)
     if root.is_symlink() or not root.is_dir():
@@ -302,6 +355,7 @@ def check_installation(skill_dir: Path | str) -> dict:
     _validate_gate_schema_contract(root)
     _validate_diagnostic_schema_contract(root)
     _validate_planner_admission_schema_contract(root)
+    _validate_stability_schema_contract(root)
     checks.append("v3_control_runtime")
 
     _validate_capability_registry(root)

@@ -22,6 +22,32 @@ FROZEN_SCHEMA = "cuda-optimizer/workload-contract-v1"
 _CLAIMS = {"kernel", "workload", "serving"}
 _DIRECTIONS = {"lower", "higher"}
 _BUDGETS = {"quick", "balanced", "thorough"}
+_STABILITY_DEFAULTS = {
+    "quick": {
+        "confidence": 0.90,
+        "power": 0.80,
+        "bootstrap_samples": 1000,
+        "min_valid_pairs": 4,
+        "seed": 17,
+        "audit_every_candidates": 1,
+    },
+    "balanced": {
+        "confidence": 0.95,
+        "power": 0.80,
+        "bootstrap_samples": 2000,
+        "min_valid_pairs": 4,
+        "seed": 17,
+        "audit_every_candidates": 1,
+    },
+    "thorough": {
+        "confidence": 0.95,
+        "power": 0.90,
+        "bootstrap_samples": 5000,
+        "min_valid_pairs": 6,
+        "seed": 17,
+        "audit_every_candidates": 1,
+    },
+}
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -226,6 +252,7 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
         "workload",
         "objective",
         "budget",
+        "stability",
         "mutation",
         "evidence",
     }
@@ -311,6 +338,31 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
     _finite(budget["max_seconds"], "budget.max_seconds", minimum=1.0)
     _positive_integer(budget["max_candidates"], "budget.max_candidates")
 
+    stability = _object(contract["stability"], "stability")
+    _closed(
+        stability,
+        {
+            "confidence", "power", "bootstrap_samples", "min_valid_pairs",
+            "seed", "audit_every_candidates"
+        },
+        "stability",
+    )
+    confidence = _finite(stability["confidence"], "stability.confidence")
+    power = _finite(stability["power"], "stability.power")
+    if not 0.0 < confidence < 1.0:
+        raise ValidationError("stability.confidence must be between zero and one")
+    if not 0.5 < power < 1.0:
+        raise ValidationError("stability.power must be between 0.5 and one")
+    if type(stability["bootstrap_samples"]) is not int or stability["bootstrap_samples"] < 1000:
+        raise ValidationError("stability.bootstrap_samples must be at least 1000")
+    if type(stability["min_valid_pairs"]) is not int or stability["min_valid_pairs"] < 4:
+        raise ValidationError("stability.min_valid_pairs must be at least 4")
+    if type(stability["seed"]) is not int:
+        raise ValidationError("stability.seed must be an integer")
+    _positive_integer(
+        stability["audit_every_candidates"], "stability.audit_every_candidates"
+    )
+
     mutation = _object(contract["mutation"], "mutation")
     _closed(mutation, {"project_paths", "environment_root", "host_policy"}, "mutation")
     mutation_paths = _string_list(mutation["project_paths"], "mutation.project_paths")
@@ -350,7 +402,14 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
 
 def validate_draft(value: Mapping[str, Any]) -> dict:
     """Validate and detach a draft contract without reading bound artifacts."""
-    return _validate_common(value, frozen=False)
+    draft = _copy_json(value)
+    if type(draft) is dict and "stability" not in draft:
+        budget = draft.get("budget")
+        if type(budget) is dict and budget.get("preset") in _STABILITY_DEFAULTS:
+            draft["stability"] = _copy_json(
+                _STABILITY_DEFAULTS[budget["preset"]], "stability defaults"
+            )
+    return _validate_common(draft, frozen=False)
 
 
 def _canonical_digest(value: Mapping[str, Any]) -> str:

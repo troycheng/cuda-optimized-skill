@@ -135,6 +135,15 @@ class SkillEvalTests(unittest.TestCase):
             "combined-long-run-faults",
             {item["id"] for item in validated["scenarios"]},
         )
+        scenarios = {item["id"]: item for item in validated["scenarios"]}
+        self.assertEqual(
+            scenarios["noisy-environment"]["fixture"],
+            "tests/test_stability_calibration.py",
+        )
+        self.assertIn(
+            "audit_cadence_enforced",
+            scenarios["combined-long-run-faults"]["required_events"],
+        )
 
     def test_suite_requires_the_preregistered_five_arm_matrix_and_prompt_hash(self) -> None:
         changed = _suite()

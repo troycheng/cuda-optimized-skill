@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib.util
 import json
 import tempfile
@@ -41,6 +43,14 @@ def _draft(project: Path, environment: Path) -> dict:
             "constraints": ["correctness"],
         },
         "budget": {"preset": "quick", "max_seconds": 600, "max_candidates": 2},
+        "stability": {
+            "confidence": 0.95,
+            "power": 0.8,
+            "bootstrap_samples": 2000,
+            "min_valid_pairs": 4,
+            "seed": 17,
+            "audit_every_candidates": 1,
+        },
         "mutation": {
             "project_paths": ["kernels"],
             "environment_root": str(environment),
@@ -50,11 +60,11 @@ def _draft(project: Path, environment: Path) -> dict:
     }
 
 
-def _proposal() -> dict:
+def _proposal(candidate_id: str = "candidate-1") -> dict:
     return {
         "schema_version": "cuda-optimizer/candidate-proposal-v1",
-        "candidate_id": "candidate-1",
-        "observation_id": "obs-1",
+        "candidate_id": candidate_id,
+        "observation_id": f"obs-{candidate_id}",
         "observation_summary_sha256": "d" * 64,
         "capability_query_sha256": "e" * 64,
         "hypothesis": "A bounded layout change should reduce latency.",
@@ -74,9 +84,17 @@ class LongRunRecoveryTests(unittest.TestCase):
         cls.control = _load("run_control")
         cls.ledger = _load("evidence_ledger")
         cls.admission = _load("planner_admission")
+        cls.stability = _load("stability_calibration")
 
-    def _admission(self, contract_path: Path, *, now: float, age: float) -> dict:
-        proposal = _proposal()
+    def _admission(
+        self,
+        contract_path: Path,
+        *,
+        now: float,
+        age: float,
+        proposal: dict | None = None,
+    ) -> dict:
+        proposal = _proposal() if proposal is None else proposal
         contract = json.loads(contract_path.read_text("utf-8"))
         gates = []
         for index, gate in enumerate(
@@ -131,14 +149,229 @@ class LongRunRecoveryTests(unittest.TestCase):
         self.control.initialize_run(contract_path, run_dir, now=0.0)
         self.control.transition_run(contract_path, run_dir, "freeze", now=1.0)
         self.control.transition_run(contract_path, run_dir, "calibrate", now=2.0)
-        return self.control.transition_run(
+        calibration = self.stability.calibrate(
+            contract_path=contract_path,
+            blocks=[
+                {"pair_id": f"pair-{index}", "first": 100.0, "second": value, "valid": True}
+                for index, value in enumerate((100.1, 99.9, 100.2, 99.8), 1)
+            ],
+            hard_guardrails_passed=True,
+            environment_sha256="b" * 64,
+            source_sha256="c" * 64,
+            recorded_at=3.0,
+            controller_seal_key=SEAL_KEY,
+        )
+        return self.control.apply_run_calibration(
             contract_path,
             run_dir,
-            "start_exploration",
+            calibration,
             now=3.0,
-            environment_state="green",
-            measurable=True,
+            controller_seal_key=SEAL_KEY,
         )
+
+    def test_persistent_state_cannot_claim_green_without_controller_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, run_dir, contract_path = self._run(root)
+            self.control.initialize_run(contract_path, run_dir, now=0.0)
+            self.control.transition_run(contract_path, run_dir, "freeze", now=1.0)
+            self.control.transition_run(contract_path, run_dir, "calibrate", now=2.0)
+            with self.assertRaisesRegex(ValueError, "calibration|derived|stability"):
+                self.control.transition_run(
+                    contract_path,
+                    run_dir,
+                    "start_exploration",
+                    now=3.0,
+                    environment_state="green",
+                    measurable=True,
+                    controller_seal_key=SEAL_KEY,
+                )
+            loaded = self.control.load_run(
+                contract_path, run_dir, controller_seal_key=SEAL_KEY
+            )
+            self.assertEqual(loaded["state"]["phase"], "CALIBRATING")
+            self.assertEqual(loaded["event_count"], 3)
+
+    def test_tampered_calibration_cannot_advance_or_append_to_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, run_dir, contract_path = self._run(root)
+            self.control.initialize_run(contract_path, run_dir, now=0.0)
+            self.control.transition_run(contract_path, run_dir, "freeze", now=1.0)
+            calibrating = self.control.transition_run(
+                contract_path, run_dir, "calibrate", now=2.0
+            )
+            calibration = self.stability.calibrate(
+                contract_path=contract_path,
+                blocks=[
+                    {"pair_id": f"pair-{index}", "first": 100.0, "second": 100.0, "valid": True}
+                    for index in range(1, 5)
+                ],
+                hard_guardrails_passed=True,
+                environment_sha256="b" * 64,
+                source_sha256="c" * 64,
+                recorded_at=3.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            calibration["environment_state"] = "green" if calibration["environment_state"] != "green" else "yellow"
+            with self.assertRaisesRegex(ValueError, "attestation|controller"):
+                self.control.apply_run_calibration(
+                    contract_path,
+                    run_dir,
+                    calibration,
+                    now=3.0,
+                    controller_seal_key=SEAL_KEY,
+                )
+            loaded = self.control.load_run(
+                contract_path, run_dir, controller_seal_key=SEAL_KEY
+            )
+            self.assertEqual(loaded, calibrating)
+
+    def test_contract_cadence_requires_attested_periodic_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, run_dir, contract_path = self._run(root)
+            self._exploring(run_dir, contract_path)
+            first = _proposal("candidate-1")
+            self.control.register_run_candidate(
+                contract_path,
+                run_dir,
+                first,
+                admission=self._admission(
+                    contract_path, now=10.0, age=1.0, proposal=first
+                ),
+                controller_seal_key=SEAL_KEY,
+                now=10.0,
+            )
+            self.control.resolve_run_candidate(
+                contract_path,
+                run_dir,
+                candidate_id="candidate-1",
+                outcome="KILL",
+                correctness_ok=True,
+                performance_gate_passed=False,
+                now=20.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            second = _proposal("candidate-2")
+            with self.assertRaisesRegex(ValueError, "audit|cadence"):
+                self.control.register_run_candidate(
+                    contract_path,
+                    run_dir,
+                    second,
+                    admission=self._admission(
+                        contract_path, now=21.0, age=1.0, proposal=second
+                    ),
+                    controller_seal_key=SEAL_KEY,
+                    now=21.0,
+                )
+
+            self.control.transition_run(
+                contract_path,
+                run_dir,
+                "audit",
+                now=21.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            records = self.ledger.verify_ledger(run_dir / "ledger")
+            anchor = next(
+                record["payload"]["calibration"]
+                for record in records
+                if record["event_type"] == "stability_calibrated"
+            )
+            audit = self.stability.audit(
+                anchor,
+                contract_path=contract_path,
+                blocks=[
+                    {"pair_id": f"audit-{index}", "first": 100.0, "second": value, "valid": True}
+                    for index, value in enumerate((100.1, 99.9, 100.2, 99.8), 1)
+                ],
+                hard_guardrails_passed=True,
+                environment_sha256="b" * 64,
+                source_sha256="c" * 64,
+                recorded_at=22.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            resumed = self.control.apply_run_stability_audit(
+                contract_path,
+                run_dir,
+                audit,
+                now=22.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            self.assertEqual(resumed["state"]["phase"], "EXPLORING")
+            registered = self.control.register_run_candidate(
+                contract_path,
+                run_dir,
+                second,
+                admission=self._admission(
+                    contract_path, now=23.0, age=1.0, proposal=second
+                ),
+                controller_seal_key=SEAL_KEY,
+                now=23.0,
+            )
+            self.assertEqual(
+                registered["state"]["active_candidate"]["candidate_id"],
+                "candidate-2",
+            )
+
+    def test_ledger_replay_rejects_candidate_past_audit_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, run_dir, contract_path = self._run(root)
+            self._exploring(run_dir, contract_path)
+            first = _proposal("candidate-1")
+            self.control.register_run_candidate(
+                contract_path,
+                run_dir,
+                first,
+                admission=self._admission(
+                    contract_path, now=10.0, age=1.0, proposal=first
+                ),
+                controller_seal_key=SEAL_KEY,
+                now=10.0,
+            )
+            resolved = self.control.resolve_run_candidate(
+                contract_path,
+                run_dir,
+                candidate_id="candidate-1",
+                outcome="KILL",
+                correctness_ok=True,
+                performance_gate_passed=False,
+                now=20.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            second = _proposal("candidate-2")
+            admission = self._admission(
+                contract_path, now=21.0, age=1.0, proposal=second
+            )
+            illegal_state = self.control.register_candidate(
+                resolved["state"],
+                second,
+                admission=admission,
+                controller_seal_key=SEAL_KEY,
+                now=21.0,
+            )
+            records = self.ledger.verify_ledger(run_dir / "ledger")
+            records.append(
+                {
+                    "event_type": "candidate_registered",
+                    "payload": {
+                        "proposal": second,
+                        "admission": admission,
+                        "now": 21.0,
+                        "state": illegal_state,
+                    },
+                }
+            )
+            contract = self.contract.verify_frozen_contract(contract_path)
+            with self.assertRaisesRegex(ValueError, "audit|cadence"):
+                self.control._replay_records(
+                    contract,
+                    records,
+                    contract_path=contract_path,
+                    controller_seal_key=SEAL_KEY,
+                )
 
     def test_reload_replays_every_event_after_interruption(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

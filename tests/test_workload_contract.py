@@ -62,6 +62,14 @@ def _draft(project: Path, environment: Path) -> dict:
             "max_seconds": 10800,
             "max_candidates": 24,
         },
+        "stability": {
+            "confidence": 0.95,
+            "power": 0.8,
+            "bootstrap_samples": 2000,
+            "min_valid_pairs": 4,
+            "seed": 17,
+            "audit_every_candidates": 1,
+        },
         "mutation": {
             "project_paths": ["kernels"],
             "environment_root": str(environment),
@@ -106,6 +114,26 @@ class WorkloadContractTests(unittest.TestCase):
             expected = hashlib.sha256((project / "workload.json").read_bytes()).hexdigest()
             self.assertEqual(frozen["artifacts"][0]["sha256"], expected)
             self.assertEqual(len(frozen["contract_sha256"]), 64)
+
+    def test_budget_preset_supplies_explicit_frozen_stability_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, _environment, draft = self._fixture(root)
+            draft.pop("stability")
+            draft["budget"]["preset"] = "balanced"
+            frozen = self.contract.freeze_contract(draft, root / "contract.json")
+
+        self.assertEqual(
+            frozen["stability"],
+            {
+                "confidence": 0.95,
+                "power": 0.8,
+                "bootstrap_samples": 2000,
+                "min_valid_pairs": 4,
+                "seed": 17,
+                "audit_every_candidates": 1,
+            },
+        )
 
     def test_frozen_contract_is_create_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,19 +255,11 @@ class WorkloadContractTests(unittest.TestCase):
             control.initialize_run(parent_contract_path, parent_run, now=0.0)
             control.transition_run(parent_contract_path, parent_run, "freeze", now=1.0)
             control.transition_run(parent_contract_path, parent_run, "calibrate", now=2.0)
-            control.transition_run(
-                parent_contract_path,
-                parent_run,
-                "start_exploration",
-                now=3.0,
-                environment_state="green",
-                measurable=True,
-            )
             record = control.transition_run(
                 parent_contract_path,
                 parent_run,
                 "drift",
-                now=4.0,
+                now=3.0,
                 reason="source_identity_changed",
             )
 

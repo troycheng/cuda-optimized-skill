@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/stability_audit.schema.json",
+  "title": "CUDA optimizer periodic stability audit v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "contract_sha256", "environment_sha256",
+    "anchor_calibration_sha256", "replay_calibration_sha256", "source_sha256",
+    "recorded_at", "baseline_shift_pct", "calibrated_noise_bound_pct",
+    "environment_state", "measurable", "reasons", "audit_sha256", "controller_attestation"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/stability-audit-v1"},
+    "contract_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "anchor_calibration_sha256": {"$ref": "#/$defs/sha256"},
+    "replay_calibration_sha256": {"$ref": "#/$defs/sha256"},
+    "source_sha256": {"$ref": "#/$defs/sha256"},
+    "recorded_at": {"type": "number", "minimum": 0},
+    "baseline_shift_pct": {"type": "number", "minimum": 0},
+    "calibrated_noise_bound_pct": {"type": "number", "minimum": 0},
+    "environment_state": {"enum": ["green", "yellow", "red"]},
+    "measurable": {"type": "boolean"},
+    "reasons": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "enum": [
+          "hard_guardrail_failed", "insufficient_valid_pairs",
+          "noise_exceeds_minimum_practical_effect",
+          "mde_exceeds_minimum_practical_effect",
+          "baseline_shift_exceeds_calibrated_noise"
+        ]
+      }
+    },
+    "audit_sha256": {"$ref": "#/$defs/sha256"},
+    "controller_attestation": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

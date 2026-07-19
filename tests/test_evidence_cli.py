@@ -264,6 +264,41 @@ class InstalledSelfCheckTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(message, result.stderr.lower())
 
+    def test_self_check_detects_stability_schema_runtime_drift(self) -> None:
+        def calibration_reason(schema):
+            schema["properties"]["reasons"]["items"]["enum"].remove(
+                "mde_exceeds_minimum_practical_effect"
+            )
+
+        def baseline_minimum(schema):
+            number = next(
+                item
+                for item in schema["properties"]["baseline_median"]["oneOf"]
+                if item.get("type") == "number"
+            )
+            number.pop("exclusiveMinimum")
+
+        def mde_method(schema):
+            schema["properties"]["mde_method"]["const"] = "unbound_method"
+
+        for mutate, message in (
+            (calibration_reason, "reason vocabulary"),
+            (baseline_minimum, "baseline minimum"),
+            (mde_method, "mde method"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
+                installed = Path(tmp) / "cuda-kernel-optimizer"
+                shutil.copytree(SKILL, installed)
+                schema_path = installed / "templates" / "stability_calibration.schema.json"
+                schema = json.loads(schema_path.read_text("utf-8"))
+                mutate(schema)
+                schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+                result = _run(SELF_CHECK, "--skill-dir", str(installed))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr.lower())
+
     def test_self_check_rejects_symlinked_capability_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
