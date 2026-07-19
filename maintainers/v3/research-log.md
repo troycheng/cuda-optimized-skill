@@ -100,7 +100,32 @@ skill 根开始，用目录文件描述符逐层 `O_NOFOLLOW` 打开；安装自
 账本尾、reference、target、workload、精确架构、candidate ID 与 candidate SHA；
 错误密钥、篡改产物和 reserved event 注入均 fail closed。
 
-仍需实现的信任根：Controller 独占 per-run 密钥；adapter 只交原始测量；Controller
-按 allowlist 中的实现摘要调用 adapter、重算 verdict、构造规范化证据并封印；证明
-再绑定 run 和账本身份。若 verifier 离开 Controller，改用私签公验，不能把共享 HMAC
-验证密钥交给无权封印的组件。该边界完成前，这一切片不能宣称正式晋级链路完成。
+随后实现改为由 Controller 捕获并运行 allowlist 中的自包含 adapter 哈希快照。实现
+身份绑定入口、Python runtime 和固定隔离模式；快照在临时空目录以 `-I -S` 执行，
+不能从可写 sealed 目录加载未声明 helper。adapter 输出不再包含 kind、producer、
+status 和 recorded_at；Controller 校验所有 check、重算 PASS 并构造规范化证据。
+密钥不进入 adapter 的 stdin、环境和 argv，输出与请求都有硬字节上限，执行期间入口
+或 runtime 身份变化时不落账，退出后清理整个进程组。证明同时绑定 run、账本和
+adapter 实现摘要。
+
+复审还复现了两条落盘边界：ledger 已提交但返回异常时，旧清理会删掉被账本引用的
+artifact；超大 request 会在进入 finally 前遗留隐藏快照。现在 append 异常会先重验
+账本，精确记录已提交时恢复成功；所有 append 异常都保留不可变 final artifact，孤儿
+留给后续按账本可达性安全回收，不能在并发路径同步删除；request 硬上限在创建快照
+前检查，执行目录由统一生命周期清理。
+
+第二轮复审继续复现了 acknowledgement loss：同一 `observation_id` 在提交后重试会
+追加第二条事件，摘要随后因重复 ID 永久失败。修复后，Controller-owned 规范化请求
+摘要进入 payload 和 HMAC；相同 ID、请求、实现、run 与账本身份直接复用旧记录，
+任一项冲突都拒绝。账本在排他锁内再次检查 ID 唯一，封住并发竞态；同名字节 artifact
+可用于恢复提交前崩溃留下的孤儿，不同字节则 fail closed。
+
+一手资料复核采用当前 SLSA 1.2 的 provenance 与 build platform 文档。采用的原则是：
+证明字段应由可信控制面生成或验证，用户步骤不能读取签名材料，消费者要同时核对
+产物摘要和预期 builder 身份。这里借用的是控制面设计原则，不把 GPU 实验系统包装成
+SLSA 认证。默认本地模式防止 Planner 越权与意外伪造；抵抗同账号主机攻击需要独立
+账号、容器或密钥服务，作为高保证部署配置继续实现。
+
+- [SLSA 1.2 Build Provenance](https://slsa.dev/spec/v1.2/build-provenance)
+- [SLSA Build Levels](https://slsa.dev/spec/v1.2/levels)
+- [Sigstore signing overview](https://docs.sigstore.dev/cosign/signing/overview/)

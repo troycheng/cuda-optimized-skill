@@ -5,12 +5,14 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "contract_sha256", "environment_sha256", "as_of",
+    "schema_version", "run_id", "ledger_id", "contract_sha256", "environment_sha256", "as_of",
     "max_age_seconds", "max_observations", "context_budget_bytes",
     "selected_context_bytes", "ledger_tail_sha256", "observations", "summary_sha256"
   ],
   "properties": {
     "schema_version": {"const": "cuda-optimizer/observation-summary-v1"},
+    "run_id": {"$ref": "#/$defs/identifier"},
+    "ledger_id": {"$ref": "#/$defs/identifier"},
     "contract_sha256": {"$ref": "#/$defs/sha256"},
     "environment_sha256": {"$ref": "#/$defs/sha256"},
     "as_of": {"type": "number", "minimum": 0},
@@ -33,11 +35,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "observation_id", "kind", "layer", "summary", "signals", "producer",
+        "observation_id", "adapter_request_sha256", "kind", "layer", "summary", "signals", "producer",
         "subject", "result", "artifact", "age_seconds", "freshness"
       ],
       "properties": {
         "observation_id": {"$ref": "#/$defs/identifier"},
+        "adapter_request_sha256": {"$ref": "#/$defs/sha256"},
         "kind": {
           "enum": [
             "correctness_reference", "dispatch_identity", "target_compile_probe",
@@ -52,10 +55,11 @@
         },
         "producer": {
           "type": "object", "additionalProperties": false,
-          "required": ["id", "version"],
+          "required": ["id", "version", "implementation_sha256"],
           "properties": {
             "id": {"$ref": "#/$defs/identifier"},
-            "version": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+){1,3}$"}
+            "version": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+){1,3}$"},
+            "implementation_sha256": {"$ref": "#/$defs/sha256"}
           }
         },
         "subject": {"type": "object"},

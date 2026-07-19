@@ -158,12 +158,25 @@ Planner 可以看到已验证的指标变化、失败分类、瓶颈信号、候
 并在每次门禁裁决时用 Controller 当前时间重新计算新鲜度。摘要与能力查询结果都有
 规范化摘要，候选必须引用这两个摘要，不能把 Planner 写出的类别字符串当成证据。
 
-开发中的 HMAC 封印只解决了“无密钥写入者伪造封存事件”，尚不能单独证明 JSON
-中自报的 adapter 确实运行过。正式 Controller 必须独占每个 run 的密钥和封印能力：
-Planner、AI 与 adapter 不能读取密钥或直接写 sealed store/ledger；adapter 只能输出
-原始测量，Controller 根据原始数据重算结论后生成规范化证据，并将 `run_id`、账本
-身份和 adapter 实现摘要一并纳入证明。这个进程边界接通前，现有封印层只作为阶段 3
-的开发组件，不能用于发布版晋级裁决。
+HMAC 只能证明“持钥 Controller 批准了这份证据”，不能替代 adapter 的真实执行。
+因此 Controller 不再接受完整 gate JSON：它从 allowlist 捕获自包含 adapter 的哈希
+快照，连同 no-follow 读取的 Python runtime 摘要和固定隔离模式组成实现身份；随后在
+临时空目录中用 `-I -S` 运行，禁止从可写 artifact 目录隐式导入本地模块。adapter
+只能返回不含 kind、producer、status 和时间的原始测量。Controller 检查全部结果、
+重算 PASS、生成规范化证据，再将 `run_id`、账本身份和 adapter 实现摘要一并封印。
+密钥不进入 adapter 的 prompt、stdin、环境或 argv。adapter 结束或超时后清理整个
+进程组，入口和 runtime 身份在执行前后都要一致。
+
+`observation_id` 是幂等键，不是显示名称。Controller 将规范化请求摘要纳入封印；
+相同 ID、相同请求和相同 adapter 实现直接返回已提交记录，不重新消耗测量预算；
+相同 ID 对应不同请求时拒绝。账本还会在排他锁内强制 ID 唯一，防止并发重试追加
+两条记录。提交后响应丢失、同名字节产物遗留和进程级重试都走同一恢复规则。
+
+这条保证用于阻止 Planner 越权和意外伪造，不宣称能抵抗已控制同一宿主机、同一
+账号且能读取 Controller 内存或密钥文件的攻击者。高保证部署必须把 Controller 放在
+独立账号、容器或密钥服务中，并只向 Planner 暴露固定请求接口。这个边界沿用 SLSA
+“可信控制面生成或验证证明字段、用户步骤不能接触签名材料”的原则，但项目不据此
+宣称达到任何 SLSA 等级。
 
 ## 6. 完整 workload 如何进入 3.0
 

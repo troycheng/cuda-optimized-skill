@@ -41,8 +41,12 @@ _GATES = {
     },
 }
 _OBSERVATION_FIELDS = {
+    "run_id",
+    "ledger_id",
     "observation_id",
     "artifact",
+    "adapter_implementation_sha256",
+    "adapter_request_sha256",
     "controller_attestation",
 }
 _ARTIFACT_FIELDS = {
@@ -139,15 +143,23 @@ def _controller_attestation(
     *,
     contract_sha256: str,
     environment_sha256: str,
+    run_id: str,
+    ledger_id: str,
     observation_id: str,
     artifact: Mapping[str, Any],
+    adapter_implementation_sha256: str,
+    adapter_request_sha256: str,
 ) -> str:
     material = {
         "event_type": "observation_sealed",
         "contract_sha256": contract_sha256,
         "environment_sha256": environment_sha256,
+        "run_id": run_id,
+        "ledger_id": ledger_id,
         "observation_id": observation_id,
         "artifact": dict(artifact),
+        "adapter_implementation_sha256": adapter_implementation_sha256,
+        "adapter_request_sha256": adapter_request_sha256,
     }
     return hmac.new(key, _canonical_bytes(material), hashlib.sha256).hexdigest()
 
@@ -181,6 +193,8 @@ def _validate_payload(
     artifact_root: Path,
     contract_sha256: str,
     environment_sha256: str,
+    run_id: str,
+    ledger_id: str,
     controller_seal_key: bytes,
     as_of: float,
     max_age_seconds: float,
@@ -188,7 +202,18 @@ def _validate_payload(
     if type(payload) is not dict:
         raise ValidationError("observation payload must be an object")
     _closed(payload, _OBSERVATION_FIELDS, "observation payload")
+    payload_run_id = _identifier(payload["run_id"], "run_id")
+    payload_ledger_id = _identifier(payload["ledger_id"], "ledger_id")
+    if payload_run_id != run_id or payload_ledger_id != ledger_id:
+        raise ValidationError("observation run or ledger identity mismatch")
     observation_id = _identifier(payload["observation_id"], "observation_id")
+    adapter_implementation = _sha(
+        payload["adapter_implementation_sha256"],
+        "adapter_implementation_sha256",
+    )
+    adapter_request = _sha(
+        payload["adapter_request_sha256"], "adapter_request_sha256"
+    )
     artifact = payload["artifact"]
     if type(artifact) is not dict:
         raise ValidationError("artifact must be an object")
@@ -204,8 +229,12 @@ def _validate_payload(
         _seal_key(controller_seal_key),
         contract_sha256=contract_sha256,
         environment_sha256=environment_sha256,
+        run_id=run_id,
+        ledger_id=ledger_id,
         observation_id=observation_id,
         artifact=artifact,
+        adapter_implementation_sha256=adapter_implementation,
+        adapter_request_sha256=adapter_request,
     )
     if not hmac.compare_digest(attestation, expected_attestation):
         raise ValidationError("controller attestation does not match this observation")
@@ -225,6 +254,10 @@ def _validate_payload(
         )
     except ValueError as exc:
         raise ValidationError(f"invalid gate evidence artifact {relative}: {exc}") from exc
+    if derived["producer"]["implementation_sha256"] != adapter_implementation:
+        raise ValidationError("adapter implementation identity mismatch")
+    if derived["adapter_request_sha256"] != adapter_request:
+        raise ValidationError("adapter request identity mismatch")
 
     recorded_at = derived["recorded_at"]
     if recorded_at > as_of:
@@ -235,6 +268,7 @@ def _validate_payload(
         freshness = "stale" if age_seconds > max_age_seconds else "current"
     return {
         "observation_id": observation_id,
+        "adapter_request_sha256": adapter_request,
         "kind": derived["kind"],
         "layer": derived["layer"],
         "summary": derived["summary"],
@@ -258,6 +292,8 @@ def build_summary(
     artifact_root: str | os.PathLike,
     contract_sha256: str,
     environment_sha256: str,
+    run_id: str,
+    ledger_id: str,
     as_of: float,
     max_age_seconds: float,
     max_observations: int,
@@ -267,6 +303,8 @@ def build_summary(
     """Verify a ledger and its artifacts, then return bounded observation metadata."""
     contract = _sha(contract_sha256, "contract_sha256")
     environment = _sha(environment_sha256, "environment_sha256")
+    clean_run_id = _identifier(run_id, "run_id")
+    clean_ledger_id = _identifier(ledger_id, "ledger_id")
     timestamp = _finite(as_of, "as_of")
     if timestamp < 0:
         raise ValidationError("as_of must be non-negative")
@@ -291,6 +329,8 @@ def build_summary(
             artifact_root=root,
             contract_sha256=contract,
             environment_sha256=environment,
+            run_id=clean_run_id,
+            ledger_id=clean_ledger_id,
             controller_seal_key=_seal_key(controller_seal_key),
             as_of=timestamp,
             max_age_seconds=max_age,
@@ -308,6 +348,8 @@ def build_summary(
         raise ValidationError("ledger contains no sealed observations")
     summary = {
         "schema_version": SUMMARY_SCHEMA,
+        "run_id": clean_run_id,
+        "ledger_id": clean_ledger_id,
         "contract_sha256": contract,
         "environment_sha256": environment,
         "as_of": timestamp,
@@ -322,14 +364,18 @@ def build_summary(
     return summary
 
 
-def append_gate_observation(
+def _append_controller_gate_observation(
     ledger_path: str | os.PathLike,
     *,
     artifact_root: str | os.PathLike,
     contract_sha256: str,
     environment_sha256: str,
+    run_id: str,
+    ledger_id: str,
     observation_id: str,
     artifact: Mapping[str, Any],
+    adapter_implementation_sha256: str,
+    adapter_request_sha256: str,
     as_of: float,
     max_age_seconds: float,
     controller_seal_key: bytes,
@@ -338,17 +384,31 @@ def append_gate_observation(
     """Validate adapter evidence before appending the reserved ledger event."""
     contract = _sha(contract_sha256, "contract_sha256")
     environment = _sha(environment_sha256, "environment_sha256")
+    clean_run_id = _identifier(run_id, "run_id")
+    clean_ledger_id = _identifier(ledger_id, "ledger_id")
+    implementation = _sha(
+        adapter_implementation_sha256, "adapter_implementation_sha256"
+    )
+    request_sha = _sha(adapter_request_sha256, "adapter_request_sha256")
     key = _seal_key(controller_seal_key)
     clean_artifact = dict(artifact)
     payload = {
+        "run_id": clean_run_id,
+        "ledger_id": clean_ledger_id,
         "observation_id": observation_id,
         "artifact": clean_artifact,
+        "adapter_implementation_sha256": implementation,
+        "adapter_request_sha256": request_sha,
         "controller_attestation": _controller_attestation(
             key,
             contract_sha256=contract,
             environment_sha256=environment,
+            run_id=clean_run_id,
+            ledger_id=clean_ledger_id,
             observation_id=observation_id,
             artifact=clean_artifact,
+            adapter_implementation_sha256=implementation,
+            adapter_request_sha256=request_sha,
         ),
     }
     _validate_payload(
@@ -356,6 +416,8 @@ def append_gate_observation(
         artifact_root=Path(os.path.abspath(os.fspath(artifact_root))),
         contract_sha256=contract,
         environment_sha256=environment,
+        run_id=clean_run_id,
+        ledger_id=clean_ledger_id,
         controller_seal_key=key,
         as_of=_finite(as_of, "as_of"),
         max_age_seconds=_finite(
@@ -376,6 +438,8 @@ def _validate_summary(value: Any) -> dict:
         raise ValidationError("summary must be an object")
     fields = {
         "schema_version",
+        "run_id",
+        "ledger_id",
         "contract_sha256",
         "environment_sha256",
         "as_of",
@@ -390,6 +454,8 @@ def _validate_summary(value: Any) -> dict:
     _closed(value, fields, "summary")
     if value["schema_version"] != SUMMARY_SCHEMA:
         raise ValidationError("unsupported summary schema")
+    _identifier(value["run_id"], "run_id")
+    _identifier(value["ledger_id"], "ledger_id")
     for field in ("contract_sha256", "environment_sha256", "ledger_tail_sha256"):
         _sha(value[field], field)
     _finite(value["as_of"], "as_of")
@@ -429,6 +495,8 @@ def verify_summary(
         artifact_root=artifact_root,
         contract_sha256=clean["contract_sha256"],
         environment_sha256=clean["environment_sha256"],
+        run_id=clean["run_id"],
+        ledger_id=clean["ledger_id"],
         as_of=clean["as_of"],
         max_age_seconds=clean["max_age_seconds"],
         max_observations=clean["max_observations"],
@@ -446,6 +514,8 @@ def resolve_gate_requirements(
     *,
     ledger_path: str | os.PathLike | None = None,
     artifact_root: str | os.PathLike | None = None,
+    expected_run_id: str | None = None,
+    expected_ledger_id: str | None = None,
     expected_contract_sha256: str | None = None,
     expected_environment_sha256: str | None = None,
     current_as_of: float | None = None,
@@ -463,6 +533,8 @@ def resolve_gate_requirements(
     if (
         ledger_path is None
         or artifact_root is None
+        or expected_run_id is None
+        or expected_ledger_id is None
         or expected_contract_sha256 is None
         or expected_environment_sha256 is None
         or current_as_of is None
@@ -484,6 +556,8 @@ def resolve_gate_requirements(
         controller_seal_key=_seal_key(controller_seal_key),
     )
     contract = _sha(expected_contract_sha256, "expected_contract_sha256")
+    run_id = _identifier(expected_run_id, "expected_run_id")
+    ledger_id = _identifier(expected_ledger_id, "expected_ledger_id")
     environment = _sha(
         expected_environment_sha256, "expected_environment_sha256"
     )
@@ -509,6 +583,8 @@ def resolve_gate_requirements(
         )
     if original["contract_sha256"] != contract:
         raise ValidationError("summary contract identity does not match the controller")
+    if original["run_id"] != run_id or original["ledger_id"] != ledger_id:
+        raise ValidationError("summary run or ledger identity does not match the controller")
     if original["environment_sha256"] != environment:
         raise ValidationError("summary environment identity does not match the controller")
     if original["ledger_tail_sha256"] != tail:
@@ -518,6 +594,8 @@ def resolve_gate_requirements(
         artifact_root=artifact_root,
         contract_sha256=contract,
         environment_sha256=environment,
+        run_id=run_id,
+        ledger_id=ledger_id,
         as_of=current_as_of,
         max_age_seconds=max_age_seconds,
         max_observations=original["max_observations"],
@@ -530,6 +608,8 @@ def resolve_gate_requirements(
         raise ValidationError("gate_requirements must contain both phases")
     result = {
         "schema_version": GATE_SCHEMA,
+        "run_id": clean["run_id"],
+        "ledger_id": clean["ledger_id"],
         "contract_sha256": clean["contract_sha256"],
         "environment_sha256": clean["environment_sha256"],
         "observation_summary_sha256": clean["summary_sha256"],
@@ -596,6 +676,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--artifact-root", required=True)
     parser.add_argument("--contract-sha256", required=True)
     parser.add_argument("--environment-sha256", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--ledger-id", required=True)
     parser.add_argument("--as-of", required=True, type=float)
     parser.add_argument("--max-age-seconds", required=True, type=float)
     parser.add_argument("--max-observations", required=True, type=int)
@@ -608,6 +690,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         artifact_root=args.artifact_root,
         contract_sha256=args.contract_sha256,
         environment_sha256=args.environment_sha256,
+        run_id=args.run_id,
+        ledger_id=args.ledger_id,
         as_of=args.as_of,
         max_age_seconds=args.max_age_seconds,
         max_observations=args.max_observations,

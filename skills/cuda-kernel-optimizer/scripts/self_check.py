@@ -57,6 +57,7 @@ _V3_SCRIPTS = (
     "capability_query.py",
     "evidence_summary.py",
     "gate_evidence.py",
+    "evidence_controller.py",
 )
 _V3_SCHEMAS = (
     "workload_contract.schema.json",
@@ -66,6 +67,7 @@ _V3_SCHEMAS = (
     "capability.schema.json",
     "observation_summary.schema.json",
     "gate_evidence.schema.json",
+    "gate_measurement.schema.json",
 )
 
 
@@ -119,6 +121,43 @@ def _validate_capability_registry(root: Path) -> None:
         capability_root=capability_root,
         trusted_root=root,
     )
+
+
+def _validate_gate_schema_contract(root: Path) -> None:
+    script = root / "scripts" / "gate_evidence.py"
+    module = ModuleType("installed_gate_evidence")
+    module.__file__ = str(script)
+    source = _read_safe_file(root, Path("scripts") / "gate_evidence.py")
+    exec(compile(source, str(script), "exec"), module.__dict__)
+    measurement = json.loads(
+        _read_safe_file(root, Path("templates") / "gate_measurement.schema.json")
+    )
+    variants = measurement.get("oneOf")
+    if not isinstance(variants, list):
+        raise ValueError("gate measurement schema must define closed kind variants")
+    by_kind = {item.get("title"): item for item in variants}
+    if set(by_kind) != set(module._SUBJECT_FIELDS):
+        raise ValueError("gate measurement schema kind set differs from runtime")
+    if measurement.get("properties", {}).get("checks", {}).get("uniqueItems") is not True:
+        raise ValueError("gate measurement schema must reject duplicate checks")
+    for kind, variant in by_kind.items():
+        properties = variant.get("properties", {})
+        subject = properties.get("subject", {})
+        result = properties.get("result", {})
+        if "$ref" in subject:
+            subject_required = {"candidate_id", "candidate_sha256"}
+        else:
+            subject_required = set(subject.get("required", []))
+        if subject_required != set(module._SUBJECT_FIELDS[kind]):
+            raise ValueError(f"gate measurement subject schema differs for {kind}")
+        if set(result.get("required", [])) != set(module._RESULT_FIELDS[kind]):
+            raise ValueError(f"gate measurement result schema differs for {kind}")
+    evidence = json.loads(
+        _read_safe_file(root, Path("templates") / "gate_evidence.schema.json")
+    )
+    producer = evidence.get("properties", {}).get("producer", {})
+    if "implementation_sha256" not in set(producer.get("required", [])):
+        raise ValueError("gate evidence schema must bind adapter implementation")
 
 
 def check_installation(skill_dir: Path | str) -> dict:
@@ -179,6 +218,7 @@ def check_installation(skill_dir: Path | str) -> dict:
         payload = json.loads(_read_safe_file(root, Path("templates") / name))
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"V3 schema root must be closed: {name}")
+    _validate_gate_schema_contract(root)
     checks.append("v3_control_runtime")
 
     _validate_capability_registry(root)

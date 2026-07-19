@@ -238,6 +238,24 @@ class EvidenceLedgerTests(unittest.TestCase):
                     payload={},
                 )
 
+    def test_reserved_observation_id_is_unique_under_the_ledger_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger"
+            first = self.ledger._append_reserved_event(
+                path,
+                event_type="observation_sealed",
+                contract_sha256="a" * 64,
+                payload={"observation_id": "obs-1", "value": 1},
+            )
+            with self.assertRaisesRegex(ValueError, "observation_id|duplicate|unique"):
+                self.ledger._append_reserved_event(
+                    path,
+                    event_type="observation_sealed",
+                    contract_sha256="a" * 64,
+                    payload={"observation_id": "obs-1", "value": 2},
+                )
+            self.assertEqual(self.ledger.verify_ledger(path), [first])
+
 
 if __name__ == "__main__":
     unittest.main()

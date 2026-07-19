@@ -17,8 +17,14 @@ ENVIRONMENT_SHA = "b" * 64
 REFERENCE_SHA = "1" * 64
 TARGET_SHA = "2" * 64
 WORKLOAD_SHA = "9" * 64
+ADAPTER_SHA = "e" * 64
+ADAPTER_REQUEST_SHA = "0" * 64
+RUN_ID = "run-1"
+LEDGER_ID = "ledger-1"
 SEAL_KEY = b"s" * 32
 SUMMARY_LIMITS = {
+    "run_id": RUN_ID,
+    "ledger_id": LEDGER_ID,
     "max_observations": 16,
     "context_budget_bytes": 10000,
     "controller_seal_key": SEAL_KEY,
@@ -95,7 +101,12 @@ def _payload(
             {
                 "schema_version": "cuda-optimizer/gate-evidence-v1",
                 "kind": kind,
-                "producer": {"id": producers[kind], "version": "1.0.0"},
+                "producer": {
+                    "id": producers[kind],
+                    "version": "1.0.0",
+                    "implementation_sha256": ADAPTER_SHA,
+                },
+                "adapter_request_sha256": ADAPTER_REQUEST_SHA,
                 "contract_sha256": CONTRACT_SHA,
                 "environment_sha256": environment_sha256,
                 "recorded_at": recorded_at,
@@ -125,13 +136,17 @@ class EvidenceSummaryTests(unittest.TestCase):
         cls.ledger = _load(LEDGER_PATH, "cuda_v3_summary_ledger")
 
     def _append(self, ledger: Path, payload: dict) -> None:
-        self.summary.append_gate_observation(
+        self.summary._append_controller_gate_observation(
             ledger,
             artifact_root=ledger.parent,
             contract_sha256=CONTRACT_SHA,
             environment_sha256=ENVIRONMENT_SHA,
+            run_id=RUN_ID,
+            ledger_id=LEDGER_ID,
             observation_id=payload["observation_id"],
             artifact=payload["artifact"],
+            adapter_implementation_sha256=ADAPTER_SHA,
+            adapter_request_sha256=ADAPTER_REQUEST_SHA,
             as_of=110.0,
             max_age_seconds=60.0,
             controller_seal_key=SEAL_KEY,
@@ -166,6 +181,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                     artifact_root=root,
                     contract_sha256=CONTRACT_SHA,
                     environment_sha256=ENVIRONMENT_SHA,
+                    run_id=RUN_ID,
+                    ledger_id=LEDGER_ID,
                     as_of=110.0,
                     max_age_seconds=60.0,
                     max_observations=16,
@@ -227,6 +244,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                 },
                 ledger_path=ledger,
                 artifact_root=root,
+                expected_run_id=RUN_ID,
+                expected_ledger_id=LEDGER_ID,
                 expected_contract_sha256=CONTRACT_SHA,
                 expected_environment_sha256=ENVIRONMENT_SHA,
                 current_as_of=110.0,
@@ -288,6 +307,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                 },
                 ledger_path=ledger,
                 artifact_root=root,
+                expected_run_id=RUN_ID,
+                expected_ledger_id=LEDGER_ID,
                 expected_contract_sha256=CONTRACT_SHA,
                 expected_environment_sha256=ENVIRONMENT_SHA,
                 current_as_of=200.0,
@@ -341,6 +362,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                 },
                 ledger_path=ledger,
                 artifact_root=root,
+                expected_run_id=RUN_ID,
+                expected_ledger_id=LEDGER_ID,
                 expected_contract_sha256=CONTRACT_SHA,
                 expected_environment_sha256=ENVIRONMENT_SHA,
                 current_as_of=110.0,
@@ -399,6 +422,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                 },
                 ledger_path=ledger,
                 artifact_root=root,
+                expected_run_id=RUN_ID,
+                expected_ledger_id=LEDGER_ID,
                 expected_contract_sha256=CONTRACT_SHA,
                 expected_environment_sha256=ENVIRONMENT_SHA,
                 current_as_of=110.0,
@@ -488,6 +513,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                     artifact_root=root,
                     contract_sha256=CONTRACT_SHA,
                     environment_sha256=ENVIRONMENT_SHA,
+                    run_id=RUN_ID,
+                    ledger_id=LEDGER_ID,
                     as_of=110.0,
                     max_age_seconds=60.0,
                     max_observations=1,
@@ -500,6 +527,8 @@ class EvidenceSummaryTests(unittest.TestCase):
                     artifact_root=root,
                     contract_sha256=CONTRACT_SHA,
                     environment_sha256=ENVIRONMENT_SHA,
+                    run_id=RUN_ID,
+                    ledger_id=LEDGER_ID,
                     as_of=110.0,
                     max_age_seconds=60.0,
                     max_observations=2,
@@ -561,13 +590,17 @@ class EvidenceSummaryTests(unittest.TestCase):
             valid_payload["artifact"]["size_bytes"] = len(raw)
             ledger2 = root / "ledger2"
             with self.assertRaisesRegex(ValueError, "correctness|PASS|cases"):
-                self.summary.append_gate_observation(
+                self.summary._append_controller_gate_observation(
                     ledger2,
                     artifact_root=root,
                     contract_sha256=CONTRACT_SHA,
                     environment_sha256=ENVIRONMENT_SHA,
+                    run_id=RUN_ID,
+                    ledger_id=LEDGER_ID,
                     observation_id=valid_payload["observation_id"],
                     artifact=valid_payload["artifact"],
+                    adapter_implementation_sha256=ADAPTER_SHA,
+                    adapter_request_sha256=ADAPTER_REQUEST_SHA,
                     as_of=110.0,
                     max_age_seconds=60.0,
                     controller_seal_key=SEAL_KEY,

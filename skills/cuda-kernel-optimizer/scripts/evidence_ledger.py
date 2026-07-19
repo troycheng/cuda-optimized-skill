@@ -293,6 +293,7 @@ def _append_event(
     contract_sha256: str,
     payload: Mapping[str, Any],
     expected_previous_sha256: str | None = None,
+    unique_payload_field: str | None = None,
 ) -> dict:
     """Append one create-once event after verifying the complete existing chain."""
     _identifier(event_type, "event_type")
@@ -302,10 +303,30 @@ def _append_event(
     if not isinstance(payload, Mapping):
         raise ValidationError("payload must be an object")
     clean_payload = _json_copy(dict(payload))
+    if unique_payload_field is not None:
+        _identifier(unique_payload_field, "unique_payload_field")
+        if unique_payload_field not in clean_payload:
+            raise ValidationError(
+                f"reserved payload is missing unique field: {unique_payload_field}"
+            )
+        _identifier(
+            clean_payload[unique_payload_field],
+            f"payload.{unique_payload_field}",
+        )
     directory_fd, lock_fd, _root = _open_lock(path)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         records = _verify_locked(directory_fd, contract_sha256, clean_pending=True)
+        if unique_payload_field is not None:
+            unique_value = clean_payload[unique_payload_field]
+            if any(
+                record["event_type"] == event_type
+                and record["payload"].get(unique_payload_field) == unique_value
+                for record in records
+            ):
+                raise ValidationError(
+                    f"duplicate {unique_payload_field} for {event_type}: {unique_value}"
+                )
         sequence = len(records) + 1
         previous = records[-1]["record_sha256"] if records else _ZERO_SHA
         if expected_previous_sha256 is not None and previous != expected_previous_sha256:
@@ -408,4 +429,7 @@ def _append_reserved_event(
         contract_sha256=contract_sha256,
         payload=payload,
         expected_previous_sha256=expected_previous_sha256,
+        unique_payload_field=(
+            "observation_id" if event_type == "observation_sealed" else None
+        ),
     )

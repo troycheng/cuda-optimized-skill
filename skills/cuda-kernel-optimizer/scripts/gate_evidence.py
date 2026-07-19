@@ -10,6 +10,7 @@ from typing import Any
 
 
 SCHEMA = "cuda-optimizer/gate-evidence-v1"
+MEASUREMENT_SCHEMA = "cuda-optimizer/gate-measurement-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _PRODUCERS = {
@@ -126,15 +127,9 @@ def _validate_result(kind: str, value: Any) -> dict:
     return result
 
 
-def validate_gate_evidence(
-    raw: bytes,
-    *,
-    expected_contract_sha256: str,
-    expected_environment_sha256: str,
-) -> dict:
-    """Parse one gate artifact and derive its trusted routing metadata."""
+def _strict_json(raw: bytes, label: str) -> dict:
     if not isinstance(raw, bytes):
-        raise ValidationError("gate evidence must be bytes")
+        raise ValidationError(f"{label} must be bytes")
     try:
         value = json.loads(
             raw.decode("utf-8"),
@@ -142,11 +137,101 @@ def validate_gate_evidence(
             parse_constant=_invalid_number,
         )
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ValidationError("gate evidence artifact must be strict JSON") from exc
+        raise ValidationError(f"{label} must be strict JSON") from exc
+    if type(value) is not dict:
+        raise ValidationError(f"{label} must be an object")
+    return value
+
+
+def derive_gate_evidence(
+    raw_measurement: bytes,
+    *,
+    kind: str,
+    producer_id: str,
+    producer_version: str,
+    implementation_sha256: str,
+    adapter_request_sha256: str,
+    contract_sha256: str,
+    environment_sha256: str,
+    recorded_at: float,
+) -> bytes:
+    """Recompute PASS from a raw allowlisted-adapter measurement."""
+    if kind not in _PRODUCERS:
+        raise ValidationError(f"unsupported gate evidence kind: {kind}")
+    if producer_id != _PRODUCERS[kind] or producer_version != "1.0.0":
+        raise ValidationError(f"untrusted producer for {kind}")
+    implementation = _sha(
+        implementation_sha256, "producer.implementation_sha256"
+    )
+    measurement = _strict_json(raw_measurement, "gate measurement")
+    _closed(
+        measurement,
+        {"schema_version", "subject", "result", "checks"},
+        "gate measurement",
+    )
+    if measurement["schema_version"] != MEASUREMENT_SCHEMA:
+        raise ValidationError("unsupported gate measurement schema")
+    checks = measurement["checks"]
+    if type(checks) is not list or not checks:
+        raise ValidationError("gate measurement checks must be a non-empty array")
+    names = set()
+    for index, check in enumerate(checks):
+        item = _closed(check, {"name", "passed"}, f"gate measurement check {index}")
+        name = _identifier(item["name"], f"gate measurement check {index}.name")
+        if name in names:
+            raise ValidationError("gate measurement check names must be unique")
+        names.add(name)
+        if item["passed"] is not True:
+            raise ValidationError("gate measurement checks do not support PASS")
+    subject = _validate_subject(kind, measurement["subject"])
+    result = _validate_result(kind, measurement["result"])
+    if type(recorded_at) not in {int, float} or not math.isfinite(recorded_at) or recorded_at < 0:
+        raise ValidationError("controller recorded_at must be non-negative and finite")
+    evidence = {
+        "schema_version": SCHEMA,
+        "kind": kind,
+        "producer": {
+            "id": producer_id,
+            "version": producer_version,
+            "implementation_sha256": implementation,
+        },
+        "adapter_request_sha256": _sha(
+            adapter_request_sha256, "adapter_request_sha256"
+        ),
+        "contract_sha256": _sha(contract_sha256, "contract_sha256"),
+        "environment_sha256": _sha(
+            environment_sha256, "environment_sha256"
+        ),
+        "recorded_at": float(recorded_at),
+        "status": "PASS",
+        "subject": dict(subject),
+        "result": dict(result),
+    }
+    return (
+        json.dumps(
+            evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def validate_gate_evidence(
+    raw: bytes,
+    *,
+    expected_contract_sha256: str,
+    expected_environment_sha256: str,
+) -> dict:
+    """Parse one gate artifact and derive its trusted routing metadata."""
+    value = _strict_json(raw, "gate evidence artifact")
     fields = {
         "schema_version",
         "kind",
         "producer",
+        "adapter_request_sha256",
         "contract_sha256",
         "environment_sha256",
         "recorded_at",
@@ -160,9 +245,17 @@ def validate_gate_evidence(
     kind = evidence["kind"]
     if kind not in _PRODUCERS:
         raise ValidationError(f"unsupported gate evidence kind: {kind}")
-    producer = _closed(evidence["producer"], {"id", "version"}, "gate evidence producer")
-    if producer != {"id": _PRODUCERS[kind], "version": "1.0.0"}:
+    producer = _closed(
+        evidence["producer"],
+        {"id", "version", "implementation_sha256"},
+        "gate evidence producer",
+    )
+    if producer.get("id") != _PRODUCERS[kind] or producer.get("version") != "1.0.0":
         raise ValidationError(f"untrusted producer for {kind}")
+    _sha(producer["implementation_sha256"], "producer.implementation_sha256")
+    adapter_request_sha = _sha(
+        evidence["adapter_request_sha256"], "adapter_request_sha256"
+    )
     if _sha(evidence["contract_sha256"], "contract_sha256") != _sha(
         expected_contract_sha256, "expected_contract_sha256"
     ):
@@ -184,6 +277,7 @@ def validate_gate_evidence(
         "summary": f"Validated {kind} evidence from {_PRODUCERS[kind]}.",
         "signals": [],
         "producer": dict(producer),
+        "adapter_request_sha256": adapter_request_sha,
         "recorded_at": float(recorded_at),
         "subject": dict(subject),
         "result": dict(result),
