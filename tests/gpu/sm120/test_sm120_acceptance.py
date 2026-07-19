@@ -276,6 +276,18 @@ class Sm120AcceptanceHelperTests(unittest.TestCase):
         self.assertIn("Mapping", adapter)
         self.assertIn('candidate["path"]', adapter)
 
+    def test_v3_lane_uses_contract_bound_stability_control(self) -> None:
+        source = inspect.getsource(
+            Sm120AcceptanceTests.test_v3_real_pairs_drive_stability_state
+        )
+        for marker in (
+            "run_paired",
+            "freeze_contract",
+            "stability.calibrate",
+            "apply_run_calibration",
+        ):
+            self.assertIn(marker, source)
+
 @unittest.skipUnless(
     os.environ.get("CUDA_SM120_E2E") == "1",
     "set CUDA_SM120_E2E=1 on an SM120 CUDA host",
@@ -477,6 +489,124 @@ class Sm120AcceptanceTests(unittest.TestCase):
                 for record in records
             )
         )
+
+    def test_v3_real_pairs_drive_stability_state(self) -> None:
+        paired_benchmark = _load_script("paired_benchmark")
+        workload_contract = _load_script("workload_contract")
+        stability = _load_script("stability_calibration")
+        run_control = _load_script("run_control")
+        artifact_store = _load_script("artifact_store")
+        case_root = ARTIFACTS / "v3_stability"
+        workspace = _stage_fixture_workspace("workspace", artifacts=case_root)
+        environment_root = case_root / "environment"
+        environment_root.mkdir()
+        solution = workspace / "triton_vector.py"
+        reference = workspace / "triton_vector_ref.py"
+        pair_count = int(os.environ.get("CUDA_E2E_V3_STABILITY_PAIRS", "8"))
+        raw = paired_benchmark.run_paired(
+            str(solution),
+            str(solution),
+            backend="triton",
+            dims={"N": 1_048_576},
+            ptr_size=0,
+            arch="sm_120",
+            nvcc_bin="nvcc",
+            seed=31,
+            blocks=pair_count,
+            warmup=5,
+        )
+        blocks = [
+            {
+                "pair_id": f"gpu-pair-{index}",
+                "first": pair["baseline"],
+                "second": pair["candidate"],
+                "valid": pair["valid"],
+            }
+            for index, pair in enumerate(raw["pairs"], 1)
+        ]
+        draft = {
+            "schema_version": "cuda-optimizer/workload-contract-draft-v1",
+            "run_id": "sm120-v3-stability",
+            "parent_run": None,
+            "requested_claim": "kernel",
+            "project_root": str(workspace),
+            "artifacts": [
+                {"role": "kernel", "path": solution.name},
+                {"role": "correctness_reference", "path": reference.name},
+            ],
+            "workload": {
+                "argv": [sys.executable, solution.name],
+                "input_distribution": "sm120-opt-in-identical-kernel",
+                "representative_cases": ["N-1048576"],
+            },
+            "objective": {
+                "metric": "kernel_latency",
+                "unit": "ms",
+                "direction": "lower",
+                "aggregation": "median",
+                "minimum_practical_effect_pct": 0.5,
+                "constraints": ["reference_correctness"],
+            },
+            "budget": {
+                "preset": "quick",
+                "max_seconds": 300,
+                "max_candidates": 2,
+            },
+            "mutation": {
+                "project_paths": [solution.name],
+                "environment_root": str(environment_root),
+                "host_policy": "recommend_only",
+            },
+            "evidence": {"max_age_seconds": 300},
+        }
+        contract_path = case_root / "contract.json"
+        frozen = workload_contract.freeze_contract(draft, contract_path)
+        seal_key = b"sm120-v3-controller-test-key" * 2
+        environment_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "gpu": "sm_120",
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        calibration = stability.calibrate(
+            contract_path=contract_path,
+            blocks=blocks,
+            hard_guardrails_passed=True,
+            environment_sha256=environment_sha256,
+            source_sha256=_fixture_hash(solution),
+            recorded_at=3.0,
+            controller_seal_key=seal_key,
+        )
+        artifact_store.atomic_write_json(case_root / "calibration.json", calibration)
+        run_dir = case_root / "run"
+        run_dir.mkdir()
+        run_control.initialize_run(contract_path, run_dir, now=0.0)
+        run_control.transition_run(contract_path, run_dir, "freeze", now=1.0)
+        run_control.transition_run(contract_path, run_dir, "calibrate", now=2.0)
+        applied = run_control.apply_run_calibration(
+            contract_path,
+            run_dir,
+            calibration,
+            now=3.0,
+            controller_seal_key=seal_key,
+        )
+
+        self.assertEqual(calibration["contract_sha256"], frozen["contract_sha256"])
+        self.assertEqual(calibration["valid_pairs"], pair_count)
+        self.assertIn(calibration["environment_state"], {"green", "yellow"})
+        expected_phase = (
+            "EXPLORING"
+            if calibration["environment_state"] == "green"
+            else "CALIBRATING"
+        )
+        self.assertEqual(applied["state"]["phase"], expected_phase)
+        reloaded = run_control.load_run(
+            contract_path, run_dir, controller_seal_key=seal_key
+        )
+        self.assertEqual(reloaded, applied)
 
     def test_ncu_target_profile_records_success_or_explicit_degradation(self) -> None:
         profile_root = ARTIFACTS / "ncu_target"
