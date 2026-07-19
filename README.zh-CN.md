@@ -117,6 +117,11 @@ workload 结果。两者都不承诺新项目能获得相同提速。
 
 本项目从 V2.2 开始维护版本记录。这里记录项目版本，并不表示每个历史版本都有 Git tag。
 
+### V3.0.1
+
+增加单变量软件栈对照检查、无效证据永久隔离、组合候选规则和测量工具维护停止条件。
+这些补丁来自一次真实的 Triton 升级排查，并按 3.0 的 fail-closed 标准重新实现。
+
 ### V3.0
 
 增加 Workload Contract、确定性 Controller、只增不改的回放账本、与证据绑定的 Planner
@@ -167,6 +172,7 @@ workload 结果。两者都不承诺新项目能获得相同提速。
 - [知识、搜索与独立质证](docs/knowledge-and-research.md)
 - [AI 执行协议](skills/cuda-kernel-optimizer/SKILL.md)与[示例](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [性能迭代](skills/cuda-kernel-optimizer/references/performance_iteration.md)、[方向准入](skills/cuda-kernel-optimizer/references/direction_admission.md)和[长任务控制](skills/cuda-kernel-optimizer/references/long_running_control.md)
+- [软件栈版本对照](skills/cuda-kernel-optimizer/references/version_stack_audit.md)
 - [正式证据](skills/cuda-kernel-optimizer/references/evidence_automation.md)与[兼容性参考](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in 测试说明](tests/gpu/sm120/README.md)
 - [MIT License](LICENSE)

@@ -87,5 +87,14 @@ Importing a report does not prove current NCU counter permission, current binary
 identity, or current environment cleanliness. Profiler output is diagnostic and
 cannot promote a candidate by itself.
 
+## Software-stack version comparison
+
+Use the single-variable audit when comparing Triton, TensorRT, CUDA, PyTorch,
+vLLM, or complete container-stack versions. Freeze source, inputs, objective,
+GPU, driver, build intent, and measurement design; rebuild derived engines,
+plugins, timing caches, and kernels separately in each stack. Correctness and
+self-repeat stability must pass before timing. See
+[Software-stack audit](../skills/cuda-kernel-optimizer/references/version_stack_audit.md).
+
 Review [Evidence & Safety](evidence-and-safety.md) before using a result for a
 performance decision.

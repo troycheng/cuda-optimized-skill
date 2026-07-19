@@ -135,6 +135,12 @@ separate. Neither page predicts the speedup of a new project.
 The maintained release history starts with V2.2. These are project versions;
 not every historical version has a matching Git tag.
 
+### V3.0.1
+
+Added a fail-closed single-variable software-stack audit, permanent invalid-
+evidence quarantine, explicit composition rules, and a stop rule for measurement
+runner maintenance. These changes came from a real Triton upgrade investigation.
+
 ### V3.0
 
 Added a frozen Workload Contract, deterministic Controller, append-only replay,
@@ -187,6 +193,7 @@ Established the dual-loop kernel/workload optimizer and RTX 5090 test lane.
 - [Knowledge and research](docs/knowledge-and-research.md)
 - [Agent protocol](skills/cuda-kernel-optimizer/SKILL.md) and [walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
 - [Performance iteration](skills/cuda-kernel-optimizer/references/performance_iteration.md), [direction admission](skills/cuda-kernel-optimizer/references/direction_admission.md), and [long-run control](skills/cuda-kernel-optimizer/references/long_running_control.md)
+- [Software-stack comparison](skills/cuda-kernel-optimizer/references/version_stack_audit.md)
 - [Formal evidence](skills/cuda-kernel-optimizer/references/evidence_automation.md) and [canonical compatibility](skills/cuda-kernel-optimizer/references/compatibility.md)
 - [RTX 5090 opt-in guide](tests/gpu/sm120/README.md)
 - [MIT License](LICENSE)

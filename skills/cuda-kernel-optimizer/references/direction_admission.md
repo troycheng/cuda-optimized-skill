@@ -117,6 +117,12 @@ continue on its own.
 After admission, V2.6 still owns candidate budgets, fallback paths, and
 per-round stopping. V2.7 does not authorize a promotion by itself.
 
+A composition of prior candidates is a new candidate, not inherited evidence.
+Bind the exact parent source or artifact digests and state the interaction
+mechanism. Do not add measured gains unless an experiment establishes that the
+effects are independent. Re-run build/resource gates and correctness before
+timing; a favorable parent result cannot promote the composition.
+
 Whenever the AI reports that a direction should stop, it must append
 `--request close` before generating, editing, compiling, or measuring another
 candidate. If an earlier spoken stop was not recorded, backfill the close

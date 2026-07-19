@@ -29,6 +29,7 @@ catalog or all evidence protocols.
 | Time-varying serving state | Check comparability before interpreting speed | `references/nonstationary_serving_evidence.md` |
 | Long run, many candidates, or resume after interruption | Freeze the run and let the Controller own state | `references/long_running_control.md` |
 | Existing `.ncu-rep` only | Analyze read-only; do not launch the original target | `references/ncu_metrics_guide.md` |
+| Compare GPU software-stack versions | Freeze one variable and rebuild derived artifacts per stack | `references/version_stack_audit.md` |
 | Architecture, API, or tool version uncertain | Query bundled knowledge, then verify locally or with primary sources | `references/offline_knowledge.md` |
 | Major direction choice or reasoning plateau | Use optional search or independent challenge | `references/research_augmentation.md` |
 
@@ -183,6 +184,10 @@ Network or provider failure must fall back to the offline workflow.
 Read `references/optimizer_limits.md` when the target behavior depends on
 undocumented hardware, proprietary semantics, or missing workload facts.
 
+For a Triton, TensorRT, CUDA, framework, or container upgrade, read
+`references/version_stack_audit.md` and validate the frozen comparison with
+`python3 <skill>/scripts/version_audit.py --help` before timing.
+
 ## Modification and host boundary
 
 Modify only declared project paths and user-approved isolated environments.
@@ -222,6 +227,7 @@ highest-value action.
 - Formal evidence: `references/evidence_automation.md`
 - Direction admission: `references/direction_admission.md`
 - Performance rounds: `references/performance_iteration.md`
+- Software-stack comparisons: `references/version_stack_audit.md`
 - Long-running Controller: `references/long_running_control.md`
 - Nonstationary serving: `references/nonstationary_serving_evidence.md`
 - External research: `references/research_augmentation.md`

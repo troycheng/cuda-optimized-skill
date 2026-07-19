@@ -187,12 +187,15 @@ class ReadmeSyncTests(unittest.TestCase):
     def test_readmes_publish_matching_release_notes_from_v2_2(self) -> None:
         english = self.english[self.english.index("## Release notes"):]
         chinese = self.chinese[self.chinese.index("## 版本记录"):]
-        versions = ("### V3.0",) + tuple(f"### V2.{minor}" for minor in range(9, 1, -1))
+        versions = ("### V3.0.1", "### V3.0") + tuple(
+            f"### V2.{minor}" for minor in range(9, 1, -1)
+        )
         assert_in_order(self, english, versions)
         assert_in_order(self, chinese, versions)
         for version in versions:
-            self.assertEqual(english.count(version), 1)
-            self.assertEqual(chinese.count(version), 1)
+            heading = re.compile(r"^%s$" % re.escape(version), re.MULTILINE)
+            self.assertEqual(len(heading.findall(english)), 1)
+            self.assertEqual(len(heading.findall(chinese)), 1)
         self.assertIn("maintained release history starts with V2.2", english)
         self.assertIn("从 V2.2 开始维护", chinese)
         for marker in (
@@ -222,7 +225,7 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("docs/case-studies.md", text)
         validation = (ROOT / "docs/validation.md").read_text(encoding="utf-8")
         cases = (ROOT / "docs/case-studies.md").read_text(encoding="utf-8")
-        for fact in ("927", "921", "15 of 15", "34.307", "ERR_NVGPUCTRPERM"):
+        for fact in ("935", "929", "15 of 15", "34.307", "ERR_NVGPUCTRPERM"):
             self.assertIn(fact, validation)
         for fact in ("60.4616%", "26.3287%", "-0.0097%", "140"):
             self.assertIn(fact, cases)
@@ -246,6 +249,7 @@ class ReadmeSyncTests(unittest.TestCase):
             "skills/cuda-kernel-optimizer/references/performance_iteration.md",
             "skills/cuda-kernel-optimizer/references/compatibility.md",
             "skills/cuda-kernel-optimizer/references/long_running_control.md",
+            "skills/cuda-kernel-optimizer/references/version_stack_audit.md",
             "tests/gpu/sm120/README.md",
             "LICENSE",
         )

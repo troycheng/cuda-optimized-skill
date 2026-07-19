@@ -5,8 +5,8 @@ predict the speedup of a new workload.
 
 ## Automated checks
 
-The current suite contains 927 tests. In the local CPU/static lane on
-2026-07-19, 921 passed, six physical RTX 5090 opt-in tests were skipped, and
+The current suite contains 935 tests. In the local CPU/static lane on
+2026-07-19, 929 passed, six physical RTX 5090 opt-in tests were skipped, and
 none failed. These checks cover input validation, state recovery, evidence
 binding, shared-host guards, timeouts, restoration, capability retrieval,
 stability calibration, audit cadence, and deterministic decision logic. They

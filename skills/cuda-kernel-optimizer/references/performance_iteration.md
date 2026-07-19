@@ -15,6 +15,11 @@ Prepare a registry containing measurement paths that already work. Each path
 needs a different `definition_sha256`; renaming the same runner does not create
 a fallback.
 
+Also freeze an append-only list of invalid evidence IDs or artifact digests.
+Invalid means unusable everywhere: later summaries, baselines, plots, direction
+ranking, external review packets, and promotion inputs must reject any
+intersection with that list. A corrected rerun gets a new identity.
+
 ```json
 {
   "schema_version": "cuda-optimizer/measurement-path-registry-v1",
@@ -162,6 +167,12 @@ stop the direction. Two consecutive `measurement_blocked` or
 `infrastructure_only` decisions in the same hash chain cause the same action.
 Do not build or validate another runner inside the optimization round; registry
 maintenance is a separate task.
+
+Runner completeness has an end. Once one path produces a sealed, reproducible
+correctness-plus-timing attempt, freeze it. Cosmetic output cleanup, extra
+telemetry, and broader edge-case work are not optimization. Reopen the runner
+only when a demonstrated defect can change correctness, sample identity,
+pairing, contamination detection, cleanup safety, or the claimed metric.
 
 The output action is one of:
 
