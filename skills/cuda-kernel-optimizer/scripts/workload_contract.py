@@ -366,6 +366,7 @@ def freeze_contract(
     *,
     parent_contract_path: str | os.PathLike | None = None,
     parent_run_dir: str | os.PathLike | None = None,
+    controller_seal_key: bytes | None = None,
 ) -> dict:
     """Bind regular artifact bytes and create one immutable contract file."""
     draft = validate_draft(value)
@@ -380,7 +381,9 @@ def freeze_contract(
             )
         parent_contract = verify_frozen_contract(parent_contract_path)
         loaded_parent = _load_run_control().load_run(
-            parent_contract_path, parent_run_dir
+            parent_contract_path,
+            parent_run_dir,
+            controller_seal_key=controller_seal_key,
         )
         if loaded_parent["state"]["phase"] not in {"DRIFTED", "STOPPED"}:
             raise ValidationError("parent run must be DRIFTED or STOPPED")
@@ -451,6 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--out", required=True)
     freeze.add_argument("--parent-contract")
     freeze.add_argument("--parent-run-dir")
+    freeze.add_argument("--controller-seal-key-file")
     verify = subparsers.add_parser("verify", help="verify a frozen contract")
     verify.add_argument("--input", required=True)
     return parser
@@ -459,11 +463,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "freeze":
+        seal_key = (
+            None
+            if args.controller_seal_key_file is None
+            else _ARTIFACT_STORE.read_regular_bytes(args.controller_seal_key_file)
+        )
         result = freeze_contract(
             load_json_strict(args.input),
             args.out,
             parent_contract_path=args.parent_contract,
             parent_run_dir=args.parent_run_dir,
+            controller_seal_key=seal_key,
         )
     else:
         result = verify_frozen_contract(args.input)

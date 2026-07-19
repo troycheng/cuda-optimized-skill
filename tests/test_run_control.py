@@ -105,7 +105,7 @@ class RunControlTests(unittest.TestCase):
     def test_candidate_is_preregistered_and_resolved_without_mutating_input(self) -> None:
         state = _exploring(self.control)
         before = copy.deepcopy(state)
-        registered = self.control.register_candidate(
+        registered = self.control._register_candidate_state(
             state,
             _proposal(),
             contract_sha256="a" * 64,
@@ -129,7 +129,7 @@ class RunControlTests(unittest.TestCase):
         self.assertEqual(resolved["candidate_history"][0]["outcome"], "KILL")
 
     def test_pass_cannot_bypass_correctness_or_performance_gate(self) -> None:
-        state = self.control.register_candidate(
+        state = self.control._register_candidate_state(
             _exploring(self.control),
             _proposal(),
             contract_sha256="a" * 64,
@@ -149,7 +149,7 @@ class RunControlTests(unittest.TestCase):
                     )
 
     def test_promotion_is_fail_closed_until_verified_evidence_adapter_is_connected(self) -> None:
-        state = self.control.register_candidate(
+        state = self.control._register_candidate_state(
             _exploring(self.control),
             _proposal(),
             contract_sha256="a" * 64,
@@ -169,7 +169,7 @@ class RunControlTests(unittest.TestCase):
     def test_stale_evidence_drift_and_budget_stop_new_candidates(self) -> None:
         state = _exploring(self.control)
         with self.assertRaisesRegex(ValueError, "stale"):
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 state,
                 _proposal(),
                 contract_sha256="a" * 64,
@@ -177,14 +177,14 @@ class RunControlTests(unittest.TestCase):
                 now=3.0,
             )
         with self.assertRaisesRegex(ValueError, "contract"):
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 state,
                 _proposal(),
                 contract_sha256="b" * 64,
                 evidence_age_seconds=1.0,
                 now=3.0,
             )
-        stopped = self.control.register_candidate(
+        stopped = self.control._register_candidate_state(
             state,
             _proposal(),
             contract_sha256="a" * 64,
@@ -197,7 +197,7 @@ class RunControlTests(unittest.TestCase):
         drifted = self.control.advance(state, "drift", now=5.0, reason="source_identity_changed")
         self.assertEqual(drifted["phase"], "DRIFTED")
         with self.assertRaisesRegex(ValueError, "EXPLORING"):
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 drifted,
                 _proposal(),
                 contract_sha256="a" * 64,
@@ -211,7 +211,7 @@ class RunControlTests(unittest.TestCase):
             expected_metric={"name": "throughput", "direction": "higher"}
         )
         with self.assertRaisesRegex(ValueError, "objective|metric"):
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 state,
                 wrong_metric,
                 contract_sha256="a" * 64,
@@ -219,7 +219,7 @@ class RunControlTests(unittest.TestCase):
                 now=3.0,
             )
         with self.assertRaisesRegex(ValueError, "mutation|allowed|paths"):
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 state,
                 _proposal(paths=["runtime/outside.py"]),
                 contract_sha256="a" * 64,
@@ -247,7 +247,7 @@ class RunControlTests(unittest.TestCase):
                 measurable=True,
             )
             with self.assertRaisesRegex(ValueError, "symlink|unsafe|mutation"):
-                self.control.register_candidate(
+                self.control._register_candidate_state(
                     state,
                     _proposal(paths=["kernels/link/out.py"]),
                     contract_sha256="a" * 64,
@@ -301,7 +301,7 @@ class RunControlTests(unittest.TestCase):
             )
 
     def test_candidate_resolved_after_deadline_cannot_promote_and_stops_run(self) -> None:
-        state = self.control.register_candidate(
+        state = self.control._register_candidate_state(
             _exploring(self.control),
             _proposal(estimated_cost_seconds=10.0),
             contract_sha256="a" * 64,
@@ -338,7 +338,7 @@ class RunControlTests(unittest.TestCase):
             environment_state="green",
             measurable=True,
         )
-        state = self.control.register_candidate(
+        state = self.control._register_candidate_state(
             state,
             _proposal(),
             contract_sha256="a" * 64,
@@ -353,7 +353,7 @@ class RunControlTests(unittest.TestCase):
             performance_gate_passed=False,
             now=5.0,
         )
-        stopped = self.control.register_candidate(
+        stopped = self.control._register_candidate_state(
             state,
             _proposal(candidate_id="candidate-2"),
             contract_sha256="a" * 64,
@@ -376,7 +376,7 @@ class RunControlTests(unittest.TestCase):
         state = _exploring(self.control)
         state["candidates_started"] = 1
         with self.assertRaisesRegex(ValueError, "candidates_started|history"):
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 state,
                 _proposal(),
                 contract_sha256="a" * 64,
@@ -384,7 +384,7 @@ class RunControlTests(unittest.TestCase):
                 now=3.0,
             )
 
-        registered = self.control.register_candidate(
+        registered = self.control._register_candidate_state(
             _exploring(self.control),
             _proposal(),
             contract_sha256="a" * 64,
@@ -403,7 +403,7 @@ class RunControlTests(unittest.TestCase):
             )
 
         killed = self.control.resolve_candidate(
-            self.control.register_candidate(
+            self.control._register_candidate_state(
                 _exploring(self.control),
                 _proposal(),
                 contract_sha256="a" * 64,

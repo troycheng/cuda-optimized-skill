@@ -129,3 +129,22 @@ SLSA 认证。默认本地模式防止 Planner 越权与意外伪造；抵抗同
 - [SLSA 1.2 Build Provenance](https://slsa.dev/spec/v1.2/build-provenance)
 - [SLSA Build Levels](https://slsa.dev/spec/v1.2/levels)
 - [Sigstore signing overview](https://docs.sigstore.dev/cosign/signing/overview/)
+
+## 诊断观察与 Planner 登记边界
+
+外部质证提出的“完整信号组、阶段门禁、确定性上下文预算、产物哈希与环境/时间绑定”
+已经落到 Planner 运行时，而不是停在能力卡字段。Nsys 与 PyTorch Profiler 的 adapter
+只能输出封闭 measurement；kind、producer、请求身份、环境和时间由 Controller 构造。
+观察摘要只把当前目标、当前时间窗内的诊断证据交给能力查询，Planner 不能自行声明
+`observed_signals` 或 `available_evidence`。
+
+首版实现仍留下三个可复现绕过：旧 `run_control` 接口可凭两个形状正确的哈希直接
+登记；登记 `now` 未绑定摘要 `as_of`，旧快照可在未来复用；诊断 schema 只表达信号和
+producer 并集，安装自检看不出逐 kind 漂移。独立审查把三项都判为阻塞问题。
+
+修复后，admission 绑定候选、摘要、能力查询、三项执行前门禁、证据年龄和登记时间，
+并由 Controller HMAC。内存登记、持久化 run ledger 和 replay 都重新验证 admission；
+parent run 含候选时，创建 child contract 也必须由 Controller key 验证旧账本。诊断
+schema 使用 kind 条件约束，安装自检同时核对顶层词表、逐 kind producer/signal、
+schema version 和 check 唯一性。默认本地模式的控制面闭环由此成立；同账号恶意进程
+隔离仍属于高保证部署配置。

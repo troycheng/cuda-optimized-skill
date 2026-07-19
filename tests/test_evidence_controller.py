@@ -136,6 +136,75 @@ class EvidenceControllerTests(unittest.TestCase):
             },
         )
 
+    def test_controller_seals_diagnostic_evidence_into_verified_summary(self) -> None:
+        measurement = {
+            "schema_version": "cuda-optimizer/diagnostic-measurement-v1",
+            "subject": {"target_sha256": "2" * 64},
+            "report": {"artifact_sha256": "5" * 64, "events_total": 12},
+            "signals": ["launch_gap_short_context"],
+            "checks": [{"name": "report_parse_complete", "passed": True}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sealed = root / "sealed"
+            sealed.mkdir()
+            adapter, digest = _adapter(root, measurement)
+            runtime_path = Path(sys.executable).resolve()
+            runtime_sha = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+            implementation_sha = self.controller.adapter_implementation_sha256(
+                producer_id="nsys-timeline-adapter",
+                producer_version="1.0.0",
+                entrypoint_sha256=digest,
+                runtime_sha256=runtime_sha,
+            )
+            runtime = self.controller.EvidenceController(
+                run_id="run-1",
+                ledger_id="ledger-1",
+                contract_sha256=CONTRACT_SHA,
+                environment_sha256=ENVIRONMENT_SHA,
+                ledger_path=root / "ledger",
+                artifact_root=sealed,
+                controller_seal_key=SEAL_KEY,
+                adapters={
+                    "nsys_timeline": {
+                        "id": "nsys-timeline-adapter",
+                        "version": "1.0.0",
+                        "path": str(adapter),
+                        "entrypoint_sha256": digest,
+                        "runtime_path": str(runtime_path),
+                        "runtime_sha256": runtime_sha,
+                        "implementation_sha256": implementation_sha,
+                        "timeout_seconds": 5.0,
+                        "max_output_bytes": 4096,
+                    }
+                },
+                clock=lambda: 100.0,
+            )
+            runtime.run_and_seal(
+                kind="nsys_timeline",
+                observation_id="obs-nsys",
+                request={"report_sha256": "5" * 64},
+            )
+            summary = self.controller._SUMMARY.build_summary(
+                root / "ledger",
+                artifact_root=sealed,
+                contract_sha256=CONTRACT_SHA,
+                environment_sha256=ENVIRONMENT_SHA,
+                run_id="run-1",
+                ledger_id="ledger-1",
+                as_of=110.0,
+                max_age_seconds=60.0,
+                max_observations=4,
+                context_budget_bytes=8192,
+                controller_seal_key=SEAL_KEY,
+            )
+
+        observation = summary["observations"][0]
+        self.assertEqual(observation["kind"], "nsys_timeline")
+        self.assertEqual(observation["layer"], "workload")
+        self.assertEqual(observation["signals"], ["launch_gap_short_context"])
+        self.assertEqual(observation["freshness"], "current")
+
     def test_controller_rejects_adapter_identity_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

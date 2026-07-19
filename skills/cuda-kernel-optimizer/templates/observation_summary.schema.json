@@ -44,7 +44,8 @@
         "kind": {
           "enum": [
             "correctness_reference", "dispatch_identity", "target_compile_probe",
-            "candidate_correctness", "paired_measurement", "workload_replay"
+            "candidate_correctness", "paired_measurement", "workload_replay",
+            "nsys_timeline", "pytorch_profile"
           ]
         },
         "layer": {"enum": ["kernel", "workload", "serving"]},

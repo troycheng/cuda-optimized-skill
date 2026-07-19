@@ -475,7 +475,7 @@ def advance(
     return current
 
 
-def register_candidate(
+def _register_candidate_state(
     state: Mapping[str, Any],
     proposal: Mapping[str, Any],
     *,
@@ -529,6 +529,33 @@ def register_candidate(
     current["candidates_started"] += 1
     current["updated_at"] = timestamp
     return current
+
+
+def register_candidate(
+    state: Mapping[str, Any],
+    proposal: Mapping[str, Any],
+    *,
+    admission: Mapping[str, Any],
+    controller_seal_key: bytes,
+    now: float,
+) -> dict:
+    """Register only a candidate carrying a current Controller admission."""
+    clean_state = _validate_state(state)
+    clean_proposal = validate_candidate_proposal(proposal)
+    clean_admission = _sibling("planner_admission").validate_admission(
+        admission,
+        controller_seal_key=controller_seal_key,
+        proposal=clean_proposal,
+        expected_contract_sha256=clean_state["contract_sha256"],
+        expected_admitted_at=now,
+    )
+    return _register_candidate_state(
+        clean_state,
+        clean_proposal,
+        contract_sha256=clean_admission["contract_sha256"],
+        evidence_age_seconds=clean_admission["evidence_age_seconds"],
+        now=now,
+    )
 
 
 def resolve_candidate(
@@ -600,7 +627,12 @@ def _payload_fields(payload: Any, fields: set[str], event_type: str) -> dict:
     return payload
 
 
-def _replay_records(contract: Mapping[str, Any], records: list[Mapping[str, Any]]) -> dict:
+def _replay_records(
+    contract: Mapping[str, Any],
+    records: list[Mapping[str, Any]],
+    *,
+    controller_seal_key: bytes | None = None,
+) -> dict:
     if not records:
         raise ValidationError("run ledger is empty")
     state = None
@@ -638,14 +670,18 @@ def _replay_records(contract: Mapping[str, Any], records: list[Mapping[str, Any]
         elif event_type == "candidate_registered":
             payload = _payload_fields(
                 payload,
-                {"proposal", "evidence_age_seconds", "now", "state"},
+                {"proposal", "admission", "now", "state"},
                 event_type,
             )
+            if controller_seal_key is None:
+                raise ValidationError(
+                    "candidate replay requires the Controller seal key"
+                )
             state = register_candidate(
                 state,
                 payload["proposal"],
-                contract_sha256=contract["contract_sha256"],
-                evidence_age_seconds=payload["evidence_age_seconds"],
+                admission=payload["admission"],
+                controller_seal_key=controller_seal_key,
                 now=payload["now"],
             )
             recorded_state = _validate_state(payload["state"])
@@ -679,14 +715,19 @@ def _replay_records(contract: Mapping[str, Any], records: list[Mapping[str, Any]
 
 
 def load_run(
-    contract_path: str | os.PathLike, run_dir: str | os.PathLike
+    contract_path: str | os.PathLike,
+    run_dir: str | os.PathLike,
+    *,
+    controller_seal_key: bytes | None = None,
 ) -> dict:
     """Verify the frozen contract and reconstruct state from the complete ledger."""
     contract = _sibling("workload_contract").verify_frozen_contract(contract_path)
     records = _sibling("evidence_ledger").verify_ledger(
         _ledger_path(run_dir), expected_contract_sha256=contract["contract_sha256"]
     )
-    state = _replay_records(contract, records)
+    state = _replay_records(
+        contract, records, controller_seal_key=controller_seal_key
+    )
     return {
         "state": state,
         "tail_sha256": records[-1]["record_sha256"],
@@ -732,10 +773,13 @@ def transition_run(
     measurable: bool | None = None,
     reason: str | None = None,
     expected_tail_sha256: str | None = None,
+    controller_seal_key: bytes | None = None,
 ) -> dict:
     if action == "refreeze":
         raise ValidationError("refreeze requires a new contract and a new run ledger")
-    loaded = load_run(contract_path, run_dir)
+    loaded = load_run(
+        contract_path, run_dir, controller_seal_key=controller_seal_key
+    )
     tail = _expected_tail(loaded, expected_tail_sha256)
     arguments = {
         key: value
@@ -766,18 +810,21 @@ def register_run_candidate(
     run_dir: str | os.PathLike,
     proposal: Mapping[str, Any],
     *,
-    evidence_age_seconds: float,
+    admission: Mapping[str, Any],
+    controller_seal_key: bytes,
     now: float,
     expected_tail_sha256: str | None = None,
 ) -> dict:
     contract = _sibling("workload_contract").verify_frozen_contract(contract_path)
-    loaded = load_run(contract_path, run_dir)
+    loaded = load_run(
+        contract_path, run_dir, controller_seal_key=controller_seal_key
+    )
     tail = _expected_tail(loaded, expected_tail_sha256)
     state = register_candidate(
         loaded["state"],
         proposal,
-        contract_sha256=contract["contract_sha256"],
-        evidence_age_seconds=evidence_age_seconds,
+        admission=admission,
+        controller_seal_key=controller_seal_key,
         now=now,
     )
     clean_proposal = validate_candidate_proposal(proposal)
@@ -788,7 +835,7 @@ def register_run_candidate(
         expected_previous_sha256=tail,
         payload={
             "proposal": clean_proposal,
-            "evidence_age_seconds": evidence_age_seconds,
+            "admission": dict(admission),
             "now": now,
             "state": state,
         },
@@ -810,8 +857,11 @@ def resolve_run_candidate(
     performance_gate_passed: bool | None,
     now: float,
     expected_tail_sha256: str | None = None,
+    controller_seal_key: bytes | None = None,
 ) -> dict:
-    loaded = load_run(contract_path, run_dir)
+    loaded = load_run(
+        contract_path, run_dir, controller_seal_key=controller_seal_key
+    )
     tail = _expected_tail(loaded, expected_tail_sha256)
     state = resolve_candidate(
         loaded["state"],

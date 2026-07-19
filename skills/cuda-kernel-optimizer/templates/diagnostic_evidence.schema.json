@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/diagnostic_evidence.schema.json",
+  "title": "CUDA optimizer Controller-derived diagnostic evidence v1",
+  "$comment": "Runtime validation additionally enforces the exact producer and signal vocabulary for each diagnostic kind.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "producer", "adapter_request_sha256",
+    "contract_sha256", "environment_sha256", "recorded_at", "subject",
+    "report", "signals"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/diagnostic-evidence-v1"},
+    "kind": {"enum": ["nsys_timeline", "pytorch_profile"]},
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "implementation_sha256"],
+      "properties": {
+        "id": {"enum": ["nsys-timeline-adapter", "pytorch-profile-adapter"]},
+        "version": {"const": "1.0.0"},
+        "implementation_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "adapter_request_sha256": {"$ref": "#/$defs/sha256"},
+    "contract_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "recorded_at": {"type": "number", "minimum": 0},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_sha256"],
+      "properties": {"target_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "events_total"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "events_total": {"type": "integer", "minimum": 1}
+      }
+    },
+    "signals": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "launch_gap_short_context", "gpu_idle_gap", "cpu_launch_overhead",
+          "gqa_head_ratio", "shape_fragmentation", "framework_dispatch_overhead"
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "nsys_timeline"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "nsys-timeline-adapter"}}},
+          "signals": {
+            "items": {"enum": ["launch_gap_short_context", "gpu_idle_gap", "cpu_launch_overhead"]}
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "pytorch_profile"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "pytorch-profile-adapter"}}},
+          "signals": {
+            "items": {"enum": ["gqa_head_ratio", "shape_fragmentation", "framework_dispatch_overhead"]}
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

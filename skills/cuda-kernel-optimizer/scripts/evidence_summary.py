@@ -20,7 +20,7 @@ SUMMARY_SCHEMA = "cuda-optimizer/observation-summary-v1"
 GATE_SCHEMA = "cuda-optimizer/gate-resolution-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_KINDS = {
+_GATE_KINDS = {
     "correctness_reference",
     "dispatch_identity",
     "target_compile_probe",
@@ -28,6 +28,8 @@ _KINDS = {
     "paired_measurement",
     "workload_replay",
 }
+_DIAGNOSTIC_KINDS = {"nsys_timeline", "pytorch_profile"}
+_KINDS = _GATE_KINDS | _DIAGNOSTIC_KINDS
 _GATES = {
     "pre_execution": {
         "correctness_reference",
@@ -73,6 +75,7 @@ def _sibling(name: str):
 _LEDGER = _sibling("evidence_ledger")
 _ARTIFACT_STORE = _sibling("artifact_store")
 _GATE_EVIDENCE = _sibling("gate_evidence")
+_DIAGNOSTIC_EVIDENCE = _sibling("diagnostic_evidence")
 
 
 def _closed(value: Mapping[str, Any], fields: set[str], label: str) -> None:
@@ -247,13 +250,26 @@ def _validate_payload(
     if hashlib.sha256(raw).hexdigest() != expected_sha:
         raise ValidationError(f"observation artifact hash identity changed: {relative}")
     try:
-        derived = _GATE_EVIDENCE.validate_gate_evidence(
+        artifact_value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"invalid evidence artifact {relative}: strict JSON required") from exc
+    schema_version = artifact_value.get("schema_version") if type(artifact_value) is dict else None
+    if schema_version == _GATE_EVIDENCE.SCHEMA:
+        validator = _GATE_EVIDENCE.validate_gate_evidence
+        label = "gate"
+    elif schema_version == _DIAGNOSTIC_EVIDENCE.EVIDENCE_SCHEMA:
+        validator = _DIAGNOSTIC_EVIDENCE.validate_diagnostic_evidence
+        label = "diagnostic"
+    else:
+        raise ValidationError(f"unsupported evidence schema in artifact {relative}")
+    try:
+        derived = validator(
             raw,
             expected_contract_sha256=contract_sha256,
             expected_environment_sha256=environment_sha256,
         )
     except ValueError as exc:
-        raise ValidationError(f"invalid gate evidence artifact {relative}: {exc}") from exc
+        raise ValidationError(f"invalid {label} evidence artifact {relative}: {exc}") from exc
     if derived["producer"]["implementation_sha256"] != adapter_implementation:
         raise ValidationError("adapter implementation identity mismatch")
     if derived["adapter_request_sha256"] != adapter_request:
@@ -381,7 +397,11 @@ def _append_controller_gate_observation(
     controller_seal_key: bytes,
     expected_previous_sha256: str | None = None,
 ) -> dict:
-    """Validate adapter evidence before appending the reserved ledger event."""
+    """Validate Controller-derived evidence before appending the reserved event.
+
+    The historical name is retained as an internal compatibility surface; the
+    validator accepts both gate and diagnostic evidence schemas.
+    """
     contract = _sha(contract_sha256, "contract_sha256")
     environment = _sha(environment_sha256, "environment_sha256")
     clean_run_id = _identifier(run_id, "run_id")

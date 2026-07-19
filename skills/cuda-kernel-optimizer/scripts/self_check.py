@@ -57,7 +57,10 @@ _V3_SCRIPTS = (
     "capability_query.py",
     "evidence_summary.py",
     "gate_evidence.py",
+    "diagnostic_evidence.py",
     "evidence_controller.py",
+    "planner_admission.py",
+    "planner_boundary.py",
 )
 _V3_SCHEMAS = (
     "workload_contract.schema.json",
@@ -68,6 +71,9 @@ _V3_SCHEMAS = (
     "observation_summary.schema.json",
     "gate_evidence.schema.json",
     "gate_measurement.schema.json",
+    "diagnostic_evidence.schema.json",
+    "diagnostic_measurement.schema.json",
+    "planner_admission.schema.json",
 )
 
 
@@ -160,6 +166,81 @@ def _validate_gate_schema_contract(root: Path) -> None:
         raise ValueError("gate evidence schema must bind adapter implementation")
 
 
+def _validate_diagnostic_schema_contract(root: Path) -> None:
+    script = root / "scripts" / "diagnostic_evidence.py"
+    module = ModuleType("installed_diagnostic_evidence")
+    module.__file__ = str(script)
+    source = _read_safe_file(root, Path("scripts") / "diagnostic_evidence.py")
+    exec(compile(source, str(script), "exec"), module.__dict__)
+    measurement = json.loads(
+        _read_safe_file(root, Path("templates") / "diagnostic_measurement.schema.json")
+    )
+    if measurement.get("properties", {}).get("schema_version", {}).get("const") != module.MEASUREMENT_SCHEMA:
+        raise ValueError("diagnostic measurement schema version differs from runtime")
+    signal_enum = set(
+        measurement.get("properties", {}).get("signals", {}).get("items", {}).get("enum", [])
+    )
+    runtime_signals = set().union(*module._SIGNALS.values())
+    if signal_enum != runtime_signals:
+        raise ValueError("diagnostic measurement signal vocabulary differs from runtime")
+    if measurement.get("properties", {}).get("checks", {}).get("uniqueItems") is not True:
+        raise ValueError("diagnostic measurement schema must reject duplicate checks")
+    evidence = json.loads(
+        _read_safe_file(root, Path("templates") / "diagnostic_evidence.schema.json")
+    )
+    kind_enum = set(evidence.get("properties", {}).get("kind", {}).get("enum", []))
+    if kind_enum != set(module._PRODUCERS):
+        raise ValueError("diagnostic evidence kind set differs from runtime")
+    if evidence.get("properties", {}).get("schema_version", {}).get("const") != module.EVIDENCE_SCHEMA:
+        raise ValueError("diagnostic evidence schema version differs from runtime")
+    producer = evidence.get("properties", {}).get("producer", {})
+    if "implementation_sha256" not in set(producer.get("required", [])):
+        raise ValueError("diagnostic evidence schema must bind adapter implementation")
+    top_producers = set(
+        producer.get("properties", {}).get("id", {}).get("enum", [])
+    )
+    if top_producers != set(module._PRODUCERS.values()):
+        raise ValueError("diagnostic evidence producer vocabulary differs from runtime")
+    top_signals = set(
+        evidence.get("properties", {}).get("signals", {}).get("items", {}).get("enum", [])
+    )
+    if top_signals != runtime_signals:
+        raise ValueError("diagnostic evidence signal vocabulary differs from runtime")
+    contracts = {}
+    for rule in evidence.get("allOf", []):
+        kind = rule.get("if", {}).get("properties", {}).get("kind", {}).get("const")
+        properties = rule.get("then", {}).get("properties", {})
+        producer_id = (
+            properties.get("producer", {}).get("properties", {}).get("id", {}).get("const")
+        )
+        signals = set(properties.get("signals", {}).get("items", {}).get("enum", []))
+        if kind is not None:
+            contracts[kind] = {"producer": producer_id, "signals": signals}
+    expected_contracts = {
+        kind: {"producer": module._PRODUCERS[kind], "signals": set(module._SIGNALS[kind])}
+        for kind in module._PRODUCERS
+    }
+    if contracts != expected_contracts:
+        raise ValueError("diagnostic per-kind schema contract differs from runtime")
+
+
+def _validate_planner_admission_schema_contract(root: Path) -> None:
+    script = root / "scripts" / "planner_admission.py"
+    module = ModuleType("installed_planner_admission")
+    module.__file__ = str(script)
+    source = _read_safe_file(root, Path("scripts") / "planner_admission.py")
+    exec(compile(source, str(script), "exec"), module.__dict__)
+    schema = json.loads(
+        _read_safe_file(root, Path("templates") / "planner_admission.schema.json")
+    )
+    if set(schema.get("required", [])) != set(module._FIELDS):
+        raise ValueError("planner admission schema fields differ from runtime")
+    if schema.get("properties", {}).get("schema_version", {}).get("const") != module.SCHEMA:
+        raise ValueError("planner admission schema version differs from runtime")
+    if "controller_attestation" not in schema.get("properties", {}):
+        raise ValueError("planner admission schema must bind Controller attestation")
+
+
 def check_installation(skill_dir: Path | str) -> dict:
     root = Path(skill_dir)
     if root.is_symlink() or not root.is_dir():
@@ -219,6 +300,8 @@ def check_installation(skill_dir: Path | str) -> dict:
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"V3 schema root must be closed: {name}")
     _validate_gate_schema_contract(root)
+    _validate_diagnostic_schema_contract(root)
+    _validate_planner_admission_schema_contract(root)
     checks.append("v3_control_runtime")
 
     _validate_capability_registry(root)

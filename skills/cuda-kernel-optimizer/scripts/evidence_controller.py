@@ -35,10 +35,11 @@ def _sibling(name: str):
 
 _ARTIFACT_STORE = _sibling("artifact_store")
 _GATE_EVIDENCE = _sibling("gate_evidence")
+_DIAGNOSTIC_EVIDENCE = _sibling("diagnostic_evidence")
 _SUMMARY = _sibling("evidence_summary")
 _LEDGER = _sibling("evidence_ledger")
 
-_KINDS = {
+_GATE_KINDS = {
     "correctness_reference",
     "dispatch_identity",
     "target_compile_probe",
@@ -46,6 +47,8 @@ _KINDS = {
     "paired_measurement",
     "workload_replay",
 }
+_DIAGNOSTIC_KINDS = {"nsys_timeline", "pytorch_profile"}
+_KINDS = _GATE_KINDS | _DIAGNOSTIC_KINDS
 _PRODUCERS = {
     "correctness_reference": "correctness-reference-adapter",
     "dispatch_identity": "dispatch-identity-adapter",
@@ -53,6 +56,8 @@ _PRODUCERS = {
     "candidate_correctness": "candidate-correctness-adapter",
     "paired_measurement": "paired-measurement-adapter",
     "workload_replay": "workload-replay-adapter",
+    "nsys_timeline": "nsys-timeline-adapter",
+    "pytorch_profile": "pytorch-profile-adapter",
 }
 _IDENTIFIER = __import__("re").compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SHA256 = __import__("re").compile(r"[0-9a-f]{64}\Z")
@@ -304,7 +309,7 @@ class EvidenceController:
             raise ValidationError("adapter request must be an object")
         spec = self._adapters[kind]
         trusted_request = {
-            "schema_version": "cuda-optimizer/gate-adapter-request-v1",
+            "schema_version": "cuda-optimizer/evidence-adapter-request-v1",
             "run_id": self._run_id,
             "ledger_id": self._ledger_id,
             "contract_sha256": self._contract_sha256,
@@ -387,7 +392,15 @@ class EvidenceController:
         # executable. Rechecking detects drift and prevents sealing stale code.
         self._capture_implementation(spec)
         recorded_at = self._clock()
-        evidence = _GATE_EVIDENCE.derive_gate_evidence(
+        evidence_module = (
+            _GATE_EVIDENCE if kind in _GATE_KINDS else _DIAGNOSTIC_EVIDENCE
+        )
+        derive = (
+            evidence_module.derive_gate_evidence
+            if kind in _GATE_KINDS
+            else evidence_module.derive_diagnostic_evidence
+        )
+        evidence = derive(
             adapter_output,
             kind=kind,
             producer_id=spec["id"],

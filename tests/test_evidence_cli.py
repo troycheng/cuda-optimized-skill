@@ -232,6 +232,38 @@ class InstalledSelfCheckTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("playbook hash mismatch", result.stderr.lower())
 
+    def test_self_check_detects_diagnostic_kind_contract_drift(self) -> None:
+        def conditional(schema):
+            schema["allOf"][0]["then"]["properties"]["producer"]["properties"]["id"]["const"] = "pytorch-profile-adapter"
+
+        def top_producer(schema):
+            schema["properties"]["producer"]["properties"]["id"]["enum"].remove(
+                "nsys-timeline-adapter"
+            )
+
+        def top_signal(schema):
+            schema["properties"]["signals"]["items"]["enum"].remove(
+                "cpu_launch_overhead"
+            )
+
+        for mutate, message in (
+            (conditional, "per-kind"),
+            (top_producer, "producer vocabulary"),
+            (top_signal, "signal vocabulary"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
+                installed = Path(tmp) / "cuda-kernel-optimizer"
+                shutil.copytree(SKILL, installed)
+                schema_path = installed / "templates" / "diagnostic_evidence.schema.json"
+                schema = json.loads(schema_path.read_text("utf-8"))
+                mutate(schema)
+                schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+                result = _run(SELF_CHECK, "--skill-dir", str(installed))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr.lower())
+
     def test_self_check_rejects_symlinked_capability_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

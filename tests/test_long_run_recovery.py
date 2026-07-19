@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = ROOT / "skills" / "cuda-kernel-optimizer" / "scripts"
+SEAL_KEY = b"long-run-controller-secret" * 2
 
 
 def _load(name: str):
@@ -61,7 +62,7 @@ def _proposal() -> dict:
         "expected_effect_pct": 2.0,
         "kill_gate": "Kill when paired latency is not measurably lower.",
         "estimated_cost_seconds": 60,
-        "capability_ids": [],
+        "capability_ids": ["test.capability"],
         "paths": ["kernels/op.py"],
     }
 
@@ -72,6 +73,46 @@ class LongRunRecoveryTests(unittest.TestCase):
         cls.contract = _load("workload_contract")
         cls.control = _load("run_control")
         cls.ledger = _load("evidence_ledger")
+        cls.admission = _load("planner_admission")
+
+    def _admission(self, contract_path: Path, *, now: float, age: float) -> dict:
+        proposal = _proposal()
+        contract = json.loads(contract_path.read_text("utf-8"))
+        gates = []
+        for index, gate in enumerate(
+            ("correctness_reference", "dispatch_identity", "target_compile_probe")
+        ):
+            gates.append(
+                {
+                    "gate": gate,
+                    "satisfied": True,
+                    "observation_ids": [f"obs-gate-{index}"],
+                    "artifact_sha256s": [str(index + 1) * 64],
+                }
+            )
+        return self.admission.seal_admission(
+            {
+                "schema_version": "cuda-optimizer/planner-admission-v1",
+                "status": "ADMITTED",
+                "run_id": "recovery-test",
+                "ledger_id": "ledger-1",
+                "contract_sha256": contract["contract_sha256"],
+                "environment_sha256": "b" * 64,
+                "candidate_id": proposal["candidate_id"],
+                "observation_id": proposal["observation_id"],
+                "observation_summary_sha256": proposal["observation_summary_sha256"],
+                "capability_query_sha256": proposal["capability_query_sha256"],
+                "capability_ids": proposal["capability_ids"],
+                "admitted_at": now,
+                "evidence_age_seconds": age,
+                "pre_execution": {
+                    "satisfied": True,
+                    "missing_gates": [],
+                    "gates": gates,
+                },
+            },
+            controller_seal_key=SEAL_KEY,
+        )
 
     def _run(self, root: Path) -> tuple[Path, Path, Path]:
         project = root / "project"
@@ -108,12 +149,15 @@ class LongRunRecoveryTests(unittest.TestCase):
                 contract_path,
                 run_dir,
                 _proposal(),
-                evidence_age_seconds=5.0,
+                admission=self._admission(contract_path, now=10.0, age=5.0),
+                controller_seal_key=SEAL_KEY,
                 now=10.0,
             )
             self.assertEqual(registered["state"]["active_candidate"]["candidate_id"], "candidate-1")
 
-            reloaded = self.control.load_run(contract_path, run_dir)
+            reloaded = self.control.load_run(
+                contract_path, run_dir, controller_seal_key=SEAL_KEY
+            )
             self.assertEqual(reloaded, registered)
             resolved = self.control.resolve_run_candidate(
                 contract_path,
@@ -123,6 +167,7 @@ class LongRunRecoveryTests(unittest.TestCase):
                 correctness_ok=True,
                 performance_gate_passed=False,
                 now=20.0,
+                controller_seal_key=SEAL_KEY,
             )
             self.assertEqual(resolved["state"]["candidate_history"][0]["outcome"], "KILL")
             self.assertEqual(resolved["event_count"], 6)
@@ -142,6 +187,55 @@ class LongRunRecoveryTests(unittest.TestCase):
                     now=1.0,
                     expected_tail_sha256=stale_tail,
                 )
+
+    def test_child_contract_can_verify_a_parent_with_admitted_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, run_dir, contract_path = self._run(root)
+            self._exploring(run_dir, contract_path)
+            self.control.register_run_candidate(
+                contract_path,
+                run_dir,
+                _proposal(),
+                admission=self._admission(contract_path, now=10.0, age=5.0),
+                controller_seal_key=SEAL_KEY,
+                now=10.0,
+            )
+            self.control.resolve_run_candidate(
+                contract_path,
+                run_dir,
+                candidate_id="candidate-1",
+                outcome="KILL",
+                correctness_ok=True,
+                performance_gate_passed=False,
+                now=20.0,
+                controller_seal_key=SEAL_KEY,
+            )
+            stopped = self.control.transition_run(
+                contract_path,
+                run_dir,
+                "stop",
+                now=21.0,
+                reason="recalibration_required",
+                controller_seal_key=SEAL_KEY,
+            )
+            parent = json.loads(contract_path.read_text("utf-8"))
+            child = _draft(project, root / "env")
+            child["run_id"] = "recovery-child"
+            child["parent_run"] = {
+                "run_id": parent["run_id"],
+                "contract_sha256": parent["contract_sha256"],
+                "ledger_tail_sha256": stopped["tail_sha256"],
+            }
+            frozen = self.contract.freeze_contract(
+                child,
+                root / "child-contract.json",
+                parent_contract_path=contract_path,
+                parent_run_dir=run_dir,
+                controller_seal_key=SEAL_KEY,
+            )
+
+        self.assertEqual(frozen["parent_run"], child["parent_run"])
 
     def test_contract_artifact_drift_blocks_resume_before_state_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
