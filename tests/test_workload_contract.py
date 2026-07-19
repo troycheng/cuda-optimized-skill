@@ -155,6 +155,24 @@ class WorkloadContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "recommend_only"):
                 self.contract.validate_draft(draft)
 
+    def test_rejects_symlinked_mutation_and_environment_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, environment, draft = self._fixture(root)
+            outside = root / "outside"
+            outside.mkdir()
+            (project / "linked-kernels").symlink_to(outside, target_is_directory=True)
+            draft["mutation"]["project_paths"] = ["linked-kernels"]
+            with self.assertRaisesRegex(ValueError, "symlink|unsafe|project_paths"):
+                self.contract.validate_draft(draft)
+
+            draft["mutation"]["project_paths"] = ["kernels"]
+            linked_environment = root / "linked-env"
+            linked_environment.symlink_to(environment, target_is_directory=True)
+            draft["mutation"]["environment_root"] = str(linked_environment)
+            with self.assertRaisesRegex(ValueError, "symlink|unsafe|environment_root"):
+                self.contract.validate_draft(draft)
+
     def test_rejects_claim_objective_and_mutation_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

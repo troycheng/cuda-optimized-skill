@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/run_event.schema.json",
+  "title": "CUDA optimizer hash-chained run event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sequence",
+    "event_type",
+    "contract_sha256",
+    "previous_sha256",
+    "payload",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/run-event-v1"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "event_type": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "previous_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {"type": "object"},
+    "record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
+

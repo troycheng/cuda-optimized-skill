@@ -190,6 +190,7 @@ class InstalledSelfCheckTests(unittest.TestCase):
         self.assertIn("v2_6_iteration_guard", payload["checks"])
         self.assertIn("v2_7_direction_guard", payload["checks"])
         self.assertIn("v2_8_nonstationarity_guard", payload["checks"])
+        self.assertIn("v3_control_runtime", payload["checks"])
 
     def test_self_check_fails_closed_for_missing_installation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

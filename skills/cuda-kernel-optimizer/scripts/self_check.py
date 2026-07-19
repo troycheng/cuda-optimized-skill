@@ -47,6 +47,17 @@ _V2_8_SCHEMAS = (
     "nonstationarity_series.schema.json",
     "nonstationarity_verdict.schema.json",
 )
+_V3_SCRIPTS = (
+    "workload_contract.py",
+    "evidence_ledger.py",
+    "run_control.py",
+)
+_V3_SCHEMAS = (
+    "workload_contract.schema.json",
+    "candidate_proposal.schema.json",
+    "run_event.schema.json",
+    "run_control.schema.json",
+)
 
 
 def check_installation(skill_dir: Path | str) -> dict:
@@ -115,6 +126,20 @@ def check_installation(skill_dir: Path | str) -> dict:
     if reference.is_symlink() or not reference.is_file():
         raise ValueError("missing reference: nonstationary_serving_evidence.md")
     checks.append("v2_8_nonstationarity_guard")
+
+    for name in _V3_SCRIPTS:
+        path = root / "scripts" / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"missing V3 script: {name}")
+        compile(path.read_text(encoding="utf-8"), str(path), "exec")
+    for name in _V3_SCHEMAS:
+        path = root / "templates" / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"missing V3 schema: {name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("additionalProperties") is not False:
+            raise ValueError(f"V3 schema root must be closed: {name}")
+    checks.append("v3_control_runtime")
 
     return {
         "schema_version": "cuda-evidence/self-check-v1",

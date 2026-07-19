@@ -39,6 +39,12 @@
 
 首批 fixture：错误 kernel 瓶颈、边界正确性、无 NCU 权限、噪声升高、中断恢复、证据过期、完整 workload 回归。Runner 输出统一 JSON，不把模型主观评分当主要指标。
 
+实验矩阵固定为 `no_skill`、`v2.9`、`v3_random_planner`、
+`v3_shuffled_registry` 和 `v3_full`。每次运行绑定模型、prompt、skill、合同、
+环境、种子和重复编号；required event 必须由账本和带哈希产物派生，不能由模型
+自报。另设一个组合故障注入长跑场景，覆盖预算单调性、旧证据、改名重试和新
+合同必须新建 run。
+
 先记录 2.9 的完成率、错误方向实验数、耗时、候选数和证据违规，再冻结 3.0 发布门槛。
 
 验证：
@@ -70,6 +76,9 @@ python3 tools/run_skill_eval.py --suite tests/evals/v3/scenarios.json --mode v2.
 5. 写账本追加、哈希链、截断、覆盖、并发和恢复测试；
 6. 复用安全原子写入，以 create-once 事件文件加链式摘要形成账本；
 7. 集成 baseline/champion 定期重放和停止快照。
+
+在阶段 3 的证据适配器接通前，Controller 对 `PASS` 保持 fail-closed；两个
+调用方布尔值不能生成 champion。
 
 验证：
 
@@ -191,4 +200,3 @@ python3 tools/run_skill_eval.py --suite tests/evals/v3/scenarios.json --mode v3 
 3. 为 eval manifest 和 deterministic runner 写失败测试；
 4. 记录 2.9 对照数据；
 5. 通过审查后进入长期控制器和证据账本。
-

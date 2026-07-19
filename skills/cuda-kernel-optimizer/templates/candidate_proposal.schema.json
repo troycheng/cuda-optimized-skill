@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/candidate_proposal.schema.json",
+  "title": "CUDA optimizer candidate proposal v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "observation_id",
+    "hypothesis",
+    "expected_metric",
+    "expected_effect_pct",
+    "kill_gate",
+    "estimated_cost_seconds",
+    "capability_ids",
+    "paths"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/candidate-proposal-v1"},
+    "candidate_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "observation_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "hypothesis": {"type": "string", "minLength": 1},
+    "expected_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "direction"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "direction": {"enum": ["lower", "higher"]}
+      }
+    },
+    "expected_effect_pct": {"type": "number", "minimum": 0},
+    "kill_gate": {"type": "string", "minLength": 1},
+    "estimated_cost_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "capability_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}
+    },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"}
+    }
+  }
+}

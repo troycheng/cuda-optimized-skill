@@ -75,7 +75,12 @@
       "additionalProperties": false,
       "required": ["project_paths", "environment_root", "host_policy"],
       "properties": {
-        "project_paths": {"$ref": "#/$defs/nonemptyStrings"},
+        "project_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"}
+        },
         "environment_root": {"type": "string", "minLength": 1},
         "host_policy": {"const": "recommend_only"}
       }

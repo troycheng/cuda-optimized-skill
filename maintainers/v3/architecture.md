@@ -78,7 +78,7 @@ flowchart TD
 - 预算、并发、停止条件和最大证据陈旧时间；
 - 所请求结论层级：kernel、workload 或 serving。
 
-合同、源码、输入和关键环境记录采用规范化摘要和文件哈希双重绑定。任何身份变化都进入 `DRIFTED`，不能沿用旧基线继续晋级。
+合同、源码、输入和关键环境记录采用规范化摘要和文件哈希双重绑定。任何身份变化都进入不可晋级的 `DRIFTED` 终态。新合同必须创建新的 `run_id` 和账本，并以 `parent_run_id` 指向旧 run；两份合同的候选、预算和 champion 不能混在同一条证据链中。
 
 ### 4.2 确定性状态机
 
@@ -94,8 +94,7 @@ stateDiagram-v2
     AUDITING --> DRIFTED: identity or baseline changed
     EXPLORING --> CONVERGING: no eligible high-value direction
     CONVERGING --> STOPPED: stop rule met
-    DRIFTED --> FROZEN: new contract and baseline
-    DRIFTED --> STOPPED: cannot restore validity
+    DRIFTED --> STOPPED: seal the old run
 ```
 
 每个候选在执行前登记：观察、假设、预计影响的指标、预计成本、杀死条件、所用能力版本和代码修改范围。候选只能得到 `PASS`、`KILL`、`INCONCLUSIVE` 或 `DEFERRED`。测不到小效应时应标为结论不足，不能当成失败，也不能反复重试消耗预算。
@@ -169,6 +168,13 @@ Planner 可以看到已验证的指标变化、失败分类、瓶颈信号、候
 | 3.0 控制框架 + 随机 Planner | 分离确定性实验框架的价值 |
 | 3.0 完整版 | 判断能力库和 AI 规划是否带来增量 |
 
+评测记录必须绑定模型及版本、prompt 摘要、skill 摘要、Workload Contract
+摘要、环境摘要、随机种子和重复编号。事件名不能由执行模型自行填写；评测
+oracle 只能从已校验的控制账本和带哈希的原始产物派生事件与成本。除单项故障
+外，还要用虚拟时钟完成一次组合长跑：依次注入噪声、中断、pending 写入、
+workload 漂移、证据过期和重复机制提案，验证旧 run 终止、预算不双花、旧证据
+不晋级、失败机制不能靠改名重试。
+
 主要指标：正确性违规数、首次有效假设时间、每 GPU 小时有效候选数、端到端指标变化、无效建议率、上下文和实验成本、中断恢复成功率、身份或状态违规数。
 
 发布前必须通过三项反证实验：
@@ -204,4 +210,3 @@ Planner 可以看到已验证的指标变化、失败分类、瓶颈信号、候
 - [PyTorch Profiler](https://docs.pytorch.org/docs/stable/profiler.html)：框架级事件和 execution trace。
 - [vLLM bench serve](https://docs.vllm.ai/en/stable/cli/bench/serve/) 与 [TensorRT-LLM Performance Tuning Guide](https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/index.html)：完整推理 workload 指标和调优边界。
 - [tensormux/kernel-skills](https://github.com/tensormux/kernel-skills/tree/7b7337a)：细粒度能力组织的参考实现；引用内容受其 MIT License 约束。
-

@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,33 @@ def _inside(path: Path, root: Path) -> bool:
     return True
 
 
+def _existing_no_follow(path: Path, field: str, *, directory: bool) -> None:
+    try:
+        parent_fd, leaf, _target = _ARTIFACT_STORE._open_parent_directory(
+            path, create=False
+        )
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"{field} contains a symlink or is unsafe") from error
+    fd = None
+    try:
+        fd = os.open(
+            leaf,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        mode = os.fstat(fd).st_mode
+        if directory and not stat.S_ISDIR(mode):
+            raise ValidationError(f"{field} must be an existing directory")
+        if not directory and not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise ValidationError(f"{field} must be an existing regular file or directory")
+    except OSError as error:
+        raise ValidationError(f"{field} contains a symlink or is unsafe") from error
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent_fd)
+
+
 def _copy_json(value: Any, field: str = "contract") -> Any:
     if value is None or type(value) in {bool, str, int}:
         return copy.deepcopy(value)
@@ -202,6 +230,7 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
     project_root = _absolute(contract["project_root"], "project_root")
     if not project_root.is_dir():
         raise ValidationError("project_root must be an existing directory")
+    _existing_no_follow(project_root, "project_root", directory=True)
 
     artifacts = contract["artifacts"]
     if type(artifacts) is not list or not artifacts:
@@ -264,6 +293,9 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
         candidate = Path(os.path.abspath(project_root / relative))
         if not _inside(candidate, project_root):
             raise ValidationError(f"mutation.project_paths[{index}] escapes project_root")
+        _existing_no_follow(
+            candidate, f"mutation.project_paths[{index}]", directory=False
+        )
         normalized.append(candidate)
     for index, path in enumerate(normalized):
         for other in normalized[index + 1 :]:
@@ -272,6 +304,9 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
     environment_root = _absolute(mutation["environment_root"], "mutation.environment_root")
     if environment_root == project_root or _inside(environment_root, project_root) or _inside(project_root, environment_root):
         raise ValidationError("mutation.environment_root must be isolated from project_root")
+    _existing_no_follow(
+        environment_root, "mutation.environment_root", directory=True
+    )
     if mutation["host_policy"] != "recommend_only":
         raise ValidationError("mutation.host_policy must be recommend_only")
 
@@ -376,4 +411,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
