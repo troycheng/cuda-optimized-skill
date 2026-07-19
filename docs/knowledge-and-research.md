@@ -18,9 +18,15 @@ snapshot, verification date, and staleness policy. Unknown architectures and
 version mismatches fail closed: the agent must probe locally or report that the
 fact is unverified.
 
-The query tool returns only a few cards matching the exact architecture,
-optimization layer, and observed bottleneck. This avoids placing the full method
-catalog in the model context.
+The Capability Registry returns only a few cards matching the exact
+architecture, optimization layer, observed signal set, and available evidence.
+Each card names counter-signals, required gates, verification steps, and stop
+conditions. A hard UTF-8 byte budget limits the loaded playbooks; the complete
+catalog never enters the Planner context.
+
+Registry matches propose methods. They cannot admit an experiment or promote a
+candidate. The Controller re-reads sealed local artifacts and decides whether
+the required gates are satisfied.
 
 ## External search
 

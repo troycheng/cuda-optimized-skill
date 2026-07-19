@@ -27,6 +27,7 @@ catalog or all evidence protocols.
 | Bottleneck unknown across a full workload | Run workload diagnosis before choosing a mutation | `examples/workload-controller.md` |
 | Serving KPI validation | Freeze strata, identities, guards, and experiment design | `references/serving_evidence_protocol.md` |
 | Time-varying serving state | Check comparability before interpreting speed | `references/nonstationary_serving_evidence.md` |
+| Long run, many candidates, or resume after interruption | Freeze the run and let the Controller own state | `references/long_running_control.md` |
 | Existing `.ncu-rep` only | Analyze read-only; do not launch the original target | `references/ncu_metrics_guide.md` |
 | Architecture, API, or tool version uncertain | Query bundled knowledge, then verify locally or with primary sources | `references/offline_knowledge.md` |
 | Major direction choice or reasoning plateau | Use optional search or independent challenge | `references/research_augmentation.md` |
@@ -72,17 +73,22 @@ eligible direction remains, or the claim ceiling blocks promotion.
 
 ## Core workflow
 
-1. Freeze the objective, direction, constraints, representative cases,
-   measurement design, mutation roots, environment identity, and budget.
-2. Confirm the baseline passes correctness and produces stable raw timing.
+1. Freeze the objective, constraints, representative cases, artifacts, mutation
+   roots, environment, budget, and stability policy with
+   `scripts/workload_contract.py`.
+2. Confirm correctness, collect baseline-only pairs, and run
+   `scripts/stability_calibration.py`. Admit candidates only while the
+   Controller-attested environment state is `green`.
 3. Profile the full path at the highest available claim layer.
 4. Summarize the observed bottleneck and the evidence that supports it.
 5. Admit only directions with measured headroom. Use
    `references/direction_admission.md` for stop and reopen rules.
-6. Query at most a few compatible methods instead of loading the full catalog:
+6. Query a few capability cards by exact task, architecture, observed signals,
+   and available evidence. Use the hard context budget and load only returned
+   playbooks:
 
    ```bash
-   python3 <skill>/scripts/knowledge_query.py --arch sm_120 --layer kernel --axis memory --metrics profiler-summary.json --limit 5
+   python3 <skill>/scripts/capability_query.py --help
    ```
 
 7. State one falsifiable hypothesis, one bounded change, the expected metric
@@ -101,6 +107,23 @@ python3 <skill>/scripts/orchestrate.py --help
 python3 <skill>/scripts/workload_controller.py --help
 python3 <skill>/scripts/evidence.py --help
 ```
+
+## Long-running control
+
+For a multi-candidate or resumable run, read
+`references/long_running_control.md`. Keep the Planner and Controller separate:
+
+- `scripts/evidence_controller.py` runs allowlisted evidence adapters and seals
+  their normalized output;
+- `scripts/planner_boundary.py` admits a preregistered candidate only when its
+  summary, capability query, execution gates, evidence age, and time match;
+- the append-only run ledger replays calibrations, audits, admissions, and
+  candidate results before work resumes.
+
+The frozen `audit_every_candidates` value limits registrations between baseline
+audits. Only a Controller-attested calibration or audit may move the persistent
+run into or back to `EXPLORING`. A changed workload, source, objective, or
+environment requires a new contract and a new ledger.
 
 ## Workload and kernel decisions
 
@@ -134,7 +157,14 @@ experiment.
 
 ## Knowledge and external research
 
-Use `scripts/knowledge_query.py` to return only architecture-compatible cards.
+Use `scripts/knowledge_query.py` for the legacy method catalog and
+`scripts/capability_query.py` for evidence-bound playbooks. Return only
+architecture-compatible cards.
+
+```bash
+python3 <skill>/scripts/knowledge_query.py --task gemm --arch sm_120 --limit 5
+```
+
 Exact SM capabilities are required; never inherit features by numeric ordering.
 Cards without a matching observed signal remain `unverified`; do not admit a
 direction from registry order alone. Historical speedup ranges are context, not
@@ -192,5 +222,6 @@ highest-value action.
 - Formal evidence: `references/evidence_automation.md`
 - Direction admission: `references/direction_admission.md`
 - Performance rounds: `references/performance_iteration.md`
+- Long-running Controller: `references/long_running_control.md`
 - Nonstationary serving: `references/nonstationary_serving_evidence.md`
 - External research: `references/research_augmentation.md`

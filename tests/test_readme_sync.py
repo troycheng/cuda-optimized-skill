@@ -187,7 +187,7 @@ class ReadmeSyncTests(unittest.TestCase):
     def test_readmes_publish_matching_release_notes_from_v2_2(self) -> None:
         english = self.english[self.english.index("## Release notes"):]
         chinese = self.chinese[self.chinese.index("## 版本记录"):]
-        versions = tuple(f"### V2.{minor}" for minor in range(9, 1, -1))
+        versions = ("### V3.0",) + tuple(f"### V2.{minor}" for minor in range(9, 1, -1))
         assert_in_order(self, english, versions)
         assert_in_order(self, chinese, versions)
         for version in versions:
@@ -222,7 +222,7 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("docs/case-studies.md", text)
         validation = (ROOT / "docs/validation.md").read_text(encoding="utf-8")
         cases = (ROOT / "docs/case-studies.md").read_text(encoding="utf-8")
-        for fact in ("813", "808", "13 of 13", "34.302", "ERR_NVGPUCTRPERM"):
+        for fact in ("927", "921", "15 of 15", "34.307", "ERR_NVGPUCTRPERM"):
             self.assertIn(fact, validation)
         for fact in ("60.4616%", "26.3287%", "-0.0097%", "140"):
             self.assertIn(fact, cases)
@@ -239,11 +239,13 @@ class ReadmeSyncTests(unittest.TestCase):
             "docs/validation.md",
             "docs/case-studies.md",
             "docs/knowledge-and-research.md",
+            "docs/long-running-optimization.md",
             "skills/cuda-kernel-optimizer/SKILL.md",
             "skills/cuda-kernel-optimizer/examples/walkthrough.md",
             "skills/cuda-kernel-optimizer/references/evidence_automation.md",
             "skills/cuda-kernel-optimizer/references/performance_iteration.md",
             "skills/cuda-kernel-optimizer/references/compatibility.md",
+            "skills/cuda-kernel-optimizer/references/long_running_control.md",
             "tests/gpu/sm120/README.md",
             "LICENSE",
         )

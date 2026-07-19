@@ -18,6 +18,12 @@ Correctness, constraints, paired raw rows, and the default 95% confidence
 interval must agree with the frozen design. Missing or contradictory required
 evidence must **fail closed**.
 
+For long runs, the frozen Workload Contract also records the stability policy
+and audit cadence. Only Controller-attested calibration and audit events may
+open candidate exploration. A changed workload, target source, objective, or
+environment starts a new run; it cannot reuse the old run's budget or champion.
+See [Long-running optimization](long-running-optimization.md).
+
 ## Shared-host guard
 
 Formal timing requires continuous shared-host samples for the target, peer, and
@@ -64,8 +70,8 @@ and image boundaries. Same source does not imply same binary.
 and auditable. A performance win with invalid evidence cannot be adopted.
 
 The installed `self_check` is CPU/static only and does not validate a GPU environment.
-It checks package metadata, Python scripts, and the bundled V2.5-V2.8 schemas
-without running GPU or network work.
+It checks package metadata, Python scripts, capability sources and byte costs,
+and the bundled V2.5-V3 schemas without running GPU or network work.
 
 ## Modification boundary
 

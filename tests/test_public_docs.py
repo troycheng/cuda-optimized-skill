@@ -11,6 +11,7 @@ PUBLIC_PAGES = (
     "docs/getting-started.md",
     "docs/environment-readiness.md",
     "docs/workflows.md",
+    "docs/long-running-optimization.md",
     "docs/evidence-and-safety.md",
     "docs/compatibility.md",
     "docs/validation.md",
@@ -35,6 +36,7 @@ class PublicDocsTests(unittest.TestCase):
                 "getting-started.md",
                 "environment-readiness.md",
                 "workflows.md",
+                "long-running-optimization.md",
                 "evidence-and-safety.md",
                 "compatibility.md",
                 "validation.md",
@@ -84,6 +86,24 @@ class PublicDocsTests(unittest.TestCase):
             "kernel-level claim",
             "end-to-end claim",
             "read-only",
+        ):
+            self.assertIn(marker, text)
+
+    def test_long_running_page_explains_contract_controller_and_cadence(self) -> None:
+        text = (ROOT / "docs/long-running-optimization.md").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "Workload Contract",
+            "Controller",
+            "Capability Registry",
+            "append-only ledger",
+            "minimum detectable effect",
+            "green",
+            "yellow",
+            "red",
+            "audit_every_candidates",
+            "External",
         ):
             self.assertIn(marker, text)
 

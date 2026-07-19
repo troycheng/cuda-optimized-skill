@@ -48,6 +48,18 @@ class SkillMetadataTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.text)
 
+    def test_v3_router_binds_contract_capabilities_and_long_run_control(self) -> None:
+        for marker in (
+            "scripts/workload_contract.py",
+            "scripts/stability_calibration.py",
+            "scripts/capability_query.py",
+            "scripts/evidence_controller.py",
+            "scripts/planner_boundary.py",
+            "references/long_running_control.md",
+            "audit_every_candidates",
+        ):
+            self.assertIn(marker, self.text)
+
     def test_claim_ceiling_requires_user_owned_workload_and_measurement(self) -> None:
         prose = " ".join(self.text.split())
         for marker in (

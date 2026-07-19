@@ -12,6 +12,7 @@ nav:
   - Getting Started: getting-started.md
   - Environment Readiness: environment-readiness.md
   - Workflows: workflows.md
+  - Long-running Optimization: long-running-optimization.md
   - Evidence & Safety: evidence-and-safety.md
   - Compatibility: compatibility.md
   - Validation Status: validation.md

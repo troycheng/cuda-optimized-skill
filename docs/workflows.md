@@ -33,6 +33,11 @@ may use only a prevalidated fallback or stop that direction; it does not turn
 the optimization round into runner development. See the
 [performance-first iteration contract](../skills/cuda-kernel-optimizer/references/performance_iteration.md).
 
+For a search that spans many candidates or sessions, the V3 Controller adds a
+frozen Workload Contract, baseline noise calibration, an append-only ledger,
+periodic champion replay, and deterministic recovery. See
+[Long-running optimization](long-running-optimization.md).
+
 ## Kernel optimization
 
 Use this path for a CUDA, CUTLASS, or Triton implementation with a runnable

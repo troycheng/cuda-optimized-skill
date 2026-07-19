@@ -16,6 +16,10 @@ set. It covers:
   workload, collects a normalized GPU probe, registers a project-scoped
   ChangeSet, replaces redundant launches, runs paired workload evaluation, and
   requires a deterministic promotion with no host mutation;
+- a V3 long-run calibration round that freezes the workload contract, measures
+  eight real identical-kernel pairs, binds the calibration to source,
+  environment, and contract identities, and refuses to leave `CALIBRATING`
+  when noise or minimum detectable effect is too high;
 - a target-bounded Nsight Compute attempt. It must either collect real metrics
   with readable counters or record exactly `ERR_NVGPUCTRPERM`; no other
   degraded result is accepted. The test never adds capabilities or changes
@@ -28,7 +32,7 @@ The no-op check uses the production `run_paired`, `classify_pairs`, and
 
 ## Local and current-lane execution
 
-Without opt-in, eight CPU helper regressions pass and all five GPU tests are
+Without opt-in, nine CPU helper regressions pass and all six GPU tests are
 reported as skipped:
 
 ```bash
@@ -128,7 +132,7 @@ artifacts/<lane>/
 Large profiler reports remain in the isolated artifact tree. `ncu
 --query-metrics` is not treated as proof that hardware counters are readable.
 
-## V2.4 validation result
+## Recorded validation results
 
 The V2.4 controller lane ran on a physical RTX 5090 on 2026-07-17. The current
 container passed 13/13 checks in 34.302 seconds using immutable image
@@ -140,3 +144,13 @@ checksum constraint and measured a 60.4616% latency improvement with a 95% CI
 of [60.0894%, 61.4941%]. The optional reviewer was not configured, and the
 deterministic controller promoted the change. NCU returned
 `ERR_NVGPUCTRPERM`; the test did not change host permissions or driver policy.
+
+The V3 lane ran on the same physical RTX 5090 on 2026-07-19. A fresh artifact
+lane passed 15/15 checks in 34.307 seconds with the same immutable image. Eight
+real identical-kernel pairs produced a 34.153% median symmetric-pair noise
+estimate, a 36.712% upper confidence bound, and a 40.193% minimum detectable
+effect against a frozen 0.5% practical effect. The calibrated state was
+`yellow`, so the run remained `CALIBRATING`. This is a fail-closed result: the
+controller detected that the environment could not support the requested
+claim and did not begin candidate exploration. NCU again returned
+`ERR_NVGPUCTRPERM`; no host permission or driver policy was changed.

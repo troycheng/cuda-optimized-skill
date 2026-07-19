@@ -13,6 +13,9 @@ read-only analysis of an existing Nsight Compute report.
 - [Environment readiness](environment-readiness.md) — find the strongest result
   the current workload and test environment can support.
 - [Workflows](workflows.md) — choose the claim that matches your inputs.
+- [Long-running optimization](long-running-optimization.md) — see how the
+  workload contract, controller, evidence ledger, and recurring audits keep a
+  long search aligned.
 - [Evidence & Safety](evidence-and-safety.md) — understand what must pass before
   a result can be trusted.
 - [Compatibility](compatibility.md) — check toolchain and target requirements.

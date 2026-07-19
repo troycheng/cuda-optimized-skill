@@ -18,61 +18,68 @@
 
 ## About
 
-`cuda-kernel-optimizer` is a reusable Codex skill for improving CUDA, CUTLASS,
-and Triton code. It can optimize one kernel, diagnose a complete GPU workload,
-validate a kernel change against a serving objective, or analyze an existing
-Nsight Compute report without launching the original program.
+`cuda-kernel-optimizer` is a Codex skill for improving CUDA, CUTLASS, Triton,
+and the GPU workloads around them. It can optimize a kernel, find a bottleneck
+across a complete workload, validate a change against a serving objective, or
+analyze an existing Nsight Compute report without rerunning its program.
 
-It combines environment checks, profiling, bounded code changes, correctness
-validation, and paired performance measurements in one resumable workflow. It
-does not assume that every bottleneck is on the GPU: framework scheduling, CPU
-work, transfers, communication, I/O, and runtime conditions are part of the
-diagnosis when the user supplies a complete workload.
+The skill profiles the real target, makes bounded project changes, checks
+correctness, and compares paired measurements. It also checks framework
+scheduling, CPU and data work, transfers, communication, I/O, allocator behavior,
+and runtime state when the evidence points outside a kernel.
 
-The skill may modify only declared project paths and isolated project
-environments. It never changes host-level settings automatically; drivers,
-permissions, clocks, power limits, and system configuration remain advisory.
+Version 3.0 adds a deterministic long-run Controller. A frozen Workload Contract
+defines the objective, files, environment, budget, measurement policy, and
+allowed scope. The AI proposes candidates; signed evidence and an append-only
+ledger decide what may continue. Interrupted, noisy, or drifted runs stop or
+resume without silently changing the experiment.
+
+The skill never changes host-level settings automatically. Drivers, counter
+permissions, clocks, power limits, services, and system configuration remain
+recommendations unless the user separately authorizes them.
 
 ## Quick start
 
-Installation is performed by Codex. Ask Codex to install or update the skill
-from [troycheng/cuda-optimized-skill](https://github.com/troycheng/cuda-optimized-skill)
-at `skills/cuda-kernel-optimizer`, then start a new session so the instructions
-are reloaded.
+Installation is performed by Codex. Ask Codex to install or update
+`skills/cuda-kernel-optimizer` from
+[troycheng/cuda-optimized-skill](https://github.com/troycheng/cuda-optimized-skill),
+then start a new session so the instructions are reloaded.
 
-Provide a runnable target, a correctness reference, the test environment, a
-performance goal, constraints, and the allowed modification scope.
-A real workload must be supplied by the user; the skill does not download or invent one.
-If some of these are missing, the skill first reports what can be established
-with the current setup and helps create the missing project-local foundation.
+Provide a runnable target, correctness reference, target environment,
+performance goal, constraints, and allowed modification scope. A real workload must be supplied by the user; the skill does not download or invent one. When a
+foundation is missing, it reports the strongest result the current setup can
+support and helps prepare project-local tests instead of claiming an unmeasured
+speedup.
 
-Choose `quick` for a 45-minute search, `balanced` for the default three-hour
-budget, or `thorough` for up to ten hours of broader exploration.
+Choose `quick` for a 45-minute ceiling, `balanced` for the default three hours,
+or `thorough` for up to ten hours. The run may stop earlier when the evidence is
+conclusive or no useful direction remains.
 
-> Use cuda-kernel-optimizer to optimize the Triton kernel in this directory. Verify the reference and inputs first, keep host settings unchanged, and retain a change only when correctness and paired performance evidence pass.
+> Use cuda-kernel-optimizer on this Triton workload. Confirm the reference, real inputs, target metric, allowed files, and environment first. Keep host settings unchanged and retain a change only when correctness and paired performance both pass.
 
-See [Getting Started](docs/getting-started.md) for the input checklist and first
-run boundaries.
+See [Getting Started](docs/getting-started.md) for the input checklist.
 
 ## Choose a workflow
 
 | Workflow | Use it when | Result boundary |
 |---|---|---|
-| **Environment readiness** | The workload, reference, stable benchmark, profiler, or target environment is incomplete | A gap report, claim ceiling, and project-local preparation plan; no unsupported speed claim |
-| **Kernel optimization** | A CUDA, CUTLASS, or Triton implementation has a comparable reference | A kernel-level result with correctness, compiler/profiler evidence, paired samples, and a confidence result |
-| **Complete workload** | Latency, throughput, or cost is off target and the bottleneck is unknown | A diagnosis across kernel, framework, CPU, transfer, communication, I/O, and environment paths, followed by a bounded end-to-end evaluation |
-| **Serving validation** | A kernel benchmark improved and the product KPI must be checked | Frozen c1/c2/c4/c8/c12 strata, serving-stack identity, per-stratum constraints, and a separate performance and evidence-integrity decision |
-| **Existing NCU report** | A `.ncu-rep` already exists and the profiled workload must not run again | Read-only report analysis; importing a report does not prove current counter access or current target identity |
+| **Environment readiness** | The workload, reference, benchmark, profiler, or target environment is incomplete | A gap report, claim ceiling, and project-local preparation plan |
+| **Kernel optimization** | A CUDA, CUTLASS, or Triton implementation has a comparable reference | A kernel-level result with correctness and paired measurement evidence |
+| **Complete workload** | The bottleneck may span GPU, framework, CPU, transfers, communication, I/O, or runtime state | A bounded diagnosis and end-to-end evaluation on the supplied workload |
+| **Serving validation** | A local change must be checked against a product KPI | Frozen c1/c2/c4/c8/c12 strata, constraints, runtime identity, and separate performance and integrity decisions |
+| **Existing NCU report** | A `.ncu-rep` exists and the original workload must not run | Read-only analysis with exact degradation when the report cannot be interpreted |
 
-[Workflows](docs/workflows.md) explains required inputs, allowed changes, and the
-claim each path can support.
+[Workflows](docs/workflows.md) explains the required inputs and supported claim
+for each path. [Long-running Optimization](docs/long-running-optimization.md)
+explains the 3.0 Controller, capability registry, calibration, audit cadence, and
+recovery behavior.
 
 ## How it works
 
 ```mermaid
 flowchart LR
     goal["Goal, code, and constraints"] --> environment["Check the test environment"]
-    environment --> baseline["Establish a reproducible baseline"]
+    environment --> baseline["Freeze and calibrate the baseline"]
     baseline --> profiling["Profile and locate the bottleneck"]
     profiling --> change["Create a bounded change"]
     change --> evaluation["Check correctness and paired performance"]
@@ -80,111 +87,109 @@ flowchart LR
     evaluation --> restore["Evidence is insufficient: restore the original"]
 ```
 
-Before the first candidate, the workflow freezes the baseline, environment, and prevalidated measurement paths. It first checks whether the direction's measured ceiling can still justify another round and records stop or reopen decisions in an append-only ledger. Comparable directions are ranked only within the same claim layer; other comparisons remain explicit rather than receiving invented weights.
-See the [direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md).
+Before timed work, the Controller freezes the objective and authorized scope,
+then estimates measurement noise and the minimum detectable effect. `green`
+permits a candidate, `yellow` pauses for better measurement or baseline replay,
+and `red` stops the run. The contract also limits how many candidates may run
+between baseline audits.
 
-Serving measurements can move with load, queue depth, cache state, or another runtime condition. V2.8 checks a predeclared, balanced AB/BA series before those numbers reach the performance gate. It verifies fixed-duration windows, burn-in to timed transitions, paired state, chronology, and the bound raw source. A pass means the rows are comparable; it does not mean the candidate is faster. See
-[nonstationary serving evidence](skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md).
+Verified observations query only a few matching capability cards. Cards supply
+methods, counterexamples, and checks; they do not decide results. Every admitted
+round starts with a falsifiable performance hypothesis. Only a rehashed V2.5
+evidence closure counts as an evaluated candidate. Measurement tooling has a
+hard time and repair limit. Tool work is not a performance improvement.
 
-Each admitted round starts with a falsifiable performance hypothesis, and only a rehashed V2.5 evidence closure counts as an evaluated candidate. Measurement tooling has a hard time and repair limit; after that, the AI switches to a different frozen path or stops the direction. Tool work is not a performance improvement and is not reported as one. The detailed rules are in the
-[performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md).
-
-The workflow freezes the objective and authorized scope before timed work. Each
-candidate is tied to its source, binary, inputs, schedule, raw rows, and runtime
-identity. A rejected or interrupted candidate is recorded without overwriting a
-previously valid result.
+Direction headroom and stop/reopen rules remain in the
+[direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md).
+The detailed iteration rules are in the
+[performance-first contract](skills/cuda-kernel-optimizer/references/performance_iteration.md).
 
 ## Evidence, not best-sample claims
 
-A performance claim is accepted only when the evidence closes:
+A performance claim is accepted only when:
 
 - correctness and every declared constraint pass;
-- paired A/B samples use the frozen schedule and aggregation rule;
-- the default 95% confidence interval supports the required relative and
-  absolute gain, with enough valid pairs;
-- the continuous shared-host guard covers the timed phase without unknown,
-  missing, stale, or contaminated samples;
-- formal serving runs cover every c1/c2/c4/c8/c12 stratum and bind the timed
-  binary to the proved execution path.
+- paired A/B samples follow the frozen schedule and aggregation rule;
+- the default 95% confidence interval supports the required effect with enough valid pairs;
+- the continuous shared-host guard covers timed work without missing, stale, or contaminated samples;
+- formal serving evidence covers c1/c2/c4/c8/c12 and binds the measured binary to its execution path.
 
-Formal uncertainty, missing required evidence, identity drift, or contamination
-must fail closed. Timed work cannot be rescued by excluding inconvenient rows or
-retrying only one role after the frozen experiment begins.
+Missing, contradictory, contaminated, stale, or identity-invalid evidence must
+fail closed. `performance_verdict` and `evidence_integrity` remain separate: a
+fast number cannot repair an invalid experiment. The installed `self_check` is
+CPU/static only and does not validate a GPU environment.
 
-`performance_verdict` and `evidence_integrity` are separate decisions: a fast
-number cannot compensate for an invalid attempt. The installed `self_check` is
-CPU/static only and does not validate a GPU environment. See
-[Evidence & Safety](docs/evidence-and-safety.md) for the claim ladder and host
-boundaries.
+See [Evidence & Safety](docs/evidence-and-safety.md), the
+[formal V2.5 reference](skills/cuda-kernel-optimizer/references/evidence_automation.md),
+and the [long-run control reference](skills/cuda-kernel-optimizer/references/long_running_control.md).
 
 ## Validation status
 
-Project checks and workload results are deliberately separate:
-
-- [Validation status](docs/validation.md) records automated checks, the physical
-  RTX 5090 lane, tool permissions, and what those checks do and do not establish.
-- [Case studies](docs/case-studies.md) records historical workload outcomes,
-  including rejected kernel wins. Those numbers apply only to their recorded
-  code, inputs, environment, and objective.
-
-Neither page promises a speedup for a new project. The current task establishes
-its own claim ceiling and must close its own correctness and measurement evidence.
+[Validation status](docs/validation.md) records automated checks, the physical
+RTX 5090 lane, tool permissions, and the 3.0 real-pair stability result.
+[Case studies](docs/case-studies.md) keeps workload-specific historical results
+separate. Neither page predicts the speedup of a new project.
 
 ## Release notes
 
-The maintained release history starts with V2.2. These notes describe project
-versions; they do not imply that every historical version has a matching Git tag.
+The maintained release history starts with V2.2. These are project versions;
+not every historical version has a matching Git tag.
+
+### V3.0
+
+Added a frozen Workload Contract, deterministic Controller, append-only replay,
+evidence-bound Planner admission, a context-budgeted Capability Registry, and
+noise/MDE calibration with mandatory periodic audits. External research remains
+optional and local evidence remains decisive.
 
 ### V2.9
 
-Reorganized public documentation around user tasks, moved development history out of `docs`, and reduced the skill entrypoint to an on-demand router. Added an environment-readiness claim ceiling, bounded offline knowledge queries, workload-level method cards, a dated primary-source manifest, and optional external search and independent model challenge while keeping local evidence decisive.
+Reorganized public docs around user tasks; added readiness claim ceilings,
+bounded offline knowledge, primary-source manifests, and optional independent review.
 
 ### V2.8
 
-Added a read-only nonstationary serving-evidence gate. A create-once anchor binds the pre-measurement design before a balanced AB/BA plan is checked against fixed-duration, burn-in, paired-state, chronological, and raw-source identity rules. Inconclusive evidence remains visible and is routed to a redesigned experiment; the gate never claims a speedup or changes host settings.
+Added nonstationary serving comparability checks for balanced AB/BA evidence.
 
 ### V2.7
 
-Added direction-level admission, conservative impact ceilings, and an append-only stop/reopen ledger. The initial direction set is frozen, normalized evidence is byte-bound to its raw measurement source, closed directions leave the recommendation pool, equal ceilings cannot be reordered by display names, and reopening requires an exact closed-record reference plus a new window or target, normalized evidence, and raw source. AI agents now decide whether a direction is still worth a candidate round before spending V2.6 budget.
+Added direction-level admission, conservative headroom, and stop/reopen history.
 
 ### V2.6
 
-Added the performance-first iteration gate: frozen hypotheses, bounded tool repair, prevalidated fallbacks, and machine-readable round outcomes that cannot turn infrastructure work into a speedup claim.
+Added the performance-first iteration gate and bounded tool repair.
 
 ### V2.5
 
-Added formal evidence automation for shared hosts and serving runs: frozen designs, continuous guards, artifact and execution-path identity, sealed attempts, audit, and separate performance and integrity decisions.
+Added formal evidence automation, continuous guards, sealing, and audit.
 
 ### V2.4
 
-Added the complete workload controller, deterministic bottleneck diagnosis, bounded ChangeSets, advisory review, and the recommend-only boundary for host changes.
+Added the workload controller, bounded ChangeSets, and advisory host review.
 
 ### V2.3
 
-Expanded portable CUDA, CUTLASS, Triton, native and legacy coverage; added read-only NCU report analysis, strategy memory, and clearer systems, IR, and serving guidance.
+Expanded portable CUDA, CUTLASS, Triton, report analysis, and systems coverage.
 
 ### V2.2
 
-Established the dual-loop optimizer: paired kernel measurements, user-supplied workload validation, resumable checkpoints, sanitizer and compiler evidence, separate kernel/end-to-end conclusions, and the RTX 5090 test lane.
+Established the dual-loop kernel/workload optimizer and RTX 5090 test lane.
 
 ## Documentation
 
 - [Getting Started](docs/getting-started.md)
-- [Preparing a workload and environment](docs/environment-readiness.md)
+- [Preparing a workload](docs/environment-readiness.md)
 - [Workflow selection](docs/workflows.md)
+- [Long-running optimization](docs/long-running-optimization.md)
 - [Evidence and safety](docs/evidence-and-safety.md)
 - [Compatibility](docs/compatibility.md)
-- [Validation status](docs/validation.md)
-- [Case studies](docs/case-studies.md)
-- [Knowledge, search, and independent challenge](docs/knowledge-and-research.md)
-- [Agent execution protocol](skills/cuda-kernel-optimizer/SKILL.md)
-- [Kernel and workload walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
-- [Performance-first iteration contract](skills/cuda-kernel-optimizer/references/performance_iteration.md)
-- [Direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md)
-- [Nonstationary serving-evidence contract](skills/cuda-kernel-optimizer/references/nonstationary_serving_evidence.md)
-- [Formal V2.5 evidence reference](skills/cuda-kernel-optimizer/references/evidence_automation.md)
-- [Canonical compatibility reference](skills/cuda-kernel-optimizer/references/compatibility.md)
-- [RTX 5090 opt-in test guide](tests/gpu/sm120/README.md)
+- [Validation status](docs/validation.md) and [case studies](docs/case-studies.md)
+- [Knowledge and research](docs/knowledge-and-research.md)
+- [Agent protocol](skills/cuda-kernel-optimizer/SKILL.md) and [walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
+- [Performance iteration](skills/cuda-kernel-optimizer/references/performance_iteration.md), [direction admission](skills/cuda-kernel-optimizer/references/direction_admission.md), and [long-run control](skills/cuda-kernel-optimizer/references/long_running_control.md)
+- [Formal evidence](skills/cuda-kernel-optimizer/references/evidence_automation.md) and [canonical compatibility](skills/cuda-kernel-optimizer/references/compatibility.md)
+- [RTX 5090 opt-in guide](tests/gpu/sm120/README.md)
 - [MIT License](LICENSE)
 
-This project is independent of CUDA, CUTLASS, Triton, and Nsight Compute. Use those dependencies under their respective licenses.
+This project is independent of CUDA, CUTLASS, Triton, and Nsight Compute. Use
+those dependencies under their respective licenses.

@@ -44,9 +44,17 @@ may produce useful hypotheses, but not a performance result.
 These are ceilings. A task may stop earlier when it has a conclusive result, no
 eligible candidate remains, or required evidence is unavailable.
 
+Each budget also supplies a default stability policy: confidence and power
+targets, bootstrap count, minimum valid calibration pairs, and a recurring
+audit cadence. The frozen workload contract records the effective values, so a
+long run cannot silently relax them later. Users may override these values
+before the contract is frozen.
+
 ## First request
 
 > Use cuda-kernel-optimizer to optimize the Triton kernel in this directory. Confirm the runnable reference, inputs, performance goal, constraints, allowed files, and target environment before profiling. Use the balanced budget and keep a change only when correctness and paired performance both pass.
 
 Next, select the matching [workflow](workflows.md) and review the
-[evidence and safety boundaries](evidence-and-safety.md).
+[evidence and safety boundaries](evidence-and-safety.md). For work that may run
+for many iterations, also review the
+[long-running optimization loop](long-running-optimization.md).

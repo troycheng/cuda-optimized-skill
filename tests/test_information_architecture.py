@@ -43,6 +43,7 @@ class InformationArchitectureTests(unittest.TestCase):
             "references/environment_readiness.md",
             "references/research_augmentation.md",
             "references/offline_knowledge.md",
+            "references/long_running_control.md",
         ):
             self.assertIn(marker, text)
 
