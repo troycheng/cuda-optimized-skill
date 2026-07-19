@@ -102,7 +102,7 @@ python3 -m unittest tests.test_state_schema tests.test_iteration_guard tests.tes
 
 首批六个 playbook 对应架构文档中的六类场景。每个 playbook 控制篇幅，只包含适用信号、反例、步骤、验证、停止条件和来源；完整参考资料继续放在 `references/`，不复制进 `SKILL.md`。
 
-必须测试：精确架构、版本范围、必需信号、反向信号、冲突能力、最大返回数、上下文预算、过期降级和来源完整性。加入 `real` 与 `shuffled` registry 对照。
+必须测试：精确架构、版本范围、完整信号组、反向信号、冲突能力、最大返回数、UTF-8 字节硬预算、成本错报、过期与未来知识降级、来源完整性、单次快照和各级目录符号链接逃逸。加入 `real` 与 `shuffled` registry 对照。检索层没有执行或晋级权，只返回分阶段的封闭 `gate_requirements` 供阶段 3 的 Controller 解析。
 
 验证：
 
@@ -126,6 +126,11 @@ python3 skills/cuda-kernel-optimizer/scripts/self_check.py
 - `tests/test_planner_boundary.py`
 
 先接入现有 benchmark、PyTorch profiler、Nsys/NCU、compiler 和 serving 产物，不一次性重写采集器。摘要只能引用已封存产物；每个结论带来源摘要、时间、层级和新鲜度。Planner 输出严格候选 schema，任何预算、合同、账本或晋级字段都视为越权并拒绝。
+
+本阶段还要把能力查询返回的证据类别和 `gate_requirements` 解析为合同绑定的产物
+引用。`target_compile_probe`、autotune/dispatch identity、正确性、配对测量和
+workload replay 均由 Controller 校验；不能把字符串类别或知识卡自身状态当作已
+通过门禁。
 
 验证：
 

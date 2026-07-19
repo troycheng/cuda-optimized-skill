@@ -191,6 +191,7 @@ class InstalledSelfCheckTests(unittest.TestCase):
         self.assertIn("v2_7_direction_guard", payload["checks"])
         self.assertIn("v2_8_nonstationarity_guard", payload["checks"])
         self.assertIn("v3_control_runtime", payload["checks"])
+        self.assertIn("v3_capability_registry", payload["checks"])
 
     def test_self_check_fails_closed_for_missing_installation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -210,6 +211,74 @@ class InstalledSelfCheckTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("error", result.stderr.lower())
+
+    def test_self_check_fails_closed_for_tampered_capability_playbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            installed = Path(tmp) / "cuda-kernel-optimizer"
+            shutil.copytree(SKILL, installed)
+            playbook = (
+                installed
+                / "references"
+                / "capabilities"
+                / "triton-decode-attention-gqa.md"
+            )
+            playbook.write_text(
+                playbook.read_text(encoding="utf-8") + "\ntampered\n",
+                encoding="utf-8",
+            )
+
+            result = _run(SELF_CHECK, "--skill-dir", str(installed))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("playbook hash mismatch", result.stderr.lower())
+
+    def test_self_check_rejects_symlinked_capability_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            installed = base / "cuda-kernel-optimizer"
+            shutil.copytree(SKILL, installed)
+            capability_root = installed / "references" / "capabilities"
+            external = base / "external-capabilities"
+            shutil.copytree(capability_root, external)
+            shutil.rmtree(capability_root)
+            capability_root.symlink_to(external, target_is_directory=True)
+
+            result = _run(SELF_CHECK, "--skill-dir", str(installed))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink", result.stderr.lower())
+
+    def test_self_check_rejects_symlinked_references_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            installed = base / "cuda-kernel-optimizer"
+            shutil.copytree(SKILL, installed)
+            references = installed / "references"
+            external = base / "external-references"
+            shutil.copytree(references, external)
+            shutil.rmtree(references)
+            references.symlink_to(external, target_is_directory=True)
+
+            result = _run(SELF_CHECK, "--skill-dir", str(installed))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink", result.stderr.lower())
+
+    def test_self_check_rejects_symlinked_scripts_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            installed = base / "cuda-kernel-optimizer"
+            shutil.copytree(SKILL, installed)
+            scripts = installed / "scripts"
+            external = base / "external-scripts"
+            shutil.copytree(scripts, external)
+            shutil.rmtree(scripts)
+            scripts.symlink_to(external, target_is_directory=True)
+
+            result = _run(SELF_CHECK, "--skill-dir", str(installed))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink", result.stderr.lower())
 
 
 if __name__ == "__main__":

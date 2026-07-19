@@ -1,0 +1,46 @@
+{
+  "schema_version": "cuda-optimizer/capability-sources-v1",
+  "sources": [
+    {
+      "id": "tensormux.kernel-skills",
+      "title": "tensormux/kernel-skills",
+      "url": "https://github.com/tensormux/kernel-skills/tree/7b7337a123f8711aa8e3d0452351d8fd30dde4b7",
+      "kind": "reference-implementation",
+      "license": "MIT",
+      "last_reviewed": "2026-07-19",
+      "commit_sha": "7b7337a123f8711aa8e3d0452351d8fd30dde4b7"
+    },
+    {
+      "id": "triton.fused-attention",
+      "title": "Triton Fused Attention tutorial",
+      "url": "https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html",
+      "kind": "official-documentation",
+      "license": "MIT repository; documentation snapshot",
+      "last_reviewed": "2026-07-19"
+    },
+    {
+      "id": "triton.block-pointer-load",
+      "title": "triton.language.load block pointer semantics",
+      "url": "https://triton-lang.org/main/python-api/generated/triton.language.load.html",
+      "kind": "official-api-documentation",
+      "license": "MIT repository; documentation snapshot",
+      "last_reviewed": "2026-07-19"
+    },
+    {
+      "id": "nvidia.blackwell-tuning-12.9",
+      "title": "NVIDIA Blackwell Tuning Guide 12.9",
+      "url": "https://docs.nvidia.com/cuda/archive/12.9.2/blackwell-tuning-guide/index.html",
+      "kind": "official-documentation",
+      "license": "NVIDIA documentation terms",
+      "last_reviewed": "2026-07-19"
+    },
+    {
+      "id": "nvidia.nsys-user-guide",
+      "title": "NVIDIA Nsight Systems User Guide",
+      "url": "https://docs.nvidia.com/nsight-systems/UserGuide/index.html",
+      "kind": "official-documentation",
+      "license": "NVIDIA documentation terms",
+      "last_reviewed": "2026-07-19"
+    }
+  ]
+}

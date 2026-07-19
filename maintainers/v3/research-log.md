@@ -53,3 +53,38 @@
 保留：确定性控制、完整 workload 的有界离线闭环、按需能力库、可选外部质证、五臂消融和故障注入长跑。
 
 推迟：线上非平稳自适应、跨架构自动迁移、外部模型自动投票和未经授权的宿主机修改。
+
+## 能力层首轮技能 TDD 与外部质证
+
+首个场景是 RTX 5090 / `sm_120` 上的 Triton decode attention / GQA。无
+playbook 基线能守住“当前不能晋级”，但一次加载多份大文档，并在尚未证明 K/V
+重复读取时直接提出四 Q head 合并候选；它还自行分配了合同中不存在的基础设施
+时间比例。首张 playbook 因此先要求修复尾块正确性、确认 dispatch 与生成代码，
+再把短上下文 launch 和长上下文 KV 机制分开。
+
+同一设计交给 GLM、DeepSeek、Kimi 独立攻击，三方均给出 `REVISE`。采纳：
+
+- 把宽松的单信号 OR 改成“任一完整信号组”；
+- 删除检索输出中的 `candidate_admissible`，明确检索没有执行权；
+- 将门禁拆成 `pre_execution` 和 `promotion`：前者包含 correctness reference、
+  dispatch identity、target compile probe，后者包含 candidate correctness、paired
+  measurement 和 workload replay；
+- 对 playbook 正文复算精确 UTF-8 字节成本，声明值不一致时安装自检失败；具体
+  模型的 token 消耗留给评测记录，不再用启发式估算充当硬预算。
+
+随后独立代码审查发现清单校验后重复读取、符号链接逃逸、门禁词表未封闭、运行时
+校验弱于 schema，以及 `--validate` 仍依赖查询参数。实现改为单次快照校验和路由，
+清单、来源与 playbook 拒绝符号链接，查询同时返回 registry/source 哈希；阶段门禁
+采用封闭且完整的最小集合，版本、风险、playbook 后缀和版本区间由运行时同步校验。
+复审进一步复现了上层 `references` 软链和未来复核日期问题。最终读取改为从可信
+skill 根开始，用目录文件描述符逐层 `O_NOFOLLOW` 打开；安装自检执行的能力查询
+脚本也来自同一安全快照。历史 `as_of` 早于能力卡或任一来源复核日期时，知识状态
+降级为 `unverified_future`，避免未来知识污染旧实验。
+
+留到阶段 3：证据类别必须解析成带合同摘要、产物哈希、环境范围和新鲜度的真实
+引用；compile probe、autotune 配置和 dispatch identity 属于本次运行的证据，不
+固化在知识卡中。
+
+未采用：随机探索槽、固定 20% 探索概率、按命中次数计算固定冷却轮数、预写短长
+上下文阈值、知识卡级二进制哈希。这些建议要么破坏确定性和可归因性，要么把目标
+环境的运行事实错误地变成通用知识。短长分界必须由冻结 workload 和校准结果决定。

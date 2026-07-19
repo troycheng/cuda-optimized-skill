@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from pathlib import Path
+from types import ModuleType
 
 
 _SCHEMAS = (
@@ -51,13 +54,67 @@ _V3_SCRIPTS = (
     "workload_contract.py",
     "evidence_ledger.py",
     "run_control.py",
+    "capability_query.py",
 )
 _V3_SCHEMAS = (
     "workload_contract.schema.json",
     "candidate_proposal.schema.json",
     "run_event.schema.json",
     "run_control.schema.json",
+    "capability.schema.json",
 )
+
+
+def _read_safe_file(root: Path, relative: Path | str) -> bytes:
+    """Read a package file without following any child symlink."""
+    root = Path(os.path.abspath(root))
+    relative = Path(relative)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError(f"unsafe package path: {relative}")
+    common_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    directory_flags = common_flags | getattr(os, "O_DIRECTORY", 0)
+    descriptors = []
+    try:
+        parent = os.open(root, directory_flags)
+        descriptors.append(parent)
+        for part in relative.parts[:-1]:
+            parent = os.open(part, directory_flags, dir_fd=parent)
+            descriptors.append(parent)
+        descriptor = os.open(relative.parts[-1], common_flags, dir_fd=parent)
+        descriptors.append(descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"unsafe package file: {relative}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ValueError(
+            f"package path contains a symlink or unsafe component: {relative}"
+        ) from exc
+    finally:
+        for opened in reversed(descriptors):
+            os.close(opened)
+
+
+def _validate_capability_registry(root: Path) -> None:
+    script = root / "scripts" / "capability_query.py"
+    module = ModuleType("installed_capability_query")
+    module.__file__ = str(script)
+    script_bytes = _read_safe_file(root, Path("scripts") / "capability_query.py")
+    exec(compile(script_bytes, str(script), "exec"), module.__dict__)
+    capability_root = root / "references" / "capabilities"
+    module.validate_registry(
+        registry_path=capability_root / "registry.json",
+        sources_path=capability_root / "sources.json",
+        capability_root=capability_root,
+        trusted_root=root,
+    )
 
 
 def check_installation(skill_dir: Path | str) -> dict:
@@ -72,16 +129,12 @@ def check_installation(skill_dir: Path | str) -> dict:
 
     for name in _SCRIPTS:
         path = root / "scripts" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing script: {name}")
-        compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        source = _read_safe_file(root, Path("scripts") / name).decode("utf-8")
+        compile(source, str(path), "exec")
     checks.append("python_scripts")
 
     for name in _SCHEMAS:
-        path = root / "templates" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing schema: {name}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_safe_file(root, Path("templates") / name))
         if "v2.5" not in payload.get("$id", ""):
             raise ValueError(f"schema does not declare V2.5 identity: {name}")
         if payload.get("additionalProperties") is not False:
@@ -89,10 +142,7 @@ def check_installation(skill_dir: Path | str) -> dict:
     checks.append("v2_5_schemas")
 
     for name in _V2_6_SCHEMAS:
-        path = root / "templates" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing schema: {name}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_safe_file(root, Path("templates") / name))
         if "v2.6" not in payload.get("$id", ""):
             raise ValueError(f"schema does not declare V2.6 identity: {name}")
         if payload.get("additionalProperties") is not False:
@@ -100,46 +150,35 @@ def check_installation(skill_dir: Path | str) -> dict:
     checks.append("v2_6_iteration_guard")
 
     for name in _V2_7_SCHEMAS:
-        path = root / "templates" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing schema: {name}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_safe_file(root, Path("templates") / name))
         if "v2.7" not in payload.get("$id", ""):
             raise ValueError(f"schema does not declare V2.7 identity: {name}")
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"schema root must be closed: {name}")
-    reference = root / "references" / "direction_admission.md"
-    if reference.is_symlink() or not reference.is_file():
-        raise ValueError("missing reference: direction_admission.md")
+    _read_safe_file(root, Path("references") / "direction_admission.md")
     checks.append("v2_7_direction_guard")
 
     for name in _V2_8_SCHEMAS:
-        path = root / "templates" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing schema: {name}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_safe_file(root, Path("templates") / name))
         if "v2.8" not in payload.get("$id", ""):
             raise ValueError(f"schema does not declare V2.8 identity: {name}")
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"schema root must be closed: {name}")
-    reference = root / "references" / "nonstationary_serving_evidence.md"
-    if reference.is_symlink() or not reference.is_file():
-        raise ValueError("missing reference: nonstationary_serving_evidence.md")
+    _read_safe_file(root, Path("references") / "nonstationary_serving_evidence.md")
     checks.append("v2_8_nonstationarity_guard")
 
     for name in _V3_SCRIPTS:
         path = root / "scripts" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing V3 script: {name}")
-        compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        source = _read_safe_file(root, Path("scripts") / name).decode("utf-8")
+        compile(source, str(path), "exec")
     for name in _V3_SCHEMAS:
-        path = root / "templates" / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing V3 schema: {name}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_read_safe_file(root, Path("templates") / name))
         if payload.get("additionalProperties") is not False:
             raise ValueError(f"V3 schema root must be closed: {name}")
     checks.append("v3_control_runtime")
+
+    _validate_capability_registry(root)
+    checks.append("v3_capability_registry")
 
     return {
         "schema_version": "cuda-evidence/self-check-v1",

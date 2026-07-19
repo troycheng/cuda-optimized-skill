@@ -1,0 +1,37 @@
+{
+  "schema_version": "cuda-optimizer/capability-registry-v1",
+  "known_architectures": {
+    "sm_120": ["tensor_core", "cp_async", "tma", "block_scaling"]
+  },
+  "capabilities": [
+    {
+      "id": "triton.decode-attention-gqa",
+      "version": "0.1.0",
+      "status": "experimental",
+      "task": "decode_attention",
+      "layer": "kernel",
+      "axes": ["latency", "memory", "correctness"],
+      "architectures": ["sm_120"],
+      "required_features": [],
+      "frameworks": {
+        "triton": {"min_inclusive": "3.0.0", "max_exclusive": "4.0.0"}
+      },
+      "signal_groups": [["collective_rank_imbalance", "input_pipeline_starvation"]],
+      "counter_signals_any": ["gqa_head_ratio"],
+      "requires_evidence": ["nsys_timeline", "pytorch_profile"],
+      "gate_requirements": {
+        "pre_execution": ["correctness_reference", "dispatch_identity", "target_compile_probe"],
+        "promotion": ["candidate_correctness", "paired_measurement", "workload_replay"]
+      },
+      "contract_binding_required": true,
+      "conflicts": [],
+      "context_cost_bytes": 2774,
+      "playbook": "triton-decode-attention-gqa.md",
+      "playbook_sha256": "b36a049b02211b564c062d8baca7b7d209a46bba9b8375845bf263c744cfdc59",
+      "source_ids": ["tensormux.kernel-skills", "triton.fused-attention", "triton.block-pointer-load", "nvidia.blackwell-tuning-12.9", "nvidia.nsys-user-guide"],
+      "last_reviewed": "2026-07-19",
+      "risk": "high",
+      "method_ids": ["memory.kernel_fusion", "memory.async_copy", "latency.cuda_graphs"]
+    }
+  ]
+}
