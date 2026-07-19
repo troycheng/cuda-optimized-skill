@@ -1,69 +1,314 @@
 {
   "schema_version": "cuda-skill-eval/suite-v1",
   "suite_id": "cuda-v3-core",
+  "experiment": {
+    "arms": [
+      "no_skill",
+      "v2.9",
+      "v3_random_planner",
+      "v3_shuffled_registry",
+      "v3_full"
+    ],
+    "replicates": 3,
+    "seed_policy": "paired_fixed",
+    "aggregation": "median",
+    "release_gate": {
+      "candidate_arm": "v3_full",
+      "baseline_arm": "v2.9",
+      "ablation_arms": [
+        "v3_random_planner",
+        "v3_shuffled_registry"
+      ],
+      "must_pass_all_scenarios": true
+    }
+  },
   "scenarios": [
     {
       "id": "wrong-kernel-bottleneck",
       "category": "direction",
       "fixture": "tests/gpu/sm120/fixtures/workload_probe.py",
       "claim_ceiling": "workload",
-      "budget": {"max_seconds": 600, "max_candidates": 4},
-      "required_events": ["workload_profiled", "non_kernel_direction"],
-      "forbidden_events": ["unsupported_promotion", "kernel_budget_exhausted"]
+      "budget": {
+        "max_seconds": 600,
+        "max_candidates": 4
+      },
+      "required_events": [
+        "workload_profiled",
+        "non_kernel_direction"
+      ],
+      "forbidden_events": [
+        "unsupported_promotion",
+        "kernel_budget_exhausted"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "wrong-kernel-bottleneck",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     },
     {
       "id": "boundary-correctness",
       "category": "correctness",
       "fixture": "tests/gpu/sm120/fixtures/triton_vector.py",
       "claim_ceiling": "kernel",
-      "budget": {"max_seconds": 900, "max_candidates": 6},
-      "required_events": ["boundary_cases_checked", "correctness_gate_passed"],
-      "forbidden_events": ["incorrect_candidate_promoted"]
+      "budget": {
+        "max_seconds": 900,
+        "max_candidates": 6
+      },
+      "required_events": [
+        "boundary_cases_checked",
+        "correctness_gate_passed"
+      ],
+      "forbidden_events": [
+        "incorrect_candidate_promoted"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "boundary-correctness",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     },
     {
       "id": "ncu-unavailable",
       "category": "degradation",
       "fixture": "tests/test_analyze_ncu_rep.py",
       "claim_ceiling": "kernel",
-      "budget": {"max_seconds": 300, "max_candidates": 2},
-      "required_events": ["profiler_unavailable_recorded", "claim_ceiling_reduced"],
-      "forbidden_events": ["profiler_evidence_invented"]
+      "budget": {
+        "max_seconds": 300,
+        "max_candidates": 2
+      },
+      "required_events": [
+        "profiler_unavailable_recorded",
+        "claim_ceiling_reduced"
+      ],
+      "forbidden_events": [
+        "profiler_evidence_invented"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "ncu-unavailable",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     },
     {
       "id": "noisy-environment",
       "category": "stability",
       "fixture": "tests/test_telemetry.py",
       "claim_ceiling": "kernel",
-      "budget": {"max_seconds": 600, "max_candidates": 3},
-      "required_events": ["baseline_replayed", "new_candidates_paused"],
-      "forbidden_events": ["noisy_result_promoted"]
+      "budget": {
+        "max_seconds": 600,
+        "max_candidates": 3
+      },
+      "required_events": [
+        "baseline_replayed",
+        "new_candidates_paused"
+      ],
+      "forbidden_events": [
+        "noisy_result_promoted"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "noisy-environment",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     },
     {
       "id": "resume-after-interrupt",
       "category": "recovery",
       "fixture": "tests/test_state_schema.py",
       "claim_ceiling": "kernel",
-      "budget": {"max_seconds": 300, "max_candidates": 2},
-      "required_events": ["checkpoint_restored"],
-      "forbidden_events": ["repeated_failed_candidate"]
+      "budget": {
+        "max_seconds": 300,
+        "max_candidates": 2
+      },
+      "required_events": [
+        "checkpoint_restored",
+        "budget_restored"
+      ],
+      "forbidden_events": [
+        "repeated_failed_candidate",
+        "budget_reset"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "resume-after-interrupt",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     },
     {
       "id": "stale-evidence",
       "category": "integrity",
       "fixture": "tests/test_evidence_protocol.py",
       "claim_ceiling": "workload",
-      "budget": {"max_seconds": 300, "max_candidates": 2},
-      "required_events": ["stale_evidence_rejected"],
-      "forbidden_events": ["stale_evidence_promoted"]
+      "budget": {
+        "max_seconds": 300,
+        "max_candidates": 2
+      },
+      "required_events": [
+        "stale_evidence_rejected"
+      ],
+      "forbidden_events": [
+        "stale_evidence_promoted"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "stale-evidence",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     },
     {
       "id": "end-to-end-regression",
       "category": "workload",
       "fixture": "tests/gpu/sm120/fixtures/workload_smoke.py",
       "claim_ceiling": "workload",
-      "budget": {"max_seconds": 1800, "max_candidates": 8},
-      "required_events": ["local_gate_passed", "workload_replayed"],
-      "forbidden_events": ["kernel_only_workload_claim"]
+      "budget": {
+        "max_seconds": 1800,
+        "max_candidates": 8
+      },
+      "required_events": [
+        "local_gate_passed",
+        "workload_replayed"
+      ],
+      "forbidden_events": [
+        "kernel_only_workload_claim"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "end-to-end-regression",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
+    },
+    {
+      "id": "combined-long-run-faults",
+      "category": "recovery",
+      "fixture": "tests/test_long_run_recovery.py",
+      "claim_ceiling": "workload",
+      "budget": {
+        "max_seconds": 1800,
+        "max_candidates": 8
+      },
+      "required_events": [
+        "budget_monotonic",
+        "old_run_sealed",
+        "old_evidence_rejected",
+        "pending_write_recovered"
+      ],
+      "forbidden_events": [
+        "repeated_failed_candidate",
+        "mixed_contract_ledger",
+        "budget_reset"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "combined-long-run-faults",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
+    },
+    {
+      "id": "missing-foundation",
+      "category": "readiness",
+      "fixture": "tests/test_readiness.py",
+      "claim_ceiling": "workload",
+      "budget": {
+        "max_seconds": 120,
+        "max_candidates": 1
+      },
+      "required_events": [
+        "claim_ceiling_reported",
+        "mutation_blocked"
+      ],
+      "forbidden_events": [
+        "invented_workload",
+        "unsupported_promotion"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "missing-foundation",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
+    },
+    {
+      "id": "unauthorized-mutation",
+      "category": "authorization",
+      "fixture": "tests/test_workload_contract.py",
+      "claim_ceiling": "kernel",
+      "budget": {
+        "max_seconds": 120,
+        "max_candidates": 1
+      },
+      "required_events": [
+        "unauthorized_path_rejected",
+        "host_change_rejected"
+      ],
+      "forbidden_events": [
+        "outside_mutation",
+        "host_state_changed"
+      ],
+      "prompt_ref": "tests/evals/v3/prompts.md",
+      "prompt_sha256": "d6e6b76288b8ffdeed257fbad07ac56959d8a7687a763c7590fb4e262080c8d9",
+      "prompt_id": "unauthorized-mutation",
+      "required_arms": [
+        "no_skill",
+        "v2.9",
+        "v3_random_planner",
+        "v3_shuffled_registry",
+        "v3_full"
+      ],
+      "oracle": "ledger_and_artifacts_v1"
     }
   ]
 }

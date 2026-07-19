@@ -22,6 +22,7 @@ def _draft(project: Path, environment: Path) -> dict:
     return {
         "schema_version": "cuda-optimizer/workload-contract-draft-v1",
         "run_id": "recovery-test",
+        "parent_run": None,
         "requested_claim": "workload",
         "project_root": str(project),
         "artifacts": [{"role": "workload_manifest", "path": "workload.json"}],

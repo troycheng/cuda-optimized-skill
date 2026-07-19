@@ -14,6 +14,7 @@ MODULE_PATH = (
     / "scripts"
     / "workload_contract.py"
 )
+CONTROL_PATH = MODULE_PATH.with_name("run_control.py")
 
 
 def _load_module():
@@ -24,10 +25,19 @@ def _load_module():
     return module
 
 
+def _load_control():
+    spec = importlib.util.spec_from_file_location("cuda_contract_parent_control", CONTROL_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _draft(project: Path, environment: Path) -> dict:
     return {
         "schema_version": "cuda-optimizer/workload-contract-draft-v1",
         "run_id": "sm120-attention-001",
+        "parent_run": None,
         "requested_claim": "workload",
         "project_root": str(project),
         "artifacts": [
@@ -192,6 +202,74 @@ class WorkloadContractTests(unittest.TestCase):
                     changed[field] = value
                 with self.subTest(field), self.assertRaisesRegex(ValueError, message):
                     self.contract.validate_draft(changed)
+
+    def test_parent_run_identity_is_closed_and_cannot_reuse_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, _environment, draft = self._fixture(root)
+            draft["parent_run"] = {
+                "run_id": draft["run_id"],
+                "contract_sha256": "1" * 64,
+                "ledger_tail_sha256": "2" * 64,
+            }
+            with self.assertRaisesRegex(ValueError, "parent|run_id"):
+                self.contract.validate_draft(draft)
+
+    def test_child_contract_requires_and_verifies_parent_contract_and_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _project, _environment, parent_draft = self._fixture(root)
+            parent_draft["run_id"] = "parent-run"
+            parent_contract_path = root / "parent-contract.json"
+            parent = self.contract.freeze_contract(parent_draft, parent_contract_path)
+            parent_run = root / "parent-run"
+            control = _load_control()
+            control.initialize_run(parent_contract_path, parent_run, now=0.0)
+            control.transition_run(parent_contract_path, parent_run, "freeze", now=1.0)
+            control.transition_run(parent_contract_path, parent_run, "calibrate", now=2.0)
+            control.transition_run(
+                parent_contract_path,
+                parent_run,
+                "start_exploration",
+                now=3.0,
+                environment_state="green",
+                measurable=True,
+            )
+            record = control.transition_run(
+                parent_contract_path,
+                parent_run,
+                "drift",
+                now=4.0,
+                reason="source_identity_changed",
+            )
+
+            child = dict(parent_draft)
+            child["run_id"] = "child-run"
+            child["parent_run"] = {
+                "run_id": "parent-run",
+                "contract_sha256": parent["contract_sha256"],
+                "ledger_tail_sha256": record["tail_sha256"],
+            }
+            with self.assertRaisesRegex(ValueError, "parent"):
+                self.contract.freeze_contract(child, root / "unlinked-child.json")
+            frozen = self.contract.freeze_contract(
+                child,
+                root / "child.json",
+                parent_contract_path=parent_contract_path,
+                parent_run_dir=parent_run,
+            )
+            self.assertEqual(frozen["parent_run"], child["parent_run"])
+
+            changed = dict(child)
+            changed["parent_run"] = dict(child["parent_run"])
+            changed["parent_run"]["ledger_tail_sha256"] = "9" * 64
+            with self.assertRaisesRegex(ValueError, "parent.*tail|ledger"):
+                self.contract.freeze_contract(
+                    changed,
+                    root / "bad-child.json",
+                    parent_contract_path=parent_contract_path,
+                    parent_run_dir=parent_run,
+                )
 
 
 if __name__ == "__main__":

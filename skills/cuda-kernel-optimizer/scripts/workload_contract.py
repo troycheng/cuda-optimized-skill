@@ -40,6 +40,17 @@ def _load_artifact_store():
 _ARTIFACT_STORE = _load_artifact_store()
 
 
+def _load_run_control():
+    path = Path(__file__).with_name("run_control.py")
+    spec = importlib.util.spec_from_file_location(
+        "cuda_optimizer_parent_run_control", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 class ValidationError(ValueError):
     """Raised when a workload contract is open, unsafe, or inconsistent."""
 
@@ -208,6 +219,7 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
     fields = {
         "schema_version",
         "run_id",
+        "parent_run",
         "requested_claim",
         "project_root",
         "artifacts",
@@ -224,6 +236,21 @@ def _validate_common(value: Mapping[str, Any], *, frozen: bool) -> dict:
     if contract["schema_version"] != expected_schema:
         raise ValidationError(f"schema_version must be {expected_schema}")
     _identifier(contract["run_id"], "run_id")
+    parent_run = contract["parent_run"]
+    if parent_run is not None:
+        parent_run = _object(parent_run, "parent_run")
+        _closed(
+            parent_run,
+            {"run_id", "contract_sha256", "ledger_tail_sha256"},
+            "parent_run",
+        )
+        parent_run_id = _identifier(parent_run["run_id"], "parent_run.run_id")
+        if parent_run_id == contract["run_id"]:
+            raise ValidationError("parent_run.run_id must differ from run_id")
+        for field in ("contract_sha256", "ledger_tail_sha256"):
+            digest = parent_run[field]
+            if type(digest) is not str or _SHA256.fullmatch(digest) is None:
+                raise ValidationError(f"parent_run.{field} must be lowercase SHA-256")
     if contract["requested_claim"] not in _CLAIMS:
         raise ValidationError("requested_claim must be kernel, workload, or serving")
 
@@ -333,9 +360,37 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def freeze_contract(value: Mapping[str, Any], out_path: str | os.PathLike) -> dict:
+def freeze_contract(
+    value: Mapping[str, Any],
+    out_path: str | os.PathLike,
+    *,
+    parent_contract_path: str | os.PathLike | None = None,
+    parent_run_dir: str | os.PathLike | None = None,
+) -> dict:
     """Bind regular artifact bytes and create one immutable contract file."""
     draft = validate_draft(value)
+    parent = draft["parent_run"]
+    if parent is None:
+        if parent_contract_path is not None or parent_run_dir is not None:
+            raise ValidationError("root contract must not supply parent run paths")
+    else:
+        if parent_contract_path is None or parent_run_dir is None:
+            raise ValidationError(
+                "child contract requires parent_contract_path and parent_run_dir"
+            )
+        parent_contract = verify_frozen_contract(parent_contract_path)
+        loaded_parent = _load_run_control().load_run(
+            parent_contract_path, parent_run_dir
+        )
+        if loaded_parent["state"]["phase"] not in {"DRIFTED", "STOPPED"}:
+            raise ValidationError("parent run must be DRIFTED or STOPPED")
+        expected_parent = {
+            "run_id": parent_contract["run_id"],
+            "contract_sha256": parent_contract["contract_sha256"],
+            "ledger_tail_sha256": loaded_parent["tail_sha256"],
+        }
+        if parent != expected_parent:
+            raise ValidationError("parent run contract or ledger tail identity mismatch")
     project_root = Path(draft["project_root"])
     frozen = _copy_json(draft)
     frozen["schema_version"] = FROZEN_SCHEMA
@@ -394,6 +449,8 @@ def build_parser() -> argparse.ArgumentParser:
     freeze = subparsers.add_parser("freeze", help="freeze a draft contract")
     freeze.add_argument("--input", required=True)
     freeze.add_argument("--out", required=True)
+    freeze.add_argument("--parent-contract")
+    freeze.add_argument("--parent-run-dir")
     verify = subparsers.add_parser("verify", help="verify a frozen contract")
     verify.add_argument("--input", required=True)
     return parser
@@ -402,7 +459,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "freeze":
-        result = freeze_contract(load_json_strict(args.input), args.out)
+        result = freeze_contract(
+            load_json_strict(args.input),
+            args.out,
+            parent_contract_path=args.parent_contract,
+            parent_run_dir=args.parent_run_dir,
+        )
     else:
         result = verify_frozen_contract(args.input)
     print(json.dumps(result, sort_keys=True, ensure_ascii=False))

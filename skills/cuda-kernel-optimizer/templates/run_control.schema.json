@@ -16,6 +16,7 @@
     "objective_metric",
     "objective_direction",
     "mutation_paths",
+    "project_root",
     "candidates_started",
     "active_candidate",
     "candidate_history",
@@ -43,6 +44,7 @@
       "uniqueItems": true,
       "items": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"}
     },
+    "project_root": {"type": "string", "pattern": "^/"},
     "candidates_started": {"type": "integer", "minimum": 0},
     "active_candidate": {"type": ["object", "null"]},
     "candidate_history": {"type": "array", "items": {"type": "object"}},

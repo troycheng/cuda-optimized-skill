@@ -7,6 +7,7 @@
   "required": [
     "schema_version",
     "run_id",
+    "parent_run",
     "requested_claim",
     "project_root",
     "artifacts",
@@ -20,6 +21,21 @@
   "properties": {
     "schema_version": {"const": "cuda-optimizer/workload-contract-v1"},
     "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "parent_run": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run_id", "contract_sha256", "ledger_tail_sha256"],
+          "properties": {
+            "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+            "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "ledger_tail_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      ]
+    },
     "requested_claim": {"enum": ["kernel", "workload", "serving"]},
     "project_root": {"type": "string", "minLength": 1},
     "artifacts": {

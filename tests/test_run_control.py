@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -30,6 +31,7 @@ def _contract(**overrides) -> dict:
         "evidence": {"max_age_seconds": 60.0},
         "objective": {"metric": "request_latency", "direction": "lower"},
         "mutation": {"project_paths": ["kernels"]},
+        "project_root": str(ROOT),
     }
     value.update(overrides)
     return value
@@ -180,14 +182,15 @@ class RunControlTests(unittest.TestCase):
                 evidence_age_seconds=1.0,
                 now=3.0,
             )
-        with self.assertRaisesRegex(ValueError, "budget"):
-            self.control.register_candidate(
-                state,
-                _proposal(),
-                contract_sha256="a" * 64,
-                evidence_age_seconds=1.0,
-                now=1001.0,
-            )
+        stopped = self.control.register_candidate(
+            state,
+            _proposal(),
+            contract_sha256="a" * 64,
+            evidence_age_seconds=1.0,
+            now=1001.0,
+        )
+        self.assertEqual(stopped["phase"], "STOPPED")
+        self.assertEqual(stopped["stop_reason"], "time_budget_exhausted")
 
         drifted = self.control.advance(state, "drift", now=5.0, reason="source_identity_changed")
         self.assertEqual(drifted["phase"], "DRIFTED")
@@ -222,6 +225,33 @@ class RunControlTests(unittest.TestCase):
                 now=3.0,
             )
 
+    def test_nested_symlink_cannot_escape_an_allowed_mutation_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            kernels = project / "kernels"
+            outside = Path(tmp) / "outside"
+            kernels.mkdir(parents=True)
+            outside.mkdir()
+            (kernels / "link").symlink_to(outside, target_is_directory=True)
+            contract = _contract(project_root=str(project))
+            state = self.control.initialize_state(contract, now=0.0)
+            state = self.control.advance(state, "freeze", now=1.0)
+            state = self.control.advance(state, "calibrate", now=2.0)
+            state = self.control.advance(
+                state,
+                "start_exploration",
+                now=3.0,
+                environment_state="green",
+                measurable=True,
+            )
+            with self.assertRaisesRegex(ValueError, "symlink|unsafe|mutation"):
+                self.control.register_candidate(
+                    state,
+                    _proposal(paths=["kernels/link/out.py"]),
+                    contract_sha256="a" * 64,
+                    evidence_age_seconds=0.0,
+                    now=4.0,
+                )
     def test_yellow_pauses_for_audit_and_red_stops(self) -> None:
         state = _exploring(self.control)
         yellow = self.control.advance(
@@ -285,7 +315,51 @@ class RunControlTests(unittest.TestCase):
             now=1001.0,
         )
         self.assertEqual(stopped["phase"], "STOPPED")
-        self.assertEqual(stopped["stop_reason"], "budget_exhausted")
+        self.assertEqual(stopped["stop_reason"], "time_budget_exhausted")
+
+    def test_idle_deadline_and_candidate_count_exhaustion_persist_stop_state(self) -> None:
+        state = _exploring(self.control)
+        timed_out = self.control.advance(state, "audit", now=1001.0)
+        self.assertEqual(timed_out["phase"], "STOPPED")
+        self.assertEqual(timed_out["stop_reason"], "time_budget_exhausted")
+
+        one_candidate_contract = _contract(
+            budget={"preset": "quick", "max_seconds": 1000.0, "max_candidates": 1}
+        )
+        state = self.control.initialize_state(one_candidate_contract, now=0.0)
+        state = self.control.advance(state, "freeze", now=1.0)
+        state = self.control.advance(state, "calibrate", now=2.0)
+        state = self.control.advance(
+            state,
+            "start_exploration",
+            now=3.0,
+            environment_state="green",
+            measurable=True,
+        )
+        state = self.control.register_candidate(
+            state,
+            _proposal(),
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=4.0,
+        )
+        state = self.control.resolve_candidate(
+            state,
+            candidate_id="candidate-1",
+            outcome="KILL",
+            correctness_ok=True,
+            performance_gate_passed=False,
+            now=5.0,
+        )
+        stopped = self.control.register_candidate(
+            state,
+            _proposal(candidate_id="candidate-2"),
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=6.0,
+        )
+        self.assertEqual(stopped["phase"], "STOPPED")
+        self.assertEqual(stopped["stop_reason"], "candidate_budget_exhausted")
 
     def test_proposal_is_closed_and_cannot_set_control_or_promotion_fields(self) -> None:
         valid = self.control.validate_candidate_proposal(_proposal())

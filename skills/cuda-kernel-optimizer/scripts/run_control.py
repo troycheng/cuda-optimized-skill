@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,22 @@ def _paths(value: Any) -> list[str]:
     return paths
 
 
+def _candidate_path_has_no_symlink(project_root: str, relative: str) -> None:
+    current = Path(project_root)
+    for component in Path(relative).parts:
+        current = current / component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValidationError(f"candidate mutation path is unsafe: {relative}") from error
+        if stat.S_ISLNK(mode):
+            raise ValidationError(
+                f"candidate mutation path contains a symlink: {relative}"
+            )
+
+
 def validate_candidate_proposal(value: Mapping[str, Any]) -> dict:
     if type(value) is not dict:
         raise ValidationError("candidate proposal must be an object")
@@ -174,7 +191,7 @@ def validate_candidate_proposal(value: Mapping[str, Any]) -> dict:
 
 def _validate_contract_subset(
     contract: Mapping[str, Any]
-) -> tuple[str, dict, dict, dict, list[str]]:
+) -> tuple[str, dict, dict, dict, list[str], str]:
     if not isinstance(contract, Mapping):
         raise ValidationError("contract must be an object")
     if contract.get("schema_version") != "cuda-optimizer/workload-contract-v1":
@@ -199,19 +216,28 @@ def _validate_contract_subset(
     if direction not in {"lower", "higher"}:
         raise ValidationError("objective.direction must be lower or higher")
     mutation_paths = _paths(mutation.get("project_paths"))
+    project_root = contract.get("project_root")
+    if type(project_root) is not str or not Path(project_root).is_absolute():
+        raise ValidationError("contract project_root must be an absolute path")
     return (
         contract_sha,
         {"max_seconds": max_seconds, "max_candidates": max_candidates},
         {"max_age_seconds": max_age},
         {"metric": metric, "direction": direction},
         mutation_paths,
+        project_root,
     )
 
 
 def initialize_state(contract: Mapping[str, Any], *, now: float) -> dict:
-    contract_sha, budget, evidence, objective, mutation_paths = _validate_contract_subset(
-        contract
-    )
+    (
+        contract_sha,
+        budget,
+        evidence,
+        objective,
+        mutation_paths,
+        project_root,
+    ) = _validate_contract_subset(contract)
     timestamp = _finite(now, "now")
     return {
         "schema_version": STATE_SCHEMA,
@@ -225,6 +251,7 @@ def initialize_state(contract: Mapping[str, Any], *, now: float) -> dict:
         "objective_metric": objective["metric"],
         "objective_direction": objective["direction"],
         "mutation_paths": mutation_paths,
+        "project_root": project_root,
         "candidates_started": 0,
         "active_candidate": None,
         "candidate_history": [],
@@ -252,6 +279,7 @@ def _validate_state(value: Mapping[str, Any]) -> dict:
         "objective_metric",
         "objective_direction",
         "mutation_paths",
+        "project_root",
         "candidates_started",
         "active_candidate",
         "candidate_history",
@@ -279,6 +307,8 @@ def _validate_state(value: Mapping[str, Any]) -> dict:
     if value["objective_direction"] not in {"lower", "higher"}:
         raise ValidationError("objective_direction must be lower or higher")
     _paths(value["mutation_paths"])
+    if type(value["project_root"]) is not str or not Path(value["project_root"]).is_absolute():
+        raise ValidationError("project_root must be an absolute path")
     if isinstance(value["candidates_started"], bool) or not isinstance(value["candidates_started"], int) or value["candidates_started"] < 0:
         raise ValidationError("candidates_started must be a nonnegative integer")
     if type(value["candidate_history"]) is not list:
@@ -360,6 +390,22 @@ def _validate_stored_candidate(
     return _json_copy(value, field)
 
 
+def _stop_for_budget(current: dict, *, timestamp: float, reason: str) -> dict:
+    if current["active_candidate"] is not None:
+        deferred = current["active_candidate"] | {
+            "outcome": "DEFERRED",
+            "resolved_at": timestamp,
+            "correctness_ok": None,
+            "performance_gate_passed": None,
+        }
+        current["candidate_history"].append(deferred)
+        current["active_candidate"] = None
+    current["phase"] = "STOPPED"
+    current["stop_reason"] = reason
+    current["updated_at"] = timestamp
+    return current
+
+
 def advance(
     state: Mapping[str, Any],
     action: str,
@@ -379,6 +425,13 @@ def advance(
         raise ValidationError(f"illegal state transition: {current['phase']} + {action}")
     if current["active_candidate"] is not None and action not in {"drift", "environment_red", "stop"}:
         raise ValidationError("active candidate must be resolved before state transition")
+    if (
+        timestamp - current["started_at"] >= current["max_seconds"]
+        and action not in {"stop", "drift", "environment_red"}
+    ):
+        return _stop_for_budget(
+            current, timestamp=timestamp, reason="time_budget_exhausted"
+        )
 
     target = _TRANSITIONS[key]
     if action == "start_exploration":
@@ -455,11 +508,16 @@ def register_candidate(
             raise ValidationError(
                 f"candidate paths are outside the allowed mutation roots: {path}"
             )
+        _candidate_path_has_no_symlink(current["project_root"], path)
     elapsed = timestamp - current["started_at"]
     if current["candidates_started"] >= current["max_candidates"]:
-        raise ValidationError("candidate budget is exhausted")
+        return _stop_for_budget(
+            current, timestamp=timestamp, reason="candidate_budget_exhausted"
+        )
     if elapsed >= current["max_seconds"] or elapsed + candidate["estimated_cost_seconds"] > current["max_seconds"]:
-        raise ValidationError("time budget cannot admit this candidate")
+        return _stop_for_budget(
+            current, timestamp=timestamp, reason="time_budget_exhausted"
+        )
     existing_ids = {item["candidate_id"] for item in current["candidate_history"]}
     if candidate["candidate_id"] in existing_ids:
         raise ValidationError("candidate_id was already used")
@@ -508,7 +566,7 @@ def resolve_candidate(
     current["active_candidate"] = None
     if timestamp - current["started_at"] >= current["max_seconds"]:
         current["phase"] = "STOPPED"
-        current["stop_reason"] = "budget_exhausted"
+        current["stop_reason"] = "time_budget_exhausted"
     current["updated_at"] = timestamp
     return current
 

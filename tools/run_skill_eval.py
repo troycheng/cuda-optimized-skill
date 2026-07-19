@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
 import math
@@ -20,6 +21,14 @@ SCORE_SCHEMA = "cuda-skill-eval/score-v1"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _CLAIMS = {"kernel", "workload", "serving"}
 _STATUSES = {"completed", "blocked", "failed"}
+_ARMS = [
+    "no_skill",
+    "v2.9",
+    "v3_random_planner",
+    "v3_shuffled_registry",
+    "v3_full",
+]
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _load_artifact_store():
@@ -95,6 +104,14 @@ def _identifier(value: Any, field: str) -> str:
     return value
 
 
+def _sha(value: Any, field: str, *, nullable: bool = False) -> str | None:
+    if nullable and value is None:
+        return None
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        raise ValidationError(f"{field} must be lowercase SHA-256")
+    return value
+
+
 def _string(value: Any, field: str) -> str:
     if type(value) is not str or not value.strip():
         raise ValidationError(f"{field} must be a non-empty string")
@@ -138,10 +155,47 @@ def _copy(value: Any) -> Any:
 
 def validate_suite(value: Mapping[str, Any], root: str | os.PathLike) -> dict:
     suite = _object(value, "suite")
-    _closed(suite, {"schema_version", "suite_id", "scenarios"}, "suite")
+    _closed(
+        suite,
+        {"schema_version", "suite_id", "experiment", "scenarios"},
+        "suite",
+    )
     if suite["schema_version"] != SUITE_SCHEMA:
         raise ValidationError(f"schema_version must be {SUITE_SCHEMA}")
     _identifier(suite["suite_id"], "suite_id")
+    experiment = _object(suite["experiment"], "experiment")
+    _closed(
+        experiment,
+        {"arms", "replicates", "seed_policy", "aggregation", "release_gate"},
+        "experiment",
+    )
+    if experiment["arms"] != _ARMS:
+        raise ValidationError(
+            "experiment arms must use the preregistered five-arm matrix"
+        )
+    if (
+        isinstance(experiment["replicates"], bool)
+        or not isinstance(experiment["replicates"], int)
+        or experiment["replicates"] < 2
+    ):
+        raise ValidationError("experiment.replicates must be an integer of at least 2")
+    if experiment["seed_policy"] != "paired_fixed":
+        raise ValidationError("experiment.seed_policy must be paired_fixed")
+    if experiment["aggregation"] != "median":
+        raise ValidationError("experiment.aggregation must be median")
+    release_gate = _object(experiment["release_gate"], "experiment.release_gate")
+    _closed(
+        release_gate,
+        {"candidate_arm", "baseline_arm", "ablation_arms", "must_pass_all_scenarios"},
+        "experiment.release_gate",
+    )
+    if release_gate != {
+        "candidate_arm": "v3_full",
+        "baseline_arm": "v2.9",
+        "ablation_arms": ["v3_random_planner", "v3_shuffled_registry"],
+        "must_pass_all_scenarios": True,
+    }:
+        raise ValidationError("experiment.release_gate must preserve the V3 ablations")
     scenarios = suite["scenarios"]
     if type(scenarios) is not list or not scenarios:
         raise ValidationError("scenarios must be a non-empty array")
@@ -155,6 +209,11 @@ def validate_suite(value: Mapping[str, Any], root: str | os.PathLike) -> dict:
         "budget",
         "required_events",
         "forbidden_events",
+        "prompt_ref",
+        "prompt_sha256",
+        "prompt_id",
+        "required_arms",
+        "oracle",
     }
     for index, item in enumerate(scenarios):
         scenario = _object(item, f"scenarios[{index}]")
@@ -186,6 +245,30 @@ def validate_suite(value: Mapping[str, Any], root: str | os.PathLike) -> dict:
         forbidden = _events(scenario["forbidden_events"], f"scenarios[{index}].forbidden_events")
         if set(required).intersection(forbidden):
             raise ValidationError("required_events and forbidden_events must not overlap")
+        prompt_relative = Path(
+            _string(scenario["prompt_ref"], f"scenarios[{index}].prompt_ref")
+        )
+        if prompt_relative.is_absolute() or ".." in prompt_relative.parts:
+            raise ValidationError(f"scenarios[{index}].prompt_ref must be contained")
+        prompt_path = (root_path / prompt_relative).resolve()
+        try:
+            prompt_path.relative_to(root_path)
+        except ValueError as error:
+            raise ValidationError(f"scenarios[{index}].prompt_ref escapes root") from error
+        if not prompt_path.is_file():
+            raise ValidationError(f"scenarios[{index}].prompt_ref does not exist")
+        expected_prompt_sha = _sha(
+            scenario["prompt_sha256"], f"scenarios[{index}].prompt_sha256"
+        )
+        if hashlib.sha256(prompt_path.read_bytes()).hexdigest() != expected_prompt_sha:
+            raise ValidationError(f"scenarios[{index}] prompt identity changed")
+        _identifier(scenario["prompt_id"], f"scenarios[{index}].prompt_id")
+        if scenario["required_arms"] != _ARMS:
+            raise ValidationError(f"scenarios[{index}] must require every experiment arm")
+        if scenario["oracle"] != "ledger_and_artifacts_v1":
+            raise ValidationError(
+                f"scenarios[{index}].oracle must be ledger_and_artifacts_v1"
+            )
     return _copy(suite)
 
 
@@ -203,6 +286,8 @@ def _validate_result(value: Mapping[str, Any], index: int) -> dict:
         "correctness_violations",
         "policy_violations",
         "events",
+        "event_evidence",
+        "run_identity",
     }
     _closed(result, fields, f"results[{index}]")
     _identifier(result["scenario_id"], f"results[{index}].scenario_id")
@@ -226,11 +311,68 @@ def _validate_result(value: Mapping[str, Any], index: int) -> dict:
     _count(result["correctness_violations"], f"results[{index}].correctness_violations")
     _count(result["policy_violations"], f"results[{index}].policy_violations")
     _events(result["events"], f"results[{index}].events")
+    event_evidence = result["event_evidence"]
+    if type(event_evidence) is not list:
+        raise ValidationError(f"results[{index}].event_evidence must be an array")
+    bound_names = []
+    for evidence_index, item in enumerate(event_evidence):
+        evidence = _object(
+            item, f"results[{index}].event_evidence[{evidence_index}]"
+        )
+        _closed(
+            evidence,
+            {"name", "ledger_sequence", "source_sha256"},
+            f"results[{index}].event_evidence[{evidence_index}]",
+        )
+        bound_names.append(
+            _identifier(
+                evidence["name"],
+                f"results[{index}].event_evidence[{evidence_index}].name",
+            )
+        )
+        if (
+            isinstance(evidence["ledger_sequence"], bool)
+            or not isinstance(evidence["ledger_sequence"], int)
+            or evidence["ledger_sequence"] <= 0
+        ):
+            raise ValidationError("event evidence ledger_sequence must be positive")
+        _sha(evidence["source_sha256"], "event evidence source_sha256")
+    if bound_names != result["events"]:
+        raise ValidationError("every event must have matching event evidence")
+    identity = _object(result["run_identity"], f"results[{index}].run_identity")
+    _closed(
+        identity,
+        {
+            "model_identity",
+            "prompt_sha256",
+            "skill_sha256",
+            "contract_sha256",
+            "environment_sha256",
+            "seed",
+            "replicate",
+        },
+        f"results[{index}].run_identity",
+    )
+    _string(identity["model_identity"], "run_identity.model_identity")
+    _sha(identity["prompt_sha256"], "run_identity.prompt_sha256")
+    _sha(identity["skill_sha256"], "run_identity.skill_sha256", nullable=True)
+    _sha(identity["contract_sha256"], "run_identity.contract_sha256")
+    _sha(identity["environment_sha256"], "run_identity.environment_sha256")
+    if isinstance(identity["seed"], bool) or not isinstance(identity["seed"], int):
+        raise ValidationError("run_identity.seed must be an integer")
+    if (
+        isinstance(identity["replicate"], bool)
+        or not isinstance(identity["replicate"], int)
+        or identity["replicate"] <= 0
+    ):
+        raise ValidationError("run_identity.replicate must be positive")
     return _copy(result)
 
 
 def score_results(suite: Mapping[str, Any], results: Sequence[Mapping[str, Any]], *, mode: str) -> dict:
     _identifier(mode, "mode")
+    if mode not in suite["experiment"]["arms"]:
+        raise ValidationError("mode is not a preregistered experiment arm")
     if isinstance(results, (str, bytes, bytearray, Mapping)):
         raise ValidationError("results must be an array")
     validated = [_validate_result(item, index) for index, item in enumerate(results)]
@@ -253,6 +395,19 @@ def score_results(suite: Mapping[str, Any], results: Sequence[Mapping[str, Any]]
     total_valid = 0
     for scenario in suite["scenarios"]:
         result = by_id[scenario["id"]]
+        identity = result["run_identity"]
+        if identity["prompt_sha256"] != scenario["prompt_sha256"]:
+            raise ValidationError(
+                f"prompt identity mismatch for scenario {scenario['id']}"
+            )
+        if identity["replicate"] > suite["experiment"]["replicates"]:
+            raise ValidationError(
+                f"replicate exceeds preregistered count for scenario {scenario['id']}"
+            )
+        if mode == "no_skill" and identity["skill_sha256"] is not None:
+            raise ValidationError("no_skill arm must not bind a skill_sha256")
+        if mode != "no_skill" and identity["skill_sha256"] is None:
+            raise ValidationError(f"{mode} arm must bind skill_sha256")
         events = set(result["events"])
         required_missing = sorted(set(scenario["required_events"]) - events)
         forbidden_seen = sorted(set(scenario["forbidden_events"]) & events)
@@ -290,6 +445,13 @@ def score_results(suite: Mapping[str, Any], results: Sequence[Mapping[str, Any]]
         "valid_candidates": total_valid,
         "valid_candidate_rate": total_valid / total_candidates if total_candidates else None,
         "details": details,
+        "run_identities": [
+            {
+                "scenario_id": item["scenario_id"],
+                **item["run_identity"],
+            }
+            for item in validated
+        ],
     }
 
 
@@ -330,4 +492,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
