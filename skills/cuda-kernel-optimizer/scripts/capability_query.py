@@ -159,6 +159,17 @@ def _closed_fields(value: Mapping[str, Any], expected: set[str], label: str) -> 
         raise ValueError(f"{label} has unknown fields: {sorted(extra)}")
 
 
+def _canonical_digest(value: Mapping[str, Any]) -> str:
+    raw = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _strings(value: Any, label: str, *, allow_empty: bool = True) -> List[str]:
     if not isinstance(value, list) or (not allow_empty and not value):
         raise ValueError(f"{label} must be a{' non-empty' if not allow_empty else ''} list")
@@ -596,7 +607,7 @@ def query(
         selected.append(item)
         consumed += item["context_cost_bytes"]
 
-    return {
+    result = {
         "schema_version": "cuda-optimizer/capability-query-v1",
         "registry_variant": registry_variant,
         "registry_sha256": validation["registry_sha256"],
@@ -607,7 +618,10 @@ def query(
         "observed_signals": sorted(observed_signals),
         "available_evidence": sorted(evidence),
         "framework_versions": dict(sorted(framework_versions.items())),
+        "as_of": today.isoformat(),
+        "max_review_age_days": max_review_age_days,
         "context_budget_bytes": context_budget_bytes,
+        "limit": limit,
         "selected_context_bytes": consumed,
         "capabilities": selected,
         "rejected": rejected,
@@ -615,6 +629,53 @@ def query(
         "execution_authority": "none",
         "promotion_authority": "local_correctness_and_measurement_only",
     }
+    result["query_sha256"] = _canonical_digest(result)
+    return result
+
+
+def validate_query_result(value: Mapping[str, Any]) -> Dict[str, Any]:
+    """Replay a query against the current hash-bound registry."""
+    if type(value) is not dict:
+        raise ValueError("query result must be an object")
+    recorded = value.get("query_sha256")
+    if type(recorded) is not str or _HASH_RE.fullmatch(recorded) is None:
+        raise ValueError("query result has an invalid query_sha256")
+    unsigned = dict(value)
+    unsigned.pop("query_sha256")
+    if _canonical_digest(unsigned) != recorded:
+        raise ValueError("query result digest changed")
+    required = {
+        "arch",
+        "task",
+        "layer",
+        "observed_signals",
+        "available_evidence",
+        "framework_versions",
+        "context_budget_bytes",
+        "limit",
+        "as_of",
+        "max_review_age_days",
+        "registry_variant",
+    }
+    if not required.issubset(value):
+        raise ValueError("query result is missing replay inputs")
+    replayed = query(
+        arch=value["arch"],
+        task=value["task"],
+        layer=value["layer"],
+        signals=value["observed_signals"],
+        available_evidence=value["available_evidence"],
+        framework_versions=value["framework_versions"],
+        context_budget_bytes=value["context_budget_bytes"],
+        limit=value["limit"],
+        as_of=value["as_of"],
+        max_review_age_days=value["max_review_age_days"],
+        registry_variant=value["registry_variant"],
+        allow_ablation=value["registry_variant"] == "shuffled",
+    )
+    if replayed != value:
+        raise ValueError("query result does not match registry replay")
+    return replayed
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

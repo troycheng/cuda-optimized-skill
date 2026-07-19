@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/observation_summary.schema.json",
+  "title": "CUDA optimizer bounded observation summary v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "contract_sha256", "environment_sha256", "as_of",
+    "max_age_seconds", "max_observations", "context_budget_bytes",
+    "selected_context_bytes", "ledger_tail_sha256", "observations", "summary_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/observation-summary-v1"},
+    "contract_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "as_of": {"type": "number", "minimum": 0},
+    "max_age_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "max_observations": {"type": "integer", "minimum": 1},
+    "context_budget_bytes": {"type": "integer", "minimum": 1},
+    "selected_context_bytes": {"type": "integer", "minimum": 1},
+    "ledger_tail_sha256": {"$ref": "#/$defs/sha256"},
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/observation"}
+    },
+    "summary_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation_id", "kind", "layer", "summary", "signals", "producer",
+        "subject", "result", "artifact", "age_seconds", "freshness"
+      ],
+      "properties": {
+        "observation_id": {"$ref": "#/$defs/identifier"},
+        "kind": {
+          "enum": [
+            "correctness_reference", "dispatch_identity", "target_compile_probe",
+            "candidate_correctness", "paired_measurement", "workload_replay"
+          ]
+        },
+        "layer": {"enum": ["kernel", "workload", "serving"]},
+        "summary": {"type": "string", "minLength": 1},
+        "signals": {
+          "type": "array", "uniqueItems": true,
+          "items": {"$ref": "#/$defs/identifier"}
+        },
+        "producer": {
+          "type": "object", "additionalProperties": false,
+          "required": ["id", "version"],
+          "properties": {
+            "id": {"$ref": "#/$defs/identifier"},
+            "version": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+){1,3}$"}
+          }
+        },
+        "subject": {"type": "object"},
+        "result": {"type": "object"},
+        "artifact": {
+          "type": "object", "additionalProperties": false,
+          "required": ["path", "sha256", "size_bytes", "recorded_at", "environment_sha256"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size_bytes": {"type": "integer", "minimum": 1},
+            "recorded_at": {"type": "number", "minimum": 0},
+            "environment_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "age_seconds": {"type": "number", "minimum": 0},
+        "freshness": {"enum": ["current", "stale", "future"]}
+      }
+    }
+  }
+}

@@ -88,3 +88,19 @@ skill 根开始，用目录文件描述符逐层 `O_NOFOLLOW` 打开；安装自
 未采用：随机探索槽、固定 20% 探索概率、按命中次数计算固定冷却轮数、预写短长
 上下文阈值、知识卡级二进制哈希。这些建议要么破坏确定性和可归因性，要么把目标
 环境的运行事实错误地变成通用知识。短长分界必须由冻结 workload 和校准结果决定。
+
+## 门禁证据信任边界复审
+
+阶段 3 的首版摘要先把六类门禁限制为封闭格式，并通过 reserved ledger event、产物
+哈希和 Controller HMAC 阻断通用账本写入与私造摘要。独立复审随后指出：HMAC 只能
+证明持钥者批准了某份 JSON；如果 JSON 中的 producer、PASS 和结果仍由 artifact
+自报，它不能证明对应 adapter 真正运行过。这个问题不能靠增加 schema 字段解决。
+
+已关闭的问题：摘要会在 Controller 当前时间重算新鲜度；门禁匹配绑定合同、环境、
+账本尾、reference、target、workload、精确架构、candidate ID 与 candidate SHA；
+错误密钥、篡改产物和 reserved event 注入均 fail closed。
+
+仍需实现的信任根：Controller 独占 per-run 密钥；adapter 只交原始测量；Controller
+按 allowlist 中的实现摘要调用 adapter、重算 verdict、构造规范化证据并封印；证明
+再绑定 run 和账本身份。若 verifier 离开 Controller，改用私签公验，不能把共享 HMAC
+验证密钥交给无权封印的组件。该边界完成前，这一切片不能宣称正式晋级链路完成。

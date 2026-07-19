@@ -34,6 +34,8 @@ _PROPOSAL_FIELDS = {
     "schema_version",
     "candidate_id",
     "observation_id",
+    "observation_summary_sha256",
+    "capability_query_sha256",
     "hypothesis",
     "expected_metric",
     "expected_effect_pct",
@@ -172,6 +174,8 @@ def validate_candidate_proposal(value: Mapping[str, Any]) -> dict:
         raise ValidationError(f"schema_version must be {PROPOSAL_SCHEMA}")
     _identifier(value["candidate_id"], "candidate_id")
     _identifier(value["observation_id"], "observation_id")
+    _sha(value["observation_summary_sha256"], "observation_summary_sha256")
+    _sha(value["capability_query_sha256"], "capability_query_sha256")
     _string(value["hypothesis"], "hypothesis")
     metric = value["expected_metric"]
     if type(metric) is not dict:

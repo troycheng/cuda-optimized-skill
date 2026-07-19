@@ -24,6 +24,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _EVENT_FILE = re.compile(r"([0-9]{20})\.json\Z")
 _PENDING_FILE = re.compile(r"\.pending-[0-9]+-[0-9a-f]{16}\Z")
 _ZERO_SHA = "0" * 64
+_RESERVED_EVENT_TYPES = {"observation_sealed"}
 
 
 def _load_artifact_store():
@@ -285,7 +286,7 @@ def verify_ledger(
             os.close(directory_fd)
 
 
-def append_event(
+def _append_event(
     path: str | os.PathLike,
     *,
     event_type: str,
@@ -366,3 +367,45 @@ def append_event(
         finally:
             os.close(lock_fd)
             os.close(directory_fd)
+
+
+def append_event(
+    path: str | os.PathLike,
+    *,
+    event_type: str,
+    contract_sha256: str,
+    payload: Mapping[str, Any],
+    expected_previous_sha256: str | None = None,
+) -> dict:
+    """Append a non-reserved event through the public ledger API."""
+    if event_type in _RESERVED_EVENT_TYPES:
+        raise ValidationError(
+            f"event_type {event_type} is reserved for its deterministic adapter"
+        )
+    return _append_event(
+        path,
+        event_type=event_type,
+        contract_sha256=contract_sha256,
+        payload=payload,
+        expected_previous_sha256=expected_previous_sha256,
+    )
+
+
+def _append_reserved_event(
+    path: str | os.PathLike,
+    *,
+    event_type: str,
+    contract_sha256: str,
+    payload: Mapping[str, Any],
+    expected_previous_sha256: str | None = None,
+) -> dict:
+    """Internal adapter hook; reserved records still use the normal ledger checks."""
+    if event_type not in _RESERVED_EVENT_TYPES:
+        raise ValidationError(f"event_type is not reserved: {event_type}")
+    return _append_event(
+        path,
+        event_type=event_type,
+        contract_sha256=contract_sha256,
+        payload=payload,
+        expected_previous_sha256=expected_previous_sha256,
+    )

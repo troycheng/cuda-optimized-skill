@@ -8,6 +8,8 @@
     "schema_version",
     "candidate_id",
     "observation_id",
+    "observation_summary_sha256",
+    "capability_query_sha256",
     "hypothesis",
     "expected_metric",
     "expected_effect_pct",
@@ -20,6 +22,8 @@
     "schema_version": {"const": "cuda-optimizer/candidate-proposal-v1"},
     "candidate_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
     "observation_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "observation_summary_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "capability_query_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "hypothesis": {"type": "string", "minLength": 1},
     "expected_metric": {
       "type": "object",

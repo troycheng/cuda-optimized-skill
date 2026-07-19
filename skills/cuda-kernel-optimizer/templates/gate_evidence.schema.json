@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/gate_evidence.schema.json",
+  "title": "CUDA optimizer adapter-specific gate evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "producer", "contract_sha256",
+    "environment_sha256", "recorded_at", "status", "subject", "result"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/gate-evidence-v1"},
+    "kind": {
+      "enum": [
+        "correctness_reference", "dispatch_identity", "target_compile_probe",
+        "candidate_correctness", "paired_measurement", "workload_replay"
+      ]
+    },
+    "producer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "version": {"const": "1.0.0"}
+      }
+    },
+    "contract_sha256": {"$ref": "#/$defs/sha256"},
+    "environment_sha256": {"$ref": "#/$defs/sha256"},
+    "recorded_at": {"type": "number", "minimum": 0},
+    "status": {"const": "PASS"},
+    "subject": {"type": "object"},
+    "result": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "correctness_reference"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "correctness-reference-adapter"}}},
+          "subject": {
+            "additionalProperties": false, "required": ["reference_sha256"],
+            "properties": {"reference_sha256": {"$ref": "#/$defs/sha256"}}
+          },
+          "result": {
+            "additionalProperties": false, "required": ["oracle_sha256", "cases_total"],
+            "properties": {
+              "oracle_sha256": {"$ref": "#/$defs/sha256"},
+              "cases_total": {"type": "integer", "minimum": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "dispatch_identity"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "dispatch-identity-adapter"}}},
+          "subject": {
+            "additionalProperties": false, "required": ["target_sha256"],
+            "properties": {"target_sha256": {"$ref": "#/$defs/sha256"}}
+          },
+          "result": {
+            "additionalProperties": false, "required": ["dispatch_sha256", "cases_total"],
+            "properties": {
+              "dispatch_sha256": {"$ref": "#/$defs/sha256"},
+              "cases_total": {"type": "integer", "minimum": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "target_compile_probe"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "compiler-evidence-adapter"}}},
+          "subject": {
+            "additionalProperties": false, "required": ["target_sha256"],
+            "properties": {"target_sha256": {"$ref": "#/$defs/sha256"}}
+          },
+          "result": {
+            "additionalProperties": false,
+            "required": ["arch", "binary_sha256", "compiler_sha256"],
+            "properties": {
+              "arch": {"type": "string", "pattern": "^sm_[0-9]+$"},
+              "binary_sha256": {"$ref": "#/$defs/sha256"},
+              "compiler_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "candidate_correctness"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "candidate-correctness-adapter"}}},
+          "subject": {"$ref": "#/$defs/candidateSubject"},
+          "result": {
+            "additionalProperties": false,
+            "required": ["reference_sha256", "cases_total", "cases_passed"],
+            "properties": {
+              "reference_sha256": {"$ref": "#/$defs/sha256"},
+              "cases_total": {"type": "integer", "minimum": 1},
+              "cases_passed": {"type": "integer", "minimum": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "paired_measurement"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "paired-measurement-adapter"}}},
+          "subject": {"$ref": "#/$defs/candidateSubject"},
+          "result": {
+            "additionalProperties": false,
+            "required": ["samples_sha256", "pairs_total", "decision"],
+            "properties": {
+              "samples_sha256": {"$ref": "#/$defs/sha256"},
+              "pairs_total": {"type": "integer", "minimum": 1},
+              "decision": {"const": "PASS"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "workload_replay"}}},
+      "then": {
+        "properties": {
+          "producer": {"properties": {"id": {"const": "workload-replay-adapter"}}},
+          "subject": {"$ref": "#/$defs/candidateSubject"},
+          "result": {
+            "additionalProperties": false,
+            "required": ["workload_sha256", "constraints_passed", "objective_gate_passed"],
+            "properties": {
+              "workload_sha256": {"$ref": "#/$defs/sha256"},
+              "constraints_passed": {"const": true},
+              "objective_gate_passed": {"const": true}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "candidateSubject": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_id", "candidate_sha256"],
+      "properties": {
+        "candidate_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "candidate_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

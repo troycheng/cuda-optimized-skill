@@ -42,6 +42,8 @@ def _proposal(candidate_id: str = "candidate-1", **overrides) -> dict:
         "schema_version": "cuda-optimizer/candidate-proposal-v1",
         "candidate_id": candidate_id,
         "observation_id": "obs-1",
+        "observation_summary_sha256": "d" * 64,
+        "capability_query_sha256": "e" * 64,
         "hypothesis": "Coalescing the selected load should reduce request latency.",
         "expected_metric": {"name": "request_latency", "direction": "lower"},
         "expected_effect_pct": 2.0,

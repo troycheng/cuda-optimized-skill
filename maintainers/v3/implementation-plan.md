@@ -132,6 +132,22 @@ python3 skills/cuda-kernel-optimizer/scripts/self_check.py
 workload replay 均由 Controller 校验；不能把字符串类别或知识卡自身状态当作已
 通过门禁。
 
+当前已完成开发切片：能力查询结果可重放校验；观察摘要有数量和精确 UTF-8 字节
+硬上限；六类门禁产物使用封闭格式并绑定合同、环境、源码/候选/架构身份；门禁在
+Controller 当前时间重算新鲜度；候选 schema 引用观察摘要和能力查询摘要。HMAC
+封印已经阻断无密钥的 reserved event 伪造，但还没有完成进程级 Controller 隔离。
+
+进入 Planner 边界前必须先完成：
+
+1. Controller 独立持有 per-run 密钥，密钥不进入 prompt、环境变量、argv 或 adapter
+   子进程；
+2. adapter 只写 staging 原始测量，Controller 重算 verdict 并生成 canonical gate
+   evidence；
+3. 封印绑定 `run_id`、账本身份和 allowlist 中的 adapter 实现摘要；
+4. sealed store 与账本只有 Controller 可写，开发期同进程兼容路径不能拥有晋级权；
+5. 再实现 Planner 上下文绑定，拒绝摘要、能力结果、观察 ID 或 capability IDs 不一致
+   的候选。
+
 验证：
 
 ```bash

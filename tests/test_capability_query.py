@@ -84,6 +84,19 @@ class CapabilityQueryTests(unittest.TestCase):
         self.assertNotIn("steps", capability)
         self.assertNotIn("playbook_body", capability)
         self.assertEqual(result["execution_authority"], "none")
+        unsigned = dict(result)
+        recorded_query_sha = unsigned.pop("query_sha256")
+        expected_query_sha = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(recorded_query_sha, expected_query_sha)
+        self.assertEqual(load_module().validate_query_result(result), result)
 
     def test_unknown_arch_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown architecture"):
@@ -246,6 +259,33 @@ class CapabilityQueryTests(unittest.TestCase):
         self.assertEqual(paths.count(module.REGISTRY_PATH), 1)
         self.assertEqual(paths.count(module.SOURCES_PATH), 1)
         self.assertIn("sources_sha256", result)
+
+    def test_query_result_replay_rejects_forged_routing_metadata(self) -> None:
+        module = load_module()
+        result = module.query(
+            arch="sm_120",
+            task="decode_attention",
+            layer="kernel",
+            signals=["gqa_head_ratio", "kv_gather_dram"],
+            available_evidence=["pytorch_profile", "nsys_timeline"],
+            framework_versions={"triton": "3.4.0"},
+            as_of="2026-07-19",
+        )
+        forged = json.loads(json.dumps(result))
+        forged["capabilities"][0]["risk"] = "low"
+        unsigned = dict(forged)
+        unsigned.pop("query_sha256")
+        forged["query_sha256"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "replay|registry|query"):
+            module.validate_query_result(forged)
 
     def test_tampered_playbook_fails_validation(self) -> None:
         module = load_module()

@@ -54,6 +54,8 @@ def _proposal() -> dict:
         "schema_version": "cuda-optimizer/candidate-proposal-v1",
         "candidate_id": "candidate-1",
         "observation_id": "obs-1",
+        "observation_summary_sha256": "d" * 64,
+        "capability_query_sha256": "e" * 64,
         "hypothesis": "A bounded layout change should reduce latency.",
         "expected_metric": {"name": "latency", "direction": "lower"},
         "expected_effect_pct": 2.0,

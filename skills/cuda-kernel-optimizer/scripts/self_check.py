@@ -55,6 +55,8 @@ _V3_SCRIPTS = (
     "evidence_ledger.py",
     "run_control.py",
     "capability_query.py",
+    "evidence_summary.py",
+    "gate_evidence.py",
 )
 _V3_SCHEMAS = (
     "workload_contract.schema.json",
@@ -62,6 +64,8 @@ _V3_SCHEMAS = (
     "run_event.schema.json",
     "run_control.schema.json",
     "capability.schema.json",
+    "observation_summary.schema.json",
+    "gate_evidence.schema.json",
 )
 
 
