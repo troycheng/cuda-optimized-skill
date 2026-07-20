@@ -214,6 +214,32 @@ def _safe_regular(path: Path, field: str, *, executable: bool = False) -> None:
             os.close(parent_fd)
 
 
+def _safe_isolated_python(path: Path, field: str) -> None:
+    """Allow only the leaf symlink shape used by standard isolated venvs."""
+    parent_fd = None
+    try:
+        parent_fd, leaf, _target = _ARTIFACT_STORE._open_parent_directory(
+            path, create=False
+        )
+        metadata = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISREG(metadata.st_mode):
+            _safe_regular(path, field, executable=True)
+            return
+        if not stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(f"{field} must be a regular file or venv symlink")
+        resolved = Path(os.path.realpath(path))
+        _safe_regular(resolved, f"{field} target", executable=True)
+        if not os.access(path, os.X_OK):
+            raise ValidationError(f"{field} must resolve to an executable")
+    except ValidationError:
+        raise
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"{field} contains an unsafe symlink") from error
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
 def _validate_probe(value: Any, field: str) -> dict:
     probe = _closed(value, {"argv", "timeout_seconds"}, field)
     argv = probe["argv"]
@@ -276,7 +302,7 @@ def _validate_remediation(
         ) is None:
             raise ValidationError(f"{field}.requirements_sha256 must be SHA-256")
         _finite_positive(value["timeout_seconds"], f"{field}.timeout_seconds")
-        _safe_regular(python, f"{field}.python", executable=True)
+        _safe_isolated_python(python, f"{field}.python")
         _safe_regular(requirements, f"{field}.requirements_file")
     return value
 

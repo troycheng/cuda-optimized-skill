@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,22 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+TOOL_SPECS = {
+    "nvcc": ("nvcc", ["--version"]),
+    "ncu": ("ncu", ["--version"]),
+    "nvidia-smi": ("nvidia-smi", ["--version"]),
+    "nsys": ("nsys", ["--version"]),
+    "compute-sanitizer": ("compute-sanitizer", ["--version"]),
+    "ptxas": ("ptxas", ["--version"]),
+    "cuobjdump": ("cuobjdump", ["--version"]),
+    "nvdisasm": ("nvdisasm", ["--version"]),
+    "cmake": ("cmake", ["--version"]),
+    "ninja": ("ninja", ["--version"]),
+    "cc": ("cc", ["--version"]),
+    "cxx": ("c++", ["--version"]),
+}
 
 
 def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
@@ -27,6 +44,61 @@ def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
         return r.returncode, r.stdout or "", r.stderr or ""
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
         return -1, "", str(e)
+
+
+def _first_version_line(stdout: str, stderr: str) -> str | None:
+    for stream in (stdout, stderr):
+        for line in stream.splitlines():
+            text = line.strip()
+            if text:
+                return text[:512]
+    return None
+
+
+def _file_sha256(path: str) -> str | None:
+    try:
+        candidate = Path(path)
+        if not candidate.is_file():
+            return None
+        digest = hashlib.sha256()
+        with candidate.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    return digest.hexdigest()
+                digest.update(chunk)
+    except OSError:
+        return None
+
+
+def _detect_tool(
+    name: str, version_args: list[str], timeout: int = 10
+) -> dict:
+    """Inventory a command without claiming that its capability works."""
+    path = shutil.which(name)
+    if path is None:
+        return {
+            "available": False,
+            "path": None,
+            "realpath": None,
+            "sha256": None,
+            "version": None,
+            "version_query_returncode": None,
+            "usable": None,
+        }
+    realpath = os.path.realpath(path)
+    rc, stdout, stderr = _run(
+        [path, *version_args], timeout=timeout
+    )
+    return {
+        "available": True,
+        "path": path,
+        "realpath": realpath,
+        "sha256": _file_sha256(realpath),
+        "version": _first_version_line(stdout, stderr),
+        "version_query_returncode": rc,
+        "usable": None,
+    }
 
 
 def _detect_gpus() -> list[dict]:
@@ -41,7 +113,9 @@ def _detect_gpus() -> list[dict]:
                     "name": torch.cuda.get_device_name(i),
                     "compute_capability": f"{major}.{minor}",
                     "sm_arch": f"sm_{major}{minor}",
-                    "total_memory_mb": torch.cuda.get_device_properties(i).total_memory // (1024 * 1024),
+                    "total_memory_mb": (
+                        torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)
+                    ),
                 })
     except Exception as e:
         return [{"error": f"torch probe failed: {e}"}]
@@ -106,6 +180,7 @@ def _detect_driver() -> dict:
             "path": None,
             "driver_versions": [],
             "max_cuda_version": None,
+            "gpu_identities": [],
         }
 
     rc, out, _ = _run(
@@ -124,11 +199,32 @@ def _detect_driver() -> dict:
         if match:
             max_cuda_version = match.group(1)
 
+    identity_rc, identity_out, _ = _run(
+        [
+            path,
+            "--query-gpu=uuid,pci.bus_id,compute_mode",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    gpu_identities = []
+    if identity_rc == 0:
+        for line in identity_out.splitlines():
+            parts = [item.strip() for item in line.split(",")]
+            if len(parts) == 3 and all(parts):
+                gpu_identities.append(
+                    {
+                        "uuid": parts[0],
+                        "pci_bus_id": parts[1],
+                        "compute_mode": parts[2],
+                    }
+                )
+
     return {
         "available": True,
         "path": path,
         "driver_versions": driver_versions,
         "max_cuda_version": max_cuda_version,
+        "gpu_identities": gpu_identities,
     }
 
 
@@ -167,6 +263,7 @@ def _detect_python_libs() -> dict:
 
 
 def collect_env() -> dict:
+    identity_inventory = collect_identity_inventory()
     gpus = _detect_gpus()
     primary_arch = None
     for g in gpus:
@@ -180,9 +277,21 @@ def collect_env() -> dict:
         "primary_sm_arch": primary_arch,
         "nvcc": _detect_nvcc(),
         "ncu": _detect_ncu(),
-        "driver": _detect_driver(),
+        "driver": identity_inventory["driver"],
         "cutlass": _detect_cutlass(),
         "libs": _detect_python_libs(),
+        "tools": identity_inventory["tools"],
+    }
+
+
+def collect_identity_inventory() -> dict:
+    """Collect stable tool identity inputs without running capability probes."""
+    return {
+        "tools": {
+            key: _detect_tool(command, version_args)
+            for key, (command, version_args) in TOOL_SPECS.items()
+        },
+        "driver": _detect_driver(),
     }
 
 

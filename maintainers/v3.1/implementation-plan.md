@@ -444,12 +444,14 @@ git commit -m "feat(v3.1): require readiness before workload baseline"
 - 创建：`skills/cuda-kernel-optimizer/scripts/readiness_identity.py`
 - 测试：`tests/test_check_env.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 覆盖 `nsys`、`compute-sanitizer`、`ptxas`、`cuobjdump`、`nvdisasm`、`cmake`、`ninja`、C/C++
 编译器。工具存在但版本失败时仍 `available=true`、`usable=null`，不能标记 ready。环境 identity
-必须绑定实际工具路径/版本/摘要、隔离 Python 与已安装 distribution 清单、uid、容器、GPU、
-可见设备和权限状态；隔离 pip 后重新生成 identity 时必须发生可解释的摘要变化。
+必须绑定实际工具路径/realpath/版本/摘要、driver、隔离 Python 与已安装 distribution/RECORD
+清单、uid、容器、GPU、可见设备和权限状态；隔离 pip 后重新生成 identity 时必须发生可解释的
+摘要变化。标准 venv 的 Python leaf symlink 可以使用，但父目录、解析目标和执行前后身份必须
+复核；requirements 仍拒绝 symlink。
 
 ```python
 def test_inventory_never_claims_tool_capability(self):
@@ -459,13 +461,13 @@ def test_inventory_never_claims_tool_capability(self):
     self.assertNotIn("can_profile", result)
 ```
 
-- [ ] **步骤 2：运行并确认失败**
+- [x] **步骤 2：运行并确认失败**
 
 ```bash
 python3 -m unittest tests.test_check_env -v
 ```
 
-- [ ] **步骤 3：实现统一 detector**
+- [x] **步骤 3：实现统一 detector**
 
 ```python
 def _detect_tool(name: str, version_args: list[str], timeout: int = 10) -> dict:
@@ -483,7 +485,7 @@ NCU 的 `can_read_counters` 保持 `None`；真实状态只来自 readiness 或 
 `readiness_identity.py` 提供 gate 的 `identity_provider`；它只读库存，不运行 profile，不把 ECC
 计数、瞬时 clock throttling 等波动指标混入稳定身份。
 
-- [ ] **步骤 4：验证并提交**
+- [x] **步骤 4：验证并提交**
 
 ```bash
 python3 -m unittest tests.test_check_env tests.test_profile_ncu -v

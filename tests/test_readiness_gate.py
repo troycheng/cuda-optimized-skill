@@ -576,6 +576,24 @@ class ReadinessGateTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "python_identity_changed")
 
+    def test_installer_supports_a_stable_venv_python_leaf_symlink(self) -> None:
+        real_python = self.root / "system-python"
+        real_python.write_text("#!/bin/sh\nexit 0\n", "utf-8")
+        real_python.chmod(0o755)
+        self.python.unlink()
+        self.python.symlink_to(real_python)
+        remediation = self.isolated_remediation()
+
+        result = self.install.install_isolated_pip(
+            remediation,
+            project_root=self.project,
+            environment_root=self.environment,
+            run_dir=self.root / "symlink-python",
+            deadline_epoch=time.time() + 5,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+
 
 if __name__ == "__main__":
     unittest.main()

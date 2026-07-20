@@ -66,6 +66,8 @@ _WORKLOAD_MODULE = None
 _EVALUATE_MODULE = None
 _READINESS_CONTRACT_MODULE = None
 _READINESS_GATE_MODULE = None
+_READINESS_IDENTITY_MODULE = None
+_CHECK_ENV_MODULE = None
 _BUDGET_RUNTIME = {
     "fast": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
     "balanced": {
@@ -559,6 +561,25 @@ def _load_readiness_gate_module():
             "cuda_optimizer_readiness_gate_controller",
         )
     return _READINESS_GATE_MODULE
+
+
+def _load_readiness_identity_module():
+    global _READINESS_IDENTITY_MODULE
+    if _READINESS_IDENTITY_MODULE is None:
+        _READINESS_IDENTITY_MODULE = _load_sibling_module(
+            "readiness_identity.py",
+            "cuda_optimizer_readiness_identity_controller",
+        )
+    return _READINESS_IDENTITY_MODULE
+
+
+def _load_check_env_module():
+    global _CHECK_ENV_MODULE
+    if _CHECK_ENV_MODULE is None:
+        _CHECK_ENV_MODULE = _load_sibling_module(
+            "check_env.py", "cuda_optimizer_check_env_controller"
+        )
+    return _CHECK_ENV_MODULE
 
 
 def _canonical_digest(value: Any) -> str:
@@ -1211,20 +1232,12 @@ def _current_readiness_identity(control: Mapping[str, Any]) -> dict:
         raise ValidationError(
             "control-v2 environment_root must be an existing non-symlink directory"
         )
-    toolchain_digest = _identity(control, "isolated_environment")["digest"]
-    return {
-        "toolchain_digest": toolchain_digest,
-        "uid": os.getuid() if hasattr(os, "getuid") else None,
-        "container_identity": os.environ.get("CUDA_OPTIMIZER_CONTAINER_ID"),
-        "gpu_identity": os.environ.get("CUDA_OPTIMIZER_GPU_IDENTITY"),
-        "visible_devices": {
-            "cuda": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "nvidia": os.environ.get("NVIDIA_VISIBLE_DEVICES"),
-        },
-        "permission_state": os.environ.get(
-            "CUDA_OPTIMIZER_COUNTER_PERMISSION"
-        ),
-    }
+    inventory = _load_check_env_module().collect_identity_inventory()
+    return _load_readiness_identity_module().build_identity(
+        environment_root=environment_root,
+        inventory=inventory,
+        run=_load_check_env_module()._run,
+    )
 
 
 def _load_frozen_readiness_contract(

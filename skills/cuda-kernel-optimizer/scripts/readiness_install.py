@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,6 +28,16 @@ _CONTRACT = _load_sibling(
     "readiness_contract.py", "cuda_readiness_install_contract"
 )
 _PROBE = _load_sibling("readiness_probe.py", "cuda_readiness_install_probe")
+
+
+def _python_identity(path: str) -> tuple[str | None, str | None, str | None]:
+    candidate = Path(path)
+    metadata = candidate.lstat()
+    symlink_target = (
+        os.readlink(candidate) if stat.S_ISLNK(metadata.st_mode) else None
+    )
+    realpath, digest = _PROBE._executable_identity(str(candidate))
+    return realpath, digest, symlink_target
 
 
 def _result(
@@ -146,7 +158,7 @@ def install_isolated_pip(
         environment.pop("CUDA_OPTIMIZER_READINESS_OUTPUT", None)
         environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
         environment["PIP_NO_INPUT"] = "1"
-        python_before = _STORE.sha256_file(validated["python"])
+        python_before = _python_identity(validated["python"])
         try:
             execution = _PROBE._run_bounded(
                 command,
@@ -167,7 +179,7 @@ def install_isolated_pip(
             reason = "pip_command_unavailable"
             status = "failed"
         else:
-            python_after = _STORE.sha256_file(validated["python"])
+            python_after = _python_identity(validated["python"])
             requirements_after = _STORE.sha256_file(requirements)
             if python_after != python_before:
                 status, reason = "failed", "python_identity_changed"

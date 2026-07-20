@@ -237,6 +237,26 @@ class ReadinessContractTests(unittest.TestCase):
                     value, project_root=project, environment_root=environment
                 )
 
+    def test_isolated_python_accepts_a_bounded_venv_leaf_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, environment, value = self._fixture(root)
+            python = environment / "bin" / "python3"
+            python.unlink()
+            real_python = root / "system-python"
+            real_python.write_text("#!/bin/sh\nexit 0\n", "utf-8")
+            real_python.chmod(0o755)
+            python.symlink_to(real_python)
+
+            validated = self.module.validate_contract(
+                value, project_root=project, environment_root=environment
+            )
+
+            self.assertEqual(
+                validated["requirements"][0]["remediation"]["python"],
+                str(python),
+            )
+
     def test_remediation_variants_are_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project, environment, value = self._fixture(Path(tmp))

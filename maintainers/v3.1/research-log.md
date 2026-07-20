@@ -213,3 +213,8 @@ v1 仅保留 validate、内部兼容和历史 resume/replay。
 - Controller 在 baseline 前执行 readiness gate，required 未通过时不启动真实 workload；
 - vertical slice 通过本地故障注入后，再到 RTX 5090 验证真实 Nsys、NCU、sanitizer、
   SASS 和 workload smoke。
+
+本机用 Python 标准库创建 venv 后确认，`bin/python` 与 `bin/python3` 都是指向基础解释器的
+leaf symlink。若一律拒绝会让合同声称支持 venv、实际只能使用复制解释器或 Conda。实现因此只
+放开这一种受限形态：environment root 和父目录不跟随 symlink，记录 leaf target、realpath 与
+目标 SHA-256，安装前后必须一致。requirements、合同、probe 输出和 report 继续拒绝 symlink。
