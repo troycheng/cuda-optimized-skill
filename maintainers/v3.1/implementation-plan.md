@@ -175,7 +175,7 @@ def admission_status(necessity, probe_status, remediation_mode, repairs_left):
 - 创建：`skills/cuda-kernel-optimizer/scripts/readiness_contract.py`
 - 测试：`tests/test_readiness_contract.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 覆盖有效合同 detached；重复键、未知字段、重复 id、非法枚举、非法 `max_age_seconds`、非有限
 预算、空 argv、相对路径、host 使用 `isolated_pip`、越界 Python/requirements、错误摘要和
@@ -191,7 +191,7 @@ def test_host_requirement_cannot_auto_install(self):
                                       environment_root=ENV)
 ```
 
-- [ ] **步骤 2：运行并确认失败**
+- [x] **步骤 2：运行并确认失败**
 
 ```bash
 python3 -m unittest tests.test_readiness_contract -v
@@ -199,7 +199,7 @@ python3 -m unittest tests.test_readiness_contract -v
 
 预期：导入失败，因为 `readiness_contract.py` 尚不存在。
 
-- [ ] **步骤 3：实现固定接口**
+- [x] **步骤 3：实现固定接口**
 
 ```python
 class ValidationError(ValueError):
@@ -218,7 +218,7 @@ def contract_digest(value: Mapping[str, Any]) -> str:
 
 复用 `artifact_store.read_regular_bytes()`，不复制软链接和原子文件实现。
 
-- [ ] **步骤 4：验证并提交**
+- [x] **步骤 4：验证并提交**
 
 ```bash
 python3 -m unittest tests.test_readiness_contract -v
@@ -236,11 +236,11 @@ git commit -m "feat(v3.1): define readiness capability contracts"
 - 创建：`skills/cuda-kernel-optimizer/scripts/readiness_probe.py`
 - 测试：`tests/test_readiness_probe.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 覆盖安全环境、create-once 输出、命令不存在、非零退出、超时、输出缺失、重复键、超过 1 MiB、
-id 不符、symlink、父目录替换、子进程残留、日志截断、secret redact，以及工具版本、uid、容器、
-GPU identity、可见设备和权限摘要完整记录。
+id 不符、symlink/hardlink、父目录替换、子进程残留、日志头尾截断、secret redact、执行文件和
+argv 输入漂移，以及工具版本、uid、容器、GPU identity、可见设备和权限摘要完整记录。
 
 ```python
 def test_timeout_kills_descendants_and_returns_unavailable(self):
@@ -254,13 +254,13 @@ def test_timeout_kills_descendants_and_returns_unavailable(self):
     self.assertFalse(pid_exists(read_child_pid(self.root)))
 ```
 
-- [ ] **步骤 2：运行并确认失败**
+- [x] **步骤 2：运行并确认失败**
 
 ```bash
 python3 -m unittest tests.test_readiness_probe -v
 ```
 
-- [ ] **步骤 3：实现固定接口**
+- [x] **步骤 3：实现固定接口**
 
 ```python
 def validate_probe(value: Mapping[str, Any], expected_requirement_id: str) -> dict:
@@ -275,7 +275,7 @@ def run_requirement(requirement: Mapping[str, Any], *, run_dir: Path,
 输出位于 `readiness/probes/<id>.json` 和 `<id>.execution.json`。completion marker 最后发布；
 任何失败先删除旧 marker，不能复用上一次成功。
 
-- [ ] **步骤 4：验证并提交**
+- [x] **步骤 4：验证并提交**
 
 ```bash
 python3 -m unittest tests.test_readiness_probe -v
