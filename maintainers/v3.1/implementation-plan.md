@@ -500,15 +500,17 @@ git commit -m "feat(v3.1): inventory GPU diagnostic tools"
 
 - 修改：`skills/cuda-kernel-optimizer/scripts/self_check.py`
 - 修改：`tests/test_skill_metadata.py`
+- 创建：`tests/test_readiness_vertical_slice.py`
 - 创建：`tests/fixtures/readiness/emit_probe.py`
+- 创建：`tests/fixtures/readiness/readiness-contract.json.in`
 - 创建：`tests/fixtures/readiness/control-v2.json.in`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 验证 schema 可解析、CLI help 可运行、示例 contract 可验证、blocked fixture 不运行 baseline、
 degraded fixture 可进入 baseline mock。
 
-- [ ] **步骤 2：接入 self-check**
+- [x] **步骤 2：接入 self-check**
 
 ```json
 {
@@ -521,7 +523,7 @@ degraded fixture 可进入 baseline mock。
 
 self-check 保持 CPU/static，不探测本机 GPU。
 
-- [ ] **步骤 3：验证并提交**
+- [x] **步骤 3：验证并提交**
 
 ```bash
 python3 -m unittest \

@@ -218,3 +218,9 @@ v1 仅保留 validate、内部兼容和历史 resume/replay。
 leaf symlink。若一律拒绝会让合同声称支持 venv、实际只能使用复制解释器或 Conda。实现因此只
 放开这一种受限形态：environment root 和父目录不跟随 symlink，记录 leaf target、realpath 与
 目标 SHA-256，安装前后必须一致。requirements、合同、probe 输出和 report 继续拒绝 symlink。
+
+本地发布自检现会在不访问 GPU 和网络的前提下，对照 runtime 检查 readiness contract、probe、
+report 三份 schema 的版本、字段和枚举。确定性 fixture 还冻结了两条 Controller 边界：required
+readiness 失败时绝不能加载 baseline evaluator；只有 diagnostic 能力降级时，允许进入 mock
+baseline，并把 claim 保持在较低但有效的证据层。这能在远端 GPU 验证之前发现打包和准入顺序
+回归。

@@ -78,6 +78,20 @@ _V3_SCHEMAS = (
     "stability_calibration.schema.json",
     "stability_audit.schema.json",
 )
+_V3_1_SCRIPTS = (
+    "readiness_contract.py",
+    "readiness_probe.py",
+    "readiness_gate.py",
+    "readiness_install.py",
+    "readiness_identity.py",
+    "check_env.py",
+    "workload_controller.py",
+)
+_V3_1_SCHEMAS = (
+    "readiness_contract.schema.json",
+    "readiness_probe.schema.json",
+    "readiness_report.schema.json",
+)
 
 
 def _read_safe_file(root: Path, relative: Path | str) -> bytes:
@@ -294,6 +308,107 @@ def _validate_stability_schema_contract(root: Path) -> None:
         raise ValueError("stability audit reason vocabulary differs from runtime")
 
 
+def _load_installed_module(root: Path, filename: str, module_name: str) -> ModuleType:
+    script = root / "scripts" / filename
+    module = ModuleType(module_name)
+    module.__file__ = str(script)
+    source = _read_safe_file(root, Path("scripts") / filename)
+    exec(compile(source, str(script), "exec"), module.__dict__)
+    return module
+
+
+def _validate_readiness_schema_contract(root: Path) -> None:
+    contract_runtime = _load_installed_module(
+        root, "readiness_contract.py", "installed_readiness_contract"
+    )
+    probe_runtime = _load_installed_module(
+        root, "readiness_probe.py", "installed_readiness_probe"
+    )
+    gate_runtime = _load_installed_module(
+        root, "readiness_gate.py", "installed_readiness_gate"
+    )
+    contract = json.loads(
+        _read_safe_file(root, Path("templates") / "readiness_contract.schema.json")
+    )
+    probe = json.loads(
+        _read_safe_file(root, Path("templates") / "readiness_probe.schema.json")
+    )
+    report = json.loads(
+        _read_safe_file(root, Path("templates") / "readiness_report.schema.json")
+    )
+
+    if contract.get("additionalProperties") is not False:
+        raise ValueError("readiness contract schema root must be closed")
+    contract_properties = contract.get("properties", {})
+    if (
+        contract_properties.get("schema_version", {}).get("const")
+        != contract_runtime.SCHEMA_VERSION
+    ):
+        raise ValueError("readiness contract schema version differs from runtime")
+    if set(contract_properties.get("requested_claim", {}).get("enum", [])) != set(
+        contract_runtime.REQUESTED_CLAIMS
+    ):
+        raise ValueError("readiness claim vocabulary differs from runtime")
+    requirement = contract.get("$defs", {}).get("requirement", {})
+    requirement_properties = requirement.get("properties", {})
+    for field, runtime_values in (
+        ("necessity", contract_runtime.NECESSITIES),
+        ("control_scope", contract_runtime.CONTROL_SCOPES),
+        ("phase", contract_runtime.PHASES),
+        ("kind", contract_runtime.KINDS),
+    ):
+        if set(requirement_properties.get(field, {}).get("enum", [])) != set(
+            runtime_values
+        ):
+            raise ValueError(f"readiness {field} vocabulary differs from runtime")
+    closed_contract_defs = ("budget", "probe", "requirement")
+    for name in closed_contract_defs:
+        if contract.get("$defs", {}).get(name, {}).get("additionalProperties") is not False:
+            raise ValueError(f"readiness contract {name} schema must be closed")
+    remediation = contract.get("$defs", {}).get("remediation", {}).get("oneOf", [])
+    modes = {
+        item.get("properties", {}).get("mode", {}).get("const")
+        for item in remediation
+    }
+    if modes != set(contract_runtime.REMEDIATION_MODES) or any(
+        item.get("additionalProperties") is not False for item in remediation
+    ):
+        raise ValueError("readiness remediation variants differ from runtime")
+
+    if probe.get("additionalProperties") is not False:
+        raise ValueError("readiness probe schema root must be closed")
+    probe_properties = probe.get("properties", {})
+    if probe_properties.get("schema_version", {}).get("const") != probe_runtime.PROBE_SCHEMA:
+        raise ValueError("readiness probe schema version differs from runtime")
+    if set(probe_properties.get("status", {}).get("enum", [])) != set(
+        probe_runtime.PROBE_STATUSES
+    ):
+        raise ValueError("readiness probe status vocabulary differs from runtime")
+    if set(probe.get("required", [])) != {
+        "schema_version",
+        "requirement_id",
+        "status",
+        "observations",
+        "artifacts",
+    }:
+        raise ValueError("readiness probe fields differ from runtime")
+
+    if report.get("additionalProperties") is not False:
+        raise ValueError("readiness report schema root must be closed")
+    report_properties = report.get("properties", {})
+    if report_properties.get("schema_version", {}).get("const") != gate_runtime.REPORT_SCHEMA:
+        raise ValueError("readiness report schema version differs from runtime")
+    result = report.get("$defs", {}).get("result", {})
+    if result.get("additionalProperties") is not False:
+        raise ValueError("readiness result schema must be closed")
+    if "evidence_path" not in set(result.get("required", [])):
+        raise ValueError("readiness result must bind durable evidence")
+    if set(
+        result.get("properties", {}).get("kind", {}).get("enum", [])
+    ) != set(contract_runtime.KINDS):
+        raise ValueError("readiness report capability vocabulary differs from runtime")
+
+
 def check_installation(skill_dir: Path | str) -> dict:
     root = Path(skill_dir)
     if root.is_symlink() or not root.is_dir():
@@ -361,12 +476,27 @@ def check_installation(skill_dir: Path | str) -> dict:
     _validate_capability_registry(root)
     checks.append("v3_capability_registry")
 
+    for name in _V3_1_SCRIPTS:
+        path = root / "scripts" / name
+        source = _read_safe_file(root, Path("scripts") / name).decode("utf-8")
+        compile(source, str(path), "exec")
+    for name in _V3_1_SCHEMAS:
+        payload = json.loads(_read_safe_file(root, Path("templates") / name))
+        if payload.get("additionalProperties") is not False:
+            raise ValueError(f"V3.1 schema root must be closed: {name}")
+    _validate_readiness_schema_contract(root)
+    checks.append("v3_1_readiness_admission")
+
     return {
         "schema_version": "cuda-evidence/self-check-v1",
         "status": "PASS",
         "checks": checks,
         "gpu_checks_run": False,
         "network_checks_run": False,
+        "readiness_contract": "passed",
+        "readiness_probe_schema": "passed",
+        "readiness_report_schema": "passed",
+        "gpu_environment_validated": False,
     }
 
 

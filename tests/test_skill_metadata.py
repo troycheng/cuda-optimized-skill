@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -10,6 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "skills" / "cuda-kernel-optimizer"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 OPENAI_YAML = SKILL_DIR / "agents" / "openai.yaml"
+
+
+def _load_self_check():
+    path = SKILL_DIR / "scripts" / "self_check.py"
+    module_name = "cuda_optimizer_self_check_metadata_test"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class SkillMetadataTests(unittest.TestCase):
@@ -237,6 +252,15 @@ class SkillMetadataTests(unittest.TestCase):
             if path.is_file() and path.suffix in {".md", ".json", ".yaml", ".py"}:
                 text = path.read_text(encoding="utf-8", errors="ignore")
                 self.assertNotIn("Claude Code", text, str(path))
+
+    def test_self_check_reports_static_readiness_admission_coverage(self) -> None:
+        result = _load_self_check().check_installation(SKILL_DIR)
+
+        self.assertEqual(result["readiness_contract"], "passed")
+        self.assertEqual(result["readiness_probe_schema"], "passed")
+        self.assertEqual(result["readiness_report_schema"], "passed")
+        self.assertFalse(result["gpu_environment_validated"])
+        self.assertIn("v3_1_readiness_admission", result["checks"])
 
 
 if __name__ == "__main__":

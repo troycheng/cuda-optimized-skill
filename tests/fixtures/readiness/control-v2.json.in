@@ -1,0 +1,21 @@
+{
+  "schema_version": "cuda-workload-optimizer/control-v2",
+  "project_root": "@PROJECT_ROOT@",
+  "workload_manifest": "@PROJECT_ROOT@/workload.json",
+  "readiness_contract": "@PROJECT_ROOT@/readiness.json",
+  "baseline_candidate": {"name": "baseline", "revision": "baseline"},
+  "budget": "fast",
+  "mutation": {
+    "project_paths": ["src", "configs"],
+    "environment_root": "@ENVIRONMENT_ROOT@",
+    "host_policy": "recommend_only"
+  },
+  "probes": [
+    {
+      "id": "timeline",
+      "kind": "timeline",
+      "argv": ["@PYTHON@", "@EMITTER@", "timeline", "ready"],
+      "timeout_seconds": 5
+    }
+  ]
+}

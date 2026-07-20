@@ -1,0 +1,6 @@
+{
+  "schema_version": "cuda-workload-optimizer/readiness-contract-v1",
+  "requested_claim": "workload",
+  "budget": {"max_seconds": 30, "max_repairs": 0},
+  "requirements": @REQUIREMENTS@
+}
