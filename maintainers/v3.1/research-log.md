@@ -255,3 +255,18 @@ Driver API 文档仍保留 `cuProfilerStart/cuProfilerStop`，因此不能把工
 已移除 profiler API。最终 fixture 使用 `<cuda.h>`、官方 Driver API 签名和 `libcuda`；NCU
 13.3 官方 CLI 文档确认 `--kernel-name-base`、正则 kernel filter、`--launch-count` 与
 `--profile-from-start` 的组合语义。真机复核后才保留这条路径。
+
+### 主动诊断合同质证
+
+2026-07-20 重新核对 NVIDIA Nsight Systems 2026.3 User Guide、Post-Collection Analysis
+Guide 和 PyTorch 2.13 profiler 文档。Nsight Systems 的 SQLite schema 可能变化且表按采集内容
+惰性创建；内置统计百分比不是 workload wall time 占比。PyTorch Execution Trace 提供图结构，
+但相关接口不保证向后兼容。由此决定：V3.1 execution map 必须绑定 profiler/export schema 和
+adapter implementation digest，缺表进入覆盖缺口，不能写成零值，也不能直接用统计汇总拼关键路径。
+
+DeepSeek 对第二个纵向切片做了敌意评审，给出未建模 idle 归因逃逸、渐进退化跨 epoch、无权限
+导致不可区分假设循环三个反例。采纳：显式 `unmodeled` 假设、`boundary_ambiguous`、等价请求
+签名去重和无可行区分项时的 `evidence_gap`。拒绝：未经真实 workload 回放校准的固定 30% 退化
+阈值、动态节点插件、epoch 自动合并，以及把需要 root 的采集变成自动宿主机修改。
+
+Gemini 同一轮提交返回页面错误 1096，没有把旧 readiness 评审误记为本轮质证结果。
