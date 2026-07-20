@@ -69,6 +69,9 @@
           "label",
           "duration_us",
           "occurrences",
+          "timing_status",
+          "first_start_us",
+          "last_end_us",
           "attribution_status",
           "evidence_ids"
         ],
@@ -80,6 +83,19 @@
           "label": {"type": "string", "minLength": 1, "maxLength": 512},
           "duration_us": {"type": "number", "exclusiveMinimum": 0},
           "occurrences": {"type": "integer", "minimum": 1},
+          "timing_status": {"enum": ["observed", "unavailable"]},
+          "first_start_us": {
+            "oneOf": [
+              {"type": "number", "minimum": 0},
+              {"type": "null"}
+            ]
+          },
+          "last_end_us": {
+            "oneOf": [
+              {"type": "number", "exclusiveMinimum": 0},
+              {"type": "null"}
+            ]
+          },
           "attribution_status": {
             "enum": ["explained", "unexplained", "not_applicable"]
           },
@@ -93,7 +109,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source", "target", "relation", "evidence_ids"],
+        "required": ["source", "target", "relation", "overlap_us", "evidence_ids"],
         "properties": {
           "source": {"$ref": "#/$defs/identifier"},
           "target": {"$ref": "#/$defs/identifier"},
@@ -104,7 +120,14 @@
               "transfers_to",
               "synchronizes",
               "precedes",
-              "unknown_dependency"
+              "unknown_dependency",
+              "overlaps"
+            ]
+          },
+          "overlap_us": {
+            "oneOf": [
+              {"type": "number", "exclusiveMinimum": 0},
+              {"type": "null"}
             ]
           },
           "evidence_ids": {"$ref": "#/$defs/evidence_ids"}

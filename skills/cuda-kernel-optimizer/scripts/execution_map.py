@@ -32,10 +32,12 @@ _RELATIONS = {
     "synchronizes",
     "precedes",
     "unknown_dependency",
+    "overlaps",
 }
 _ATTRIBUTION = {"explained", "unexplained", "not_applicable"}
 _COVERAGE = {"observed", "not_observed", "unavailable"}
 _CONCLUSIONS = {"observed", "inconclusive"}
+_TIMING_STATUS = {"observed", "unavailable"}
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
@@ -223,6 +225,7 @@ def validate_execution_map(
     if type(nodes) is not list or not nodes or len(nodes) > 256:
         raise ValidationError("execution_map nodes must contain 1 to 256 entries")
     node_ids = set()
+    node_timing = {}
     node_layers = {layer: 0 for layer in LAYERS}
     unexplained = False
     for index, raw in enumerate(nodes):
@@ -236,6 +239,9 @@ def validate_execution_map(
                 "label",
                 "duration_us",
                 "occurrences",
+                "timing_status",
+                "first_start_us",
+                "last_end_us",
                 "attribution_status",
                 "evidence_ids",
             },
@@ -254,9 +260,40 @@ def validate_execution_map(
         _identifier(node["lane"], f"nodes[{index}].lane")
         _identifier(node["kind"], f"nodes[{index}].kind")
         _text(node["label"], f"nodes[{index}].label")
-        _number(node["duration_us"], f"nodes[{index}].duration_us", positive=True)
+        duration = _number(
+            node["duration_us"], f"nodes[{index}].duration_us", positive=True
+        )
         if type(node["occurrences"]) is not int or node["occurrences"] < 1:
             raise ValidationError(f"nodes[{index}].occurrences must be positive")
+        timing_status = node["timing_status"]
+        if timing_status not in _TIMING_STATUS:
+            raise ValidationError(f"nodes[{index}].timing_status is unsupported")
+        if timing_status == "observed":
+            first_start = _number(
+                node["first_start_us"], f"nodes[{index}].first_start_us"
+            )
+            last_end = _number(
+                node["last_end_us"], f"nodes[{index}].last_end_us"
+            )
+            if first_start < start or last_end > end or last_end <= first_start:
+                raise ValidationError("observed node timing must be inside the map window")
+            if duration > last_end - first_start:
+                raise ValidationError(
+                    "node duration_us cannot exceed its observed timing span"
+                )
+        else:
+            if node["first_start_us"] is not None or node["last_end_us"] is not None:
+                raise ValidationError("unavailable node timing bounds must be null")
+            first_start = None
+            last_end = None
+            unexplained = True
+        node_timing[node_id] = {
+            "lane": node["lane"],
+            "duration_us": duration,
+            "status": timing_status,
+            "first_start_us": first_start,
+            "last_end_us": last_end,
+        }
         if node["attribution_status"] not in _ATTRIBUTION:
             raise ValidationError(f"nodes[{index}].attribution_status is unsupported")
         unexplained = unexplained or node["attribution_status"] == "unexplained"
@@ -270,7 +307,11 @@ def validate_execution_map(
         raise ValidationError("execution_map edges must be an array of at most 1024 entries")
     edge_keys = set()
     for index, raw in enumerate(edges):
-        edge = _closed(raw, {"source", "target", "relation", "evidence_ids"}, f"edges[{index}]")
+        edge = _closed(
+            raw,
+            {"source", "target", "relation", "overlap_us", "evidence_ids"},
+            f"edges[{index}]",
+        )
         source = _identifier(edge["source"], f"edges[{index}].source")
         target = _identifier(edge["target"], f"edges[{index}].target")
         if source not in node_ids or target not in node_ids:
@@ -280,6 +321,34 @@ def validate_execution_map(
         relation = edge["relation"]
         if relation not in _RELATIONS:
             raise ValidationError(f"edges[{index}].relation is unsupported")
+        if relation == "overlaps":
+            if source >= target:
+                raise ValidationError("overlap edge must use canonical node order")
+            source_timing = node_timing[source]
+            target_timing = node_timing[target]
+            if (
+                source_timing["status"] != "observed"
+                or target_timing["status"] != "observed"
+            ):
+                raise ValidationError("overlap edge requires observed timing")
+            if source_timing["lane"] == target_timing["lane"]:
+                raise ValidationError("overlap edge must connect distinct lanes")
+            overlap = _number(
+                edge["overlap_us"], f"edges[{index}].overlap_us", positive=True
+            )
+            span_overlap = min(
+                source_timing["last_end_us"], target_timing["last_end_us"]
+            ) - max(
+                source_timing["first_start_us"], target_timing["first_start_us"]
+            )
+            if span_overlap <= 0 or overlap > span_overlap:
+                raise ValidationError("overlap_us exceeds observed timing intersection")
+            if overlap > min(
+                source_timing["duration_us"], target_timing["duration_us"]
+            ):
+                raise ValidationError("overlap_us exceeds node active duration")
+        elif edge["overlap_us"] is not None:
+            raise ValidationError("non-overlap edge overlap_us must be null")
         key = (source, target, relation)
         if key in edge_keys:
             raise ValidationError("execution_map edges must be unique")
@@ -311,12 +380,18 @@ def validate_execution_map(
         _text(interval["reason"], f"uncovered_intervals[{index}].reason")
     if result["conclusion_level"] not in _CONCLUSIONS:
         raise ValidationError("execution_map conclusion_level is unsupported")
+    timing_unavailable = any(
+        item["status"] == "unavailable" for item in node_timing.values()
+    )
+    if timing_unavailable and result["conclusion_level"] != "inconclusive":
+        raise ValidationError("unavailable node timing requires an inconclusive map")
 
     requires_unmodeled = (
         unexplained
         or bool(intervals)
         or any(status == "unavailable" for status in coverage_by_layer.values())
         or bool(window["boundary_ambiguous"])
+        or timing_unavailable
     )
     return {
         "execution_map": copy.deepcopy(dict(result)),

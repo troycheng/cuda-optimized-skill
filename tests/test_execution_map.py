@@ -96,6 +96,9 @@ def map_fixture(module) -> dict:
                 "label": "cudaLaunchKernel",
                 "duration_us": 900.0,
                 "occurrences": 4,
+                "timing_status": "observed",
+                "first_start_us": 0.0,
+                "last_end_us": 900.0,
                 "attribution_status": "explained",
                 "evidence_ids": ["ev-cpu"],
             },
@@ -107,6 +110,9 @@ def map_fixture(module) -> dict:
                 "label": "decode_attention",
                 "duration_us": 900.0,
                 "occurrences": 4,
+                "timing_status": "observed",
+                "first_start_us": 100.0,
+                "last_end_us": 1000.0,
                 "attribution_status": "not_applicable",
                 "evidence_ids": ["ev-gpu"],
             },
@@ -116,6 +122,7 @@ def map_fixture(module) -> dict:
                 "source": "cpu-launch",
                 "target": "gpu-kernel",
                 "relation": "calls",
+                "overlap_us": None,
                 "evidence_ids": ["ev-edge"],
             }
         ],
@@ -142,6 +149,119 @@ class ExecutionMapTests(unittest.TestCase):
         self.assertEqual(result["execution_map"], value)
         self.assertFalse(result["requires_unmodeled_hypothesis"])
         self.assertEqual(result["window_duration_us"], 1000.0)
+
+    def test_transfer_overlap_is_explicit_and_bounded(self) -> None:
+        value = map_fixture(self.module)
+        next(x for x in value["coverage"] if x["layer"] == "transfer").update(
+            {"status": "observed", "reason": None}
+        )
+        value["nodes"].append(
+            {
+                "node_id": "h2d-copy",
+                "layer": "transfer",
+                "lane": "copy-stream-0",
+                "kind": "h2d",
+                "label": "input copy",
+                "duration_us": 200.0,
+                "occurrences": 1,
+                "timing_status": "observed",
+                "first_start_us": 200.0,
+                "last_end_us": 400.0,
+                "attribution_status": "explained",
+                "evidence_ids": ["ev-gpu"],
+            }
+        )
+        value["edges"].append(
+            {
+                "source": "gpu-kernel",
+                "target": "h2d-copy",
+                "relation": "overlaps",
+                "overlap_us": 200.0,
+                "evidence_ids": ["ev-edge"],
+            }
+        )
+        result = self.validate(value)
+        overlap = result["execution_map"]["edges"][1]
+        self.assertEqual(overlap["overlap_us"], 200.0)
+
+        value["edges"][-1]["overlap_us"] = 201.0
+        with self.assertRaisesRegex(self.module.ValidationError, "overlap"):
+            self.validate(value)
+
+    def test_partial_overlap_and_serial_transfer_are_distinguishable(self) -> None:
+        value = map_fixture(self.module)
+        next(x for x in value["coverage"] if x["layer"] == "transfer").update(
+            {"status": "observed", "reason": None}
+        )
+        for node_id, start, end in (
+            ("partial-copy", 850.0, 950.0),
+            ("serial-copy", 950.0, 1000.0),
+        ):
+            value["nodes"].append(
+                {
+                    "node_id": node_id,
+                    "layer": "transfer",
+                    "lane": f"copy-{node_id}",
+                    "kind": "h2d",
+                    "label": node_id,
+                    "duration_us": end - start,
+                    "occurrences": 1,
+                    "timing_status": "observed",
+                    "first_start_us": start,
+                    "last_end_us": end,
+                    "attribution_status": "explained",
+                    "evidence_ids": ["ev-gpu"],
+                }
+            )
+        value["edges"].extend(
+            [
+                {
+                    "source": "gpu-kernel",
+                    "target": "partial-copy",
+                    "relation": "overlaps",
+                    "overlap_us": 100.0,
+                    "evidence_ids": ["ev-edge"],
+                },
+                {
+                    "source": "partial-copy",
+                    "target": "serial-copy",
+                    "relation": "precedes",
+                    "overlap_us": None,
+                    "evidence_ids": ["ev-edge"],
+                },
+            ]
+        )
+        self.validate(value)
+
+        value["edges"][1]["overlap_us"] = 0.0
+        with self.assertRaisesRegex(self.module.ValidationError, "positive"):
+            self.validate(value)
+
+    def test_missing_node_timing_forces_inconclusive_without_fake_overlap(self) -> None:
+        value = map_fixture(self.module)
+        node = value["nodes"][1]
+        node.update(
+            {
+                "timing_status": "unavailable",
+                "first_start_us": None,
+                "last_end_us": None,
+            }
+        )
+        value["conclusion_level"] = "inconclusive"
+        result = self.validate(value)
+        self.assertTrue(result["requires_unmodeled_hypothesis"])
+
+        value["edges"].append(
+            {
+                "source": "cpu-launch",
+                "target": "gpu-kernel",
+                "relation": "overlaps",
+                "overlap_us": 10.0,
+                "evidence_ids": ["ev-edge"],
+            }
+        )
+        with self.assertRaisesRegex(self.module.ValidationError, "timing"):
+            self.validate(value)
 
     def test_epoch_and_controller_identities_are_bound(self) -> None:
         value = map_fixture(self.module)
@@ -211,6 +331,9 @@ class ExecutionMapTests(unittest.TestCase):
                 "label": "unattributed GPU idle",
                 "duration_us": 50.0,
                 "occurrences": 1,
+                "timing_status": "observed",
+                "first_start_us": 900.0,
+                "last_end_us": 950.0,
                 "attribution_status": "unexplained",
                 "evidence_ids": ["ev-gpu"],
             }
