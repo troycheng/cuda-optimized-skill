@@ -135,6 +135,15 @@ capability probe 必须彼此独立，不得依靠前一个 probe 留下的 CUDA
 预检结果分为 `ready`、`auto_fixable`、`user_action_required`、`degraded` 和 `blocked`。
 存在未处理的 `required` 项时，Controller 不能进入正式诊断。
 
+3.1 新 run 使用 `control-v2`，显式绑定 project 内的 readiness contract。Controller 状态从
+`readiness` 开始；只有 report、completion marker、冻结合同、当前环境 identity、required
+结果和 `valid_until` 同时成立，才能进入 baseline。baseline 之后、timeline 或其他高成本
+profile 之前再次做同一复核；新鲜证据只验证不重跑，过期或 identity 改变才交回 gate。
+`control-v1` 只保留历史 validate、resume 和 replay，不通过 CLI 创建新 run。
+
+readiness 期间还要复核声明的 project mutation roots 与 workload source hash。blocked run 保留
+`readiness_action` 和原证据；用户处理 host 后创建 child run，不能在变化后的环境里原地恢复。
+
 ### 4.4 独立预算
 
 环境准备使用 `readiness_budget`，profile、方向实验和候选使用

@@ -369,7 +369,7 @@ git commit -m "feat(v3.1): gate diagnosis on verified readiness"
 - 修改：`skills/cuda-kernel-optimizer/scripts/workload_controller.py`
 - 测试：`tests/test_workload_controller.py`
 
-- [ ] **步骤 1：编写 v2 和状态迁移失败测试**
+- [x] **步骤 1：编写 v2 和状态迁移失败测试**
 
 v2 固定增加：
 
@@ -380,8 +380,9 @@ v2 固定增加：
 }
 ```
 
-覆盖 v2 缺 readiness、合同越界、初始化中漂移、required blocked 仍测 baseline、resume 重复
-readiness、报告篡改、marker 篡改，以及 baseline 或后续高成本 profiler 前错误接受过期证据。
+覆盖 v2 缺 readiness、合同越界、初始化中 project/workload 漂移、required blocked 仍测 baseline、
+resume 重复 readiness、报告篡改、marker 篡改，以及 baseline 或后续高成本 profiler 前错误接受
+过期证据。blocked resume 保持 `readiness_action`，不在变化后的环境中原地重开。
 
 ```python
 def test_blocked_readiness_never_measures_baseline(self):
@@ -393,7 +394,7 @@ def test_blocked_readiness_never_measures_baseline(self):
     evaluate.assert_not_called()
 ```
 
-- [ ] **步骤 2：运行并确认失败**
+- [x] **步骤 2：运行并确认失败**
 
 ```bash
 python3 -m unittest \
@@ -401,16 +402,17 @@ python3 -m unittest \
   tests.test_workload_controller.WorkloadRoundTests -v
 ```
 
-- [ ] **步骤 3：实现兼容边界**
+- [x] **步骤 3：实现兼容边界**
 
 ```python
 CONTROL_SCHEMA_V1 = "cuda-workload-optimizer/control-v1"
 CONTROL_SCHEMA_V2 = "cuda-workload-optimizer/control-v2"
 ```
 
-v1 保留 validate、status 和历史 replay；新建 3.1 run 只接受 v2。不得原地改变 v1 字段含义。
+v1 保留 validate、内部兼容和历史 resume/replay；面向用户的 CLI 新建 3.1 run 只接受 v2。
+不得原地改变 v1 字段含义。
 
-- [ ] **步骤 4：增加初始状态和迁移**
+- [x] **步骤 4：增加初始状态和迁移**
 
 ```python
 {
@@ -424,7 +426,7 @@ v1 保留 validate、status 和历史 replay；新建 3.1 run 只接受 v2。不
 允许 `readiness -> baseline` 或 `readiness -> readiness_action`。用户处理宿主机后创建 child run，
 旧 run 不在环境变化后原地重开。
 
-- [ ] **步骤 5：验证并提交**
+- [x] **步骤 5：验证并提交**
 
 ```bash
 python3 -m unittest tests.test_workload_controller tests.test_state_schema -v

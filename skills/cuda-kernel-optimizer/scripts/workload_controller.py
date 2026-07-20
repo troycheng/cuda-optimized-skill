@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any
 
 
-CONTROL_SCHEMA = "cuda-workload-optimizer/control-v1"
+CONTROL_SCHEMA_V1 = "cuda-workload-optimizer/control-v1"
+CONTROL_SCHEMA_V2 = "cuda-workload-optimizer/control-v2"
+CONTROL_SCHEMA = CONTROL_SCHEMA_V1
 CHANGE_SCHEMA = "cuda-workload-optimizer/change-v1"
 _BUDGETS = {"fast", "balanced", "thorough"}
 _PROBE_KINDS = {
@@ -62,6 +64,8 @@ _DIAGNOSIS_MODULE = None
 _REVIEWER_MODULE = None
 _WORKLOAD_MODULE = None
 _EVALUATE_MODULE = None
+_READINESS_CONTRACT_MODULE = None
+_READINESS_GATE_MODULE = None
 _BUDGET_RUNTIME = {
     "fast": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
     "balanced": {
@@ -249,12 +253,20 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         "mutation",
         "probes",
         "reviewer",
+        "readiness_contract",
     }
-    required = allowed - {"reviewer", "evaluation_gate"}
+    schema_version = control.get("schema_version")
+    if schema_version not in {CONTROL_SCHEMA_V1, CONTROL_SCHEMA_V2}:
+        raise ValidationError(
+            f"schema_version must be {CONTROL_SCHEMA_V1} or {CONTROL_SCHEMA_V2}"
+        )
+    required = allowed - {"reviewer", "evaluation_gate", "readiness_contract"}
+    if schema_version == CONTROL_SCHEMA_V2:
+        required.add("readiness_contract")
     _closed(control, allowed, "control")
     _required(control, required, "control")
-    if control["schema_version"] != CONTROL_SCHEMA:
-        raise ValidationError(f"schema_version must be {CONTROL_SCHEMA}")
+    if schema_version == CONTROL_SCHEMA_V1 and "readiness_contract" in control:
+        raise ValidationError("control-v1 must not contain readiness_contract")
 
     project_root = _absolute(control["project_root"], "project_root")
     workload_manifest = _absolute(
@@ -262,6 +274,14 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
     )
     if not _is_within(workload_manifest, project_root):
         raise ValidationError("workload_manifest must be inside project_root")
+    if schema_version == CONTROL_SCHEMA_V2:
+        readiness_contract = _absolute(
+            control["readiness_contract"], "readiness_contract"
+        )
+        if not _is_within(readiness_contract, project_root):
+            raise ValidationError(
+                "readiness_contract must be inside project_root"
+            )
     baseline = _object(control["baseline_candidate"], "baseline_candidate")
     if not baseline:
         raise ValidationError("baseline_candidate must not be empty")
@@ -488,8 +508,17 @@ def _load_sibling_module(filename: str, module_name: str):
 def _load_workload_module():
     global _WORKLOAD_MODULE
     if _WORKLOAD_MODULE is None:
-        _load_evaluate_module()
-        _WORKLOAD_MODULE = sys.modules["workload_adapter"]
+        script_dir = str(Path(__file__).resolve().parent)
+        inserted = script_dir not in sys.path
+        if inserted:
+            sys.path.insert(0, script_dir)
+        try:
+            _WORKLOAD_MODULE = _load_sibling_module(
+                "workload_adapter.py", "workload_adapter"
+            )
+        finally:
+            if inserted:
+                sys.path.remove(script_dir)
     return _WORKLOAD_MODULE
 
 
@@ -510,6 +539,26 @@ def _load_evaluate_module():
             if inserted:
                 sys.path.remove(script_dir)
     return _EVALUATE_MODULE
+
+
+def _load_readiness_contract_module():
+    global _READINESS_CONTRACT_MODULE
+    if _READINESS_CONTRACT_MODULE is None:
+        _READINESS_CONTRACT_MODULE = _load_sibling_module(
+            "readiness_contract.py",
+            "cuda_optimizer_readiness_contract_controller",
+        )
+    return _READINESS_CONTRACT_MODULE
+
+
+def _load_readiness_gate_module():
+    global _READINESS_GATE_MODULE
+    if _READINESS_GATE_MODULE is None:
+        _READINESS_GATE_MODULE = _load_sibling_module(
+            "readiness_gate.py",
+            "cuda_optimizer_readiness_gate_controller",
+        )
+    return _READINESS_GATE_MODULE
 
 
 def _canonical_digest(value: Any) -> str:
@@ -1156,6 +1205,112 @@ def _check_deadline(state: Mapping[str, Any]) -> None:
         raise ValidationError("workload optimization budget deadline has expired")
 
 
+def _current_readiness_identity(control: Mapping[str, Any]) -> dict:
+    environment_root = Path(control["mutation"]["environment_root"])
+    if not environment_root.is_dir() or environment_root.is_symlink():
+        raise ValidationError(
+            "control-v2 environment_root must be an existing non-symlink directory"
+        )
+    toolchain_digest = _identity(control, "isolated_environment")["digest"]
+    return {
+        "toolchain_digest": toolchain_digest,
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "container_identity": os.environ.get("CUDA_OPTIMIZER_CONTAINER_ID"),
+        "gpu_identity": os.environ.get("CUDA_OPTIMIZER_GPU_IDENTITY"),
+        "visible_devices": {
+            "cuda": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "nvidia": os.environ.get("NVIDIA_VISIBLE_DEVICES"),
+        },
+        "permission_state": os.environ.get(
+            "CUDA_OPTIMIZER_COUNTER_PERMISSION"
+        ),
+    }
+
+
+def _load_frozen_readiness_contract(
+    control: Mapping[str, Any], run_root: Path, state: Mapping[str, Any]
+) -> dict:
+    module = _load_readiness_contract_module()
+    path = run_root / "readiness_contract.json"
+    value = module.load_contract(path)
+    validated = module.validate_contract(
+        value,
+        project_root=Path(control["project_root"]),
+        environment_root=Path(control["mutation"]["environment_root"]),
+    )
+    if module.contract_digest(validated) != state.get(
+        "readiness_contract_digest"
+    ):
+        raise ValidationError("frozen readiness contract digest does not match state")
+    return validated
+
+
+def _run_readiness_gate(
+    control: Mapping[str, Any], run_root: Path, state: Mapping[str, Any]
+) -> dict:
+    gate = _load_readiness_gate_module()
+    contract = _load_frozen_readiness_contract(control, run_root, state)
+    identity = _current_readiness_identity(control)
+    return gate.run_gate(
+        contract=contract,
+        control={
+            "project_root": control["project_root"],
+            "environment_root": control["mutation"]["environment_root"],
+            "environment_identity": identity,
+        },
+        run_dir=run_root,
+        identity_provider=lambda: _current_readiness_identity(control),
+    )
+
+
+def _readiness_report_digest(run_root: Path, report: Mapping[str, Any]) -> str:
+    path = run_root / "readiness" / "report.json"
+    return _sha256_path(path) if path.is_file() else _canonical_digest(report)
+
+
+def _verify_readiness_report(
+    control: Mapping[str, Any], run_root: Path, state: Mapping[str, Any]
+) -> bool:
+    gate = _load_readiness_gate_module()
+    try:
+        report = gate._load_prior_report(run_root / "readiness")
+    except ValueError as error:
+        raise ValidationError(f"readiness report verification failed: {error}") from error
+    if report is None:
+        raise ValidationError("completed readiness stage is missing its report")
+    if _readiness_report_digest(run_root, report) != state.get(
+        "readiness_report_digest"
+    ):
+        raise ValidationError("readiness report digest does not match state")
+    contract = _load_frozen_readiness_contract(control, run_root, state)
+    contract_digest = _load_readiness_contract_module().contract_digest(contract)
+    if report.get("contract_digest") != contract_digest:
+        raise ValidationError("readiness report contract digest drifted")
+    identity_digest = gate.environment_identity_digest(
+        _current_readiness_identity(control)
+    )
+    if report.get("environment_identity_digest") != identity_digest:
+        return False
+    if not report.get("can_start_diagnosis"):
+        return False
+    now = time.time()
+    required_ids = {
+        item["id"] for item in contract["requirements"] if item["necessity"] == "required"
+    }
+    ready_ids = {
+        item.get("requirement_id")
+        for item in report.get("results", [])
+        if type(item) is dict
+        and item.get("necessity") == "required"
+        and item.get("admission_status") == "ready"
+        and isinstance(item.get("valid_until"), (int, float))
+        and not isinstance(item.get("valid_until"), bool)
+        and math.isfinite(float(item["valid_until"]))
+        and float(item["valid_until"]) > now
+    }
+    return ready_ids == required_ids
+
+
 def start_run(
     control: Mapping[str, Any], run_dir: os.PathLike[str] | str
 ) -> dict:
@@ -1173,6 +1328,7 @@ def start_run(
             raise ValidationError("control manifest drifted after run initialization")
         _load_frozen_control(run_root, state)
         if state["next_action"] in {
+            "readiness_action",
             "register_change",
             "edit_then_evaluate",
             "done",
@@ -1181,6 +1337,20 @@ def start_run(
             return state
     else:
         run_root.mkdir(parents=True, exist_ok=True)
+        readiness_contract = None
+        readiness_contract_digest = None
+        if normalized["schema_version"] == CONTROL_SCHEMA_V2:
+            readiness_module = _load_readiness_contract_module()
+            readiness_contract = readiness_module.validate_contract(
+                readiness_module.load_contract(normalized["readiness_contract"]),
+                project_root=project_root,
+                environment_root=Path(
+                    normalized["mutation"]["environment_root"]
+                ),
+            )
+            readiness_contract_digest = readiness_module.contract_digest(
+                readiness_contract
+            )
         baseline_identity = _identity(normalized, "project")
         environment_root = Path(normalized["mutation"]["environment_root"])
         environment_identity = None
@@ -1210,10 +1380,18 @@ def start_run(
         state = {
             "schema_version": "cuda-workload-optimizer/state-v1",
             "status": "active",
-            "stage": "baseline",
+            "stage": (
+                "readiness"
+                if normalized["schema_version"] == CONTROL_SCHEMA_V2
+                else "baseline"
+            ),
             "round": 1,
             "completed_stages": [],
-            "next_action": "baseline",
+            "next_action": (
+                "readiness"
+                if normalized["schema_version"] == CONTROL_SCHEMA_V2
+                else "baseline"
+            ),
             "control_digest": control_digest,
             "workload_source_hash": workload.source_hash,
             "started_at_epoch": now,
@@ -1221,6 +1399,12 @@ def start_run(
             "deadline_epoch": now + runtime["deadline_seconds"],
         }
         _atomic_json(run_root / "control_manifest.json", normalized)
+        if readiness_contract is not None:
+            _atomic_json(
+                run_root / "readiness_contract.json", readiness_contract
+            )
+            state["readiness_contract_digest"] = readiness_contract_digest
+            state["readiness_report_digest"] = None
         _atomic_json(run_root / "baseline_identity.json", baseline_identity)
         state["baseline_identity_digest"] = baseline_identity["digest"]
         state["baseline_environment_identity_digest"] = (
@@ -1244,6 +1428,68 @@ def start_run(
         raise ValidationError("workload identity drifted after run initialization")
     runtime = _BUDGET_RUNTIME[normalized["budget"]]
 
+    if (
+        normalized["schema_version"] == CONTROL_SCHEMA_V2
+        and "readiness" not in state["completed_stages"]
+    ):
+        report = _run_readiness_gate(normalized, run_root, state)
+        state = copy.deepcopy(state)
+        state["readiness_report_digest"] = _readiness_report_digest(
+            run_root, report
+        )
+        state["readiness_environment_identity_digest"] = report.get(
+            "environment_identity_digest"
+        )
+        if not report.get("can_start_diagnosis"):
+            state["stage"] = "readiness"
+            state["next_action"] = "readiness_action"
+            state["updated_at_epoch"] = time.time()
+            return _write_state(run_root, state)
+        if _identity(normalized, "project")["digest"] != state.get(
+            "baseline_identity_digest"
+        ):
+            raise ValidationError(
+                "declared project identity drifted during readiness"
+            )
+        if _normalize_frozen_workload(normalized).source_hash != state.get(
+            "workload_source_hash"
+        ):
+            raise ValidationError("workload identity drifted during readiness")
+        refreshed_environment = _identity(
+            normalized, "isolated_environment"
+        )
+        _atomic_json(
+            run_root / "baseline_environment_identity.json",
+            refreshed_environment,
+        )
+        state["baseline_environment_identity_digest"] = refreshed_environment[
+            "digest"
+        ]
+        state = _advance(
+            run_root,
+            state,
+            "readiness",
+            stage="baseline",
+            next_action="baseline",
+        )
+
+    if normalized["schema_version"] == CONTROL_SCHEMA_V2:
+        if not _verify_readiness_report(normalized, run_root, state):
+            report = _run_readiness_gate(normalized, run_root, state)
+            state = copy.deepcopy(state)
+            state["readiness_report_digest"] = _readiness_report_digest(
+                run_root, report
+            )
+            state["readiness_environment_identity_digest"] = report.get(
+                "environment_identity_digest"
+            )
+            state["updated_at_epoch"] = time.time()
+            state = _write_state(run_root, state)
+            if not report.get("can_start_diagnosis"):
+                state["stage"] = "readiness"
+                state["next_action"] = "readiness_action"
+                return _write_state(run_root, state)
+
     if "baseline" not in state["completed_stages"]:
         timeout = (
             None
@@ -1266,6 +1512,24 @@ def start_run(
         )
     _check_deadline(state)
     if "probes" not in state["completed_stages"]:
+        if (
+            normalized["schema_version"] == CONTROL_SCHEMA_V2
+            and not _verify_readiness_report(normalized, run_root, state)
+        ):
+            report = _run_readiness_gate(normalized, run_root, state)
+            state = copy.deepcopy(state)
+            state["readiness_report_digest"] = _readiness_report_digest(
+                run_root, report
+            )
+            state["readiness_environment_identity_digest"] = report.get(
+                "environment_identity_digest"
+            )
+            state["updated_at_epoch"] = time.time()
+            if not report.get("can_start_diagnosis"):
+                state["stage"] = "readiness"
+                state["next_action"] = "readiness_action"
+                return _write_state(run_root, state)
+            state = _write_state(run_root, state)
         run_probes(
             normalized,
             run_root,
@@ -1899,9 +2163,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(artifact, sort_keys=True))
             return 0
         if args.command == "run":
+            control = validate_control_manifest(load_json_object(args.control))
+            if control["schema_version"] != CONTROL_SCHEMA_V2:
+                raise ValidationError(
+                    "new controller runs require control-v2 with readiness_contract; "
+                    "control-v1 remains available for validate and historical resume"
+                )
             print(
                 json.dumps(
-                    start_run(load_json_object(args.control), args.run_dir),
+                    start_run(control, args.run_dir),
                     sort_keys=True,
                 )
             )

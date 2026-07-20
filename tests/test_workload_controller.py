@@ -88,6 +88,57 @@ def _control(root: Path) -> dict:
     }
 
 
+def _enable_v2_readiness(
+    control: dict,
+    root: Path,
+    *,
+    status: str = "ready",
+    max_age_seconds: int = 300,
+) -> dict:
+    project = Path(control["project_root"])
+    environment = Path(control["mutation"]["environment_root"])
+    environment.mkdir(parents=True, exist_ok=True)
+    emitter = project / "readiness_probe.py"
+    emitter.write_text(
+        "import json, os\n"
+        "payload = {\n"
+        " 'schema_version': 'cuda-workload-optimizer/readiness-probe-v1',\n"
+        " 'requirement_id': 'gpu-execute',\n"
+        f" 'status': {status!r}, 'observations': {{}}, 'artifacts': []}}\n"
+        "open(os.environ['CUDA_OPTIMIZER_READINESS_OUTPUT'], 'w').write(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+    contract_path = project / "readiness.json"
+    contract_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "cuda-workload-optimizer/readiness-contract-v1",
+                "requested_claim": "workload",
+                "budget": {"max_seconds": 30, "max_repairs": 0},
+                "requirements": [
+                    {
+                        "id": "gpu-execute",
+                        "necessity": "required",
+                        "control_scope": "project",
+                        "phase": "foundation",
+                        "kind": "gpu_execute",
+                        "max_age_seconds": max_age_seconds,
+                        "probe": {
+                            "argv": [sys.executable, str(emitter)],
+                            "timeout_seconds": 5,
+                        },
+                        "remediation": {"mode": "none"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    control["schema_version"] = "cuda-workload-optimizer/control-v2"
+    control["readiness_contract"] = str(contract_path)
+    return control
+
+
 def _change_set() -> dict:
     return {
         "schema_version": "cuda-workload-optimizer/change-v1",
@@ -126,6 +177,68 @@ class WorkloadControllerContractTests(unittest.TestCase):
             change["paths"].append("src/later.py")
             self.assertNotIn("later", normalized["mutation"]["project_paths"])
             self.assertNotIn("src/later.py", normalized_change["paths"])
+
+    def test_v2_requires_contained_readiness_contract_but_v1_remains_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control = _control(root)
+            self.assertEqual(
+                self.controller.validate_control_manifest(control)["schema_version"],
+                "cuda-workload-optimizer/control-v1",
+            )
+
+            control["schema_version"] = "cuda-workload-optimizer/control-v2"
+            with self.assertRaisesRegex(ValueError, "readiness_contract"):
+                self.controller.validate_control_manifest(control)
+
+            control["readiness_contract"] = str(root / "outside.json")
+            with self.assertRaisesRegex(ValueError, "readiness_contract.*project_root"):
+                self.controller.validate_control_manifest(control)
+
+            control["readiness_contract"] = str(
+                root / "project" / "readiness.json"
+            )
+            normalized = self.controller.validate_control_manifest(control)
+            self.assertEqual(
+                normalized["schema_version"],
+                "cuda-workload-optimizer/control-v2",
+            )
+
+    def test_cli_new_run_rejects_v1_but_validate_keeps_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control_path = root / "control.json"
+            control_path.write_text(json.dumps(_control(root)), "utf-8")
+            validate = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "validate",
+                    "--control",
+                    str(control_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(validate.returncode, 0, validate.stderr)
+
+            run = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "run",
+                    "--control",
+                    str(control_path),
+                    "--run-dir",
+                    str(root / "run"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("require control-v2", run.stderr)
 
     def test_reject_only_gate_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -819,6 +932,169 @@ class WorkloadRoundTests(unittest.TestCase):
         change["commands"] = []
         change.update(overrides)
         return change
+
+    def test_v2_blocked_readiness_never_measures_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root, status="failed")
+            blocked = {
+                "schema_version": "cuda-workload-optimizer/readiness-report-v1",
+                "status": "blocked",
+                "can_start_diagnosis": False,
+                "contract_digest": "a" * 64,
+                "environment_identity_digest": "b" * 64,
+            }
+
+            with mock.patch.object(
+                self.controller,
+                "_run_readiness_gate",
+                return_value=blocked,
+                create=True,
+            ) as readiness, mock.patch.object(
+                self.controller, "_load_evaluate_module"
+            ) as evaluate:
+                state = self.controller.start_run(control, run_dir)
+
+            self.assertEqual(state["stage"], "readiness")
+            self.assertEqual(state["next_action"], "readiness_action")
+            self.assertEqual(state["completed_stages"], [])
+            readiness.assert_called_once()
+            evaluate.assert_not_called()
+            self.assertFalse((run_dir / "baseline" / "observation.json").exists())
+            resumed = self.controller.resume_run(run_dir)
+            self.assertEqual(resumed, state)
+            readiness.assert_called_once()
+
+    def test_v2_ready_readiness_precedes_baseline_and_is_frozen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+
+            state = self.controller.start_run(control, run_dir)
+
+            self.assertEqual(state["next_action"], "register_change")
+            self.assertEqual(
+                state["completed_stages"],
+                ["readiness", "baseline", "probes", "diagnosis"],
+            )
+            self.assertEqual(len(state["readiness_contract_digest"]), 64)
+            self.assertEqual(len(state["readiness_report_digest"]), 64)
+            self.assertTrue((run_dir / "readiness" / "report.json").is_file())
+            self.assertTrue(
+                (run_dir / "readiness" / "report.complete.json").is_file()
+            )
+            self.assertTrue((run_dir / "baseline" / "observation.json").is_file())
+
+    def test_v2_project_drift_during_readiness_blocks_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            emitter = project / "readiness_probe.py"
+            emitter.write_text(
+                emitter.read_text("utf-8")
+                + f"\nopen({str(project / 'configs' / 'value.json')!r}, 'w').write('{{}}')\n",
+                "utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "drifted during readiness"):
+                self.controller.start_run(control, run_dir)
+            self.assertFalse((run_dir / "baseline" / "observation.json").exists())
+
+    def test_v2_workload_source_drift_during_readiness_blocks_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            emitter = project / "readiness_probe.py"
+            emitter.write_text(
+                emitter.read_text("utf-8")
+                + f"\nopen({str(project / 'adapter.py')!r}, 'a').write('\\n# drift\\n')\n",
+                "utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "workload identity drifted during readiness"
+            ):
+                self.controller.start_run(control, run_dir)
+            self.assertFalse((run_dir / "baseline" / "observation.json").exists())
+
+    def test_v2_resume_does_not_rerun_fresh_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            evaluator = mock.Mock()
+            evaluator.measure_candidate.side_effect = RuntimeError("stop at baseline")
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ), self.assertRaisesRegex(RuntimeError, "stop at baseline"):
+                self.controller.start_run(control, run_dir)
+            attempts = list((run_dir / "readiness" / "attempts").iterdir())
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ), self.assertRaisesRegex(RuntimeError, "stop at baseline"):
+                self.controller.resume_run(run_dir)
+
+            self.assertEqual(
+                sorted(path.name for path in attempts),
+                sorted(
+                    path.name
+                    for path in (run_dir / "readiness" / "attempts").iterdir()
+                ),
+            )
+
+    def test_v2_report_and_marker_tampering_block_resume_before_baseline(self) -> None:
+        for target in ("report", "marker"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                control, run_dir, _project = self._workspace(root)
+                _enable_v2_readiness(control, root)
+                evaluator = mock.Mock()
+                evaluator.measure_candidate.side_effect = RuntimeError(
+                    "stop at baseline"
+                )
+                with mock.patch.object(
+                    self.controller,
+                    "_load_evaluate_module",
+                    return_value=evaluator,
+                ), self.assertRaisesRegex(RuntimeError, "stop at baseline"):
+                    self.controller.start_run(control, run_dir)
+
+                path = run_dir / "readiness" / (
+                    "report.json" if target == "report" else "report.complete.json"
+                )
+                payload = json.loads(path.read_text("utf-8"))
+                payload["tampered"] = True
+                path.write_text(json.dumps(payload), "utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "readiness report|marker|digest"
+                ):
+                    self.controller.resume_run(run_dir)
+
+    def test_v2_expired_readiness_is_refreshed_before_high_cost_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root, max_age_seconds=1)
+            evaluator = mock.Mock()
+
+            def slow_baseline(*args, **kwargs):
+                time.sleep(1.05)
+                return {"status": "measured"}
+
+            evaluator.measure_candidate.side_effect = slow_baseline
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                state = self.controller.start_run(control, run_dir)
+
+            self.assertEqual(state["next_action"], "register_change")
+            attempts = list((run_dir / "readiness" / "attempts").iterdir())
+            self.assertEqual(len(attempts), 2)
 
     def test_start_run_freezes_inputs_and_reaches_change_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

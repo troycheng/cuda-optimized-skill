@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/troycheng/cuda-optimized-skill/workload_control.schema.json",
-  "title": "CUDA Workload Optimizer Control Manifest v1",
+  "title": "CUDA Workload Optimizer Control Manifest v1/v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,13 +15,20 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "cuda-workload-optimizer/control-v1"
+      "enum": [
+        "cuda-workload-optimizer/control-v1",
+        "cuda-workload-optimizer/control-v2"
+      ]
     },
     "project_root": {
       "type": "string",
       "minLength": 1
     },
     "workload_manifest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "readiness_contract": {
       "type": "string",
       "minLength": 1
     },
@@ -114,6 +121,17 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"const": "cuda-workload-optimizer/control-v2"}
+        }
+      },
+      "then": {"required": ["readiness_contract"]},
+      "else": {"not": {"required": ["readiness_contract"]}}
+    }
+  ],
   "$defs": {
     "argv": {
       "type": "array",
