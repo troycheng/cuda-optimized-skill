@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/readiness_report.schema.json",
+  "title": "CUDA workload optimizer readiness report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "requested_claim", "status", "can_start_diagnosis",
+    "claim_ceiling", "contract_digest", "environment_identity_digest",
+    "started_at", "finished_at", "budget", "results", "status_counts",
+    "next_actions"
+  ],
+  "properties": {
+    "schema_version": {"const": "cuda-workload-optimizer/readiness-report-v1"},
+    "requested_claim": {"enum": ["kernel", "workload", "serving"]},
+    "status": {"enum": ["ready", "degraded", "user_action_required", "blocked"]},
+    "can_start_diagnosis": {"type": "boolean"},
+    "claim_ceiling": {"enum": ["static", "kernel", "workload", "serving"]},
+    "contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "environment_identity_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "started_at": {"type": "number"},
+    "finished_at": {"type": "number"},
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_seconds", "elapsed_seconds", "max_repairs", "repairs_used"],
+      "properties": {
+        "max_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "elapsed_seconds": {"type": "number", "minimum": 0},
+        "max_repairs": {"type": "integer", "minimum": 0},
+        "repairs_used": {"type": "integer", "minimum": 0}
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/result"}
+    },
+    "status_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready", "degraded", "user_action_required", "blocked"],
+      "properties": {
+        "ready": {"type": "integer", "minimum": 0},
+        "degraded": {"type": "integer", "minimum": 0},
+        "user_action_required": {"type": "integer", "minimum": 0},
+        "blocked": {"type": "integer", "minimum": 0}
+      }
+    },
+    "next_actions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id", "necessity", "phase", "kind", "probe_status",
+        "admission_status", "valid_until", "identity_digest", "unsupported_capabilities"
+      ],
+      "properties": {
+        "requirement_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "necessity": {"enum": ["required", "diagnostic", "optional"]},
+        "phase": {"enum": ["foundation", "workload"]},
+        "kind": {
+          "enum": [
+            "target_compile", "gpu_execute", "nsys_trace", "ncu_counters",
+            "sanitizer", "sass", "benchmark_noise", "workload_smoke", "rollback"
+          ]
+        },
+        "probe_status": {"enum": ["ready", "degraded", "unavailable", "failed"]},
+        "admission_status": {"enum": ["ready", "degraded", "user_action_required", "blocked"]},
+        "valid_until": {"type": ["number", "null"]},
+        "identity_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "unsupported_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

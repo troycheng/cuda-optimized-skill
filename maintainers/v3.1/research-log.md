@@ -123,6 +123,23 @@
 `conflicts`、`last_reviewed`、`max_review_age_days`、`DRIFTED` 和稳定性复核。3.1 的真实缺口是
 readiness 证据自身的身份绑定与失效触发，以及冲突知识如何影响假设排序和结论上限。
 
+### DeepSeek：Phase 0 合同实现质证
+
+提交公开协议摘要，不含代码路径、账号、日志或 workload，并明确禁止搜索和工具调用。
+有效反驳是：环境变化可能同时使多个 requirement 失效，v1 如果推断“只影响某一个 probe”
+容易漏掉系统库、驱动和运行时的隐式依赖；`authorization_id` 如果被误解为独立授权令牌，
+也会造成错误安全边界。
+
+采纳：v1 在环境 identity 变化时让全部 readiness 证据失效；证据仅因时间过期时仍只重跑
+对应 probe。`authorization_id` 明确为冻结合同内的唯一审计标签，真实授权绑定合同摘要、
+requirements 摘要、隔离根和控制范围。
+
+已由现有设计覆盖：canonical digest 包含 `schema_version`；空洞的 `/bin/true` 不会因为退出码
+为零而 ready，Task 2 runner 还要求它发布匹配 requirement id 的严格 probe evidence。
+
+留到 runner/gate：环境 identity 的精确输入、超时分类、valid-until 执行、修复后重试和预算
+累计。未采纳把这些执行语义塞回静态合同的建议，以免合同变成脚本语言。
+
 ## 3. 第一轮开发决定
 
 - 先交付一个独立的 readiness vertical slice，不同时实现知识卡和行动规划器；

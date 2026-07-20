@@ -117,6 +117,10 @@ REMEDIATION_MODES = {"none", "user_action", "isolated_pip"}
 <python> -I -m pip install --require-hashes -r <requirements_file>
 ```
 
+`authorization_id` 是冻结合同中的审计标签，不是独立授权令牌；同一合同内不得重复。实际授权
+边界由合同摘要、精确 requirements 摘要、隔离环境根和控制范围共同组成，修改任一项都产生
+新合同身份。
+
 ### 2.2 Probe evidence
 
 probe 通过 `CUDA_OPTIMIZER_READINESS_OUTPUT` 写入：
@@ -140,7 +144,8 @@ artifact，记录 argv digest、实际工具路径与版本、return code、time
 报告必须包含：schema、requested claim、总状态、`can_start_diagnosis`、claim ceiling、合同与
 环境摘要、开始/结束时间、预算、逐项结果、状态计数和 next actions。逐项结果必须保存
 `valid_until` 和 identity digest；`max_age_seconds` 由合同按能力冻结，不设置跨任务统一 TTL。
-在依赖该能力的高成本动作前，证据过期或 identity 改变时只重跑对应 probe。
+在依赖该能力的高成本动作前，证据过期时只重跑对应 probe；任一环境 identity 改变时，v1
+保守地让全部 readiness 证据失效，不推断未显式声明的跨 requirement 依赖。
 
 ```python
 def admission_status(necessity, probe_status, remediation_mode, repairs_left):
@@ -292,8 +297,8 @@ git commit -m "feat(v3.1): run bounded capability probes"
 
 覆盖 foundation 先于 workload；required foundation 失败后 workload 不执行；diagnostic 可降级；
 host 只输出 user action；预算单调；requirements hash 漂移、Python 越界、安装失败、安装后仍失败
-均 blocked；有效且 identity 未变时 resume 不重复 probe 或安装；证据过期，或工具链 digest、
-uid、容器、GPU identity、可见设备和权限状态任一变化时，只重跑受影响的 probe。
+均 blocked；有效且 identity 未变时 resume 不重复 probe 或安装；证据过期时只重跑对应 probe；
+工具链 digest、uid、容器、GPU identity、可见设备和权限状态任一变化时重跑全部所需 probe。
 
 ```python
 def test_required_foundation_failure_skips_workload_phase(self):

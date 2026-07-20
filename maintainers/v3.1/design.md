@@ -117,9 +117,10 @@ readiness 使用独立的 capability probe 协议，不复用正式 workload dia
 
 每份 readiness 证据必须绑定实际命令与版本、容器或隔离环境、执行用户、GPU identity、
 GPU 可见性和权限状态。合同为每项能力定义最大可复用时长；在依赖该能力的高成本动作前，
-只要证据过期或上述身份发生变化，就重跑对应 probe。身份未变且证据仍有效时直接复用，
-不做无条件周期检查。最小 probe 只证明工具能力可用，真实 workload 兼容性仍由后续
-workload smoke 负责。
+只要证据过期，就重跑对应 probe。3.1 v1 不尝试推断隐式依赖：上述任一环境身份发生变化时，
+全部 readiness 证据失效并重新运行所需 probe。身份未变且证据仍有效时直接复用，不做无条件
+周期检查。最小 probe 只证明工具能力可用，真实 workload 兼容性仍由后续 workload smoke
+负责。
 
 预检结果分为 `ready`、`auto_fixable`、`user_action_required`、`degraded` 和 `blocked`。
 存在未处理的 `required` 项时，Controller 不能进入正式诊断。

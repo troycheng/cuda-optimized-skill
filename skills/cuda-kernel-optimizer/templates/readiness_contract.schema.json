@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/readiness_contract.schema.json",
+  "title": "CUDA workload optimizer readiness contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "requested_claim", "budget", "requirements"],
+  "properties": {
+    "schema_version": {"const": "cuda-workload-optimizer/readiness-contract-v1"},
+    "requested_claim": {"enum": ["kernel", "workload", "serving"]},
+    "budget": {"$ref": "#/$defs/budget"},
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {"$ref": "#/$defs/requirement"}
+    }
+  },
+  "$defs": {
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_seconds", "max_repairs"],
+      "properties": {
+        "max_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "max_repairs": {"type": "integer", "minimum": 0}
+      }
+    },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {"type": "string", "minLength": 1, "maxLength": 16384}
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "timeout_seconds"],
+      "properties": {
+        "argv": {"$ref": "#/$defs/argv"},
+        "timeout_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "remediation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {"mode": {"const": "none"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "message"],
+          "properties": {
+            "mode": {"const": "user_action"},
+            "message": {"type": "string", "minLength": 1, "maxLength": 4096}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode", "authorization_id", "python", "requirements_file",
+            "requirements_sha256", "timeout_seconds"
+          ],
+          "properties": {
+            "mode": {"const": "isolated_pip"},
+            "authorization_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            },
+            "python": {"type": "string", "minLength": 1},
+            "requirements_file": {"type": "string", "minLength": 1},
+            "requirements_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "timeout_seconds": {"type": "number", "exclusiveMinimum": 0}
+          }
+        }
+      ]
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "necessity", "control_scope", "phase", "kind",
+        "max_age_seconds", "probe", "remediation"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "necessity": {"enum": ["required", "diagnostic", "optional"]},
+        "control_scope": {"enum": ["project", "isolated_environment", "host"]},
+        "phase": {"enum": ["foundation", "workload"]},
+        "kind": {
+          "enum": [
+            "target_compile", "gpu_execute", "nsys_trace", "ncu_counters",
+            "sanitizer", "sass", "benchmark_noise", "workload_smoke", "rollback"
+          ]
+        },
+        "max_age_seconds": {"type": "integer", "minimum": 1},
+        "probe": {"$ref": "#/$defs/probe"},
+        "remediation": {"$ref": "#/$defs/remediation"}
+      }
+    }
+  }
+}

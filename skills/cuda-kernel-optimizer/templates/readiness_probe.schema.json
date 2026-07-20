@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/readiness_probe.schema.json",
+  "title": "CUDA workload optimizer readiness probe v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "requirement_id", "status", "observations", "artifacts"],
+  "properties": {
+    "schema_version": {"const": "cuda-workload-optimizer/readiness-probe-v1"},
+    "requirement_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "status": {"enum": ["ready", "degraded", "unavailable", "failed"]},
+    "observations": {"type": "object"},
+    "artifacts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+          },
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}
