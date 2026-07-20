@@ -70,6 +70,7 @@ workload diagnosis probe 分开。Controller v2 冻结 readiness contract，在 
       "control_scope": "host",
       "phase": "foundation",
       "kind": "gpu_execute",
+      "max_age_seconds": 300,
       "probe": {
         "argv": ["python3", "tools/gpu_smoke.py"],
         "timeout_seconds": 30
@@ -131,12 +132,15 @@ probe 通过 `CUDA_OPTIMIZER_READINESS_OUTPUT` 写入：
 ```
 
 `status` 只允许 `ready`、`degraded`、`unavailable`、`failed`。Runner 另存 execution
-artifact，记录 argv digest、return code、timeout、duration、截断日志、环境 identity 和输出摘要。
+artifact，记录 argv digest、实际工具路径与版本、return code、timeout、duration、截断日志、
+执行 uid、容器或隔离环境 identity、GPU identity、可见设备、权限状态和输出摘要。
 
 ### 2.3 Readiness report 与裁决
 
 报告必须包含：schema、requested claim、总状态、`can_start_diagnosis`、claim ceiling、合同与
-环境摘要、开始/结束时间、预算、逐项结果、状态计数和 next actions。
+环境摘要、开始/结束时间、预算、逐项结果、状态计数和 next actions。逐项结果必须保存
+`valid_until` 和 identity digest；`max_age_seconds` 由合同按能力冻结，不设置跨任务统一 TTL。
+在依赖该能力的高成本动作前，证据过期或 identity 改变时只重跑对应 probe。
 
 ```python
 def admission_status(necessity, probe_status, remediation_mode, repairs_left):
@@ -168,8 +172,9 @@ def admission_status(necessity, probe_status, remediation_mode, repairs_left):
 
 - [ ] **步骤 1：编写失败测试**
 
-覆盖有效合同 detached；重复键、未知字段、重复 id、非法枚举、非有限预算、空 argv、相对路径、
-host 使用 `isolated_pip`、越界 Python/requirements、错误摘要和 symlink 全部拒绝。
+覆盖有效合同 detached；重复键、未知字段、重复 id、非法枚举、非法 `max_age_seconds`、非有限
+预算、空 argv、相对路径、host 使用 `isolated_pip`、越界 Python/requirements、错误摘要和
+symlink 全部拒绝。
 
 ```python
 def test_host_requirement_cannot_auto_install(self):
@@ -229,7 +234,8 @@ git commit -m "feat(v3.1): define readiness capability contracts"
 - [ ] **步骤 1：编写失败测试**
 
 覆盖安全环境、create-once 输出、命令不存在、非零退出、超时、输出缺失、重复键、超过 1 MiB、
-id 不符、symlink、父目录替换、子进程残留、日志截断和 secret redact。
+id 不符、symlink、父目录替换、子进程残留、日志截断、secret redact，以及工具版本、uid、容器、
+GPU identity、可见设备和权限摘要完整记录。
 
 ```python
 def test_timeout_kills_descendants_and_returns_unavailable(self):
@@ -286,7 +292,8 @@ git commit -m "feat(v3.1): run bounded capability probes"
 
 覆盖 foundation 先于 workload；required foundation 失败后 workload 不执行；diagnostic 可降级；
 host 只输出 user action；预算单调；requirements hash 漂移、Python 越界、安装失败、安装后仍失败
-均 blocked；resume 不重复已完成 probe 或安装。
+均 blocked；有效且 identity 未变时 resume 不重复 probe 或安装；证据过期，或工具链 digest、
+uid、容器、GPU identity、可见设备和权限状态任一变化时，只重跑受影响的 probe。
 
 ```python
 def test_required_foundation_failure_skips_workload_phase(self):
@@ -365,7 +372,7 @@ v2 固定增加：
 ```
 
 覆盖 v2 缺 readiness、合同越界、初始化中漂移、required blocked 仍测 baseline、resume 重复
-readiness、报告篡改和 marker 篡改。
+readiness、报告篡改、marker 篡改，以及 baseline 或后续高成本 profiler 前错误接受过期证据。
 
 ```python
 def test_blocked_readiness_never_measures_baseline(self):
@@ -615,6 +622,8 @@ git commit -m "docs(v3.1): explain environment readiness workflow"
 - 安装命令不是合同固定的 hash-locked isolated pip 形式；
 - 安装或 probe 超时后残留子进程，或恢复时重复消耗预算；
 - 环境 identity 改变后仍使用旧 readiness；
+- readiness 已超过合同有效期，或工具路径/版本、uid、容器、GPU identity、可见设备、权限状态
+  已变化，却仍被 baseline 或依赖它的高成本 profiler 接受；
 - Nsys/NCU/sanitizer 插桩耗时被当成正式 workload KPI；
 - Phase 0 相比 3.0 没减少工具修复或重复采集，并增加首次有效方向总耗时；
 - 5090 故障注入不能稳定区分 ready、degraded、user action 和 blocked。
