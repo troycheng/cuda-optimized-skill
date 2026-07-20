@@ -26,7 +26,13 @@
         "risk": {"$ref": "#/$defs/level"},
         "control_scope": {"enum": ["read_only", "project_copy"]},
         "repeatable": {"type": "boolean"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"control_scope": {"const": "project_copy"}}, "required": ["control_scope"]},
+          "then": {"properties": {"evidence_kind": {"const": "direction_experiment"}}}
+        }
+      ]
     }
   }
 }

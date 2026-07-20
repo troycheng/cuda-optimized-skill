@@ -358,6 +358,30 @@ def select_evidence_request(
             )
         if not changed or len(effect_signatures) < 2:
             raise ValidationError("request outcomes do not change competing hypotheses")
+        for pair in normalized_pairs:
+            left = pair["left"]
+            right = pair["right"]
+            favors_left = any(
+                left in outcome["supports"] and right in outcome["opposes"]
+                for outcome in normalized_outcomes
+            )
+            favors_right = any(
+                right in outcome["supports"] and left in outcome["opposes"]
+                for outcome in normalized_outcomes
+            )
+            if not (favors_left and favors_right):
+                raise ValidationError(
+                    "exclusive pair outcomes must discriminate in both directions"
+                )
+        opposed = {
+            hypothesis_id
+            for outcome in normalized_outcomes
+            for hypothesis_id in outcome["opposes"]
+        }
+        if not set(targets).issubset(opposed):
+            raise ValidationError(
+                "every target hypothesis must be falsifiable by an outcome"
+            )
         normalized_outcomes.sort(key=lambda item: item["outcome_id"])
         normalized_requests.append(
             {

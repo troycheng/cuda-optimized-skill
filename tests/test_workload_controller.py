@@ -162,11 +162,13 @@ def _enable_active_diagnosis(control: dict, root: Path) -> dict:
     evidence_adapter.write_text(
         "import json, os\n"
         "request = json.load(open(os.environ['CUDA_OPTIMIZER_EVIDENCE_REQUEST']))\n"
+        "artifact = os.path.join(os.environ['CUDA_OPTIMIZER_EVIDENCE_DIR'], 'framework-trace.json')\n"
+        "open(artifact, 'w').write(json.dumps({'launch_gap_us': 12.5}))\n"
         "payload = {\n"
         " 'schema_version': 'cuda-optimizer/evidence-result-v1',\n"
         " 'request_signature': request['request_signature'],\n"
         " 'status': 'observed', 'outcome_id': 'gap-present',\n"
-        " 'observations': {'launch_gap_us': 12.5}, 'artifacts': []}\n"
+        " 'observations': {'launch_gap_us': 12.5}, 'artifacts': [{'path': artifact, 'sha256': '0' * 64}]}\n"
         "open(os.environ['CUDA_OPTIMIZER_EVIDENCE_OUTPUT'], 'w').write(json.dumps(payload))\n",
         encoding="utf-8",
     )
@@ -1163,6 +1165,38 @@ class WorkloadRoundTests(unittest.TestCase):
         }
         return hypothesis, request
 
+    def test_concurrent_start_runs_baseline_and_probes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            probe = Path(control["probes"][0]["argv"][1])
+            counter = run_dir / "probe-count.txt"
+            probe.write_text(
+                "import time\n"
+                + probe.read_text("utf-8")
+                + f"\nopen({str(counter)!r}, 'a').write('1\\n')\ntime.sleep(0.2)\n",
+                encoding="utf-8",
+            )
+            results = []
+            errors = []
+
+            def start() -> None:
+                try:
+                    results.append(self.controller.start_run(control, run_dir))
+                except BaseException as error:
+                    errors.append(error)
+
+            workers = [threading.Thread(target=start) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(counter.read_text("utf-8").splitlines(), ["1"])
+            self.assertTrue(all(item["next_action"] == "register_change" for item in results))
+
     def test_v2_blocked_readiness_never_measures_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -1352,7 +1386,7 @@ class WorkloadRoundTests(unittest.TestCase):
             _enable_active_diagnosis(control, root)
             contract = json.loads(Path(control["analysis_contract"]).read_text("utf-8"))
             adapter = Path(contract["actions"][0]["adapter_path"])
-            counter = project / "evidence-count.txt"
+            counter = run_dir / "evidence-count.txt"
             adapter.write_text(
                 adapter.read_text("utf-8")
                 + f"\nopen({str(counter)!r}, 'a').write('1\\n')\n",
@@ -1384,7 +1418,7 @@ class WorkloadRoundTests(unittest.TestCase):
             contract_path = Path(control["analysis_contract"])
             contract = json.loads(contract_path.read_text("utf-8"))
             adapter = Path(contract["actions"][0]["adapter_path"])
-            counter = project / "concurrent-evidence-count.txt"
+            counter = run_dir / "concurrent-evidence-count.txt"
             adapter.write_text(
                 "import time\n"
                 + adapter.read_text("utf-8")
@@ -1435,6 +1469,10 @@ class WorkloadRoundTests(unittest.TestCase):
             attempt = run_dir / "active_diagnosis" / "evidence" / signature
             attempt.mkdir(parents=True)
             (attempt / "intent.json").write_text("{}", encoding="utf-8")
+            catalog_path = run_dir / "active_diagnosis" / "evidence_catalog.json"
+            catalog = json.loads(catalog_path.read_text("utf-8"))
+            catalog["partial-write"] = {"not": "valid"}
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
             recovered = self.controller.resume_run(run_dir)
 
@@ -1444,6 +1482,40 @@ class WorkloadRoundTests(unittest.TestCase):
                 "evidence_action_interrupted_not_reexecuted",
             )
             self.assertFalse((attempt / "execution.json").exists())
+
+    def test_resume_recovers_a_completion_written_before_state_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            pending = self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            completed = self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            signature = completed["last_request_signature"]
+            complete_path = (
+                run_dir / "active_diagnosis" / "evidence" / signature / "complete.json"
+            )
+            complete_mtime = complete_path.stat().st_mtime_ns
+            pending_digest = self.controller._canonical_digest(pending)
+            (run_dir / "state_commit.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "cuda-workload-optimizer/state-commit-v1",
+                        "state_digest": pending_digest,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recovered = self.controller.resume_run(run_dir)
+
+            self.assertEqual(recovered["next_action"], "propose_hypotheses")
+            self.assertEqual(recovered["last_request_signature"], signature)
+            self.assertEqual(complete_path.stat().st_mtime_ns, complete_mtime)
 
     def test_equivalent_request_history_survives_the_next_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1473,6 +1545,90 @@ class WorkloadRoundTests(unittest.TestCase):
                 selection["rejections"][0]["reason"],
                 "equivalent_request_already_attempted",
             )
+
+    def test_hypothesis_renaming_cannot_escape_prior_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            hypothesis["hypotheses"][0]["hypothesis_id"] = "h-framework-renamed"
+            hypothesis["hypotheses"][1]["hypothesis_id"] = "h-kernel-renamed"
+            hypothesis["hypotheses"][1]["oppose_evidence_ids"] = []
+            hypothesis["relationships"] = [
+                {
+                    "relation": "exclusive",
+                    "left": "h-framework-renamed",
+                    "right": "h-kernel-renamed",
+                }
+            ]
+
+            with self.assertRaisesRegex(ValueError, "identity registry"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
+
+    def test_second_round_proposal_crash_keeps_prior_hypothesis_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            original_atomic_json = self.controller._atomic_json
+
+            def crash_before_request(path, value):
+                if Path(path).name == "request_set.json":
+                    raise RuntimeError("simulated proposal crash")
+                return original_atomic_json(path, value)
+
+            with mock.patch.object(
+                self.controller, "_atomic_json", side_effect=crash_before_request
+            ), self.assertRaisesRegex(RuntimeError, "simulated proposal crash"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
+
+            recovered = self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.assertEqual(recovered["next_action"], "evidence_gap")
+
+    def test_committed_active_diagnosis_ledger_tail_cannot_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            ledger_paths = sorted(
+                (run_dir / "active_diagnosis" / "ledger").glob("*.json")
+            )
+            ledger_paths[-1].unlink()
+            hypothesis, request = self._active_proposal(run_dir)
+
+            with self.assertRaisesRegex(ValueError, "ledger tail is missing"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
 
     def test_readiness_report_overrides_claimed_available_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1566,6 +1722,174 @@ class WorkloadRoundTests(unittest.TestCase):
             )
             self.assertIn("direction_experiment", {item["kind"] for item in catalog.values()})
 
+    def test_read_only_evidence_cannot_modify_files_outside_mutation_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            adapter = Path(contract["actions"][0]["adapter_path"])
+            outside = project / "outside-mutation-roots.txt"
+            adapter.write_text(
+                adapter.read_text("utf-8")
+                + f"\nopen({str(outside)!r}, 'w').write('modified')\n",
+                encoding="utf-8",
+            )
+            contract["actions"][0]["adapter_sha256"] = hashlib.sha256(
+                adapter.read_bytes()
+            ).hexdigest()
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+
+            with self.assertRaisesRegex(ValueError, "complete project surface"):
+                self.controller.collect_active_diagnosis_evidence(control, run_dir)
+
+            self.assertEqual(outside.read_text("utf-8"), "modified")
+            state = self.controller.resume_run(run_dir)
+            self.assertEqual(state["next_action"], "manual_recovery")
+
+    def test_read_only_evidence_cannot_hide_equal_size_project_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            outside = project / "outside-mutation-roots.txt"
+            outside.write_text("AAAA", encoding="utf-8")
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            adapter = Path(contract["actions"][0]["adapter_path"])
+            adapter.write_text(
+                adapter.read_text("utf-8")
+                + "\n_target = " + repr(str(outside))
+                + "\n_stat = os.stat(_target)"
+                + "\nopen(_target, 'w').write('BBBB')"
+                + "\nos.utime(_target, ns=(_stat.st_atime_ns, _stat.st_mtime_ns))\n",
+                encoding="utf-8",
+            )
+            contract["actions"][0]["adapter_sha256"] = hashlib.sha256(
+                adapter.read_bytes()
+            ).hexdigest()
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+
+            with self.assertRaisesRegex(ValueError, "complete project surface"):
+                self.controller.collect_active_diagnosis_evidence(control, run_dir)
+
+            self.assertEqual(outside.read_text("utf-8"), "BBBB")
+
+    def test_action_rejects_an_unapproved_launcher_with_adapter_as_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            other = root / "other-executable"
+            other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            other.chmod(0o755)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            adapter = contract["actions"][0]["adapter_path"]
+            contract["actions"][0]["argv"] = [str(other), adapter]
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "matching Python/shell interpreter"):
+                self.controller.start_run(control, run_dir)
+
+    def test_frozen_action_launcher_digest_is_verified_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            launcher_dir = root / "launcher"
+            launcher_dir.mkdir()
+            launcher = launcher_dir / "python3"
+            shutil.copy2(sys.executable, launcher)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            contract["actions"][0]["argv"][0] = str(launcher)
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            content = launcher.read_bytes()
+            launcher.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+
+            with self.assertRaisesRegex(ValueError, "launcher identity drifted"):
+                self.controller.collect_active_diagnosis_evidence(control, run_dir)
+
+    def test_evidence_artifact_cannot_reuse_controller_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            adapter = Path(contract["actions"][0]["adapter_path"])
+            adapter.write_text(
+                "import json, os\n"
+                "request = json.load(open(os.environ['CUDA_OPTIMIZER_EVIDENCE_REQUEST']))\n"
+                "output = os.environ['CUDA_OPTIMIZER_EVIDENCE_OUTPUT']\n"
+                "payload = {'schema_version': 'cuda-optimizer/evidence-result-v1', "
+                "'request_signature': request['request_signature'], 'status': 'observed', "
+                "'outcome_id': 'gap-present', 'observations': {}, "
+                "'artifacts': [{'path': output}]}\n"
+                "open(output, 'w').write(json.dumps(payload))\n",
+                encoding="utf-8",
+            )
+            contract["actions"][0]["adapter_sha256"] = hashlib.sha256(
+                adapter.read_bytes()
+            ).hexdigest()
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+
+            with self.assertRaisesRegex(ValueError, "Controller-reserved path"):
+                self.controller.collect_active_diagnosis_evidence(control, run_dir)
+
+    def test_global_scan_cannot_redefine_project_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            adapter = Path(contract["adapter_path"])
+            outside = project / "global-scan-side-effect.txt"
+            adapter.write_text(
+                adapter.read_text("utf-8")
+                + f"\nopen({str(outside)!r}, 'w').write('modified')\n",
+                encoding="utf-8",
+            )
+            contract["source"]["adapter_sha256"] = hashlib.sha256(
+                adapter.read_bytes()
+            ).hexdigest()
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "diagnosis probes.*project surface"):
+                self.controller.start_run(control, run_dir)
+
+            self.assertEqual(outside.read_text("utf-8"), "modified")
+            self.assertFalse((run_dir / "diagnosis_context.json").exists())
+
     def test_tampered_evidence_result_invalidates_the_next_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -1586,6 +1910,51 @@ class WorkloadRoundTests(unittest.TestCase):
             hypothesis, request = self._active_proposal(run_dir)
 
             with self.assertRaisesRegex(ValueError, "evidence result.*digest"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
+
+    def test_tampered_evidence_artifact_invalidates_the_next_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            context = json.loads((run_dir / "diagnosis_context.json").read_text("utf-8"))
+            result_path = run_dir / context["evidence_results"][0]["result_path"]
+            result = json.loads(result_path.read_text("utf-8"))
+            artifact_path = result_path.parent / result["artifacts"][0]["path"]
+            artifact_path.write_text('{"launch_gap_us": 0}', encoding="utf-8")
+            hypothesis, request = self._active_proposal(run_dir)
+
+            with self.assertRaisesRegex(ValueError, "evidence artifact.*digest"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
+
+    def test_tampered_request_history_invalidates_the_next_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            history_path = run_dir / "active_diagnosis" / "request_history.json"
+            history_path.write_text("[]", encoding="utf-8")
+            hypothesis, request = self._active_proposal(run_dir)
+
+            with self.assertRaisesRegex(ValueError, "request_history_sha256 drifted"):
                 self.controller.register_active_diagnosis_proposal(
                     control, run_dir, hypothesis, request
                 )

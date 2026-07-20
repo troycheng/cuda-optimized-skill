@@ -27,8 +27,18 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["path"],
-        "properties": {"path": {"type": "string", "minLength": 1}}
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "observed"}}, "required": ["status"]},
+      "then": {"properties": {"outcome_id": {"type": "string"}}},
+      "else": {"properties": {"outcome_id": {"type": "null"}}}
+    }
+  ]
 }

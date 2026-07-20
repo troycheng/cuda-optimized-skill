@@ -240,6 +240,23 @@ class EvidenceSelectorTests(unittest.TestCase):
         with self.assertRaisesRegex(self.module.ValidationError, "change"):
             self.select(value)
 
+    def test_exclusive_pair_requires_bidirectional_outcomes(self) -> None:
+        value = self.requests()
+        value["requests"][0]["outcomes"] = [
+            {
+                "outcome_id": "gap-strong",
+                "supports": ["h-framework-gap"],
+                "opposes": ["h-kernel-bound"],
+            },
+            {
+                "outcome_id": "gap-weak",
+                "supports": ["h-framework-gap"],
+                "opposes": [],
+            },
+        ]
+        with self.assertRaisesRegex(self.module.ValidationError, "both directions"):
+            self.select(value)
+
     def test_pair_claim_must_match_an_exclusive_relationship(self) -> None:
         value = self.requests()
         value["requests"][1]["exclusive_pairs"] = [

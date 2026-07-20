@@ -477,6 +477,17 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
         != "cuda-optimizer/evidence-result-v1"
     ):
         raise ValueError("evidence result schema version differs from runtime")
+    result_conditions = evidence_result.get("allOf", [])
+    if not any(
+        condition.get("if", {}).get("properties", {}).get("status", {}).get("const")
+        == "observed"
+        and condition.get("then", {}).get("properties", {}).get("outcome_id", {}).get("type")
+        == "string"
+        and condition.get("else", {}).get("properties", {}).get("outcome_id", {}).get("type")
+        == "null"
+        for condition in result_conditions
+    ):
+        raise ValueError("evidence result outcome condition differs from runtime")
     if (
         epoch.get("properties", {}).get("schema_version", {}).get("const")
         != epoch_runtime.EPOCH_SCHEMA
@@ -523,6 +534,26 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
         )
         if actual != expected:
             raise ValueError(f"{name} version differs from runtime")
+    catalog_conditions = (
+        selector_schemas["evidence_action_catalog.schema.json"]
+        .get("$defs", {})
+        .get("action", {})
+        .get("allOf", [])
+    )
+    if not any(
+        condition.get("if", {})
+        .get("properties", {})
+        .get("control_scope", {})
+        .get("const")
+        == "project_copy"
+        and condition.get("then", {})
+        .get("properties", {})
+        .get("evidence_kind", {})
+        .get("const")
+        == "direction_experiment"
+        for condition in catalog_conditions
+    ):
+        raise ValueError("evidence action scope condition differs from runtime")
     catalog = json.loads(
         _read_safe_file(root, Path("references") / "evidence_action_catalog.json")
     )
