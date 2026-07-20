@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -321,3 +323,20 @@ def validate_execution_map(
         "window_duration_us": end - start,
         "requires_unmodeled_hypothesis": requires_unmodeled,
     }
+
+
+def execution_map_digest(
+    value: Mapping[str, Any], *, epoch: Mapping[str, Any], evidence_catalog: Mapping[str, Any]
+) -> str:
+    """Return a canonical digest after replaying epoch and evidence admission."""
+    normalized = validate_execution_map(
+        value, epoch=epoch, evidence_catalog=evidence_catalog
+    )["execution_map"]
+    payload = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()

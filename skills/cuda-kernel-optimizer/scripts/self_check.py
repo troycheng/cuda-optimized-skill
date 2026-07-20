@@ -88,6 +88,7 @@ _V3_1_SCRIPTS = (
     "workload_controller.py",
     "analysis_epoch.py",
     "execution_map.py",
+    "hypothesis_space.py",
 )
 _V3_1_SCHEMAS = (
     "readiness_contract.schema.json",
@@ -95,6 +96,7 @@ _V3_1_SCHEMAS = (
     "readiness_report.schema.json",
     "analysis_epoch.schema.json",
     "execution_map.schema.json",
+    "hypothesis_set.schema.json",
 )
 
 
@@ -420,11 +422,17 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
     map_runtime = _load_installed_module(
         root, "execution_map.py", "installed_execution_map"
     )
+    hypothesis_runtime = _load_installed_module(
+        root, "hypothesis_space.py", "installed_hypothesis_space"
+    )
     epoch = json.loads(
         _read_safe_file(root, Path("templates") / "analysis_epoch.schema.json")
     )
     execution_map = json.loads(
         _read_safe_file(root, Path("templates") / "execution_map.schema.json")
+    )
+    hypothesis = json.loads(
+        _read_safe_file(root, Path("templates") / "hypothesis_set.schema.json")
     )
     if (
         epoch.get("properties", {}).get("schema_version", {}).get("const")
@@ -443,9 +451,24 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
     )
     if schema_layers != set(map_runtime.LAYERS):
         raise ValueError("execution map layer vocabulary differs from runtime")
+    if (
+        hypothesis.get("properties", {}).get("schema_version", {}).get("const")
+        != hypothesis_runtime.HYPOTHESIS_SCHEMA
+    ):
+        raise ValueError("hypothesis set schema version differs from runtime")
+    relationship_values = set(
+        hypothesis.get("$defs", {})
+        .get("relationship", {})
+        .get("properties", {})
+        .get("relation", {})
+        .get("enum", [])
+    )
+    if relationship_values != set(hypothesis_runtime._RELATIONS):
+        raise ValueError("hypothesis relationship vocabulary differs from runtime")
     for label, item in (
         ("analysis epoch", epoch),
         ("execution map", execution_map),
+        ("hypothesis set", hypothesis),
     ):
         if "v3.1" not in item.get("$id", ""):
             raise ValueError(f"{label} schema does not declare V3.1 identity")
@@ -544,6 +567,7 @@ def check_installation(skill_dir: Path | str) -> dict:
         "readiness_report_schema": "passed",
         "analysis_epoch_schema": "passed",
         "execution_map_schema": "passed",
+        "hypothesis_set_schema": "passed",
         "gpu_environment_validated": False,
     }
 
