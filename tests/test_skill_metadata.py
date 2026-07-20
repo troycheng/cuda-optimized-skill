@@ -261,6 +261,9 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertEqual(result["readiness_report_schema"], "passed")
         self.assertFalse(result["gpu_environment_validated"])
         self.assertIn("v3_1_readiness_admission", result["checks"])
+        self.assertEqual(result["analysis_epoch_schema"], "passed")
+        self.assertEqual(result["execution_map_schema"], "passed")
+        self.assertIn("v3_1_active_diagnosis", result["checks"])
 
 
 if __name__ == "__main__":

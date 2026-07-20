@@ -86,11 +86,15 @@ _V3_1_SCRIPTS = (
     "readiness_identity.py",
     "check_env.py",
     "workload_controller.py",
+    "analysis_epoch.py",
+    "execution_map.py",
 )
 _V3_1_SCHEMAS = (
     "readiness_contract.schema.json",
     "readiness_probe.schema.json",
     "readiness_report.schema.json",
+    "analysis_epoch.schema.json",
+    "execution_map.schema.json",
 )
 
 
@@ -409,6 +413,46 @@ def _validate_readiness_schema_contract(root: Path) -> None:
         raise ValueError("readiness report capability vocabulary differs from runtime")
 
 
+def _validate_active_diagnosis_schema_contract(root: Path) -> None:
+    epoch_runtime = _load_installed_module(
+        root, "analysis_epoch.py", "installed_analysis_epoch"
+    )
+    map_runtime = _load_installed_module(
+        root, "execution_map.py", "installed_execution_map"
+    )
+    epoch = json.loads(
+        _read_safe_file(root, Path("templates") / "analysis_epoch.schema.json")
+    )
+    execution_map = json.loads(
+        _read_safe_file(root, Path("templates") / "execution_map.schema.json")
+    )
+    if (
+        epoch.get("properties", {}).get("schema_version", {}).get("const")
+        != epoch_runtime.EPOCH_SCHEMA
+    ):
+        raise ValueError("analysis epoch schema version differs from runtime")
+    if (
+        execution_map.get("properties", {})
+        .get("schema_version", {})
+        .get("const")
+        != map_runtime.MAP_SCHEMA
+    ):
+        raise ValueError("execution map schema version differs from runtime")
+    schema_layers = set(
+        execution_map.get("$defs", {}).get("layer", {}).get("enum", [])
+    )
+    if schema_layers != set(map_runtime.LAYERS):
+        raise ValueError("execution map layer vocabulary differs from runtime")
+    for label, item in (
+        ("analysis epoch", epoch),
+        ("execution map", execution_map),
+    ):
+        if "v3.1" not in item.get("$id", ""):
+            raise ValueError(f"{label} schema does not declare V3.1 identity")
+        if item.get("additionalProperties") is not False:
+            raise ValueError(f"{label} schema root must be closed")
+
+
 def check_installation(skill_dir: Path | str) -> dict:
     root = Path(skill_dir)
     if root.is_symlink() or not root.is_dir():
@@ -486,6 +530,8 @@ def check_installation(skill_dir: Path | str) -> dict:
             raise ValueError(f"V3.1 schema root must be closed: {name}")
     _validate_readiness_schema_contract(root)
     checks.append("v3_1_readiness_admission")
+    _validate_active_diagnosis_schema_contract(root)
+    checks.append("v3_1_active_diagnosis")
 
     return {
         "schema_version": "cuda-evidence/self-check-v1",
@@ -496,6 +542,8 @@ def check_installation(skill_dir: Path | str) -> dict:
         "readiness_contract": "passed",
         "readiness_probe_schema": "passed",
         "readiness_report_schema": "passed",
+        "analysis_epoch_schema": "passed",
+        "execution_map_schema": "passed",
         "gpu_environment_validated": False,
     }
 
