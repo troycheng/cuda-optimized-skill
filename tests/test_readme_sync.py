@@ -252,8 +252,8 @@ class ReadmeSyncTests(unittest.TestCase):
         validation = (ROOT / "docs/validation.md").read_text(encoding="utf-8")
         cases = (ROOT / "docs/case-studies.md").read_text(encoding="utf-8")
         for fact in (
-            "997",
-            "989",
+            "1031",
+            "1023",
             "15 of 15",
             "34.307",
             "18 of 18",
