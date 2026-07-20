@@ -306,6 +306,18 @@ class Sm120AcceptanceHelperTests(unittest.TestCase):
         ):
             self.assertIn(marker, combined)
 
+    def test_v3_1_lane_executes_active_diagnosis_on_gpu(self) -> None:
+        source = inspect.getsource(
+            Sm120AcceptanceTests.test_active_diagnosis_collects_gpu_profile_evidence
+        )
+        for marker in (
+            "analysis_contract",
+            "register_active_diagnosis_proposal",
+            "collect_active_diagnosis_evidence",
+            "torch.profiler.profile",
+        ):
+            self.assertIn(marker, source)
+
 
 @unittest.skipUnless(
     os.environ.get("CUDA_SM120_E2E") == "1",
@@ -509,6 +521,156 @@ class Sm120AcceptanceTests(unittest.TestCase):
             events.index("workload-smoke-start"),
         )
         self.assertTrue((run_dir / "baseline" / "observation.json").is_file())
+
+    def test_active_diagnosis_collects_gpu_profile_evidence(self) -> None:
+        controller = _load_script("workload_controller")
+        case_root = ARTIFACTS / "active_diagnosis_v31"
+        workspace = _stage_fixture_workspace("workspace", artifacts=case_root)
+        global_scan = workspace / "global_scan.py"
+        shutil.copy2(
+            ROOT / "tests" / "fixtures" / "active_diagnosis" / "emit_global_scan.py",
+            global_scan,
+        )
+        evidence_adapter = workspace / "collect_gpu_profile.py"
+        evidence_adapter.write_text(
+            "import json, os, torch\n"
+            "from pathlib import Path\n"
+            "request = json.load(open(os.environ['CUDA_OPTIMIZER_EVIDENCE_REQUEST']))\n"
+            "trace = Path(os.environ['CUDA_OPTIMIZER_EVIDENCE_DIR']) / 'torch-trace.json'\n"
+            "x = torch.arange(1 << 20, device='cuda', dtype=torch.float32)\n"
+            "with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as p:\n"
+            "    y = x.square().add_(1)\n"
+            "    torch.cuda.synchronize()\n"
+            "assert float(y[1].item()) == 2.0\n"
+            "p.export_chrome_trace(str(trace))\n"
+            "json.dump({'schema_version': 'cuda-optimizer/evidence-result-v1', "
+            "'request_signature': request['request_signature'], 'status': 'observed', "
+            "'outcome_id': 'gap-present', 'observations': {'cuda_events': True}, "
+            "'artifacts': [{'path': str(trace)}]}, "
+            "open(os.environ['CUDA_OPTIMIZER_EVIDENCE_OUTPUT'], 'w'))\n",
+            encoding="utf-8",
+        )
+        requirement = self._readiness_requirement(
+            workspace,
+            case_root / "probe-work",
+            "pytorch.profiler",
+            "cuda-foundation",
+            necessity="required",
+            phase="foundation",
+            kind="gpu_execute",
+        )
+        control, run_dir = self._readiness_control(
+            case_root, workspace, [requirement]
+        )
+        analysis_contract = workspace / "active-diagnosis.json"
+        analysis_contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "cuda-optimizer/active-diagnosis-contract-v1",
+                    "global_scan_probe_id": "timeline",
+                    "adapter_path": str(global_scan),
+                    "analysis_policy_sha256": "a" * 64,
+                    "source": {
+                        "profiler": "custom",
+                        "profiler_version": "gpu-smoke-v1",
+                        "export_schema": "global-scan-v1",
+                        "adapter_id": "sm120-global-scan",
+                        "adapter_version": "1.0.0",
+                        "adapter_sha256": _fixture_hash(global_scan),
+                    },
+                    "actions": [
+                        {
+                            "action_id": "pytorch-operator-trace",
+                            "adapter_path": str(evidence_adapter),
+                            "adapter_sha256": _fixture_hash(evidence_adapter),
+                            "argv": [sys.executable, str(evidence_adapter)],
+                            "timeout_seconds": 60,
+                        }
+                    ],
+                    "selection_policy": {
+                        "schema_version": "cuda-optimizer/evidence-selection-policy-v1",
+                        "max_cost": "high",
+                        "max_perturbation": "high",
+                        "max_risk": "low",
+                        "remaining_profile_actions": 1,
+                        "available_capability_ids": [],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        control["analysis_contract"] = str(analysis_contract)
+        control["probes"][0]["argv"] = [sys.executable, str(global_scan)]
+
+        state = controller.start_run(control, run_dir)
+        self.assertEqual(state["next_action"], "propose_hypotheses")
+        active = run_dir / "active_diagnosis"
+        epoch = json.loads((active / "epoch.json").read_text("utf-8"))
+        context = json.loads((run_dir / "diagnosis_context.json").read_text("utf-8"))
+        hypothesis = {
+            "schema_version": "cuda-optimizer/hypothesis-set-v1",
+            "set_id": "sm120-hypotheses",
+            "epoch_id": epoch["epoch_id"],
+            "epoch_sha256": context["epoch_sha256"],
+            "execution_map_sha256": context["execution_map_sha256"],
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h-framework-gap", "kind": "mechanism",
+                    "scope_node_ids": ["cpu-launch", "gpu-kernel"],
+                    "statement": "CPU launch work delays the measured GPU operation.",
+                    "mechanism": "framework_launch_overhead", "disposition": "active",
+                    "confidence": "plausible", "support_evidence_ids": ["ev-global-scan"],
+                    "oppose_evidence_ids": [], "missing_evidence_kinds": ["framework_trace"],
+                    "falsification_question": "Does a framework trace show no launch gap?",
+                },
+                {
+                    "hypothesis_id": "h-kernel-bound", "kind": "mechanism",
+                    "scope_node_ids": ["gpu-kernel"],
+                    "statement": "Kernel execution dominates the measured path.",
+                    "mechanism": "kernel_execution", "disposition": "active",
+                    "confidence": "inconclusive", "support_evidence_ids": [],
+                    "oppose_evidence_ids": [], "missing_evidence_kinds": ["ncu_kernel"],
+                    "falsification_question": "Does framework evidence explain the path?",
+                },
+            ],
+            "relationships": [{"relation": "exclusive", "left": "h-framework-gap", "right": "h-kernel-bound"}],
+        }
+        hypothesis_result = controller._load_hypothesis_space_module().validate_hypothesis_set(
+            hypothesis,
+            epoch=epoch,
+            execution_map=json.loads((active / "execution_map.json").read_text("utf-8")),
+            evidence_catalog=json.loads((active / "evidence_catalog.json").read_text("utf-8")),
+        )
+        request = {
+            "schema_version": "cuda-optimizer/evidence-request-set-v1",
+            "request_set_id": "sm120-requests", "epoch_id": epoch["epoch_id"],
+            "epoch_sha256": context["epoch_sha256"],
+            "hypothesis_set_sha256": hypothesis_result["hypothesis_set_sha256"],
+            "requests": [{
+                "request_id": "gpu-framework-trace", "action_id": "pytorch-operator-trace",
+                "question": "Does the GPU trace discriminate launch overhead from kernel time?",
+                "target_hypothesis_ids": ["h-framework-gap", "h-kernel-bound"],
+                "exclusive_pairs": [{"left": "h-framework-gap", "right": "h-kernel-bound"}],
+                "outcomes": [
+                    {"outcome_id": "gap-present", "supports": ["h-framework-gap"], "opposes": ["h-kernel-bound"]},
+                    {"outcome_id": "kernel-dominant", "supports": ["h-kernel-bound"], "opposes": ["h-framework-gap"]},
+                ],
+            }],
+        }
+        controller.register_active_diagnosis_proposal(
+            control, run_dir, hypothesis, request
+        )
+
+        completed = controller.collect_active_diagnosis_evidence(control, run_dir)
+
+        self.assertEqual(completed["next_action"], "propose_hypotheses")
+        updated = json.loads((run_dir / "diagnosis_context.json").read_text("utf-8"))
+        self.assertEqual(updated["evidence_results"][0]["status"], "observed")
+        catalog = json.loads((active / "evidence_catalog.json").read_text("utf-8"))
+        observed = next(item for key, item in catalog.items() if key != "ev-global-scan")
+        self.assertEqual(observed["supports_hypothesis_ids"], ["h-framework-gap"])
+        self.assertEqual(observed["opposes_hypothesis_ids"], ["h-kernel-bound"])
+        self.assertEqual(len(list((active / "evidence").glob("*/torch-trace.json"))), 1)
 
     def test_readiness_faults_fail_closed_before_baseline(self) -> None:
         controller = _load_script("workload_controller")

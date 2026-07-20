@@ -5,7 +5,7 @@ predict the speedup of a new workload.
 
 ## Automated checks
 
-The local CPU/static suite ran 1,061 tests on 2026-07-20: 1,053 passed, eight
+The local CPU/static suite ran 1,063 tests on 2026-07-20: 1,054 passed, nine
 physical RTX 5090 opt-in tests were skipped, and none failed. It covers input
 validation, state recovery, evidence binding, shared-host guards, timeouts, restoration, capability retrieval,
 stability calibration, audit cadence, and deterministic decision logic. V3.1 adds
@@ -15,6 +15,14 @@ capability replay, and project-copy direction experiments. These checks do not
 validate the reader's CUDA environment.
 
 ## Physical GPU lane
+
+The V3.1 completion lane passed 20 of 20 checks in 60.619 seconds on a physical
+RTX 5090 on 2026-07-20. It used immutable image
+`sha256:a2d9d89bc4394eab3fadc62c6b5b3f739b6494c1f64c56f5ba5e6c008252a0e5`.
+The new active-diagnosis test executed a real PyTorch CPU/CUDA profile action,
+sealed its 14,346-byte Chrome trace and observed outcome, bound the outcome's
+support/opposition effects, and returned to the next hypothesis round. No host
+setting or package was changed.
 
 The V3.1 readiness lane completed 18 of 18 checks in 52.141 seconds
 on 2026-07-20 with the same immutable image listed below. Readiness itself took

@@ -23,6 +23,8 @@ set. It covers:
 - a V3.1 readiness round that inventories required and diagnostic capabilities,
   runs a user-workload smoke test, and blocks baseline collection when a
   required check, dependency identity, or time budget fails;
+- a V3.1 active-diagnosis round that runs a real PyTorch CPU/CUDA profile action,
+  seals its trace and outcome, and returns to the next hypothesis round;
 - a target-bounded Nsight Compute attempt. It must either collect real metrics
   with readable counters or record exactly `ERR_NVGPUCTRPERM`; no other
   degraded result is accepted. The test never adds capabilities or changes
@@ -35,7 +37,7 @@ The no-op check uses the production `run_paired`, `classify_pairs`, and
 
 ## Local and current-lane execution
 
-Without opt-in, ten CPU helper regressions pass and all eight GPU tests are
+Without opt-in, eleven CPU helper regressions pass and all nine GPU tests are
 reported as skipped:
 
 ```bash
@@ -168,3 +170,11 @@ with no package, host-policy, or driver change. Injected timeout, workload
 failure, and requirements-identity drift each blocked the baseline as designed.
 The historical V3.0 path had no readiness stage, so this run proves admission
 behavior, not faster diagnosis or optimization.
+
+The V3.1 completion lane ran on 2026-07-20 using the same immutable image and
+passed 20/20 checks in 60.619 seconds. Its new active-diagnosis check executed a
+real PyTorch CPU/CUDA profile action on the RTX 5090, sealed a 14,346-byte Chrome
+trace and an observed outcome, bound the outcome as support for the framework-gap
+hypothesis and opposition to the kernel-bound hypothesis, then returned to
+`propose_hypotheses`. This proves the new adapter path on the target GPU; it does
+not prove that the selected explanation is correct for another workload.
