@@ -70,6 +70,52 @@ class StateSchemaTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.state.cmd_show(argparse.Namespace(state=str(path)))
 
+    def test_winning_descendant_must_bind_inheritance_to_current_champion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            champion = Path(tmp).resolve() / "champion.py"
+            champion.write_text("# champion\n", encoding="utf-8")
+            champion_sha = self.state.sha256_file(champion)
+            proof = {
+                "status": "passed",
+                "proof": "confirmed_paired_win_vs_current_champion",
+                "baseline_file": str(champion),
+                "baseline_sha256": champion_sha,
+                "required_method_ids": ["fastsort.store"],
+                "verified_candidate_ids": ["2"],
+            }
+            decision = {
+                "candidate_id": "2",
+                "baseline_file": str(champion),
+                "baseline_sha256": champion_sha,
+                "inheritance_verification": proof,
+                "inheritance_verification_sha256": self.state._canonical_digest(
+                    proof
+                ),
+                "kernel_paired_samples": {
+                    "candidate_id": "2",
+                    "baseline_file": str(champion),
+                    "baseline_sha256": champion_sha,
+                },
+            }
+            state = {
+                "best_file": str(champion),
+                "effective_methods": [{"id": "fastsort.store"}],
+            }
+
+            self.state._validate_success_inheritance_decision(decision, state)
+
+            tampered = copy.deepcopy(decision)
+            tampered["inheritance_verification"]["verified_candidate_ids"] = ["1"]
+            tampered["inheritance_verification_sha256"] = self.state._canonical_digest(
+                tampered["inheritance_verification"]
+            )
+            with self.assertRaisesRegex(ValueError, "not covered"):
+                self.state._validate_success_inheritance_decision(tampered, state)
+
+            champion.write_text("# changed after comparison\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "current champion"):
+                self.state._validate_success_inheritance_decision(decision, state)
+
     def test_cmd_init_creates_v2_state_manifest_and_preserves_legacy_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -722,6 +768,43 @@ class StateDecisionPromotionTests(unittest.TestCase):
             decision_path.write_text(json.dumps(decision), encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "recompute|statistics"):
+                self._run_update(args)
+            unchanged = json.loads(state_path.read_text("utf-8"))
+
+        self.assertEqual(unchanged["best_file"], before["best_file"])
+        self.assertNotIn("terminal_decision", unchanged)
+
+    def test_raw_pair_baseline_must_match_the_inheritance_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, state_path, _candidate, before = self._fixture(
+                Path(tmp), mode="kernel-only", decision_status="confirmed_win"
+            )
+            decision_path = Path(tmp) / "run" / "iterv1" / "decision.json"
+            decision = json.loads(decision_path.read_text("utf-8"))
+            evidence = decision["kernel_paired_samples"]
+            baseline = Path(before["best_file"])
+            evidence["baseline_file"] = str(baseline.resolve())
+            evidence["baseline_sha256"] = hashlib.sha256(
+                baseline.read_bytes()
+            ).hexdigest()
+            artifact = Path(evidence["path"])
+            records = [
+                json.loads(line) for line in artifact.read_text("utf-8").splitlines()
+            ]
+            for record in records:
+                record["baseline_file"] = str(baseline.resolve())
+                record["baseline_sha256"] = "f" * 64
+            artifact.write_text(
+                "".join(
+                    json.dumps(record, separators=(",", ":")) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            evidence["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "drifted bindings"):
                 self._run_update(args)
             unchanged = json.loads(state_path.read_text("utf-8"))
 

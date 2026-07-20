@@ -86,6 +86,9 @@ class BranchExploreTests(unittest.TestCase):
             "seed": 17,
             "budget": {"max_pairs": 24},
             "min_effect_pct": 0.5,
+            "effective_methods": [
+                {"id": "fastsort.store", "iter": 124}
+            ],
         }
         state_path = root / "state.json"
         state_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -131,6 +134,7 @@ class BranchExploreTests(unittest.TestCase):
             records = [
                 json.loads(line) for line in artifact.read_text("utf-8").splitlines()
             ]
+            baseline_sha256 = hashlib.sha256(baseline.read_bytes()).hexdigest()
 
         self.assertEqual(result["paired_samples"]["path"], str(artifact.resolve()))
         self.assertEqual(result["paired_samples"]["pairs"], 2)
@@ -142,6 +146,40 @@ class BranchExploreTests(unittest.TestCase):
             self.assertEqual(record["iteration"], 3)
             self.assertEqual(record["candidate_id"], "b2")
             self.assertEqual(record["candidate_sha256"], result["paired_samples"]["candidate_sha256"])
+            self.assertEqual(
+                record["baseline_sha256"],
+                baseline_sha256,
+            )
+
+    def test_paired_candidate_rejects_a_baseline_changed_during_measurement(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            baseline = root / "baseline.py"
+            candidate = root / "kernel.py"
+            baseline.write_text("# baseline\n", encoding="utf-8")
+            candidate.write_text("# candidate\n", encoding="utf-8")
+
+            def mutate_baseline(*_args, **_kwargs):
+                baseline.write_text("# drifted\n", encoding="utf-8")
+                return {"pairs": []}
+
+            with mock.patch.object(
+                branch_explore, "run_paired", side_effect=mutate_baseline
+            ), self.assertRaisesRegex(ValueError, "baseline changed"):
+                branch_explore._paired_candidate(
+                    str(baseline),
+                    str(candidate),
+                    backend="triton",
+                    dims={},
+                    ptr_size=0,
+                    arch="sm_120",
+                    nvcc_bin="nvcc",
+                    seed=7,
+                    blocks=2,
+                    warmup=0,
+                    min_effect_pct=0.5,
+                )
 
     def test_only_confirmed_win_enters_shortlist_and_writes_decision(self) -> None:
         branch_explore = _load_branch_explore()
@@ -176,6 +214,29 @@ class BranchExploreTests(unittest.TestCase):
             self.assertEqual(
                 decision["candidate_sha256"],
                 hashlib.sha256(promoted.read_bytes()).hexdigest(),
+            )
+            inheritance = output["inheritance_verification"]
+            self.assertEqual(inheritance["status"], "passed")
+            self.assertEqual(
+                inheritance["required_method_ids"], ["fastsort.store"]
+            )
+            self.assertEqual(
+                inheritance["baseline_sha256"],
+                hashlib.sha256((root / "best.py").read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                output["champion"]["baseline_sha256"],
+                inheritance["baseline_sha256"],
+            )
+            self.assertEqual(
+                decision["inheritance_verification_sha256"],
+                hashlib.sha256(
+                    json.dumps(
+                        inheritance,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
             )
 
     def test_candidate_exception_is_isolated_and_later_winner_survives(self) -> None:

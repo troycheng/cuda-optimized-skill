@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import math
@@ -33,6 +34,7 @@ _OUTCOMES = {"PASS", "KILL", "INCONCLUSIVE", "DEFERRED"}
 _PROPOSAL_FIELDS = {
     "schema_version",
     "candidate_id",
+    "mechanism_id",
     "observation_id",
     "observation_summary_sha256",
     "capability_query_sha256",
@@ -44,6 +46,7 @@ _PROPOSAL_FIELDS = {
     "capability_ids",
     "paths",
 }
+_LEGACY_PROPOSAL_FIELDS = _PROPOSAL_FIELDS - {"mechanism_id"}
 _TRANSITIONS = {
     ("INIT", "freeze"): "FROZEN",
     ("FROZEN", "calibrate"): "CALIBRATING",
@@ -166,13 +169,20 @@ def _candidate_path_has_no_symlink(project_root: str, relative: str) -> None:
             )
 
 
-def validate_candidate_proposal(value: Mapping[str, Any]) -> dict:
+def validate_candidate_proposal(
+    value: Mapping[str, Any], *, allow_legacy: bool = False
+) -> dict:
     if type(value) is not dict:
         raise ValidationError("candidate proposal must be an object")
-    _closed(value, _PROPOSAL_FIELDS, "candidate proposal")
+    fields = set(value)
+    legacy = fields == _LEGACY_PROPOSAL_FIELDS
+    if not (legacy and allow_legacy):
+        _closed(value, _PROPOSAL_FIELDS, "candidate proposal")
     if value["schema_version"] != PROPOSAL_SCHEMA:
         raise ValidationError(f"schema_version must be {PROPOSAL_SCHEMA}")
     _identifier(value["candidate_id"], "candidate_id")
+    if not legacy:
+        _identifier(value["mechanism_id"], "mechanism_id")
     _identifier(value["observation_id"], "observation_id")
     _sha(value["observation_summary_sha256"], "observation_summary_sha256")
     _sha(value["capability_query_sha256"], "capability_query_sha256")
@@ -191,6 +201,34 @@ def validate_candidate_proposal(value: Mapping[str, Any]) -> dict:
     _string_array(value["capability_ids"], "capability_ids", allow_empty=True)
     _paths(value["paths"])
     return _json_copy(value, "candidate proposal")
+
+
+def mechanism_fingerprint(proposal: Mapping[str, Any]) -> str:
+    """Identify a mechanism independently of candidate name and cost tuning."""
+    if not isinstance(proposal, Mapping):
+        raise ValidationError("mechanism proposal is incomplete")
+    fields = _PROPOSAL_FIELDS if "mechanism_id" in proposal else _LEGACY_PROPOSAL_FIELDS
+    if not fields.issubset(proposal):
+        raise ValidationError("mechanism proposal is incomplete")
+    candidate = validate_candidate_proposal(
+        {field: proposal[field] for field in fields}, allow_legacy=True
+    )
+    if candidate.get("mechanism_id") is not None:
+        basis = {"mechanism_id": candidate["mechanism_id"]}
+    else:
+        basis = {
+            "capability_ids": sorted(candidate["capability_ids"]),
+            "paths": sorted(candidate["paths"]),
+            "expected_metric": candidate["expected_metric"],
+        }
+    encoded = json.dumps(
+        basis,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_contract_subset(
@@ -365,7 +403,12 @@ def _validate_stored_candidate(
 ) -> dict:
     if type(value) is not dict:
         raise ValidationError(f"{field} must be an object")
-    fields = set(_PROPOSAL_FIELDS) | {"registered_at"}
+    proposal_fields = (
+        _PROPOSAL_FIELDS
+        if "mechanism_id" in value
+        else _LEGACY_PROPOSAL_FIELDS
+    )
+    fields = set(proposal_fields) | {"registered_at"}
     if history:
         fields |= {
             "outcome",
@@ -374,8 +417,8 @@ def _validate_stored_candidate(
             "performance_gate_passed",
         }
     _closed(value, fields, field)
-    proposal = {key: value[key] for key in _PROPOSAL_FIELDS}
-    validate_candidate_proposal(proposal)
+    proposal = {key: value[key] for key in proposal_fields}
+    validate_candidate_proposal(proposal, allow_legacy=True)
     registered_at = _finite(value["registered_at"], f"{field}.registered_at")
     if history:
         if value["outcome"] not in _OUTCOMES:
@@ -482,6 +525,7 @@ def _register_candidate_state(
     contract_sha256: str,
     evidence_age_seconds: float,
     now: float,
+    allow_legacy: bool = False,
 ) -> dict:
     current = _validate_state(state)
     if current["phase"] != "EXPLORING":
@@ -498,7 +542,9 @@ def _register_candidate_state(
     timestamp = _finite(now, "now")
     if timestamp < current["updated_at"]:
         raise ValidationError("now must not move backwards")
-    candidate = validate_candidate_proposal(proposal)
+    candidate = validate_candidate_proposal(
+        proposal, allow_legacy=allow_legacy
+    )
     if candidate["expected_metric"] != {
         "name": current["objective_metric"],
         "direction": current["objective_direction"],
@@ -525,6 +571,12 @@ def _register_candidate_state(
     existing_ids = {item["candidate_id"] for item in current["candidate_history"]}
     if candidate["candidate_id"] in existing_ids:
         raise ValidationError("candidate_id was already used")
+    fingerprint = mechanism_fingerprint(candidate)
+    if any(
+        mechanism_fingerprint(item) == fingerprint
+        for item in current["candidate_history"]
+    ):
+        raise ValidationError("candidate mechanism was already attempted")
     current["active_candidate"] = candidate | {"registered_at": timestamp}
     current["candidates_started"] += 1
     current["updated_at"] = timestamp
@@ -538,10 +590,13 @@ def register_candidate(
     admission: Mapping[str, Any],
     controller_seal_key: bytes,
     now: float,
+    _allow_legacy: bool = False,
 ) -> dict:
     """Register only a candidate carrying a current Controller admission."""
     clean_state = _validate_state(state)
-    clean_proposal = validate_candidate_proposal(proposal)
+    clean_proposal = validate_candidate_proposal(
+        proposal, allow_legacy=_allow_legacy
+    )
     clean_admission = _sibling("planner_admission").validate_admission(
         admission,
         controller_seal_key=controller_seal_key,
@@ -555,6 +610,7 @@ def register_candidate(
         contract_sha256=clean_admission["contract_sha256"],
         evidence_age_seconds=clean_admission["evidence_age_seconds"],
         now=now,
+        allow_legacy=_allow_legacy,
     )
 
 
@@ -704,6 +760,7 @@ def _replay_records(
                 admission=payload["admission"],
                 controller_seal_key=controller_seal_key,
                 now=payload["now"],
+                _allow_legacy=True,
             )
             candidates_since_stability += 1
             recorded_state = _validate_state(payload["state"])

@@ -41,6 +41,7 @@ def _proposal(candidate_id: str = "candidate-1", **overrides) -> dict:
     value = {
         "schema_version": "cuda-optimizer/candidate-proposal-v1",
         "candidate_id": candidate_id,
+        "mechanism_id": "triton.coalesced-load",
         "observation_id": "obs-1",
         "observation_summary_sha256": "d" * 64,
         "capability_query_sha256": "e" * 64,
@@ -127,6 +128,64 @@ class RunControlTests(unittest.TestCase):
         self.assertIsNone(resolved["active_candidate"])
         self.assertIsNone(resolved["champion_candidate_id"])
         self.assertEqual(resolved["candidate_history"][0]["outcome"], "KILL")
+
+    def test_same_mechanism_cannot_be_renamed_and_spend_another_candidate(self) -> None:
+        state = self.control._register_candidate_state(
+            _exploring(self.control),
+            _proposal(candidate_id="fastsort-a"),
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=3.0,
+        )
+        state = self.control.resolve_candidate(
+            state,
+            candidate_id="fastsort-a",
+            outcome="KILL",
+            correctness_ok=True,
+            performance_gate_passed=False,
+            now=4.0,
+        )
+        renamed = _proposal(
+            candidate_id="fastsort-b",
+            observation_id="obs-2",
+            hypothesis=(
+                "Merging neighboring device reads should lower request latency."
+            ),
+            estimated_cost_seconds=30.0,
+            paths=["kernels/alternate_kernel.py"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "mechanism.*already"):
+            self.control._register_candidate_state(
+                state,
+                renamed,
+                contract_sha256="a" * 64,
+                evidence_age_seconds=0.0,
+                now=5.0,
+            )
+
+    def test_legacy_candidate_state_remains_readable_but_new_registration_needs_id(self) -> None:
+        proposal = _proposal()
+        proposal.pop("mechanism_id")
+        with self.assertRaisesRegex(ValueError, "mechanism_id"):
+            self.control._register_candidate_state(
+                _exploring(self.control),
+                proposal,
+                contract_sha256="a" * 64,
+                evidence_age_seconds=0.0,
+                now=3.0,
+            )
+
+        legacy = self.control._register_candidate_state(
+            _exploring(self.control),
+            proposal,
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=3.0,
+            allow_legacy=True,
+        )
+        self.assertNotIn("mechanism_id", legacy["active_candidate"])
+        self.assertEqual(self.control._validate_state(legacy), legacy)
 
     def test_pass_cannot_bypass_correctness_or_performance_gate(self) -> None:
         state = self.control._register_candidate_state(

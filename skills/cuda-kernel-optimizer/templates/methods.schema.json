@@ -6,6 +6,12 @@
   "required": ["iter", "methods"],
   "properties": {
     "iter": { "type": "integer", "minimum": 1 },
+    "inherited_methods": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Exact IDs of all mechanisms already proven effective in state.json"
+    },
     "methods": {
       "type": "array",
       "minItems": 0,

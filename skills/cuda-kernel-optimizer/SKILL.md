@@ -58,7 +58,10 @@ A failed stage blocks every later stage. Stop when the measured effect upper
 bound is below the contract threshold. Continue past the soft target when the
 uncertainty still overlaps the threshold and the direction has credible
 headroom. Do not continue merely to use the budget. Infrastructure repair uses
-at most `min(3 minutes, 10% of hard ceiling)`.
+`min(3 minutes, 10% of hard ceiling)` as a review point, not a kill timer.
+Finish environment readiness before starting the optimization clock. A repair
+may continue to its readiness deadline; terminate the process group only when
+its command timeout or the readiness hard deadline is reached.
 
 Freeze objective, constraints, environment, paths, and stability policy with
 `scripts/workload_contract.py`; calibrate with

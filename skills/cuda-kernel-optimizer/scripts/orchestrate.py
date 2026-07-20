@@ -179,6 +179,252 @@ def _workload_from_snapshot(snapshot) -> WorkloadSpec | None:
     )
 
 
+def _run_original_business_baseline(
+    spec: WorkloadSpec,
+    *,
+    baseline: str,
+    expected_baseline_sha256: str,
+    policy: BudgetPolicy,
+    run_dir: Path,
+    deadline_monotonic: float,
+) -> dict:
+    """Execute and seal the user-owned workload before any candidate exists."""
+    verify_frozen_spec(spec)
+    cases = list(spec.cases) or [{}]
+    if policy.max_cases is not None:
+        cases = cases[: policy.max_cases]
+    if sha256_file(baseline) != expected_baseline_sha256:
+        raise ValueError("original business baseline identity changed before execution")
+    backup = run_dir / "baseline" / "original-input"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(baseline, backup)
+    observations = []
+    for index, case in enumerate(cases, 1):
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0.0:
+            raise ValueError("business baseline exceeded the hard execution deadline")
+        timeout = min(120.0, remaining)
+        if spec.kind == "python":
+            request_path = run_dir / "baseline" / f"python-case-{index}.request.json"
+            output_path = run_dir / "baseline" / f"python-case-{index}.output.json"
+            atomic_write_json(
+                request_path,
+                {
+                    "spec": str(run_dir / "workload" / "spec.json"),
+                    "candidate": baseline,
+                    "role": "baseline",
+                    "case": case,
+                },
+            )
+            completed = _run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_python-workload-once",
+                    "--request",
+                    str(request_path),
+                    "--out",
+                    str(output_path),
+                ],
+                capture_output=True,
+                hard_timeout=timeout,
+                term_grace=min(0.5, timeout),
+            )
+            if sha256_file(baseline) != expected_baseline_sha256:
+                shutil.copy2(backup, baseline)
+                raise ValueError(
+                    "original business baseline was modified by the workload"
+                )
+            if getattr(completed, "timed_out", False):
+                raise ValueError("Python business baseline reached its hard deadline")
+            if completed.returncode != 0:
+                raise ValueError(
+                    "Python business baseline failed in the isolated worker"
+                )
+            observation = _read(output_path)
+        else:
+            try:
+                observation = run_spec_once(
+                    spec,
+                    candidate=baseline,
+                    role="baseline",
+                    case=case,
+                    timeout=timeout,
+                )
+            except BaseException:
+                if sha256_file(baseline) != expected_baseline_sha256:
+                    shutil.copy2(backup, baseline)
+                raise
+        if sha256_file(baseline) != expected_baseline_sha256:
+            shutil.copy2(backup, baseline)
+            raise ValueError("original business baseline was modified by the workload")
+        if not isinstance(observation, Mapping):
+            raise ValueError("business baseline must return an observation mapping")
+        if observation.get("validation") is False:
+            raise ValueError("business baseline validation failed")
+        if not isinstance(observation.get("benchmark"), Mapping):
+            raise ValueError("business baseline benchmark is missing")
+        observations.append(_strict_json_copy(observation, "business baseline"))
+    artifact = {
+        "status": "measured",
+        "workload_source_hash": spec.source_hash,
+        "baseline_file": baseline,
+        "baseline_sha256": expected_baseline_sha256,
+        "observations": observations,
+    }
+    path = run_dir / "baseline" / "workload.json"
+    atomic_write_json(path, artifact)
+    return {
+        "status": "measured",
+        "path": str(path.resolve(strict=True)),
+        "sha256": sha256_file(path),
+        "observation_count": len(observations),
+    }
+
+
+def validate_success_inheritance(state: Mapping, methods_payload: Mapping) -> dict:
+    """Require an explicit checklist for every mechanism already proven useful."""
+    if not isinstance(state, Mapping) or not isinstance(methods_payload, Mapping):
+        raise ValueError("state and methods payload must be mappings")
+    required = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, Mapping)
+            and type(item.get("id")) is str
+            and item.get("id").strip()
+        }
+    )
+    declared = methods_payload.get("inherited_methods", [])
+    if type(declared) is not list or any(
+        type(item) is not str or not item.strip() for item in declared
+    ):
+        raise ValueError("inherited_methods must be a string array")
+    normalized = sorted({item.strip() for item in declared})
+    if len(normalized) != len(declared):
+        raise ValueError("inherited_methods must not contain duplicates")
+    missing = sorted(set(required) - set(normalized))
+    extra = sorted(set(normalized) - set(required))
+    if missing:
+        raise ValueError(
+            "inherited mechanisms are missing: " + ", ".join(missing)
+        )
+    if extra:
+        raise ValueError(
+            "inherited_methods contains mechanisms not proven effective: "
+            + ", ".join(extra)
+        )
+    return {
+        "status": "passed",
+        "required_method_ids": required,
+        "declared_method_ids": normalized,
+        "base_file": state.get("best_file"),
+    }
+
+
+def _check_success_inheritance(
+    state: Mapping, methods_json: str | os.PathLike, iteration_dir: Path
+) -> dict:
+    inheritance_path = iteration_dir / "inheritance.json"
+    if inheritance_path.is_symlink() or not inheritance_path.is_file():
+        raise ValueError("inheritance.json is required before candidate execution")
+    inheritance = _read(inheritance_path)
+    expected_base = Path(state.get("best_file", "")).expanduser().resolve(strict=True)
+    expected_methods = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, Mapping)
+            and type(item.get("id")) is str
+            and item.get("id").strip()
+        }
+    )
+    expected_inheritance = {
+        "base_file": str(expected_base),
+        "base_sha256": sha256_file(expected_base),
+        "required_method_ids": expected_methods,
+    }
+    if inheritance != expected_inheritance:
+        raise ValueError(
+            "inheritance.json no longer matches the current champion and proven mechanisms"
+        )
+    methods_path = Path(methods_json)
+    if methods_path.is_symlink() or not methods_path.is_file():
+        raise ValueError("methods.json is required before candidate execution")
+    payload = _read(methods_path)
+    evidence = validate_success_inheritance(state, payload)
+    evidence["base_sha256"] = expected_inheritance["base_sha256"]
+    evidence["inheritance_sha256"] = sha256_file(inheritance_path)
+    evidence["methods_sha256"] = sha256_file(methods_path)
+    atomic_write_json(iteration_dir / "inheritance_check.json", evidence)
+    return evidence
+
+
+def _bind_branch_inheritance(
+    decision: Mapping,
+    branch_payload: Mapping,
+    candidate: Mapping,
+    state: Mapping,
+) -> dict:
+    """Bind a terminal winner to the branch comparison against the champion."""
+    required_method_ids = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("id"), str)
+            and item.get("id").strip()
+        }
+    )
+    proof = branch_payload.get("inheritance_verification")
+    if not required_method_ids and proof is None:
+        return _strict_json_copy(decision, "terminal decision")
+    if not isinstance(proof, Mapping) or proof.get("status") != "passed":
+        raise ValueError("branch winner is missing passed inheritance evidence")
+    if proof.get("required_method_ids") != required_method_ids:
+        raise ValueError("branch inheritance method set does not match state")
+    candidate_id = _candidate_checkpoint_id(candidate)
+    if candidate_id is None or candidate_id not in proof.get(
+        "verified_candidate_ids", []
+    ):
+        raise ValueError("selected candidate is not covered by inheritance evidence")
+    if (
+        candidate.get("baseline_sha256") != proof.get("baseline_sha256")
+        or candidate.get("baseline_file") != proof.get("baseline_file")
+    ):
+        raise ValueError("selected candidate inheritance baseline is inconsistent")
+    paired = candidate.get("paired_samples")
+    if isinstance(paired, Mapping) and (
+        paired.get("baseline_sha256") != proof.get("baseline_sha256")
+        or str(paired.get("candidate_id")) != candidate_id
+    ):
+        raise ValueError("paired evidence is not bound to the inherited champion")
+    clean_proof = _strict_json_copy(proof, "inheritance verification")
+    bound = _strict_json_copy(decision, "terminal decision")
+    bound.update(
+        {
+            "candidate_id": candidate_id,
+            "baseline_file": proof["baseline_file"],
+            "baseline_sha256": proof["baseline_sha256"],
+            "inheritance_verification": clean_proof,
+            "inheritance_verification_sha256": hashlib.sha256(
+                json.dumps(
+                    clean_proof,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    if isinstance(paired, Mapping):
+        bound["kernel_paired_samples"] = _strict_json_copy(
+            paired, "kernel paired samples"
+        )
+    return bound
+
+
 def _budget_payload(policy: BudgetPolicy) -> dict:
     return _strict_json_copy(asdict(policy), "budget")
 
@@ -1134,6 +1380,26 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
         kw["stderr"] = subprocess.PIPE
     check = kw.pop("check", False)
     input_value = kw.pop("input", None)
+    heartbeat_interval = kw.pop("heartbeat_interval_seconds", 30.0)
+    event_sink = kw.pop("event_sink", None)
+    if event_sink is None:
+        command_name = Path(cmd[1] if len(cmd) > 1 else cmd[0]).name
+
+        def event_sink(event):
+            if event.get("event") == "heartbeat":
+                print(
+                    "[heartbeat] "
+                    f"command={command_name} elapsed_seconds="
+                    f"{event['elapsed_seconds']:.1f}",
+                    file=sys.stderr,
+                )
+            elif event.get("event") == "terminal":
+                print(
+                    "[terminal] "
+                    f"command={command_name} stop_reason={event['stop_reason']} "
+                    f"elapsed_seconds={event['elapsed_seconds']:.1f}",
+                    file=sys.stderr,
+                )
     return run_budgeted_command(
         cmd,
         timeout_seconds=timeout_seconds,
@@ -1141,6 +1407,8 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
         input_value=input_value,
         check=check,
         popen_options=kw,
+        heartbeat_interval_seconds=heartbeat_interval,
+        event_sink=event_sink,
     )
 
 
@@ -1415,9 +1683,9 @@ def _frozen_input_hash(
 
 
 def cmd_setup(args):
-    started_at = time.time()
+    setup_started_at = time.time()
     policy = resolve_setup_policy(args)
-    budget_clock = BudgetClock(policy, started_at=time.monotonic())
+    readiness_deadline = time.monotonic() + policy.max_seconds
     confidence = _finite_real(args.confidence, "confidence")
     min_effect_pct = _finite_real(
         args.min_effect_pct, "min_effect_pct", minimum=0.0
@@ -1477,7 +1745,7 @@ def cmd_setup(args):
                 "workload": workload_snapshot,
                 "confidence": confidence,
                 "min_effect_pct": min_effect_pct,
-                "started_at": started_at,
+                "started_at": setup_started_at,
                 "dims": copy.deepcopy(dims),
                 "backend": args.backend,
                 "ptr_size": args.ptr_size,
@@ -1497,6 +1765,22 @@ def cmd_setup(args):
         workload_file = run_dir / "workload" / "spec.json"
         atomic_write_json(workload_file, workload_snapshot)
         os.chmod(workload_file, 0o600)
+
+        business_baseline = None
+        if workload_spec is not None:
+            business_baseline = _run_original_business_baseline(
+                workload_spec,
+                baseline=baseline,
+                expected_baseline_sha256=manifest["inputs"]["baseline"]["sha256"],
+                policy=policy,
+                run_dir=run_dir,
+                deadline_monotonic=readiness_deadline,
+            )
+
+        started_at = time.time()
+        budget_clock = BudgetClock(policy, started_at=time.monotonic())
+        manifest["optimization_started_at"] = started_at
+        atomic_write_json(run_dir / "manifest.json", manifest)
 
         state_command = [
             sys.executable,
@@ -1611,6 +1895,15 @@ def cmd_setup(args):
             raise ValueError("state best_metric_ms does not match baseline evidence")
         budget_now = time.monotonic()
         now = time.time()
+        baseline_evidence = {
+            "status": "passed",
+            "bench_path": str(baseline_bench_path.resolve(strict=True)),
+            "bench_sha256": sha256_file(baseline_bench_path),
+            "metric_ms": baseline_metric,
+            "correctness_passed": True,
+        }
+        if business_baseline is not None:
+            baseline_evidence["business_workload"] = business_baseline
         checkpoint = {
             "schema_version": CURRENT_SCHEMA_VERSION,
             "input_hash": manifest["input_hash"],
@@ -1622,13 +1915,7 @@ def cmd_setup(args):
             "candidate_id": None,
             "candidate_status": None,
             "stage_evidence": {
-                "baseline": {
-                    "status": "passed",
-                    "bench_path": str(baseline_bench_path.resolve(strict=True)),
-                    "bench_sha256": sha256_file(baseline_bench_path),
-                    "metric_ms": baseline_metric,
-                    "correctness_passed": True,
-                }
+                "baseline": baseline_evidence
             },
             "budget": _checkpoint_budget(budget_clock, budget_now),
             "updated_at": now,
@@ -1693,11 +1980,40 @@ def cmd_open_iter(args):
         roofline = _read(roofline_path)
         early_stop = roofline.get("near_peak", False)
 
-    # Create branch dirs
+    # Seed every branch from the current champion before the agent edits it.
     num_branches = state.get("branches", 4)
     branches_dir = os.path.join(iter_dir, "branches")
+    best_file = Path(state["best_file"]).expanduser().resolve(strict=True)
+    required_methods = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, Mapping) and type(item.get("id")) is str
+        }
+    )
+    inheritance_path = Path(iter_dir) / "inheritance.json"
+    inheritance = {
+        "base_file": str(best_file),
+        "base_sha256": sha256_file(best_file),
+        "required_method_ids": required_methods,
+    }
+    previously_opened = inheritance_path.is_file() and not inheritance_path.is_symlink()
+    if inheritance_path.exists() and not previously_opened:
+        raise ValueError("inheritance.json must be a non-symlink regular file")
+    if previously_opened and _read(inheritance_path) != inheritance:
+        raise ValueError("iteration was opened from a different champion")
     for b in range(1, num_branches + 1):
-        os.makedirs(os.path.join(branches_dir, f"b{b}"), exist_ok=True)
+        branch_dir = Path(branches_dir) / f"b{b}"
+        branch_dir.mkdir(parents=True, exist_ok=True)
+        seeded = branch_dir / f"kernel{best_file.suffix}"
+        if not seeded.exists():
+            shutil.copyfile(best_file, seeded)
+        elif not previously_opened and sha256_file(seeded) != inheritance["base_sha256"]:
+            raise ValueError(
+                f"pre-existing branch was not seeded from the champion: {seeded}"
+            )
+    if not previously_opened:
+        atomic_write_json(inheritance_path, inheritance)
 
     print(json.dumps({
         "iter": args.iter,
@@ -1707,7 +2023,8 @@ def cmd_open_iter(args):
         "next_step": (
             f"The agent should read iterv{args.iter}/roofline.json and ncu_top.json, "
             f"write {num_branches} branch kernels under iterv{args.iter}/branches/b{{1..{num_branches}}}/kernel.<ext>, "
-            f"plus iterv{args.iter}/methods.json and iterv{args.iter}/analysis.md. "
+            f"plus iterv{args.iter}/methods.json with inherited_methods={required_methods!r} "
+            f"and iterv{args.iter}/analysis.md. "
             f"Then run: orchestrate.py close-iter --run-dir {args.run_dir} --iter {args.iter}"
         ) if not early_stop else "Near roofline — consider stopping.",
     }, indent=2))
@@ -1728,6 +2045,12 @@ _STAGE_ESTIMATES_SECONDS = {
 
 
 def _budget_stop_output(args, checkpoint: Mapping) -> None:
+    evidence = checkpoint.get("stage_evidence", {}).get(checkpoint["stage"], {})
+    reason = (
+        "hard_execution_deadline"
+        if evidence.get("reason") == "hard execution deadline expired"
+        else "hard_ceiling_admission_failed"
+    )
     print(
         json.dumps(
             {
@@ -1735,6 +2058,10 @@ def _budget_stop_output(args, checkpoint: Mapping) -> None:
                 "status": "budget_exhausted",
                 "stage": checkpoint["stage"],
                 "candidate_status": "inconclusive",
+                "elapsed_seconds": checkpoint.get("budget", {}).get(
+                    "elapsed_seconds", 0.0
+                ),
+                "stop_reason": reason,
                 "checkpoint": str(Path(args.run_dir) / "checkpoint.json"),
             },
             indent=2,
@@ -2916,6 +3243,8 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
             "close iteration does not match checkpoint next iteration "
             f"{initial['next_iteration']}"
         )
+    if initial["next_stage"] == "candidate_correctness":
+        _check_success_inheritance(state, methods_json, iteration_dir)
 
     while True:
         restored = resume(
@@ -3460,8 +3789,8 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 workload_evidence = {"status": "evaluated"}
             terminal_decision["candidate_file"] = kernel
             terminal_decision["candidate_sha256"] = sha256_file(kernel)
-            terminal_decision = _strict_json_copy(
-                terminal_decision, "terminal decision"
+            terminal_decision = _bind_branch_inheritance(
+                terminal_decision, branch_payload, selected_candidate, state
             )
             _write_workload_result_artifact(
                 iteration_dir,
@@ -3670,6 +3999,7 @@ def cmd_close_iter(args):
         )
     if not os.path.isfile(methods_json):
         sys.exit(f"methods.json missing at {methods_json}")
+    _check_success_inheritance(state, methods_json, Path(iter_dir).resolve())
 
     # Step 3e: Branch explore — compile + benchmark all branches
     branch_result = _run([
@@ -3808,7 +4138,9 @@ def cmd_close_iter(args):
         )
         terminal_decision["candidate_file"] = kernel
         terminal_decision["candidate_sha256"] = sha256_file(kernel)
-        terminal_decision = _strict_json_copy(terminal_decision, "decision")
+        terminal_decision = _bind_branch_inheritance(
+            terminal_decision, branch_payload, selected_candidate, state
+        )
     else:
         # Preserve the legacy close-iter contract for existing v2 runs.
         kernel = _selected_kernel(
@@ -4140,6 +4472,25 @@ def _removed_env_option(_text: str):
     )
 
 
+def _cmd_python_workload_once(args) -> None:
+    """Internal child-process boundary for a Python workload observation."""
+    request = _read(args.request)
+    if set(request) != {"spec", "candidate", "role", "case"}:
+        raise ValueError("Python workload request fields are invalid")
+    snapshot = _read(request["spec"])
+    spec = _workload_from_snapshot(snapshot)
+    if spec is None or spec.kind != "python":
+        raise ValueError("Python workload child requires a frozen Python spec")
+    observation = run_spec_once(
+        spec,
+        candidate=request["candidate"],
+        role=request["role"],
+        case=request["case"],
+        timeout=None,
+    )
+    atomic_write_json(args.out, observation)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Budget-aware CUDA kernel optimization orchestrator"
@@ -4147,6 +4498,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     _default_bench = str(SCRIPT_DIR / "benchmark.py")
+
+    internal = sub.add_parser("_python-workload-once", help=argparse.SUPPRESS)
+    internal.add_argument("--request", required=True)
+    internal.add_argument("--out", required=True)
+    internal.set_defaults(func=_cmd_python_workload_once)
 
     ps = sub.add_parser("setup", help="preflight and initialize a frozen run")
     ps.add_argument("--baseline", required=True)

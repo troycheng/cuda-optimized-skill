@@ -445,7 +445,9 @@ class SanitizeTests(unittest.TestCase):
                         "--", sys.executable, "bench.py",
                     ],
                     capture_output=True,
-                    hard_timeout=1.0,
+                    # Allow sanitizer startup to finish even under a loaded full-suite
+                    # run; the timeout still expires long before the fake 60 s tool.
+                    hard_timeout=3.0,
                 )
                 self.assertTrue(completed.timed_out)
                 leader_pid = int(leader_pid_path.read_text("utf-8"))

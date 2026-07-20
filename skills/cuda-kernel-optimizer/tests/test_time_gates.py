@@ -109,6 +109,35 @@ class TimeGateTests(unittest.TestCase):
         self.assertNotIn("profiler", calls)
         self.assertEqual(result["stop_reason"], "correctness_failed")
 
+    def test_missing_profiler_action_cannot_be_silently_skipped(self) -> None:
+        calls = []
+        result = self._gate().run(
+            {
+                "static_review": self.clock.action(
+                    calls, "static_review", {"status": "passed"}
+                ),
+                "build_correctness": self.clock.action(
+                    calls, "build_correctness", {"status": "passed"}
+                ),
+                "short_paired": self.clock.action(
+                    calls,
+                    "short_paired",
+                    {"status": "passed", "upper_bound": 2.0},
+                ),
+                "formal_paired": self.clock.action(
+                    calls,
+                    "formal_paired",
+                    {"status": "passed", "lower_bound": 1.5},
+                ),
+            }
+        )
+
+        self.assertEqual(
+            calls, ["static_review", "build_correctness", "short_paired"]
+        )
+        self.assertEqual(result["decision"], "STOP")
+        self.assertEqual(result["stop_reason"], "missing_profiler_action")
+
     def test_short_pair_upper_bound_below_threshold_skips_formal_test(self) -> None:
         calls = []
         actions = {
@@ -143,7 +172,7 @@ class TimeGateTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "static_falsified")
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
-    def test_runner_maintenance_budget_kills_the_process_group(self) -> None:
+    def test_runner_hard_deadline_kills_the_process_group(self) -> None:
         if not hasattr(self.budget, "run_budgeted_command"):
             self.fail("budget.py must expose run_budgeted_command")
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,18 +198,94 @@ class TimeGateTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
-    def test_maintenance_runner_derives_ten_percent_or_three_minute_cap(self) -> None:
+    def test_maintenance_soft_limit_does_not_kill_progressing_setup(self) -> None:
         if not hasattr(self.budget, "run_maintenance_command"):
             self.fail("budget.py must expose run_maintenance_command")
 
         started = time.monotonic()
         result = self.budget.run_maintenance_command(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
+            [sys.executable, "-c", "import time; time.sleep(0.35)"],
             hard_ceiling_seconds=2,
         )
 
-        self.assertTrue(result.timed_out)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.soft_limit_exceeded)
+        self.assertEqual(result.stop_reason, "completed")
         self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_declared_cheapest_falsifier_must_match_the_executable_plan(self) -> None:
+        self.candidate["cheapest_falsifier"] = "formal_paired"
+        calls = []
+
+        with self.assertRaisesRegex(ValueError, "cheapest_falsifier"):
+            self._gate().run(
+                {
+                    "static_review": self.clock.action(
+                        calls, "static_review", {"status": "passed"}
+                    ),
+                    "build_correctness": self.clock.action(
+                        calls, "build_correctness", {"status": "passed"}
+                    ),
+                    "short_paired": self.clock.action(
+                        calls,
+                        "short_paired",
+                        {"status": "passed", "upper_bound": 2.0},
+                    ),
+                    "formal_paired": self.clock.action(
+                        calls,
+                        "formal_paired",
+                        {"status": "passed", "lower_bound": 1.1},
+                    ),
+                }
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_cheaper_late_stage_cannot_bypass_cost_order_or_missing_action(self) -> None:
+        self.candidate["cheapest_falsifier"] = "profiler"
+        self.candidate["estimated_cost"]["static_review"] = 100.0
+        self.candidate["estimated_cost"]["profiler"] = 0.5
+        calls = []
+
+        with self.assertRaisesRegex(ValueError, "cost|cheapest_falsifier"):
+            self._gate().run(
+                {
+                    "static_review": self.clock.action(
+                        calls, "static_review", {"status": "passed"}
+                    ),
+                    "build_correctness": self.clock.action(
+                        calls, "build_correctness", {"status": "passed"}
+                    ),
+                    "short_paired": self.clock.action(
+                        calls,
+                        "short_paired",
+                        {"status": "passed", "upper_bound": 2.0},
+                    ),
+                    "formal_paired": self.clock.action(
+                        calls,
+                        "formal_paired",
+                        {"status": "passed", "lower_bound": 1.1},
+                    ),
+                }
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_long_command_emits_heartbeats_and_a_terminal_reason(self) -> None:
+        events = []
+        result = self.budget.run_budgeted_command(
+            [sys.executable, "-c", "import time; time.sleep(0.3)"],
+            timeout_seconds=2,
+            heartbeat_interval_seconds=0.1,
+            event_sink=events.append,
+        )
+
+        self.assertGreaterEqual(
+            sum(event["event"] == "heartbeat" for event in events), 2
+        )
+        self.assertEqual(events[-1]["event"], "terminal")
+        self.assertEqual(events[-1]["stop_reason"], "completed")
+        self.assertEqual(result.stop_reason, "completed")
 
     def test_output_always_exposes_time_stop_and_skipped_stages(self) -> None:
         result = self._gate().run(

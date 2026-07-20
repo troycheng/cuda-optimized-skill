@@ -64,6 +64,7 @@ def _proposal(candidate_id: str = "candidate-1") -> dict:
     return {
         "schema_version": "cuda-optimizer/candidate-proposal-v1",
         "candidate_id": candidate_id,
+        "mechanism_id": "layout.coalesced-load",
         "observation_id": f"obs-{candidate_id}",
         "observation_summary_sha256": "d" * 64,
         "capability_query_sha256": "e" * 64,
@@ -117,6 +118,7 @@ class LongRunRecoveryTests(unittest.TestCase):
                 "contract_sha256": contract["contract_sha256"],
                 "environment_sha256": "b" * 64,
                 "candidate_id": proposal["candidate_id"],
+                "mechanism_id": proposal["mechanism_id"],
                 "observation_id": proposal["observation_id"],
                 "observation_summary_sha256": proposal["observation_summary_sha256"],
                 "capability_query_sha256": proposal["capability_query_sha256"],
@@ -254,6 +256,9 @@ class LongRunRecoveryTests(unittest.TestCase):
                 controller_seal_key=SEAL_KEY,
             )
             second = _proposal("candidate-2")
+            second["hypothesis"] = "A bounded tiling change should reduce latency."
+            second["capability_ids"] = ["test.capability.tiling"]
+            second["mechanism_id"] = "layout.tiling"
             with self.assertRaisesRegex(ValueError, "audit|cadence"):
                 self.control.register_run_candidate(
                     contract_path,
@@ -342,6 +347,9 @@ class LongRunRecoveryTests(unittest.TestCase):
                 controller_seal_key=SEAL_KEY,
             )
             second = _proposal("candidate-2")
+            second["hypothesis"] = "A bounded tiling change should reduce latency."
+            second["capability_ids"] = ["test.capability.tiling"]
+            second["mechanism_id"] = "layout.tiling"
             admission = self._admission(
                 contract_path, now=21.0, age=1.0, proposal=second
             )

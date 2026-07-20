@@ -242,6 +242,9 @@ def _run_bounded(
     cwd: Path,
     environment: Mapping[str, str],
     log_limit: int = MAX_LOG_BYTES,
+    heartbeat_interval_seconds: float | None = None,
+    soft_limit_seconds: float | None = None,
+    event_sink=None,
 ) -> dict:
     half_limit = max(1, log_limit // 2)
     captured = {
@@ -307,10 +310,41 @@ def _run_bounded(
     ]
     for reader in readers:
         reader.start()
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    next_heartbeat = (
+        None
+        if heartbeat_interval_seconds is None
+        else started + float(heartbeat_interval_seconds)
+    )
+    soft_emitted = False
     timed_out = False
     try:
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            elapsed = max(0.0, now - started)
+            if (
+                event_sink is not None
+                and soft_limit_seconds is not None
+                and not soft_emitted
+                and elapsed >= float(soft_limit_seconds)
+            ):
+                event_sink(
+                    {
+                        "event": "soft_limit_reached",
+                        "elapsed_seconds": elapsed,
+                    }
+                )
+                soft_emitted = True
+            if (
+                event_sink is not None
+                and next_heartbeat is not None
+                and now >= next_heartbeat
+            ):
+                event_sink(
+                    {"event": "heartbeat", "elapsed_seconds": elapsed}
+                )
+                next_heartbeat = now + float(heartbeat_interval_seconds)
             if (
                 process.poll() is not None
                 and not any(reader.is_alive() for reader in readers)
@@ -329,12 +363,34 @@ def _run_bounded(
                 stream.close()
     stdout, stdout_truncated = render("stdout")
     stderr, stderr_truncated = render("stderr")
+    elapsed = max(0.0, time.monotonic() - started)
+    stop_reason = (
+        "hard_deadline_exceeded"
+        if timed_out
+        else "completed"
+        if process.returncode == 0
+        else "command_failed"
+    )
+    if event_sink is not None:
+        event_sink(
+            {
+                "event": "terminal",
+                "elapsed_seconds": elapsed,
+                "stop_reason": stop_reason,
+            }
+        )
     return {
         "returncode": process.returncode,
         "timed_out": timed_out,
         "logs_truncated": stdout_truncated or stderr_truncated,
         "stdout": stdout,
         "stderr": stderr,
+        "elapsed_seconds": elapsed,
+        "stop_reason": stop_reason,
+        "soft_limit_exceeded": bool(
+            soft_limit_seconds is not None
+            and elapsed >= float(soft_limit_seconds)
+        ),
     }
 
 

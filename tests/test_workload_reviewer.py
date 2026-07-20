@@ -235,6 +235,37 @@ class ReviewerProcessTests(unittest.TestCase):
                     self.assertEqual(artifact["status"], "unavailable")
                     self.assertEqual(artifact["response"], None)
 
+    def test_timeout_includes_stdin_delivery_to_nonreading_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            script = self._script(root, "time.sleep(2)")
+            request = self.reviewer.build_review_request(
+                diagnosis={"primary_category": "cpu_data", "confidence": "medium"},
+                change_set={"id": "round-1", "scope": "project"},
+                redacted_diff="x" * (200 * 1024),
+                experiment={"blocks": 5, "primary_metric": "p50_latency_ms"},
+                artifact_hashes={"diagnosis.json": "a" * 64},
+            )
+            started = time.monotonic()
+
+            artifact = self.reviewer.run_reviewers(
+                [
+                    {
+                        "provider": "blocked-stdin",
+                        "argv": [sys.executable, str(script)],
+                        "timeout_seconds": 1,
+                    }
+                ],
+                request,
+                root / "run",
+                total_timeout_seconds=1,
+            )
+
+            self.assertLess(time.monotonic() - started, 1.75)
+            self.assertLessEqual(artifact["total_wait_seconds"], 1.0)
+            self.assertEqual(artifact["providers_completed"], [])
+            self.assertEqual(artifact["failed_providers"], ["blocked-stdin"])
+
     def test_timeout_kills_term_ignoring_reviewer_descendant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -341,6 +372,64 @@ class ReviewerProcessTests(unittest.TestCase):
             self.assertEqual(artifact["status"], "completed")
             self.assertTrue(artifact["execution"]["stderr_truncated"])
             self.assertNotIn("never-store-this", json.dumps(artifact))
+
+    def test_multiple_reviewers_run_in_parallel_and_publish_complete_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            good = self._script(
+                root,
+                """
+                time.sleep(0.25)
+                request = json.load(sys.stdin)
+                print(json.dumps({
+                    "schema_version": "cuda-workload-optimizer/review-v1",
+                    "request_digest": request["request_digest"],
+                    "verdict": "challenge",
+                    "concerns": [{
+                        "severity": "medium",
+                        "category": "direction",
+                        "message": "check the host launch gap"
+                    }],
+                    "suggested_experiments": ["one short nsys capture"]
+                }))
+                """,
+            )
+            failed = root / "missing-reviewer"
+            request = _request(self.reviewer)
+            started = time.monotonic()
+
+            artifact = self.reviewer.run_reviewers(
+                [
+                    {
+                        "provider": "kimi",
+                        "argv": [sys.executable, str(good)],
+                        "timeout_seconds": 2,
+                    },
+                    {
+                        "provider": "deepseek",
+                        "argv": [str(failed)],
+                        "timeout_seconds": 2,
+                    },
+                ],
+                request,
+                root / "run",
+                total_timeout_seconds=1,
+            )
+
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(artifact["providers_requested"], ["kimi", "deepseek"])
+            self.assertEqual(artifact["providers_completed"], ["kimi"])
+            self.assertEqual(artifact["failed_providers"], ["deepseek"])
+            kimi = next(item for item in artifact["reviews"] if item["provider"] == "kimi")
+            self.assertEqual(kimi["response"]["concerns"][0]["message"], "check the host launch gap")
+            self.assertIsNotNone(
+                next(item for item in artifact["reviews"] if item["provider"] == "deepseek")["failure"]
+            )
+            self.assertLessEqual(artifact["total_wait_seconds"], 1.5)
+            self.assertEqual(
+                json.loads((root / "run" / "review.json").read_text("utf-8")),
+                artifact,
+            )
 
 
 if __name__ == "__main__":

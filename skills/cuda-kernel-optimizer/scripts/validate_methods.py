@@ -68,6 +68,34 @@ def validate(
 
     methods_list = methods_data["methods"]
 
+    required_inherited = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item.get("id").strip()
+        }
+    )
+    declared_inherited = methods_data.get("inherited_methods", [])
+    if not isinstance(declared_inherited, list) or any(
+        not isinstance(item, str) or not item.strip()
+        for item in declared_inherited
+    ):
+        errors.append("inherited_methods must be a string array")
+        declared_inherited = []
+    declared_inherited = sorted(set(declared_inherited))
+    missing_inherited = sorted(set(required_inherited) - set(declared_inherited))
+    unexpected_inherited = sorted(set(declared_inherited) - set(required_inherited))
+    if missing_inherited:
+        errors.append(
+            "Missing proven effective mechanisms: " + ", ".join(missing_inherited)
+        )
+    if unexpected_inherited:
+        errors.append(
+            "Unproven inherited mechanisms: " + ", ".join(unexpected_inherited)
+        )
+
     # Detect sm_arch
     gpus = state.get("env", {}).get("gpus", [{}])
     detected_arch = _normalize_sm_arch(gpus[0].get("sm_arch") if gpus else None)

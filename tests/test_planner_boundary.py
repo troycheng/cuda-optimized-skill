@@ -170,6 +170,7 @@ class PlannerBoundaryTests(unittest.TestCase):
         proposal = {
             "schema_version": "cuda-optimizer/candidate-proposal-v1",
             "candidate_id": "candidate-1",
+            "mechanism_id": "triton.decode-attention-gqa",
             "observation_id": "obs-nsys",
             "observation_summary_sha256": summary["summary_sha256"],
             "capability_query_sha256": query["query_sha256"],
@@ -372,6 +373,11 @@ class PlannerBoundaryTests(unittest.TestCase):
             invalid = dict(proposal)
             invalid["capability_ids"] = []
             with self.assertRaisesRegex(ValueError, "capability"):
+                self._admit(root, ledger, summary, policy, query, invalid)
+
+            invalid = dict(proposal)
+            invalid["mechanism_id"] = "triton.renamed-same-mechanism"
+            with self.assertRaisesRegex(ValueError, "mechanism_id.*capability"):
                 self._admit(root, ledger, summary, policy, query, invalid)
 
 

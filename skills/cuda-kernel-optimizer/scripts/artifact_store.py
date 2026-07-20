@@ -473,6 +473,7 @@ def write_paired_samples(
     iteration: int,
     candidate_id,
     candidate_file: _PathLike,
+    baseline_file: Optional[_PathLike] = None,
     classifier_config=None,
 ) -> dict:
     """Persist raw paired observations with candidate/input/iteration bindings."""
@@ -500,6 +501,16 @@ def write_paired_samples(
         raise ValueError("paired sample candidate must be a regular non-symlink file")
     candidate = candidate.resolve(strict=True)
     candidate_sha256 = sha256_file(candidate)
+    baseline = None
+    baseline_sha256 = None
+    if baseline_file is not None:
+        baseline = Path(baseline_file).expanduser()
+        if baseline.is_symlink() or not baseline.is_file():
+            raise ValueError(
+                "paired sample baseline must be a regular non-symlink file"
+            )
+        baseline = baseline.resolve(strict=True)
+        baseline_sha256 = sha256_file(baseline)
     if isinstance(pairs, (str, bytes, bytearray, dict)):
         raise ValueError("paired samples must be a sequence")
     try:
@@ -515,6 +526,14 @@ def write_paired_samples(
             "candidate_id": candidate_name,
             "candidate_file": str(candidate),
             "candidate_sha256": candidate_sha256,
+            **(
+                {
+                    "baseline_file": str(baseline),
+                    "baseline_sha256": baseline_sha256,
+                }
+                if baseline is not None
+                else {}
+            ),
             "classifier": copy.deepcopy(classifier),
             "pair_index": index,
             "pair": pair,
@@ -535,6 +554,14 @@ def write_paired_samples(
         "candidate_id": candidate_name,
         "candidate_file": str(candidate),
         "candidate_sha256": candidate_sha256,
+        **(
+            {
+                "baseline_file": str(baseline),
+                "baseline_sha256": baseline_sha256,
+            }
+            if baseline is not None
+            else {}
+        ),
         "classifier": classifier,
     }
 

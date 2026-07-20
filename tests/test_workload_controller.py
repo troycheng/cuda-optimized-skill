@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -420,6 +422,106 @@ class WorkloadControllerContractTests(unittest.TestCase):
             ):
                 self.controller.validate_control_manifest(control)
 
+    def test_multiple_reviewers_are_closed_named_and_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control = _control(root)
+            del control["reviewer"]
+            control["reviewers"] = [
+                {
+                    "provider": "kimi",
+                    "argv": ["kimi-review", "--json"],
+                    "timeout_seconds": 60,
+                },
+                {
+                    "provider": "deepseek",
+                    "argv": ["deepseek-review", "--json"],
+                    "timeout_seconds": 60,
+                    "include_diff": False,
+                },
+            ]
+
+            normalized = self.controller.validate_control_manifest(control)
+
+            self.assertEqual(
+                [item["provider"] for item in normalized["reviewers"]],
+                ["kimi", "deepseek"],
+            )
+            conflict = copy.deepcopy(control)
+            conflict["reviewer"] = {
+                "argv": ["legacy-reviewer"],
+                "timeout_seconds": 10,
+            }
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "reviewer.*reviewers|mutually"
+            ):
+                self.controller.validate_control_manifest(conflict)
+
+            too_long = copy.deepcopy(control)
+            too_long["reviewers"][0]["provider"] = "x" * 65
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "64-character"
+            ):
+                self.controller.validate_control_manifest(too_long)
+
+            too_many = copy.deepcopy(control)
+            too_many["reviewers"] = [
+                {
+                    "provider": f"provider-{index}",
+                    "argv": ["reviewer"],
+                    "timeout_seconds": 10,
+                }
+                for index in range(9)
+            ]
+            with self.assertRaisesRegex(
+                self.controller.ValidationError, "between 1 and 8"
+            ):
+                self.controller.validate_control_manifest(too_many)
+
+    def test_readiness_time_is_separate_from_optimization_budget(self) -> None:
+        state = {
+            "started_at_epoch": 100.0,
+            "soft_target_epoch": 1000.0,
+            "deadline_epoch": 2800.0,
+        }
+        runtime = {
+            "soft_target_seconds": 900.0,
+            "hard_ceiling_seconds": 2700.0,
+        }
+
+        updated = self.controller.start_optimization_budget_after_readiness(
+            state, runtime, now=460.0
+        )
+
+        self.assertEqual(updated["environment_seconds"], 360.0)
+        self.assertEqual(updated["optimization_started_at_epoch"], 460.0)
+        self.assertEqual(updated["soft_target_epoch"], 1360.0)
+        self.assertEqual(updated["deadline_epoch"], 3160.0)
+
+    def test_completed_legacy_readiness_timer_migrates_once(self) -> None:
+        state = {
+            "started_at_epoch": 100.0,
+            "updated_at_epoch": 400.0,
+            "completed_stages": ["readiness"],
+            "soft_target_epoch": 1000.0,
+            "deadline_epoch": 2800.0,
+        }
+        runtime = {
+            "soft_target_seconds": 900.0,
+            "hard_ceiling_seconds": 2700.0,
+        }
+
+        migrated = self.controller.migrate_completed_readiness_budget(
+            state, runtime, completed_at=400.0
+        )
+        repeated = self.controller.migrate_completed_readiness_budget(
+            migrated, runtime, completed_at=500.0
+        )
+
+        self.assertEqual(migrated["optimization_started_at_epoch"], 400.0)
+        self.assertEqual(migrated["deadline_epoch"], 3100.0)
+        self.assertEqual(repeated, migrated)
+
     def test_unknown_keys_are_rejected_at_every_object_layer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -634,6 +736,44 @@ class WorkloadControllerContractTests(unittest.TestCase):
             with self.assertRaisesRegex(self.controller.ValidationError, "object"):
                 self.controller.load_json_object(array)
 
+    def test_cuda_without_a_static_checker_is_explicitly_not_applicable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            project = root / "project"
+            (project / "src").mkdir(parents=True)
+            (project / "src" / "kernel.cu").write_text(
+                "this is not valid CUDA {", encoding="utf-8"
+            )
+            control = _control(root)
+            candidate = {"name": "candidate"}
+            binding = {
+                "candidate": candidate,
+                "candidate_digest": self.controller._canonical_digest(candidate),
+                "change_set_digest": "a" * 64,
+                "after_identity_digest": "b" * 64,
+            }
+            binding["digest"] = self.controller._canonical_digest(binding)
+
+            artifact = self.controller._static_review_changed_files(
+                control,
+                scope="project",
+                changed=["src/kernel.cu"],
+                candidate_binding=binding,
+                change_set_digest="a" * 64,
+                after_identity_digest="b" * 64,
+            )
+
+            self.assertEqual(artifact["status"], "not_applicable")
+            self.assertIn(
+                {
+                    "kind": "source_syntax",
+                    "path": "src/kernel.cu",
+                    "status": "not_applicable",
+                    "reason": "no_configured_static_checker",
+                },
+                artifact["checks"],
+            )
+
     def test_validate_cli_returns_zero_for_valid_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -664,6 +804,48 @@ class WorkloadControllerContractTests(unittest.TestCase):
 class ProbeRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.controller = _load_controller()
+
+    def test_controller_wait_emits_heartbeat_and_terminal_reason(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.15)"],
+            start_new_session=True,
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            returncode, timed_out, _elapsed, reason = (
+                self.controller._wait_process_with_heartbeats(
+                    process,
+                    timeout_seconds=1.0,
+                    label="test-action",
+                    heartbeat_interval_seconds=0.05,
+                )
+            )
+
+        output = stderr.getvalue()
+        self.assertEqual(returncode, 0)
+        self.assertFalse(timed_out)
+        self.assertEqual(reason, "completed")
+        self.assertIn('"event": "heartbeat"', output)
+        self.assertIn('"event": "terminal"', output)
+        self.assertIn('"stop_reason": "completed"', output)
+
+    def test_controller_wait_can_persist_the_same_heartbeat_stream(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.15)"],
+            start_new_session=True,
+        )
+        events = []
+        self.controller._wait_process_with_heartbeats(
+            process,
+            timeout_seconds=1.0,
+            label="persisted-action",
+            heartbeat_interval_seconds=0.05,
+            event_sink=events.append,
+        )
+
+        self.assertTrue(any(item["event"] == "heartbeat" for item in events))
+        self.assertEqual(events[-1]["event"], "terminal")
+        self.assertEqual(events[-1]["stop_reason"], "completed")
 
     def _workspace(self, root: Path) -> tuple[dict, Path]:
         project = root / "project"
@@ -853,6 +1035,10 @@ class ProbeRunnerTests(unittest.TestCase):
             self.assertTrue(execution["stdout_truncated"])
             self.assertLessEqual(len(execution["stdout"]), 160)
             self.assertNotIn("super-secret-value", json.dumps(execution))
+            self.assertEqual(execution["events"][-1]["event"], "terminal")
+            self.assertEqual(
+                execution["events"][-1]["stop_reason"], "completed"
+            )
 
     def test_probe_and_diagnose_cli_write_machine_readable_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -975,6 +1161,55 @@ class ReviewerControllerTests(unittest.TestCase):
             )
             self.assertIn("withheld", request["redacted_diff"])
             self.assertNotIn("do-not-send", json.dumps(request))
+
+    def test_multi_reviewer_diff_access_uses_least_privilege(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            project = root / "project"
+            (project / "configs").mkdir(parents=True)
+            (project / "src").mkdir()
+            (project / "workload.json").write_text("{}", encoding="utf-8")
+            control = _control(root)
+            del control["reviewer"]
+            control["reviewers"] = [
+                {
+                    "provider": "opted-in",
+                    "argv": ["reviewer-a"],
+                    "timeout_seconds": 10,
+                    "include_diff": True,
+                },
+                {
+                    "provider": "default-private",
+                    "argv": ["reviewer-b"],
+                    "timeout_seconds": 10,
+                },
+            ]
+            run_dir = root / "run"
+            run_dir.mkdir()
+            (run_dir / "diagnosis.json").write_text(
+                json.dumps({"primary_category": "cpu_data"}), encoding="utf-8"
+            )
+            secret_diff = "+ private implementation detail\n"
+            (run_dir / "candidate.diff").write_text(
+                secret_diff, encoding="utf-8"
+            )
+            reviewer = self.controller._load_reviewer_module()
+            captured = {}
+            original_builder = reviewer.build_review_request
+
+            def build_request(**kwargs):
+                captured.update(kwargs)
+                return original_builder(**kwargs)
+
+            reviewer.build_review_request = build_request
+            reviewer.run_reviewers = mock.Mock(return_value={"status": "completed"})
+            with mock.patch.object(
+                self.controller, "_load_reviewer_module", return_value=reviewer
+            ):
+                self.controller.review_change(control, run_dir, _change_set())
+
+            self.assertIn("withheld", captured["redacted_diff"])
+            self.assertNotIn(secret_diff.strip(), captured["redacted_diff"])
 
 
 class WorkloadRoundTests(unittest.TestCase):
@@ -2140,6 +2375,212 @@ class WorkloadRoundTests(unittest.TestCase):
             checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
             self.assertEqual(checkpoint, state)
 
+    def test_python_original_baseline_uses_the_bounded_child_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            original = self.controller._run_python_workload_once_bounded
+
+            with mock.patch.object(
+                self.controller,
+                "_run_python_workload_once_bounded",
+                wraps=original,
+            ) as bounded:
+                self.controller.start_run(control, run_dir)
+
+            self.assertGreaterEqual(bounded.call_count, 1)
+            self.assertEqual(bounded.call_args_list[0].kwargs["role"], "baseline")
+            self.assertTrue(
+                bounded.call_args_list[0].kwargs["task"].startswith(
+                    "baseline-workload-"
+                )
+            )
+
+    def test_python_original_baseline_timeout_kills_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            child_pid_path = root / "baseline-child.pid"
+            (project / "adapter.py").write_text(
+                textwrap.dedent(
+                    f"""
+                    import signal
+                    import subprocess
+                    import sys
+                    import time
+                    from pathlib import Path
+
+                    def prepare(candidate):
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        child = subprocess.Popen([
+                            sys.executable,
+                            "-c",
+                            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+                        ])
+                        Path({str(child_pid_path)!r}).write_text(str(child.pid))
+                        time.sleep(60)
+
+                    def validate(candidate):
+                        return True
+
+                    def benchmark(candidate):
+                        return {{"p50_latency_ms": 1.0, "memory_mb": 1.0}}
+
+                    def metrics():
+                        return {{
+                            "primary_metric": {{"name": "p50_latency_ms", "direction": "lower"}},
+                            "min_effect_pct": 1.0,
+                            "constraints": [{{"name": "memory_mb", "max_regression_pct": 5.0}}],
+                        }}
+
+                    def cleanup():
+                        pass
+                    """
+                ),
+                encoding="utf-8",
+            )
+            quick = self.controller._BUDGET_RUNTIME["quick"]
+            original_soft = quick["soft_target_seconds"]
+            original_hard = quick["hard_ceiling_seconds"]
+            quick["soft_target_seconds"] = 0.1
+            quick["hard_ceiling_seconds"] = 0.25
+            started = time.monotonic()
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, "baseline workload failed"):
+                        self.controller.start_run(control, run_dir)
+            finally:
+                quick["soft_target_seconds"] = original_soft
+                quick["hard_ceiling_seconds"] = original_hard
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertTrue(child_pid_path.is_file())
+            child_pid = int(child_pid_path.read_text("utf-8"))
+            try:
+                self.assertTrue(_wait_pid_gone(child_pid))
+            finally:
+                if _pid_exists(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
+
+    def test_static_parse_failure_stops_before_workload_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers":', encoding="utf-8"
+            )
+            evaluator = mock.Mock()
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                decision = self.controller.evaluate_change(run_dir)
+
+            evaluator.evaluate_pairs.assert_not_called()
+            self.assertEqual(decision["stop_reason"], "static_falsified")
+            artifact = json.loads(
+                (run_dir / "static_review.json").read_text("utf-8")
+            )
+            self.assertEqual(artifact["status"], "failed")
+            self.assertEqual(artifact["checks"][0]["kind"], "json_parse")
+
+    def test_live_uncertainty_without_a_profiler_action_stops_before_formal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            control["probes"][0]["kind"] = "cpu_data"
+            probe_path = Path(control["probes"][0]["argv"][1])
+            probe_path.write_text(
+                probe_path.read_text("utf-8").replace(
+                    '"kind": "timeline"', '"kind": "cpu_data"'
+                ),
+                encoding="utf-8",
+            )
+            self.controller.start_run(control, run_dir)
+            diagnosis = json.loads((run_dir / "diagnosis.json").read_text("utf-8"))
+            diagnosis["primary_category"] = None
+            diagnosis["confidence"] = "inconclusive"
+            (run_dir / "diagnosis.json").write_text(
+                json.dumps(diagnosis), encoding="utf-8"
+            )
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+            evaluator = mock.Mock()
+            evaluator.evaluate_pairs.return_value = {
+                "status": "evaluated",
+                "primary": {
+                    "status": "confirmed_win",
+                    "estimate_pct": 5.0,
+                    "ci_low_pct": 4.0,
+                    "ci_high_pct": 6.0,
+                },
+                "constraints": [],
+            }
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(evaluator.evaluate_pairs.call_count, 1)
+            self.assertEqual(decision["stop_reason"], "profiler_failed")
+            artifact = json.loads(
+                (run_dir / "profiler_stage.json").read_text("utf-8")
+            )
+            self.assertEqual(artifact["status"], "failed")
+            self.assertIn("live_uncertainty", artifact["reason"])
+
+    def test_live_kernel_uncertainty_runs_profiler_before_formal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            diagnosis = json.loads((run_dir / "diagnosis.json").read_text("utf-8"))
+            diagnosis["primary_category"] = "kernel"
+            diagnosis["confidence"] = "low"
+            (run_dir / "diagnosis.json").write_text(
+                json.dumps(diagnosis), encoding="utf-8"
+            )
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+            evaluator = mock.Mock()
+            evaluator.evaluate_pairs.return_value = {
+                "status": "evaluated",
+                "primary": {
+                    "status": "confirmed_win",
+                    "estimate_pct": 5.0,
+                    "ci_low_pct": 4.0,
+                    "ci_high_pct": 6.0,
+                },
+                "constraints": [],
+            }
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(decision["status"], "promoted")
+            self.assertEqual(evaluator.evaluate_pairs.call_count, 2)
+            artifact = json.loads(
+                (run_dir / "profiler_stage.json").read_text("utf-8")
+            )
+            self.assertEqual(artifact["status"], "passed")
+            execution = json.loads(
+                (
+                    run_dir
+                    / "candidate_profile"
+                    / "probes"
+                    / "timeline.execution.json"
+                ).read_text("utf-8")
+            )
+            self.assertEqual(execution["events"][-1]["event"], "terminal")
+
     def test_confirmed_workload_win_is_promoted_and_keeps_project_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -2190,6 +2631,36 @@ class WorkloadRoundTests(unittest.TestCase):
             self.assertEqual(decision["stop_reason"], "effect_upper_bound_below_minimum")
             self.assertIn("formal_paired", decision["skipped_expensive_stages"])
 
+    def test_short_constraint_failure_skips_formal_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+            evaluator = mock.Mock()
+            evaluator.evaluate_pairs.return_value = {
+                "status": "evaluated",
+                "primary": {
+                    "status": "confirmed_win",
+                    "estimate_pct": 5.0,
+                    "ci_low_pct": 4.0,
+                    "ci_high_pct": 6.0,
+                },
+                "constraints": [{"name": "memory_mb", "status": "failed"}],
+            }
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(evaluator.evaluate_pairs.call_count, 1)
+            self.assertEqual(decision["stop_reason"], "short_pair_failed")
+            self.assertIn("formal_paired", decision["skipped_expensive_stages"])
+
     def test_reject_only_positive_screen_is_rolled_back_and_never_promoted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -2201,7 +2672,12 @@ class WorkloadRoundTests(unittest.TestCase):
             original = config.read_text("utf-8")
             config.write_text('{"workers": 8}\n', encoding="utf-8")
 
-            decision = self.controller.evaluate_change(run_dir)
+            with mock.patch.object(
+                self.controller,
+                "review_change",
+                side_effect=AssertionError("reject-only invoked reviewer"),
+            ):
+                decision = self.controller.evaluate_change(run_dir)
 
             self.assertEqual(decision["status"], "rejected")
             self.assertEqual(
@@ -2266,17 +2742,15 @@ class WorkloadRoundTests(unittest.TestCase):
             decision = self.controller.evaluate_change(run_dir)
 
             self.assertEqual(decision["status"], "rejected")
-            self.assertEqual(decision["reason"], "workload_failed")
+            self.assertEqual(decision["reason"], "correctness_failed")
             self.assertEqual(config.read_text("utf-8"), original)
 
-    def test_correctness_timeout_bounds_output_and_stops_process_group(self) -> None:
+    def test_python_workload_hard_deadline_stops_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            control, run_dir, _project = self._workspace(root)
-            pid_file = root / "child.pid"
-            command = [
-                sys.executable,
-                "-c",
+            control, run_dir, project = self._workspace(root)
+            child_pid_path = root / "workload-child.pid"
+            (project / "adapter.py").write_text(
                 textwrap.dedent(
                     f"""
                     import signal
@@ -2285,67 +2759,56 @@ class WorkloadRoundTests(unittest.TestCase):
                     import time
                     from pathlib import Path
 
-                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    child = subprocess.Popen([
-                        sys.executable,
-                        "-c",
-                        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
-                    ])
-                    Path({str(pid_file)!r}).write_text(str(child.pid))
-                    print("x" * 1000000, flush=True)
-                    time.sleep(30)
+                    def prepare(candidate):
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        child = subprocess.Popen([
+                            sys.executable,
+                            "-c",
+                            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+                        ])
+                        Path({str(child_pid_path)!r}).write_text(str(child.pid))
+                        time.sleep(60)
+
+                    def validate(candidate):
+                        return True
+
+                    def benchmark(candidate):
+                        return {{"p50_latency_ms": 1.0, "memory_mb": 1.0}}
+
+                    def metrics():
+                        return {{
+                            "primary_metric": {{"name": "p50_latency_ms", "direction": "lower"}},
+                            "min_effect_pct": 1.0,
+                            "constraints": [{{"name": "memory_mb", "max_regression_pct": 5.0}}],
+                        }}
+
+                    def cleanup():
+                        pass
                     """
                 ),
-            ]
-            change = self._change(commands=[command])
+                encoding="utf-8",
+            )
+            run_dir.mkdir()
+            self.controller._atomic_json(
+                run_dir / "control_manifest.json",
+                self.controller.validate_control_manifest(control),
+            )
 
             started = time.monotonic()
-            result = self.controller._run_correctness_commands(
-                control, change, run_dir, timeout_seconds=0.2
-            )
-
-            self.assertLess(time.monotonic() - started, 3)
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["commands"][0]["failure"], "TimeoutExpired")
-            self.assertLessEqual(
-                len(result["commands"][0]["stdout"].encode("utf-8")),
-                64 * 1024 + len("...[truncated]"),
-            )
-            self.assertTrue(pid_file.exists())
-            child_pid = int(pid_file.read_text("utf-8"))
-            try:
-                self.assertTrue(_wait_pid_gone(child_pid))
-            finally:
-                if _pid_exists(child_pid):
-                    os.kill(child_pid, signal.SIGKILL)
-
-    def test_successful_correctness_command_cleans_background_descendant(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            control, run_dir, _project = self._workspace(root)
-            pid_file = root / "child.pid"
-            command = [
-                sys.executable,
-                "-c",
-                textwrap.dedent(
-                    f"""
-                    import subprocess
-                    import sys
-                    from pathlib import Path
-                    child = subprocess.Popen([
-                        sys.executable, "-c", "import time; time.sleep(30)"
-                    ])
-                    Path({str(pid_file)!r}).write_text(str(child.pid))
-                    """
-                ),
-            ]
-
-            result = self.controller._run_correctness_commands(
-                control, self._change(commands=[command]), run_dir
-            )
-
-            self.assertEqual(result["status"], "passed")
-            child_pid = int(pid_file.read_text("utf-8"))
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(TimeoutError, "hard deadline"):
+                    self.controller._run_python_workload_once_bounded(
+                        control,
+                        run_dir,
+                        candidate={"name": "candidate", "revision": "optimized"},
+                        role="candidate",
+                        case={},
+                        timeout_seconds=0.2,
+                        task="test-python-timeout",
+                    )
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertTrue(child_pid_path.is_file())
+            child_pid = int(child_pid_path.read_text("utf-8"))
             try:
                 self.assertTrue(_wait_pid_gone(child_pid))
             finally:

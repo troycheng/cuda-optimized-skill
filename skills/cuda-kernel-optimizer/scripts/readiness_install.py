@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import stat
 import sys
@@ -72,6 +73,10 @@ def _result(
         "stdout": execution.get("stdout", ""),
         "stderr": execution.get("stderr", ""),
         "logs_truncated": bool(execution.get("logs_truncated", False)),
+        "soft_limit_exceeded": bool(
+            execution.get("soft_limit_exceeded", False)
+        ),
+        "stop_reason": execution.get("stop_reason"),
     }
 
 
@@ -166,16 +171,38 @@ def install_isolated_pip(
         environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
         environment["PIP_NO_INPUT"] = "1"
         python_before = _python_identity(validated["python"])
+        execution_timeout = min(
+            float(validated["timeout_seconds"]),
+            remaining,
+        )
+        soft_limit = _BUDGET.maintenance_budget_seconds(execution_timeout)
+        progress_path = (
+            Path(run_dir)
+            / "readiness"
+            / "installs"
+            / f"{validated['authorization_id']}.progress.json"
+        )
+
+        def event_sink(event):
+            _STORE.atomic_write_json(progress_path, event)
+            if event.get("event") == "soft_limit_reached":
+                _STORE.atomic_write_json(
+                    progress_path.with_name(
+                        f"{validated['authorization_id']}.soft-checkpoint.json"
+                    ),
+                    event,
+                )
+            print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True)
+
         try:
             execution = _PROBE._run_bounded(
                 command,
-                timeout_seconds=min(
-                    float(validated["timeout_seconds"]),
-                    remaining,
-                    _BUDGET.maintenance_budget_seconds(remaining),
-                ),
+                timeout_seconds=execution_timeout,
                 cwd=project,
                 environment=environment,
+                heartbeat_interval_seconds=min(30.0, soft_limit),
+                soft_limit_seconds=soft_limit,
+                event_sink=event_sink,
             )
         except OSError as error:
             execution = {

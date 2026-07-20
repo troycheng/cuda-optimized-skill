@@ -168,6 +168,10 @@ def validate_candidate_admission(
     selected = {item["id"]: item for item in replayed_query["capabilities"]}
     if not set(candidate["capability_ids"]).issubset(selected):
         raise ValidationError("candidate cites an unselected capability")
+    if candidate["mechanism_id"] not in candidate["capability_ids"]:
+        raise ValidationError(
+            "candidate mechanism_id must be a selected capability identity"
+        )
     chosen = [selected[item] for item in candidate["capability_ids"]]
     for item in chosen:
         if item["retrieval_status"] != "ready":
@@ -246,6 +250,7 @@ def validate_candidate_admission(
         "contract_sha256": expected_contract_sha256,
         "environment_sha256": expected_environment_sha256,
         "candidate_id": candidate["candidate_id"],
+        "mechanism_id": candidate["mechanism_id"],
         "observation_id": candidate["observation_id"],
         "observation_summary_sha256": persisted["summary_sha256"],
         "capability_query_sha256": replayed_query["query_sha256"],

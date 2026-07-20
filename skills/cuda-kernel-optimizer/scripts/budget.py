@@ -253,6 +253,19 @@ def _validate_candidate(value: Mapping, contract: Mapping) -> dict:
         stage: _positive_number(costs[stage], f"estimated_cost.{stage}")
         for stage in _CANDIDATE_STAGES
     }
+    last_stage = _CLAIM_LAST_STAGE[claim]
+    applicable = _CANDIDATE_STAGES[: _CANDIDATE_STAGES.index(last_stage) + 1]
+    for earlier, later in zip(applicable, applicable[1:]):
+        if clean_costs[later] < clean_costs[earlier]:
+            raise ValueError(
+                "estimated_cost must be nondecreasing in executable stage order"
+            )
+    cheapest = applicable[0]
+    if value["cheapest_falsifier"] != cheapest:
+        raise ValueError(
+            "cheapest_falsifier must name the lowest-cost applicable stage "
+            f"({cheapest})"
+        )
     effect = value["minimum_effect"]
     if not isinstance(effect, Mapping) or set(effect) != {"metric", "value"}:
         raise ValueError("candidate minimum_effect fields are invalid")
@@ -325,8 +338,6 @@ class CandidateGate:
         threshold = self.candidate["minimum_effect"]["value"]
         for stage in applicable:
             action = actions.get(stage)
-            if action is None and stage == "profiler":
-                continue
             if not callable(action):
                 return self._result(
                     started_at=started,
@@ -443,9 +454,20 @@ def run_budgeted_command(
     input_value: str | None = None,
     check: bool = False,
     popen_options: Mapping | None = None,
+    heartbeat_interval_seconds: float | None = None,
+    event_sink: Callable[[Mapping], None] | None = None,
 ) -> subprocess.CompletedProcess:
     timeout = _positive_number(timeout_seconds, "timeout_seconds")
     grace = _positive_number(grace_seconds, "grace_seconds")
+    if event_sink is not None and not callable(event_sink):
+        raise ValueError("event_sink must be callable")
+    heartbeat_interval = None
+    if heartbeat_interval_seconds is not None:
+        heartbeat_interval = _positive_number(
+            heartbeat_interval_seconds, "heartbeat_interval_seconds"
+        )
+        if event_sink is None:
+            raise ValueError("heartbeat_interval_seconds requires event_sink")
     options = dict(popen_options or {})
     options.setdefault("text", True)
     options.setdefault("stdout", subprocess.PIPE)
@@ -453,18 +475,69 @@ def run_budgeted_command(
     options["start_new_session"] = True
     process = subprocess.Popen(list(command), **options)
     timed_out = False
+    started = time.monotonic()
+    pending_input = input_value
     try:
-        stdout, stderr = process.communicate(input=input_value, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout, stderr = _terminate_process_group(process, grace_seconds=grace)
+        while True:
+            elapsed = max(0.0, time.monotonic() - started)
+            remaining = timeout - elapsed
+            if remaining <= 0.0:
+                timed_out = True
+                stdout, stderr = _terminate_process_group(
+                    process, grace_seconds=grace
+                )
+                break
+            wait_seconds = remaining
+            if heartbeat_interval is not None:
+                wait_seconds = min(wait_seconds, heartbeat_interval)
+            try:
+                stdout, stderr = process.communicate(
+                    input=pending_input, timeout=wait_seconds
+                )
+                break
+            except subprocess.TimeoutExpired:
+                pending_input = None
+                elapsed = max(0.0, time.monotonic() - started)
+                if elapsed >= timeout:
+                    timed_out = True
+                    stdout, stderr = _terminate_process_group(
+                        process, grace_seconds=grace
+                    )
+                    break
+                if event_sink is not None:
+                    event_sink(
+                        {
+                            "event": "heartbeat",
+                            "elapsed_seconds": float(elapsed),
+                            "remaining_seconds": float(max(0.0, timeout - elapsed)),
+                        }
+                    )
     except BaseException:
         _terminate_process_group(process, grace_seconds=grace)
         raise
+    elapsed = max(0.0, time.monotonic() - started)
+    stop_reason = (
+        "hard_deadline_exceeded"
+        if timed_out
+        else "completed"
+        if process.returncode == 0
+        else "command_failed"
+    )
     result = subprocess.CompletedProcess(
         list(command), 124 if timed_out else process.returncode, stdout, stderr
     )
     result.timed_out = timed_out
+    result.elapsed_seconds = float(elapsed)
+    result.stop_reason = stop_reason
+    if event_sink is not None:
+        event_sink(
+            {
+                "event": "terminal",
+                "elapsed_seconds": float(elapsed),
+                "stop_reason": stop_reason,
+                "returncode": result.returncode,
+            }
+        )
     if check and result.returncode:
         raise subprocess.CalledProcessError(
             result.returncode,
@@ -481,9 +554,14 @@ def run_maintenance_command(
     hard_ceiling_seconds: float,
     **kwargs,
 ) -> subprocess.CompletedProcess:
-    """Run infrastructure repair inside min(180 s, 10% of the hard ceiling)."""
-    return run_budgeted_command(
+    """Run repair to its real deadline; the former 10% cap is advisory only."""
+    hard = _positive_number(hard_ceiling_seconds, "hard_ceiling_seconds")
+    soft = maintenance_budget_seconds(hard)
+    result = run_budgeted_command(
         command,
-        timeout_seconds=maintenance_budget_seconds(hard_ceiling_seconds),
+        timeout_seconds=hard,
         **kwargs,
     )
+    result.soft_limit_seconds = float(soft)
+    result.soft_limit_exceeded = result.elapsed_seconds > soft
+    return result

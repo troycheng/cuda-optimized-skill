@@ -193,14 +193,14 @@ class ReadmeSyncTests(unittest.TestCase):
         for marker in (
             "falsifiable performance hypothesis",
             "rehashed V2.5 evidence closure",
-            "hard time and repair limit",
+            "progress review point, not a timer",
             "Tool work is not a performance improvement",
         ):
             self.assertIn(marker, english)
         for marker in (
             "能被实测推翻的性能假设",
             "重新校验通过的V2.5证据闭环",
-            "时间和次数上限",
+            "只是检查进展的时点",
             "修工具不等于性能提升",
         ):
             self.assertIn(marker, chinese)

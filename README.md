@@ -104,11 +104,9 @@ permits a candidate, `yellow` pauses for better measurement or baseline replay,
 and `red` stops the run. The contract also limits how many candidates may run
 between baseline audits.
 
-Verified observations query only a few matching capability cards. Cards supply
-methods, counterexamples, and checks; they do not decide results. Every admitted
-round starts with a falsifiable performance hypothesis. Only a rehashed V2.5
-evidence closure counts as an evaluated candidate. Measurement tooling has a
-hard time and repair limit. Tool work is not a performance improvement.
+Verified observations query only a few matching capability cards; cards supply methods, counterexamples, and checks, but do not decide results. Every admitted round starts with a falsifiable performance hypothesis.
+Only a rehashed V2.5 evidence closure counts as an evaluated candidate. Environment readiness finishes before optimization timing starts; three minutes or 10% of the total budget is a progress review point, not a timer that kills an install or repair.
+The Controller terminates the process group only when the command timeout or readiness hard deadline is reached. Tool work is not a performance improvement.
 
 Direction headroom and stop/reopen rules remain in the
 [direction-admission contract](skills/cuda-kernel-optimizer/references/direction_admission.md).
@@ -156,6 +154,9 @@ explanations cannot both pass. Tampered results, interrupted execution, identity
 and missing capabilities stop closed. Project content, adapter launchers, hypothesis
 generations, and the committed ledger head are digest-bound. Direction experiments run
 in a project copy; this is cooperative isolation, not an OS security sandbox.
+
+The final patch turns the time-control lessons into runtime gates. The original business baseline runs before any candidate, every round inherits all proven mechanisms from the current champion, and applicable stages run in increasing cost order: static review, correctness, short paired screening, a profiler only for a live uncertainty, formal measurement, and—only for a serving claim—service validation. A failed stage prevents every later stage from starting.
+Renaming a mechanism or changing only its parameters cannot spend another candidate slot. Long commands emit heartbeats and a terminal reason. Multi-provider AI review runs in parallel only after local evidence supports promotion, waits at most 180 seconds, and records complete responses and provider failures.
 
 Mechanism tests and target-machine smoke are complete. Whether V3.1 finds a useful
 direction faster than V3.0 still requires a user-supplied long-running workload; sample

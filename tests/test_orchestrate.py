@@ -42,12 +42,24 @@ class CloseIterationDecisionTests(unittest.TestCase):
         iter_dir = run_dir / "iterv1"
         iter_dir.mkdir(parents=True)
         state_path = run_dir / "state.json"
+        best_file = root / "best.py"
+        best_file.write_text("# best\n", encoding="utf-8")
         state_path.write_text(
-            json.dumps({"run_dir": str(run_dir), "best_file": str(root / "best.py")}),
+            json.dumps({"run_dir": str(run_dir), "best_file": str(best_file)}),
             encoding="utf-8",
         )
         (iter_dir / "methods.json").write_text(
             json.dumps({"methods": []}), encoding="utf-8"
+        )
+        (iter_dir / "inheritance.json").write_text(
+            json.dumps(
+                {
+                    "base_file": str(best_file.resolve()),
+                    "base_sha256": hashlib.sha256(best_file.read_bytes()).hexdigest(),
+                    "required_method_ids": [],
+                }
+            ),
+            encoding="utf-8",
         )
         args = SimpleNamespace(
             run_dir=str(run_dir),
@@ -534,6 +546,84 @@ class BudgetedParserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "min_effect"):
             self.orchestrate.resolve_setup_policy(args)
 
+    def _python_baseline_fixture(
+        self, root: Path, *, prepare_body: str
+    ) -> tuple[object, Path, Path]:
+        adapter = root / "workload.py"
+        adapter.write_text(
+            "\n".join(
+                [
+                    "from pathlib import Path",
+                    "import time",
+                    "def prepare(candidate):",
+                    f"    {prepare_body}",
+                    "def validate(candidate):",
+                    "    return True",
+                    "def benchmark(candidate):",
+                    "    return {'latency_ms': 1.0}",
+                    "def metrics():",
+                    "    return {'primary_metric': {'name': 'latency_ms', 'direction': 'lower'}, 'min_effect_pct': 0.5, 'constraints': []}",
+                    "def cleanup():",
+                    "    pass",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        baseline = root / "kernel.py"
+        baseline.write_text("# original baseline\n", encoding="utf-8")
+        run_dir = root / "run"
+        (run_dir / "workload").mkdir(parents=True)
+        spec = self.orchestrate.normalize_workload(workload=adapter)
+        self.orchestrate.atomic_write_json(
+            run_dir / "workload" / "spec.json",
+            self.orchestrate._workload_snapshot(spec),
+        )
+        return spec, baseline, run_dir
+
+    def test_python_business_baseline_has_a_process_group_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec, baseline, run_dir = self._python_baseline_fixture(
+                root, prepare_body="time.sleep(60)"
+            )
+            started = time.monotonic()
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, "hard deadline"):
+                    self.orchestrate._run_original_business_baseline(
+                        spec,
+                        baseline=str(baseline),
+                        expected_baseline_sha256=self.orchestrate.sha256_file(
+                            baseline
+                        ),
+                        policy=self.orchestrate.resolve_budget("quick"),
+                        run_dir=run_dir,
+                        deadline_monotonic=time.monotonic() + 0.2,
+                    )
+            self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_business_baseline_cannot_modify_the_original_and_is_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec, baseline, run_dir = self._python_baseline_fixture(
+                root,
+                prepare_body="Path(candidate).write_text('# mutated\\n', encoding='utf-8')",
+            )
+            original = baseline.read_bytes()
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, "modified"):
+                    self.orchestrate._run_original_business_baseline(
+                        spec,
+                        baseline=str(baseline),
+                        expected_baseline_sha256=self.orchestrate.sha256_file(
+                            baseline
+                        ),
+                        policy=self.orchestrate.resolve_budget("quick"),
+                        run_dir=run_dir,
+                        deadline_monotonic=time.monotonic() + 5.0,
+                    )
+            self.assertEqual(baseline.read_bytes(), original)
+
     def test_setup_freezes_full_workload_and_places_every_artifact_in_run_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -566,7 +656,11 @@ class BudgetedParserTests(unittest.TestCase):
             normalized = mock.Mock(return_value=spec)
             preflight_run = mock.Mock(return_value={"ok": True, "errors": []})
 
+            events = []
+            business_baseline_finished = []
+
             def check_env(command, **_kwargs):
+                events.append(Path(command[1]).name)
                 if Path(command[1]).name == "check_env.py":
                     env_path = Path(command[command.index("--out") + 1])
                     env_path.write_text(json.dumps({"gpu": "mock"}), encoding="utf-8")
@@ -591,8 +685,27 @@ class BudgetedParserTests(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
                 raise AssertionError(f"unexpected setup command: {command}")
 
+            def workload_baseline(*_args, **_kwargs):
+                events.append("business-baseline")
+                business_baseline_finished.append(time.time())
+                return {
+                    "role": "baseline",
+                    "case": {},
+                    "validation": True,
+                    "benchmark": {"latency_ms": 12.5},
+                    "objective": dict(spec.objective),
+                }
+
             with mock.patch.object(self.orchestrate, "normalize_workload", normalized), \
                     mock.patch.object(self.orchestrate.preflight, "run", preflight_run), \
+                    mock.patch.object(
+                        self.orchestrate, "verify_frozen_spec"
+                    ) as verify_workload, \
+                    mock.patch.object(
+                        self.orchestrate,
+                        "run_spec_once",
+                        side_effect=workload_baseline,
+                    ) as workload_runner, \
                     mock.patch.object(self.orchestrate, "_run", side_effect=check_env) as runner, \
                     contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.orchestrate.cmd_setup(args)
@@ -610,6 +723,9 @@ class BudgetedParserTests(unittest.TestCase):
             ) if (run_dir / "workload" / "spec.json").exists() else None
             env_in_run = (run_dir / "env.json").is_file()
             env_at_source = (sources / "env.json").exists()
+            business_baseline = json.loads(
+                (run_dir / "baseline" / "workload.json").read_text("utf-8")
+            )
 
         normalized.assert_called_once_with(
             workload=None,
@@ -620,6 +736,10 @@ class BudgetedParserTests(unittest.TestCase):
         preflight_run.assert_called_once()
         self.assertIs(preflight_run.call_args.args[4], spec)
         self.assertEqual(runner.call_count, 3)
+        workload_runner.assert_called_once()
+        verify_workload.assert_called_once_with(spec)
+        self.assertLess(events.index("business-baseline"), events.index("run_iteration.py"))
+        self.assertEqual(business_baseline["status"], "measured")
         state_command = runner.call_args_list[1].args[0]
         self.assertIn("--output-root", state_command)
         self.assertIn("--budget-json", state_command)
@@ -629,6 +749,10 @@ class BudgetedParserTests(unittest.TestCase):
         self.assertEqual(run_dir.parent, output_root.resolve())
         self.assertEqual(output["mode"], "full")
         self.assertEqual(manifest["workload"]["source_hash"], "a" * 64)
+        self.assertGreaterEqual(
+            manifest["optimization_started_at"], business_baseline_finished[0]
+        )
+        self.assertEqual(state["started_at"], manifest["optimization_started_at"])
         self.assertEqual(state["workload"], manifest["workload"])
         self.assertEqual(state["input_hash"], manifest["input_hash"])
         self.assertEqual(checkpoint["input_hash"], state["input_hash"])
@@ -654,6 +778,109 @@ class BudgetedParserTests(unittest.TestCase):
         self.assertEqual(state["branches"], 8)
         self.assertTrue(env_in_run)
         self.assertFalse(env_at_source)
+
+    def test_successful_mechanisms_are_a_hard_pre_benchmark_inheritance_gate(self) -> None:
+        state = {
+            "best_file": "/tmp/kernel.py",
+            "effective_methods": [
+                {"id": "fastsort.store", "iter": 124},
+                {"id": "memory.coalesce", "iter": 125},
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "inherited.*fastsort.store"):
+            self.orchestrate.validate_success_inheritance(
+                state,
+                {"methods": [], "inherited_methods": ["memory.coalesce"]},
+            )
+
+        evidence = self.orchestrate.validate_success_inheritance(
+            state,
+            {
+                "methods": [],
+                "inherited_methods": ["memory.coalesce", "fastsort.store"],
+            },
+        )
+        self.assertEqual(
+            evidence["required_method_ids"],
+            ["fastsort.store", "memory.coalesce"],
+        )
+
+    def test_inheritance_gate_binds_checklist_to_current_champion_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            iteration = root / "iterv1"
+            iteration.mkdir()
+            champion = root / "champion.py"
+            champion.write_text("# champion\n", encoding="utf-8")
+            state = {
+                "best_file": str(champion),
+                "effective_methods": [{"id": "fastsort.store", "iter": 124}],
+            }
+            methods = iteration / "methods.json"
+            methods.write_text(
+                json.dumps(
+                    {
+                        "methods": [],
+                        "inherited_methods": ["fastsort.store"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            inheritance = iteration / "inheritance.json"
+            inheritance.write_text(
+                json.dumps(
+                    {
+                        "base_file": str(champion.resolve()),
+                        "base_sha256": self.orchestrate.sha256_file(champion),
+                        "required_method_ids": ["fastsort.store"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            evidence = self.orchestrate._check_success_inheritance(
+                state, methods, iteration
+            )
+            self.assertEqual(
+                evidence["base_sha256"],
+                self.orchestrate.sha256_file(champion),
+            )
+
+            champion.write_text("# mechanism lost\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "current champion"):
+                self.orchestrate._check_success_inheritance(
+                    state, methods, iteration
+                )
+
+    def test_open_iteration_rejects_a_preexisting_unseeded_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            branch = run_dir / "iterv1" / "branches" / "b1"
+            branch.mkdir(parents=True)
+            champion = root / "champion.py"
+            champion.write_text("# champion\n", encoding="utf-8")
+            (branch / "kernel.py").write_text("# unrelated\n", encoding="utf-8")
+            (run_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "best_file": str(champion),
+                        "branches": 1,
+                        "effective_methods": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                run_dir=str(run_dir), iter=1, benchmark="benchmark.py"
+            )
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with mock.patch.object(
+                self.orchestrate, "_run", return_value=completed
+            ):
+                with self.assertRaisesRegex(ValueError, "not seeded"):
+                    self.orchestrate.cmd_open_iter(args)
 
     def test_setup_keeps_secret_workload_snapshot_out_of_argv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -709,6 +936,12 @@ class BudgetedParserTests(unittest.TestCase):
                 return_value={"ok": True, "errors": []},
             ), mock.patch.object(
                 self.orchestrate, "_run", side_effect=runner
+            ), mock.patch.object(
+                self.orchestrate, "verify_frozen_spec"
+            ), mock.patch.object(
+                self.orchestrate,
+                "run_spec_once",
+                return_value={"benchmark": {"latency": 1.0}},
             ), contextlib.redirect_stdout(io.StringIO()):
                 self.orchestrate.cmd_setup(args)
 
@@ -996,7 +1229,32 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.orchestrate.cmd_setup(args)
         output = json.loads(stdout.getvalue())
-        return Path(output["run_dir"]), Path(output["state"])
+        run_dir = Path(output["run_dir"])
+        self._write_inheritance(run_dir, 1)
+        return run_dir, Path(output["state"])
+
+    def _write_inheritance(self, run_dir: Path, iteration: int) -> None:
+        state = json.loads((run_dir / "state.json").read_text("utf-8"))
+        champion = Path(state["best_file"]).resolve()
+        iter_dir = run_dir / f"iterv{iteration}"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        method_ids = sorted(
+            {
+                item["id"]
+                for item in state.get("effective_methods", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+        )
+        (iter_dir / "inheritance.json").write_text(
+            json.dumps(
+                {
+                    "base_file": str(champion),
+                    "base_sha256": self.orchestrate.sha256_file(champion),
+                    "required_method_ids": method_ids,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def _close_args(self, run_dir: Path) -> SimpleNamespace:
         return SimpleNamespace(
@@ -1460,6 +1718,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
 
             def write_no_win(iteration: int) -> None:
                 iter_dir = run_dir / f"iterv{iteration}"
+                self._write_inheritance(run_dir, iteration)
                 (iter_dir / "methods.json").write_text(
                     json.dumps({"methods": []}), encoding="utf-8"
                 )
@@ -1676,7 +1935,11 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 self.orchestrate.cmd_close_iter(close_args)
 
             self.assertGreater(runner.call_args.kwargs["hard_timeout"], 0.0)
-            self.assertEqual(json.loads(stdout.getvalue())["status"], "budget_exhausted")
+            timeout_output = json.loads(stdout.getvalue())
+            self.assertEqual(timeout_output["status"], "budget_exhausted")
+            self.assertEqual(
+                timeout_output["stop_reason"], "hard_execution_deadline"
+            )
             checkpoint = json.loads(
                 (run_dir / "checkpoint.json").read_text("utf-8")
             )

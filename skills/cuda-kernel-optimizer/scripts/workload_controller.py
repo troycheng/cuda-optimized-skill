@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import difflib
 import fcntl
@@ -43,6 +44,8 @@ _PROBE_KINDS = {
     "custom",
 }
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_REVIEWER_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_MAX_REVIEWERS = 8
 _SENSITIVE_KEY = re.compile(
     r"(^|[_-])(api[_-]?key|authorization|cookie|credential|password|secret|token)($|[_-])",
     re.IGNORECASE,
@@ -378,6 +381,7 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         "mutation",
         "probes",
         "reviewer",
+        "reviewers",
         "readiness_contract",
         "analysis_contract",
     }
@@ -388,6 +392,7 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         )
     required = allowed - {
         "reviewer",
+        "reviewers",
         "evaluation_gate",
         "readiness_contract",
         "analysis_contract",
@@ -511,6 +516,8 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         _argv(probe["argv"], f"probes[{index}]")
         _timeout(probe["timeout_seconds"], f"probes[{index}].timeout_seconds")
 
+    if "reviewer" in control and "reviewers" in control:
+        raise ValidationError("reviewer and reviewers are mutually exclusive")
     reviewer = control.get("reviewer")
     if reviewer is not None:
         reviewer = _object(reviewer, "reviewer")
@@ -521,6 +528,49 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         _timeout(reviewer["timeout_seconds"], "reviewer.timeout_seconds")
         if "include_diff" in reviewer and type(reviewer["include_diff"]) is not bool:
             raise ValidationError("reviewer.include_diff must be a boolean")
+    reviewers = control.get("reviewers")
+    if reviewers is not None:
+        if (
+            type(reviewers) is not list
+            or not reviewers
+            or len(reviewers) > _MAX_REVIEWERS
+        ):
+            raise ValidationError(
+                f"reviewers must contain between 1 and {_MAX_REVIEWERS} entries"
+            )
+        provider_ids = set()
+        for index, item in enumerate(reviewers):
+            reviewer = _object(item, f"reviewers[{index}]")
+            fields = {"provider", "argv", "timeout_seconds", "include_diff"}
+            _closed(reviewer, fields, f"reviewers[{index}]")
+            _required(
+                reviewer,
+                {"provider", "argv", "timeout_seconds"},
+                f"reviewers[{index}]",
+            )
+            provider = reviewer["provider"]
+            if (
+                type(provider) is not str
+                or _REVIEWER_PROVIDER.fullmatch(provider) is None
+            ):
+                raise ValidationError(
+                    f"reviewers[{index}].provider must be a safe 64-character identifier"
+                )
+            if provider in provider_ids:
+                raise ValidationError("reviewer providers must be unique")
+            provider_ids.add(provider)
+            _argv(reviewer["argv"], f"reviewers[{index}]")
+            _timeout(
+                reviewer["timeout_seconds"],
+                f"reviewers[{index}].timeout_seconds",
+            )
+            if (
+                "include_diff" in reviewer
+                and type(reviewer["include_diff"]) is not bool
+            ):
+                raise ValidationError(
+                    f"reviewers[{index}].include_diff must be a boolean"
+                )
 
     normalized = _json_copy(control, "control", reject_sensitive=True)
     if normalized["budget"] == "fast":
@@ -565,9 +615,16 @@ def validate_change_set(value: Mapping[str, Any], control: Mapping[str, Any]) ->
         "minimum_effect": {"mechanism_us": 1.0, "service_pct": 0.5},
     }
     try:
-        _load_budget_module().validate_candidate_declaration(candidate, gate_contract)
+        clean_candidate = _load_budget_module().validate_candidate_declaration(
+            candidate, gate_contract
+        )
     except ValueError as error:
         raise ValidationError(f"candidate declaration is invalid: {error}") from error
+    if clean_candidate["claim_layer"] != "workload":
+        raise ValidationError(
+            "workload Controller accepts only workload claims; use the kernel "
+            "or serving workflow for other units and evidence"
+        )
 
     paths = _string_list(change["paths"], "change_set.paths")
     relative_paths = [
@@ -892,6 +949,76 @@ def _stop_group(process: Any) -> None:
             pass
 
 
+def _wait_process_with_heartbeats(
+    process: Any,
+    *,
+    timeout_seconds: float,
+    label: str,
+    heartbeat_interval_seconds: float = 30.0,
+    event_sink=None,
+) -> tuple[int | None, bool, float, str]:
+    """Wait visibly and preserve the existing process-group hard stop."""
+    timeout = float(timeout_seconds)
+    interval = float(heartbeat_interval_seconds)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValidationError("process timeout must be a positive finite number")
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValidationError("heartbeat interval must be a positive finite number")
+    task = _identifier(label, "heartbeat label")
+
+    def emit(event: Mapping[str, Any]) -> None:
+        if event_sink is not None:
+            if not callable(event_sink):
+                raise ValidationError("event_sink must be callable")
+            event_sink(copy.deepcopy(dict(event)))
+        print(json.dumps(event, sort_keys=True), file=sys.stderr, flush=True)
+
+    started = time.monotonic()
+    timed_out = False
+    while True:
+        elapsed = max(0.0, time.monotonic() - started)
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            timed_out = True
+            _stop_group(process)
+            break
+        try:
+            process.wait(timeout=min(interval, remaining))
+            if _process_group_exists(process.pid):
+                _stop_group(process)
+            break
+        except subprocess.TimeoutExpired:
+            elapsed = max(0.0, time.monotonic() - started)
+            if elapsed >= timeout:
+                timed_out = True
+                _stop_group(process)
+                break
+            emit(
+                {
+                    "event": "heartbeat",
+                    "task": task,
+                    "elapsed_seconds": elapsed,
+                }
+            )
+    elapsed = max(0.0, time.monotonic() - started)
+    reason = (
+        "hard_deadline_exceeded"
+        if timed_out
+        else "completed"
+        if process.returncode == 0
+        else "command_failed"
+    )
+    emit(
+        {
+            "event": "terminal",
+            "task": task,
+            "elapsed_seconds": elapsed,
+            "stop_reason": reason,
+        }
+    )
+    return process.returncode, timed_out, elapsed, reason
+
+
 def _is_secret_name(name: str) -> bool:
     return _SENSITIVE_KEY.search(name) is not None
 
@@ -1028,6 +1155,8 @@ def run_probe(
     started = time.monotonic()
     timed_out = False
     exit_code = None
+    stop_reason = "launch_failed"
+    events: list[dict] = []
     process = None
     try:
         process = subprocess.Popen(
@@ -1045,15 +1174,12 @@ def run_probe(
         ]
         for reader in readers:
             reader.start()
-        try:
-            exit_code = process.wait(timeout=actual_timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _stop_group(process)
-            exit_code = process.returncode
-        else:
-            if _process_group_exists(process.pid):
-                _stop_group(process)
+        exit_code, timed_out, _elapsed, stop_reason = _wait_process_with_heartbeats(
+            process,
+            timeout_seconds=actual_timeout,
+            label=f"probe-{selected['id']}",
+            event_sink=events.append,
+        )
         for reader in readers:
             reader.join(timeout=1)
     except FileNotFoundError as error:
@@ -1128,6 +1254,8 @@ def run_probe(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_seconds": duration,
+        "stop_reason": stop_reason,
+        "events": events,
         "stdout": _redact_log(stdout.text(), secret_values),
         "stderr": _redact_log(stderr.text(), secret_values),
         "stdout_truncated": stdout.truncated,
@@ -1199,10 +1327,18 @@ def review_change(
     diagnosis = load_json_object(diagnosis_path)
     diff_path = run_root / "candidate.diff"
     redacted_diff = "Diff content withheld; set reviewer.include_diff=true to opt in."
+    if "reviewers" in normalized:
+        reviewer_includes_diff = all(
+            item.get("include_diff", False) for item in normalized["reviewers"]
+        )
+    else:
+        reviewer_includes_diff = normalized.get("reviewer", {}).get(
+            "include_diff", False
+        )
     if diff_path.exists():
         if diff_path.stat().st_size > 256 * 1024:
             raise ValidationError("candidate.diff exceeds reviewer request limit")
-        if normalized.get("reviewer", {}).get("include_diff", False):
+        if reviewer_includes_diff:
             redacted_diff = _redact_log(diff_path.read_text("utf-8"), ())
         else:
             redacted_diff += f" sha256={_sha256_path(diff_path)}"
@@ -1225,8 +1361,31 @@ def review_change(
         },
     )
     _atomic_json(run_root / "review_request.json", request)
-    if "reviewer" not in normalized:
+    if "reviewer" not in normalized and "reviewers" not in normalized:
         return reviewer.write_skipped_review(request, run_root)
+    if "reviewers" in normalized:
+        total_timeout = 180.0
+        if deadline_epoch is not None:
+            remaining = float(deadline_epoch) - time.time()
+            if remaining < 1:
+                return reviewer.write_skipped_review(request, run_root)
+            total_timeout = min(total_timeout, remaining)
+        configs = [
+            {
+                "provider": item["provider"],
+                "argv": item["argv"],
+                "timeout_seconds": min(
+                    float(item["timeout_seconds"]), total_timeout
+                ),
+            }
+            for item in normalized["reviewers"]
+        ]
+        return reviewer.run_reviewers(
+            configs,
+            request,
+            run_root,
+            total_timeout_seconds=total_timeout,
+        )
     reviewer_config = {
         "argv": normalized["reviewer"]["argv"],
         "timeout_seconds": normalized["reviewer"]["timeout_seconds"],
@@ -1474,6 +1633,101 @@ def _candidate_diff(
     return _redact_log("".join(chunks), ())
 
 
+def _static_review_changed_files(
+    control: Mapping[str, Any],
+    *,
+    scope: str,
+    changed: Sequence[str],
+    candidate_binding: Mapping[str, Any],
+    change_set_digest: str,
+    after_identity_digest: str,
+) -> dict:
+    """Apply cheap parsers plus binding checks before any workload command."""
+    base, _roots, _snapshot_name = _scope_layout(control, scope)
+    checks = []
+    for relative in changed:
+        path = base / relative
+        if not path.is_file() or path.is_symlink():
+            continue
+        kind = None
+        try:
+            source = path.read_text(encoding="utf-8")
+            if path.suffix.lower() == ".py":
+                kind = "python_ast"
+                ast.parse(source, filename=relative)
+            elif path.suffix.lower() == ".json":
+                kind = "json_parse"
+                json.loads(
+                    source,
+                    object_pairs_hook=_pairs_without_duplicates,
+                    parse_constant=lambda token: _raise_invalid_number(token),
+                )
+        except (OSError, UnicodeError, SyntaxError, json.JSONDecodeError, ValidationError) as error:
+            checks.append(
+                {
+                    "kind": kind or "text_decode",
+                    "path": relative,
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                }
+            )
+        else:
+            if kind is not None:
+                checks.append(
+                    {"kind": kind, "path": relative, "status": "passed"}
+                )
+        if path.suffix.lower() in {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cu",
+            ".cuh",
+            ".h",
+            ".hpp",
+        }:
+            checks.append(
+                {
+                    "kind": "source_syntax",
+                    "path": relative,
+                    "status": "not_applicable",
+                    "reason": "no_configured_static_checker",
+                }
+            )
+
+    binding_without_digest = dict(candidate_binding)
+    binding_digest = binding_without_digest.pop("digest", None)
+    binding_checks = {
+        "candidate_digest": candidate_binding.get("candidate_digest")
+        == _canonical_digest(candidate_binding.get("candidate")),
+        "binding_digest": binding_digest
+        == _canonical_digest(binding_without_digest),
+        "change_set_digest": candidate_binding.get("change_set_digest")
+        == change_set_digest,
+        "after_identity_digest": candidate_binding.get("after_identity_digest")
+        == after_identity_digest,
+    }
+    checks.extend(
+        {
+            "kind": kind,
+            "status": "passed" if passed else "failed",
+        }
+        for kind, passed in binding_checks.items()
+    )
+    status = "passed"
+    if any(check["status"] == "failed" for check in checks):
+        status = "failed"
+    elif any(check["status"] == "not_applicable" for check in checks):
+        status = "not_applicable"
+    return {
+        "status": status,
+        "candidate_digest": candidate_binding.get("candidate_digest"),
+        "change_set_digest": change_set_digest,
+        "after_identity_digest": after_identity_digest,
+        "changed_paths": list(changed),
+        "checks": checks,
+    }
+
+
 def read_run_state(run_dir: os.PathLike[str] | str) -> dict:
     run_root = Path(run_dir).expanduser().resolve(strict=False)
     commit = load_json_object(run_root / "state_commit.json")
@@ -1553,6 +1807,57 @@ def _normalize_frozen_workload(control: Mapping[str, Any]):
 def _check_deadline(state: Mapping[str, Any]) -> None:
     if time.time() > state["deadline_epoch"]:
         raise ValidationError("workload optimization budget deadline has expired")
+
+
+def start_optimization_budget_after_readiness(
+    state: Mapping[str, Any], runtime: Mapping[str, Any], *, now: float
+) -> dict:
+    """Start performance time only after the environment admission succeeds."""
+    if not isinstance(state, Mapping) or not isinstance(runtime, Mapping):
+        raise ValidationError("state and runtime must be mappings")
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise ValidationError("now must be a finite epoch")
+    timestamp = float(now)
+    if not math.isfinite(timestamp):
+        raise ValidationError("now must be a finite epoch")
+    started = state.get("started_at_epoch")
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        raise ValidationError("state.started_at_epoch must be finite")
+    started = float(started)
+    def duration(value: Any, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError(f"{field} must be a positive finite number")
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise ValidationError(f"{field} must be a positive finite number")
+        return parsed
+
+    soft = duration(runtime.get("soft_target_seconds"), "soft_target_seconds")
+    hard = duration(runtime.get("hard_ceiling_seconds"), "hard_ceiling_seconds")
+    if soft > hard:
+        raise ValidationError("soft target must not exceed hard ceiling")
+    updated = copy.deepcopy(dict(state))
+    updated["environment_seconds"] = max(0.0, timestamp - started)
+    updated["optimization_started_at_epoch"] = timestamp
+    updated["soft_target_epoch"] = timestamp + soft
+    updated["deadline_epoch"] = timestamp + hard
+    updated["updated_at_epoch"] = timestamp
+    return updated
+
+
+def migrate_completed_readiness_budget(
+    state: Mapping[str, Any], runtime: Mapping[str, Any], *, completed_at: float
+) -> dict:
+    """Migrate a pre-fix V3.1 state once without charging readiness time."""
+    if "readiness" not in state.get("completed_stages", []):
+        return copy.deepcopy(dict(state))
+    if "optimization_started_at_epoch" in state:
+        return copy.deepcopy(dict(state))
+    updated = start_optimization_budget_after_readiness(
+        state, runtime, now=completed_at
+    )
+    updated["optimization_timer_migration"] = "readiness-report-mtime-v1"
+    return updated
 
 
 def _current_readiness_identity(control: Mapping[str, Any]) -> dict:
@@ -2416,12 +2721,32 @@ def _start_run_unlocked(
         )
         state = _write_state(run_root, state)
 
-    _check_deadline(state)
+    runtime = _BUDGET_RUNTIME[normalized["budget"]]
+    if (
+        normalized["schema_version"] == CONTROL_SCHEMA_V2
+        and "readiness" in state["completed_stages"]
+        and "optimization_started_at_epoch" not in state
+    ):
+        report_path = run_root / "readiness" / "report.json"
+        if not report_path.is_file() or report_path.is_symlink():
+            raise ValidationError(
+                "legacy readiness state lacks a regular completion report"
+            )
+        state = migrate_completed_readiness_budget(
+            state,
+            runtime,
+            completed_at=report_path.stat().st_mtime,
+        )
+        state = _write_state(run_root, state)
+    if not (
+        normalized["schema_version"] == CONTROL_SCHEMA_V2
+        and "readiness" not in state["completed_stages"]
+    ):
+        _check_deadline(state)
     _load_frozen_control(run_root, state)
     workload = _normalize_frozen_workload(normalized)
     if workload.source_hash != state["workload_source_hash"]:
         raise ValidationError("workload identity drifted after run initialization")
-    runtime = _BUDGET_RUNTIME[normalized["budget"]]
 
     if (
         normalized["schema_version"] == CONTROL_SCHEMA_V2
@@ -2460,6 +2785,9 @@ def _start_run_unlocked(
         state["baseline_environment_identity_digest"] = refreshed_environment[
             "digest"
         ]
+        state = start_optimization_budget_after_readiness(
+            state, runtime, now=time.time()
+        )
         state = _advance(
             run_root,
             state,
@@ -2491,11 +2819,37 @@ def _start_run_unlocked(
             if "analysis_contract" in normalized
             else None
         )
-        timeout = (
-            None
-            if workload.kind == "python"
-            else min(120, max(0.001, state["deadline_epoch"] - time.time()))
+        timeout = min(
+            120.0, max(0.001, state["deadline_epoch"] - time.time())
         )
+        baseline_attempt = 0
+
+        def run_baseline_once(
+            evaluation_workload: Any,
+            *,
+            candidate: Any,
+            role: str,
+            case: Mapping[str, Any] | None = None,
+            timeout: float | None = None,
+        ) -> dict:
+            nonlocal baseline_attempt
+            if evaluation_workload.source_hash != workload.source_hash:
+                raise ValidationError("workload changed inside baseline capture")
+            effective_timeout = min(
+                max(0.001, state["deadline_epoch"] - time.time()),
+                120.0 if timeout is None else float(timeout),
+            )
+            baseline_attempt += 1
+            return _run_python_workload_once_bounded(
+                normalized,
+                run_root,
+                candidate=candidate,
+                role=role,
+                case=case,
+                timeout_seconds=effective_timeout,
+                task=f"baseline-workload-{baseline_attempt}",
+            )
+
         baseline = _load_evaluate_module().measure_candidate(
             workload,
             normalized["baseline_candidate"],
@@ -2503,6 +2857,7 @@ def _start_run_unlocked(
             retries=runtime["retries"],
             timeout=timeout,
             deadline_epoch=state["deadline_epoch"],
+            runner=run_baseline_once if workload.kind == "python" else None,
         )
         if (
             baseline_surface_before is not None
@@ -2887,6 +3242,7 @@ def _run_active_evidence_adapter(
     started = time.monotonic()
     exit_code = None
     timed_out = False
+    events: list[dict] = []
     process = subprocess.Popen(
         execution_argv,
         cwd=execution_root,
@@ -2902,15 +3258,12 @@ def _run_active_evidence_adapter(
     ]
     for reader in readers:
         reader.start()
-    try:
-        exit_code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _stop_group(process)
-        exit_code = process.returncode
-    else:
-        if _process_group_exists(process.pid):
-            _stop_group(process)
+    exit_code, timed_out, elapsed, stop_reason = _wait_process_with_heartbeats(
+        process,
+        timeout_seconds=timeout,
+        label=f"evidence-{action['action_id']}",
+        event_sink=events.append,
+    )
     for reader in readers:
         reader.join(timeout=1)
     execution = {
@@ -2921,7 +3274,9 @@ def _run_active_evidence_adapter(
         "adapter_sha256": action["adapter_sha256"],
         "exit_code": exit_code,
         "timed_out": timed_out,
-        "duration_seconds": time.monotonic() - started,
+        "duration_seconds": elapsed,
+        "stop_reason": stop_reason,
+        "events": events,
         "stdout": _redact_log(stdout.text(), secret_values),
         "stderr": _redact_log(stderr.text(), secret_values),
     }
@@ -3374,81 +3729,84 @@ def register_change(
     return committed
 
 
-def _run_correctness_commands(
+def _run_python_workload_once_bounded(
     control: Mapping[str, Any],
-    change: Mapping[str, Any],
     run_root: Path,
     *,
-    timeout_seconds: float = 300,
+    candidate: Any,
+    role: str,
+    case: Mapping[str, Any] | None,
+    timeout_seconds: float,
+    task: str,
 ) -> dict:
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
-        raise ValidationError("correctness timeout must be a positive finite number")
+    """Run a Python adapter outside the Controller process under a hard stop."""
+    label = _identifier(task, "workload task")
+    if isinstance(timeout_seconds, bool) or not isinstance(
+        timeout_seconds, (int, float)
+    ):
+        raise ValidationError("workload timeout must be a positive finite number")
     timeout = float(timeout_seconds)
-    if not math.isfinite(timeout) or timeout <= 0 or timeout > 300:
-        raise ValidationError("correctness timeout must be positive and at most 300 seconds")
-    records = []
-    environment, secrets = _probe_environment({})
-    for index, argv in enumerate(change["commands"]):
-        started = time.monotonic()
-        stdout = _BoundedLog(_DEFAULT_LOG_LIMIT)
-        stderr = _BoundedLog(_DEFAULT_LOG_LIMIT)
-        process = None
-        returncode = None
-        failure = None
-        try:
-            process = subprocess.Popen(
-                argv,
-                cwd=control["project_root"],
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 3600:
+        raise ValidationError("workload timeout must be positive and at most 3600 seconds")
+    attempt_dir = run_root / "workload_attempts" / label
+    request_path = attempt_dir / "request.json"
+    output_path = attempt_dir / "output.json"
+    _atomic_json(
+        request_path,
+        {"candidate": candidate, "role": role, "case": case},
+    )
+    environment, _secrets = _probe_environment({})
+    events: list[dict] = []
+
+    def emit(event: Mapping[str, Any]) -> None:
+        record = {**event, "task": label}
+        events.append(record)
+        if event.get("event") == "heartbeat" or event.get("stop_reason") != "completed":
+            print(
+                json.dumps(record, sort_keys=True),
+                file=sys.stderr,
+                flush=True,
             )
-            readers = [
-                threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
-                threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
-            ]
-            for reader in readers:
-                reader.start()
-            try:
-                returncode = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                failure = "TimeoutExpired"
-                _stop_group(process)
-                returncode = process.returncode
-            else:
-                if _process_group_exists(process.pid):
-                    _stop_group(process)
-            for reader in readers:
-                reader.join(timeout=1)
-        except OSError as error:
-            failure = type(error).__name__
-        records.append(
-            {
-                "index": index,
-                "argv_sha256": _canonical_digest(argv),
-                "returncode": returncode,
-                "duration_seconds": time.monotonic() - started,
-                "stdout": _redact_log(stdout.text(), secrets),
-                "stderr": _redact_log(stderr.text(), secrets),
-                "failure": failure,
-            }
-        )
-        if failure is not None or returncode != 0:
-            break
-    result = {
-        "schema_version": "cuda-workload-optimizer/correctness-v1",
-        "status": (
-            "passed"
-            if len(records) == len(change["commands"])
-            and all(record["returncode"] == 0 for record in records)
-            else "failed"
-        ),
-        "commands": records,
-    }
-    _atomic_json(run_root / "correctness.json", result)
-    return result
+
+    result = _load_budget_module().run_budgeted_command(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_workload-once",
+            "--control",
+            str(run_root / "control_manifest.json"),
+            "--request",
+            str(request_path),
+            "--out",
+            str(output_path),
+        ],
+        timeout_seconds=timeout,
+        grace_seconds=min(0.5, timeout),
+        popen_options={
+            "cwd": control["project_root"],
+            "env": environment,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        },
+        heartbeat_interval_seconds=min(30.0, timeout),
+        event_sink=emit,
+    )
+    _atomic_json(
+        attempt_dir / "execution.json",
+        {
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "elapsed_seconds": result.elapsed_seconds,
+            "stop_reason": result.stop_reason,
+            "events": events,
+        },
+    )
+    if result.timed_out:
+        raise TimeoutError("Python workload reached the hard deadline")
+    if result.returncode != 0 or not output_path.is_file():
+        raise RuntimeError("Python workload child failed")
+    return load_json_object(output_path)
 
 
 def _finish_rejected(
@@ -3673,16 +4031,54 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
     (run_root / "candidate.diff").write_text(
         _candidate_diff(control, run_root, changed, change["scope"]), encoding="utf-8"
     )
+    static_review = _static_review_changed_files(
+        control,
+        scope=change["scope"],
+        changed=changed,
+        candidate_binding=candidate_binding,
+        change_set_digest=change_digest,
+        after_identity_digest=after["digest"],
+    )
+    _atomic_json(run_root / "static_review.json", static_review)
 
     runtime = _BUDGET_RUNTIME[control["budget"]]
     evaluations: dict[str, dict] = {}
+    workload_attempt = 0
+
+    def run_workload_once(
+        evaluation_workload: Any,
+        *,
+        candidate: Any,
+        role: str,
+        case: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        nonlocal workload_attempt
+        if evaluation_workload.source_hash != workload.source_hash:
+            raise ValidationError("workload changed inside the evaluation stage")
+        if workload.kind != "python":
+            return _load_workload_module().run_spec_once(
+                workload,
+                candidate=candidate,
+                role=role,
+                case=case,
+                timeout=timeout,
+            )
+        remaining = max(0.001, state["deadline_epoch"] - time.time())
+        effective_timeout = remaining if timeout is None else min(timeout, remaining)
+        workload_attempt += 1
+        return _run_python_workload_once_bounded(
+            control,
+            run_root,
+            candidate=candidate,
+            role=role,
+            case=case,
+            timeout_seconds=effective_timeout,
+            task=f"workload-{role}-{workload_attempt}",
+        )
 
     def evaluate_pairs(stage: str, blocks: int) -> dict:
-        timeout = (
-            None
-            if workload.kind == "python"
-            else min(120, max(0.001, state["deadline_epoch"] - time.time()))
-        )
+        timeout = min(120, max(0.001, state["deadline_epoch"] - time.time()))
         evaluation = _load_evaluate_module().evaluate_pairs(
             workload,
             control["baseline_candidate"],
@@ -3693,6 +4089,7 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             timeout=timeout,
             deadline_epoch=state["deadline_epoch"],
             bootstrap_samples=runtime["bootstrap"],
+            runner=run_workload_once,
         )
         evaluations[stage] = evaluation
         _atomic_json(run_root / f"{stage}_evaluation.json", evaluation)
@@ -3701,7 +4098,10 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             item.get("status") == "passed"
             for item in evaluation.get("constraints", [])
         )
-        passed = evaluation.get("status") == "evaluated"
+        passed = (
+            evaluation.get("status") == "evaluated"
+            and constraints_passed
+        )
         if stage == "formal_paired":
             passed = (
                 passed
@@ -3714,6 +4114,90 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             "lower_bound": primary.get("ci_low_pct"),
             "upper_bound": primary.get("ci_high_pct"),
         }
+
+    def profiler_stage() -> dict:
+        diagnosis = load_json_object(run_root / "diagnosis.json")
+        primary = diagnosis.get("primary_category")
+        confidence = diagnosis.get("confidence")
+        required = primary in {None, "kernel", "mixed"} or confidence in {
+            "low",
+            "inconclusive",
+        }
+        if not required:
+            artifact = {
+                "status": "not_applicable",
+                "reason": "diagnosis_is_specific_without_live_profiler_uncertainty",
+                "primary_category": primary,
+                "confidence": confidence,
+            }
+            _atomic_json(run_root / "profiler_stage.json", artifact)
+            return artifact
+        eligible = [
+            probe
+            for probe in control["probes"]
+            if probe["kind"] in {"timeline", "framework", "custom"}
+        ]
+        if not eligible:
+            artifact = {
+                "status": "failed",
+                "reason": "live_uncertainty_has_no_configured_profiler_action",
+                "primary_category": primary,
+                "confidence": confidence,
+            }
+            _atomic_json(run_root / "profiler_stage.json", artifact)
+            return artifact
+        selected = min(
+            eligible,
+            key=lambda probe: (float(probe["timeout_seconds"]), probe["id"]),
+        )
+        profile_root = run_root / "candidate_profile"
+        result = run_probe(
+            selected,
+            control,
+            profile_root,
+            deadline_epoch=state["deadline_epoch"],
+        )
+        result_path = profile_root / "probes" / f"{selected['id']}.json"
+        artifact = {
+            "status": (
+                "passed"
+                if result.get("status") in {"ok", "degraded"}
+                else "failed"
+            ),
+            "reason": "candidate_profiler_executed",
+            "primary_category": primary,
+            "confidence": confidence,
+            "probe_id": selected["id"],
+            "probe_kind": selected["kind"],
+            "evidence_path": str(result_path.relative_to(run_root)),
+            "evidence_sha256": _sha256_path(result_path),
+        }
+        _atomic_json(run_root / "profiler_stage.json", artifact)
+        return artifact
+
+    def minimum_correctness_stage() -> dict:
+        timeout = min(60.0, max(0.001, state["deadline_epoch"] - time.time()))
+        cases = list(workload.cases) or [{}]
+        try:
+            observation = run_workload_once(
+                workload,
+                candidate=bound_candidate,
+                role="candidate",
+                case=cases[0],
+                timeout=timeout,
+            )
+        except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+            artifact = {
+                "status": "failed",
+                "failure": type(error).__name__,
+            }
+        else:
+            artifact = {
+                "status": "passed",
+                "validation": observation.get("validation"),
+            }
+        _atomic_json(run_root / "correctness.json", artifact)
+        return artifact
 
     remaining = max(0.001, state["deadline_epoch"] - time.time())
     soft_remaining = max(
@@ -3734,13 +4218,12 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
     )
     gate_result = gate.run(
         {
-            "static_review": lambda: {"status": "passed"},
-            "build_correctness": lambda: _run_correctness_commands(
-                control, change, run_root
-            ),
+            "static_review": lambda: static_review,
+            "build_correctness": minimum_correctness_stage,
             "short_paired": lambda: evaluate_pairs(
                 "short_paired", min(2, runtime["blocks"])
             ),
+            "profiler": profiler_stage,
             "formal_paired": lambda: evaluate_pairs(
                 "formal_paired", runtime["blocks"]
             ),
@@ -3777,6 +4260,27 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             control,
             scope=change["scope"],
             reason=rejection_reason,
+            primary_status=evaluation.get("primary", {}).get("status"),
+            time_gate=gate_result,
+        )
+
+    if control.get("evaluation_gate", "promotion") != "promotion":
+        _atomic_json(
+            run_root / "review.json",
+            {
+                "schema_version": "cuda-workload-optimizer/review-artifact-v1",
+                "status": "skipped",
+                "request_digest": None,
+                "response": None,
+                "execution": {"reason": "reject_only_stage_cannot_promote"},
+            },
+        )
+        return _finish_rejected(
+            run_root,
+            state,
+            control,
+            scope=change["scope"],
+            reason="reject_only_stage_cannot_promote",
             primary_status=evaluation.get("primary", {}).get("status"),
             time_gate=gate_result,
         )
@@ -3886,11 +4390,35 @@ def resume_run(run_dir: os.PathLike[str] | str) -> dict:
     return start_run(_load_frozen_control(run_root), run_root)
 
 
+def _cmd_workload_once(args: argparse.Namespace) -> None:
+    control = validate_control_manifest(
+        load_json_object(args.control), args.control
+    )
+    request = load_json_object(args.request)
+    if set(request) != {"candidate", "role", "case"}:
+        raise ValidationError("workload child request fields are invalid")
+    workload = _normalize_frozen_workload(control)
+    if workload.kind != "python":
+        raise ValidationError("workload child accepts only Python adapters")
+    observation = _load_workload_module().run_spec_once(
+        workload,
+        candidate=request["candidate"],
+        role=request["role"],
+        case=request["case"],
+        timeout=None,
+    )
+    _atomic_json(Path(args.out), observation)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate and run bounded GPU workload optimization rounds."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    workload_once = subparsers.add_parser("_workload-once", help=argparse.SUPPRESS)
+    workload_once.add_argument("--control", required=True)
+    workload_once.add_argument("--request", required=True)
+    workload_once.add_argument("--out", required=True)
     validate = subparsers.add_parser("validate", help="validate controller JSON")
     validate.add_argument("--control", required=True)
     validate.add_argument("--change-set")
@@ -3943,6 +4471,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "_workload-once":
+            _cmd_workload_once(args)
+            return 0
         if args.command == "validate":
             control = validate_control_manifest(
                 load_json_object(args.control), args.control

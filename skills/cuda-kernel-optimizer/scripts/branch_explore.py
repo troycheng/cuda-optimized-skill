@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -60,6 +61,13 @@ def _write_json(path: str, obj) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def _canonical_digest(value: dict) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _bounded_candidate_error(error: Exception, limit: int = 560) -> str:
@@ -183,8 +191,16 @@ def _paired_candidate(
     input_hash: str | None = None,
     iteration: int | None = None,
     candidate_id=None,
+    expected_baseline_sha256: str | None = None,
 ) -> dict:
     """Collect paired samples and return the shared classification payload."""
+    baseline_sha256 = sha256_file(baseline_file)
+    if (
+        expected_baseline_sha256 is not None
+        and baseline_sha256 != expected_baseline_sha256
+    ):
+        raise ValueError("paired comparison baseline differs from the champion")
+    candidate_sha256 = sha256_file(candidate_file)
     paired = run_paired(
         baseline_file,
         candidate_file,
@@ -199,6 +215,10 @@ def _paired_candidate(
         max_temperature_delta_c=max_temperature_delta_c,
         max_clock_delta_pct=max_clock_delta_pct,
     )
+    if sha256_file(baseline_file) != baseline_sha256:
+        raise ValueError("paired comparison baseline changed during measurement")
+    if sha256_file(candidate_file) != candidate_sha256:
+        raise ValueError("paired comparison candidate changed during measurement")
     statistics = classify_pairs(
         paired["pairs"],
         direction="lower",
@@ -220,6 +240,7 @@ def _paired_candidate(
         iteration=iteration,
         candidate_id=candidate_id,
         candidate_file=candidate_file,
+        baseline_file=baseline_file,
         classifier_config={
             "direction": "lower",
             "min_effect_pct": min_effect_pct,
@@ -299,6 +320,20 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
     baseline_file = state.get("best_file") or state.get("baseline_file")
     if not isinstance(baseline_file, str) or not baseline_file.strip():
         raise ValueError("state must provide best_file or baseline_file")
+    baseline_path = Path(baseline_file).expanduser()
+    if not baseline_path.is_file() or baseline_path.is_symlink():
+        raise ValueError("state best_file must be a non-symlink regular file")
+    baseline_file = str(baseline_path.absolute())
+    baseline_sha256 = sha256_file(baseline_file)
+    required_method_ids = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("id"), str)
+            and item.get("id").strip()
+        }
+    )
     budget = copy.deepcopy(state.get("budget") or {})
     blocks = budget.get("max_pairs", repeat)
     backend = state.get("backend", "auto")
@@ -374,6 +409,9 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "error": bench_result.get("error"),
             "statistics": None,
             "status": "rejected_correctness" if not passed else "invalid",
+            "baseline_file": baseline_file,
+            "baseline_sha256": baseline_sha256,
+            "candidate_sha256": sha256_file(kernel),
         }
 
         if passed:
@@ -394,6 +432,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
                         bootstrap_samples=bootstrap_samples,
                         max_temperature_delta_c=max_temperature_delta_c,
                         max_clock_delta_pct=max_clock_delta_pct,
+                        expected_baseline_sha256=baseline_sha256,
                         **(
                             {
                                 "artifact_path": os.path.join(
@@ -442,6 +481,16 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         result["passed"] and result["status"] == "invalid"
         for result in results
     )
+    inheritance_verification = {
+        "status": "passed" if shortlist else "not_promoted",
+        "proof": "confirmed_paired_win_vs_current_champion",
+        "baseline_file": baseline_file,
+        "baseline_sha256": baseline_sha256,
+        "required_method_ids": required_method_ids,
+        "verified_candidate_ids": [
+            str(result["branch_index"]) for result in shortlist
+        ],
+    }
 
     if not shortlist:
         output = {
@@ -455,6 +504,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "valid_branches": sum(result["passed"] for result in results),
             "completed_comparisons": completed_comparisons,
             "measurement_failures": measurement_failures,
+            "inheritance_verification": inheritance_verification,
         }
         _write_json(os.path.join(iter_dir, "branch_results.json"), output)
         _write_json(
@@ -497,6 +547,7 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         "valid_branches": sum(result["passed"] for result in results),
         "completed_comparisons": completed_comparisons,
         "measurement_failures": measurement_failures,
+        "inheritance_verification": inheritance_verification,
     }
 
     _write_json(os.path.join(iter_dir, "branch_results.json"), output)
@@ -511,6 +562,14 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
             "statistics": copy.deepcopy(champion["statistics"]),
             "kernel_paired_samples": copy.deepcopy(
                 champion.get("paired_samples")
+            ),
+            "baseline_file": baseline_file,
+            "baseline_sha256": baseline_sha256,
+            "inheritance_verification": copy.deepcopy(
+                inheritance_verification
+            ),
+            "inheritance_verification_sha256": _canonical_digest(
+                inheritance_verification
             ),
         },
     )

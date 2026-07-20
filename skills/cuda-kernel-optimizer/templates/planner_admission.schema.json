@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version", "status", "run_id", "ledger_id", "contract_sha256",
-    "environment_sha256", "candidate_id", "observation_id",
+    "environment_sha256", "candidate_id", "mechanism_id", "observation_id",
     "observation_summary_sha256", "capability_query_sha256", "capability_ids",
     "admitted_at", "evidence_age_seconds", "pre_execution", "admission_sha256",
     "controller_attestation"
@@ -19,6 +19,7 @@
     "contract_sha256": {"$ref": "#/$defs/sha256"},
     "environment_sha256": {"$ref": "#/$defs/sha256"},
     "candidate_id": {"$ref": "#/$defs/identifier"},
+    "mechanism_id": {"$ref": "#/$defs/identifier"},
     "observation_id": {"$ref": "#/$defs/identifier"},
     "observation_summary_sha256": {"$ref": "#/$defs/sha256"},
     "capability_query_sha256": {"$ref": "#/$defs/sha256"},

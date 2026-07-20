@@ -594,9 +594,9 @@ class ReadinessGateTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "succeeded")
 
-    def test_installer_uses_the_shared_maintenance_budget(self) -> None:
+    def test_installer_soft_threshold_does_not_replace_the_readiness_deadline(self) -> None:
         self.python.write_text(
-            "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", "utf-8"
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(0.35)\n", "utf-8"
         )
         self.python.chmod(0o755)
 
@@ -609,7 +609,20 @@ class ReadinessGateTests(unittest.TestCase):
             deadline_epoch=time.time() + 2,
         )
 
-        self.assertEqual(result["reason"], "pip_timeout")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIsNone(result["reason"])
+        self.assertTrue(result["soft_limit_exceeded"])
+        self.assertEqual(result["stop_reason"], "completed")
+        self.assertTrue(
+            (
+                self.root
+                / "maintenance-budget"
+                / "readiness"
+                / "installs"
+                / "approved-env-install.soft-checkpoint.json"
+            ).is_file()
+        )
+        self.assertGreater(result["duration_seconds"], 0.2)
         self.assertLess(time.monotonic() - started, 1.0)
 
 

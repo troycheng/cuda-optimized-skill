@@ -23,6 +23,7 @@ _FIELDS = {
     "contract_sha256",
     "environment_sha256",
     "candidate_id",
+    "mechanism_id",
     "observation_id",
     "observation_summary_sha256",
     "capability_query_sha256",
@@ -33,6 +34,7 @@ _FIELDS = {
     "admission_sha256",
     "controller_attestation",
 }
+_LEGACY_FIELDS = _FIELDS - {"mechanism_id"}
 
 
 class ValidationError(ValueError):
@@ -136,13 +138,18 @@ def validate_admission(
     expected_contract_sha256: str | None = None,
     expected_admitted_at: float | None = None,
 ) -> dict:
-    if type(value) is not dict or set(value) != _FIELDS:
+    fields = set(value) if type(value) is dict else set()
+    if type(value) is not dict or (
+        fields != _FIELDS and fields != _LEGACY_FIELDS
+    ):
         raise ValidationError("planner admission must be a closed object")
     clean = json.loads(_canonical_bytes(value))
     if clean["schema_version"] != SCHEMA or clean["status"] != "ADMITTED":
         raise ValidationError("unsupported planner admission")
     for field in ("run_id", "ledger_id", "candidate_id", "observation_id"):
         _identifier(clean[field], field)
+    if "mechanism_id" in clean:
+        _identifier(clean["mechanism_id"], "mechanism_id")
     for field in (
         "contract_sha256", "environment_sha256", "observation_summary_sha256",
         "capability_query_sha256", "admission_sha256", "controller_attestation"
@@ -184,6 +191,8 @@ def validate_admission(
             "capability_query_sha256": "capability_query_sha256",
             "capability_ids": "capability_ids",
         }
+        if "mechanism_id" in clean:
+            bindings["mechanism_id"] = "mechanism_id"
         for admission_field, proposal_field in bindings.items():
             if clean[admission_field] != proposal.get(proposal_field):
                 raise ValidationError(

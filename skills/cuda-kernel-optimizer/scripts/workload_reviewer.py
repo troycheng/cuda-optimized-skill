@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,9 @@ from typing import Any
 REQUEST_SCHEMA = "cuda-workload-optimizer/review-request-v1"
 RESPONSE_SCHEMA = "cuda-workload-optimizer/review-v1"
 ARTIFACT_SCHEMA = "cuda-workload-optimizer/review-artifact-v1"
+AGGREGATE_SCHEMA = "cuda-workload-optimizer/review-aggregate-v1"
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
+_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _SECRET_NAME = re.compile(
     r"(^|[_-])(api[_-]?key|authorization|cookie|credential|password|secret|token)($|[_-])",
     re.IGNORECASE,
@@ -236,6 +239,19 @@ def _drain(stream, capture: _BoundedCapture) -> None:
         stream.close()
 
 
+def _write_stdin(stream, payload: bytes, errors: list[str]) -> None:
+    try:
+        stream.write(payload)
+        stream.flush()
+    except (BrokenPipeError, OSError) as error:
+        errors.append(f"reviewer stdin failed: {error}")
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def _process_group_exists(process_group: int) -> bool:
     try:
         os.killpg(process_group, 0)
@@ -347,8 +363,8 @@ def run_reviewer(
     timeout = configuration["timeout_seconds"]
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise ReviewerError("reviewer timeout_seconds must be numeric")
-    if not math.isfinite(float(timeout)) or not 1 <= timeout <= 3600:
-        raise ReviewerError("reviewer timeout_seconds must be between 1 and 3600")
+    if not math.isfinite(float(timeout)) or not 0.05 <= timeout <= 3600:
+        raise ReviewerError("reviewer timeout_seconds must be between 0.05 and 3600")
     if isinstance(output_limit_bytes, bool) or not isinstance(output_limit_bytes, int):
         raise ReviewerError("output_limit_bytes must be an integer")
     if not 128 <= output_limit_bytes <= 1024 * 1024:
@@ -368,6 +384,7 @@ def run_reviewer(
     timed_out = False
     failure = None
     response = None
+    deadline = started + float(timeout)
 
     with tempfile.TemporaryDirectory(prefix="reviewer-cwd-", dir=run_root) as cwd:
         try:
@@ -386,10 +403,17 @@ def run_reviewer(
             ]
             for reader in readers:
                 reader.start()
+            writer_errors: list[str] = []
+            writer = threading.Thread(
+                target=_write_stdin,
+                args=(process.stdin, stdin_payload, writer_errors),
+                daemon=True,
+            )
+            writer.start()
             try:
-                process.stdin.write(stdin_payload)
-                process.stdin.close()
-                exit_code = process.wait(timeout=float(timeout))
+                exit_code = process.wait(
+                    timeout=max(0.001, deadline - time.monotonic())
+                )
             except subprocess.TimeoutExpired:
                 timed_out = True
                 failure = f"reviewer exceeded {timeout} seconds"
@@ -398,8 +422,11 @@ def run_reviewer(
             else:
                 if _process_group_exists(process.pid):
                     _stop_group(process)
+            writer.join(timeout=1)
             for reader in readers:
                 reader.join(timeout=1)
+            if failure is None and writer_errors:
+                failure = writer_errors[0]
         except (FileNotFoundError, OSError) as error:
             failure = f"reviewer unavailable: {error}"
 
@@ -431,6 +458,131 @@ def run_reviewer(
     )
     _atomic_json(run_root / "review.json", artifact)
     return artifact
+
+
+def run_reviewers(
+    configs: Sequence[Mapping[str, Any]],
+    request: Mapping[str, Any],
+    run_dir: str | os.PathLike[str],
+    *,
+    total_timeout_seconds: float = 180.0,
+) -> dict:
+    """Run named advisory reviewers concurrently under one total wait bound."""
+    if not isinstance(configs, Sequence) or isinstance(
+        configs, (str, bytes, bytearray)
+    ) or not configs:
+        raise ReviewerError("reviewers must be a non-empty sequence")
+    if len(configs) > 8:
+        raise ReviewerError("reviewers must contain at most 8 providers")
+    if (
+        isinstance(total_timeout_seconds, bool)
+        or not isinstance(total_timeout_seconds, (int, float))
+        or not math.isfinite(float(total_timeout_seconds))
+        or not 1 <= float(total_timeout_seconds) <= 180
+    ):
+        raise ReviewerError("total_timeout_seconds must be between 1 and 180")
+    expected = request_digest(request)
+    if request.get("request_digest") != expected:
+        raise ReviewerError("review request digest is invalid")
+
+    normalized = []
+    providers = set()
+    cleanup_reserve = min(4.0, float(total_timeout_seconds) * 0.25)
+    provider_deadline = max(
+        0.05, float(total_timeout_seconds) - cleanup_reserve
+    )
+    for index, raw in enumerate(configs):
+        config = _object(raw, f"reviewers[{index}]")
+        _closed(config, {"provider", "argv", "timeout_seconds"}, f"reviewers[{index}]")
+        _required(config, {"provider", "argv", "timeout_seconds"}, f"reviewers[{index}]")
+        provider = _string(config["provider"], f"reviewers[{index}].provider", 64)
+        if _PROVIDER.fullmatch(provider) is None:
+            raise ReviewerError(f"reviewers[{index}].provider is invalid")
+        if provider in providers:
+            raise ReviewerError("reviewer providers must be unique")
+        providers.add(provider)
+        timeout = config["timeout_seconds"]
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or not 1 <= float(timeout) <= 3600
+        ):
+            raise ReviewerError(
+                f"reviewers[{index}].timeout_seconds must be between 1 and 3600"
+            )
+        argv = config["argv"]
+        if type(argv) is not list or not argv or any(
+            type(item) is not str or not item for item in argv
+        ):
+            raise ReviewerError(f"reviewers[{index}].argv must be a non-empty string array")
+        normalized.append(
+            {
+                "provider": provider,
+                "argv": list(argv),
+                "timeout_seconds": min(
+                    float(timeout), provider_deadline
+                ),
+            }
+        )
+
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    run_root.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+
+    def execute(config: Mapping[str, Any]) -> dict:
+        provider = config["provider"]
+        try:
+            artifact = run_reviewer(
+                {
+                    "argv": config["argv"],
+                    "timeout_seconds": config["timeout_seconds"],
+                },
+                request,
+                run_root / "reviewers" / provider,
+            )
+            execution = artifact.get("execution", {})
+            return {
+                "provider": provider,
+                "status": artifact["status"],
+                "response": copy.deepcopy(artifact.get("response")),
+                "failure": execution.get("failure"),
+                "duration_seconds": float(execution.get("duration_seconds", 0.0)),
+            }
+        except (OSError, ReviewerError, RuntimeError) as error:
+            return {
+                "provider": provider,
+                "status": "unavailable",
+                "response": None,
+                "failure": str(error),
+                "duration_seconds": max(0.0, time.monotonic() - started),
+            }
+
+    with ThreadPoolExecutor(max_workers=len(normalized)) as executor:
+        futures = [executor.submit(execute, config) for config in normalized]
+        reviews = [future.result() for future in futures]
+
+    elapsed = max(0.0, time.monotonic() - started)
+    requested = [item["provider"] for item in normalized]
+    completed = [
+        item["provider"] for item in reviews if item["status"] == "completed"
+    ]
+    failed = [
+        item["provider"] for item in reviews if item["status"] != "completed"
+    ]
+    aggregate = {
+        "schema_version": AGGREGATE_SCHEMA,
+        "status": "completed" if completed else "unavailable",
+        "request_digest": expected,
+        "providers_requested": requested,
+        "providers_completed": completed,
+        "failed_providers": failed,
+        "total_timeout_seconds": float(total_timeout_seconds),
+        "total_wait_seconds": float(elapsed),
+        "reviews": reviews,
+    }
+    _atomic_json(run_root / "review.json", aggregate)
+    return aggregate
 
 
 def write_skipped_review(request: Mapping[str, Any], run_dir: str | os.PathLike[str]) -> dict:

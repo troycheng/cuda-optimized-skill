@@ -94,6 +94,18 @@ def _sha256_nofollow(path: str | os.PathLike) -> str:
     return hashlib.sha256(read_regular_bytes(path)).hexdigest()
 
 
+def _canonical_digest(value) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def validate_state(payload: dict) -> dict:
     """Validate a v2.2 state without mutating the caller's payload."""
     if not isinstance(payload, dict):
@@ -418,6 +430,25 @@ def _validate_paired_artifact(
         or not Path(clean["candidate_file"]).is_absolute()
     ):
         raise ValueError(f"{field}.candidate_file must be absolute")
+    baseline_binding = {}
+    baseline_fields = {"baseline_file", "baseline_sha256"}
+    if kind == "kernel" and baseline_fields.intersection(clean):
+        if not baseline_fields.issubset(clean):
+            raise ValueError(f"{field} baseline binding is incomplete")
+        if (
+            not isinstance(clean["baseline_file"], str)
+            or not Path(clean["baseline_file"]).is_absolute()
+        ):
+            raise ValueError(f"{field}.baseline_file must be absolute")
+        if (
+            not isinstance(clean["baseline_sha256"], str)
+            or not _SHA256.fullmatch(clean["baseline_sha256"])
+        ):
+            raise ValueError(f"{field}.baseline_sha256 must be a sha256 digest")
+        baseline_binding = {
+            "baseline_file": clean["baseline_file"],
+            "baseline_sha256": clean["baseline_sha256"],
+        }
     classifier = clean.get("classifier")
     if not isinstance(classifier, Mapping):
         raise ValueError(f"{field}.classifier must be a mapping")
@@ -431,6 +462,13 @@ def _validate_paired_artifact(
     sample_candidate = Path(clean["candidate_file"])
     if hashlib.sha256(read_regular_bytes(sample_candidate)).hexdigest() != candidate_sha256:
         raise ValueError(f"{field}.candidate_file does not match decision content")
+    if baseline_binding:
+        sample_baseline = Path(clean["baseline_file"])
+        if (
+            hashlib.sha256(read_regular_bytes(sample_baseline)).hexdigest()
+            != clean["baseline_sha256"]
+        ):
+            raise ValueError(f"{field}.baseline_file does not match summary")
 
     records = []
     try:
@@ -458,6 +496,7 @@ def _validate_paired_artifact(
         "candidate_id": candidate_id,
         "candidate_file": clean["candidate_file"],
         "candidate_sha256": candidate_sha256,
+        **baseline_binding,
     }
     for index, record in enumerate(records):
         if not isinstance(record, Mapping) or record.get("pair_index") != index:
@@ -967,6 +1006,76 @@ def _load_decision(
     return dict(decision), status, statistics, workload_statistics
 
 
+def _validate_success_inheritance_decision(
+    decision: Mapping, state: Mapping
+) -> None:
+    """Require winning descendants to prove they beat the current champion."""
+    required = sorted(
+        {
+            item.get("id")
+            for item in state.get("effective_methods", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("id"), str)
+            and item.get("id").strip()
+        }
+    )
+    if not required:
+        return
+    proof = decision.get("inheritance_verification")
+    if not isinstance(proof, Mapping):
+        raise ValueError(
+            "winning decision is missing success inheritance verification"
+        )
+    if decision.get("inheritance_verification_sha256") != _canonical_digest(
+        proof
+    ):
+        raise ValueError("success inheritance verification digest mismatch")
+    if proof.get("status") != "passed" or proof.get("proof") != (
+        "confirmed_paired_win_vs_current_champion"
+    ):
+        raise ValueError("success inheritance verification did not pass")
+    if proof.get("required_method_ids") != required:
+        raise ValueError("success inheritance method set does not match state")
+    candidate_id = decision.get("candidate_id")
+    verified_candidate_ids = proof.get("verified_candidate_ids")
+    if (
+        not isinstance(candidate_id, str)
+        or not isinstance(verified_candidate_ids, list)
+        or candidate_id not in verified_candidate_ids
+    ):
+        raise ValueError("winning candidate is not covered by inheritance proof")
+    best_file = Path(state.get("best_file", "")).expanduser()
+    if best_file.is_symlink() or not best_file.is_file():
+        raise ValueError("current champion must be a regular non-symlink file")
+    current_sha256 = sha256_file(best_file)
+    if (
+        proof.get("baseline_sha256") != current_sha256
+        or decision.get("baseline_sha256") != current_sha256
+    ):
+        raise ValueError("inheritance proof is not bound to the current champion")
+    declared_baseline = proof.get("baseline_file")
+    decision_baseline = decision.get("baseline_file")
+    expected_baseline = best_file.resolve(strict=True)
+    for value in (declared_baseline, decision_baseline):
+        if not isinstance(value, str) or Path(value).expanduser().resolve(
+            strict=True
+        ) != expected_baseline:
+            raise ValueError("inheritance baseline path does not match champion")
+    paired = decision.get("kernel_paired_samples")
+    if not isinstance(paired, Mapping) or (
+        paired.get("baseline_sha256") != current_sha256
+        or str(paired.get("candidate_id")) != candidate_id
+    ):
+        raise ValueError(
+            "paired samples are not bound to the inheritance baseline and winner"
+        )
+    paired_baseline = paired.get("baseline_file")
+    if not isinstance(paired_baseline, str) or Path(paired_baseline).expanduser().resolve(
+        strict=True
+    ) != expected_baseline:
+        raise ValueError("paired samples baseline path does not match champion")
+
+
 def _state_mode(state: dict) -> str:
     raw = state.get("mode")
     if raw is None:
@@ -1374,6 +1483,8 @@ def cmd_update(args: argparse.Namespace) -> None:
     ) = _load_decision(
         decision_path, candidate_file=args.kernel
     )
+    if decision_status in _WIN_STATUSES:
+        _validate_success_inheritance_decision(decision, state)
     candidate_binding = _capture_candidate_binding(
         decision,
         status=decision_status,
