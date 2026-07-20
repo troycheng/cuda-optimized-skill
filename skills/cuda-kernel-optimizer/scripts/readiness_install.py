@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,7 +20,12 @@ def _load_sibling(name: str, module_name: str):
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
     return module
 
 
@@ -28,6 +34,7 @@ _CONTRACT = _load_sibling(
     "readiness_contract.py", "cuda_readiness_install_contract"
 )
 _PROBE = _load_sibling("readiness_probe.py", "cuda_readiness_install_probe")
+_BUDGET = _load_sibling("budget.py", "cuda_readiness_install_budget")
 
 
 def _python_identity(path: str) -> tuple[str | None, str | None, str | None]:
@@ -163,7 +170,9 @@ def install_isolated_pip(
             execution = _PROBE._run_bounded(
                 command,
                 timeout_seconds=min(
-                    float(validated["timeout_seconds"]), remaining
+                    float(validated["timeout_seconds"]),
+                    remaining,
+                    _BUDGET.maintenance_budget_seconds(remaining),
                 ),
                 cwd=project,
                 environment=environment,

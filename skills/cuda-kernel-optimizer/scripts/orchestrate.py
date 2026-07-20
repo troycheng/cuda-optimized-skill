@@ -17,7 +17,6 @@ import hashlib
 import json
 import math
 import os
-import signal
 import shutil
 import stat
 import subprocess
@@ -43,7 +42,12 @@ from artifact_store import (  # noqa: E402
     sha256_file,
     write_paired_samples,
 )
-from budget import BudgetClock, BudgetPolicy, resolve_budget  # noqa: E402
+from budget import (  # noqa: E402
+    BudgetClock,
+    BudgetPolicy,
+    resolve_budget,
+    run_budgeted_command,
+)
 import decision as decision_engine  # noqa: E402
 import preflight  # noqa: E402
 import sanitize as sanitizer_engine  # noqa: E402
@@ -1109,42 +1113,6 @@ def _redacted_argv(cmd: Sequence[str]) -> list[str]:
     return result
 
 
-def _terminate_process_group(
-    process: subprocess.Popen, *, process_group_id: int, grace_seconds: float
-) -> tuple[str | None, str | None]:
-    def group_exists() -> bool:
-        try:
-            os.killpg(process_group_id, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-
-    try:
-        os.killpg(process_group_id, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    deadline = time.monotonic() + grace_seconds
-    while group_exists():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            break
-        process.poll()
-        time.sleep(min(0.02, remaining))
-    if group_exists():
-        try:
-            os.killpg(process_group_id, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        return process.communicate()
-    finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None and not stream.closed:
-                stream.close()
-
-
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     print(f"[run] {' '.join(_redacted_argv(cmd))}", file=sys.stderr)
     hard_timeout = kw.pop("hard_timeout", None)
@@ -1166,40 +1134,14 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
         kw["stderr"] = subprocess.PIPE
     check = kw.pop("check", False)
     input_value = kw.pop("input", None)
-    process = subprocess.Popen(
+    return run_budgeted_command(
         cmd,
-        text=True,
-        start_new_session=True,
-        **kw,
+        timeout_seconds=timeout_seconds,
+        grace_seconds=grace_seconds,
+        input_value=input_value,
+        check=check,
+        popen_options=kw,
     )
-    process_group_id = process.pid
-    timed_out = False
-    try:
-        stdout, stderr = process.communicate(
-            input=input_value, timeout=timeout_seconds
-        )
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout, stderr = _terminate_process_group(
-            process,
-            process_group_id=process_group_id,
-            grace_seconds=grace_seconds,
-        )
-    except BaseException:
-        _terminate_process_group(
-            process,
-            process_group_id=process_group_id,
-            grace_seconds=grace_seconds,
-        )
-        raise
-    returncode = 124 if timed_out else process.returncode
-    result = subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
-    result.timed_out = timed_out
-    if check and returncode:
-        raise subprocess.CalledProcessError(
-            returncode, cmd, output=stdout, stderr=stderr
-        )
-    return result
 
 
 def _read(path: str | os.PathLike) -> dict:
@@ -1273,6 +1215,7 @@ def _policy_from_state(state: Mapping) -> BudgetPolicy:
         name: budget.get(name)
         for name in (
             "name",
+            "soft_target_seconds",
             "max_seconds",
             "branches",
             "max_rounds",
@@ -1284,6 +1227,10 @@ def _policy_from_state(state: Mapping) -> BudgetPolicy:
             "reserve_seconds",
         )
     }
+    if fields["soft_target_seconds"] is None and isinstance(
+        fields["max_seconds"], int
+    ):
+        fields["soft_target_seconds"] = max(1, fields["max_seconds"] // 3)
     try:
         policy = BudgetPolicy(**fields)
     except TypeError as error:
@@ -1300,6 +1247,7 @@ def _policy_from_state(state: Mapping) -> BudgetPolicy:
         max_cases=policy.max_cases,
         sanitizer_mode=policy.sanitizer_mode,
         reserve_seconds=policy.reserve_seconds,
+        soft_target_seconds=policy.soft_target_seconds,
     )
 
 

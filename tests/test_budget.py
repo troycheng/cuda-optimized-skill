@@ -35,6 +35,7 @@ class BudgetPolicyTests(unittest.TestCase):
         expected = {
             "quick": {
                 "name": "quick",
+                "soft_target_seconds": 900,
                 "max_seconds": 2700,
                 "branches": 4,
                 "max_rounds": 2,
@@ -47,6 +48,7 @@ class BudgetPolicyTests(unittest.TestCase):
             },
             "balanced": {
                 "name": "balanced",
+                "soft_target_seconds": 3600,
                 "max_seconds": 3 * 60 * 60,
                 "branches": 8,
                 "max_rounds": 4,
@@ -59,6 +61,7 @@ class BudgetPolicyTests(unittest.TestCase):
             },
             "thorough": {
                 "name": "thorough",
+                "soft_target_seconds": 14400,
                 "max_seconds": 10 * 60 * 60,
                 "branches": 16,
                 "max_rounds": 8,

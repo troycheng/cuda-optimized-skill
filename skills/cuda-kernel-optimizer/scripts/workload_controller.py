@@ -67,6 +67,7 @@ _DIAGNOSIS_MODULE = None
 _REVIEWER_MODULE = None
 _WORKLOAD_MODULE = None
 _EVALUATE_MODULE = None
+_BUDGET_MODULE = None
 _READINESS_CONTRACT_MODULE = None
 _READINESS_GATE_MODULE = None
 _READINESS_IDENTITY_MODULE = None
@@ -78,15 +79,23 @@ _EVIDENCE_SELECTOR_MODULE = None
 _ACTIVE_DIAGNOSIS_CONTRACT_SCHEMA = "cuda-optimizer/active-diagnosis-contract-v1"
 _GLOBAL_SCAN_DRAFT_SCHEMA = "cuda-optimizer/global-scan-draft-v1"
 _BUDGET_RUNTIME = {
-    "quick": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
+    "quick": {
+        "soft_target_seconds": 900,
+        "hard_ceiling_seconds": 2700,
+        "blocks": 3,
+        "retries": 0,
+        "bootstrap": 200,
+    },
     "balanced": {
-        "deadline_seconds": 3600,
+        "soft_target_seconds": 3600,
+        "hard_ceiling_seconds": 10800,
         "blocks": 5,
         "retries": 1,
         "bootstrap": 1000,
     },
     "thorough": {
-        "deadline_seconds": 14400,
+        "soft_target_seconds": 14400,
+        "hard_ceiling_seconds": 36000,
         "blocks": 9,
         "retries": 2,
         "bootstrap": 5000,
@@ -549,6 +558,16 @@ def validate_change_set(value: Mapping[str, Any], control: Mapping[str, Any]) ->
     if "_cuda_optimizer_identity_digest" in candidate:
         raise ValidationError("change_set.candidate uses a reserved identity field")
     _json_copy(candidate, "change_set.candidate", reject_sensitive=True)
+    runtime = _BUDGET_RUNTIME[control["budget"]]
+    gate_contract = {
+        "soft_target_seconds": runtime["soft_target_seconds"],
+        "hard_ceiling_seconds": runtime["hard_ceiling_seconds"],
+        "minimum_effect": {"mechanism_us": 1.0, "service_pct": 0.5},
+    }
+    try:
+        _load_budget_module().validate_candidate_declaration(candidate, gate_contract)
+    except ValueError as error:
+        raise ValidationError(f"candidate declaration is invalid: {error}") from error
 
     paths = _string_list(change["paths"], "change_set.paths")
     relative_paths = [
@@ -674,6 +693,15 @@ def _load_evaluate_module():
             if inserted:
                 sys.path.remove(script_dir)
     return _EVALUATE_MODULE
+
+
+def _load_budget_module():
+    global _BUDGET_MODULE
+    if _BUDGET_MODULE is None:
+        _BUDGET_MODULE = _load_sibling_module(
+            "budget.py", "cuda_optimizer_budget_controller"
+        )
+    return _BUDGET_MODULE
 
 
 def _load_readiness_contract_module():
@@ -2349,7 +2377,8 @@ def _start_run_unlocked(
             "workload_source_hash": workload.source_hash,
             "started_at_epoch": now,
             "updated_at_epoch": now,
-            "deadline_epoch": now + runtime["deadline_seconds"],
+            "soft_target_epoch": now + runtime["soft_target_seconds"],
+            "deadline_epoch": now + runtime["hard_ceiling_seconds"],
         }
         _atomic_json(run_root / "control_manifest.json", normalized)
         if readiness_contract is not None:
@@ -3430,6 +3459,7 @@ def _finish_rejected(
     scope: str,
     reason: str,
     primary_status: str | None,
+    time_gate: Mapping[str, Any] | None = None,
 ) -> dict:
     try:
         _restore_snapshot(
@@ -3469,6 +3499,16 @@ def _finish_rejected(
         "primary_status": primary_status,
         "rolled_back": True,
     }
+    if time_gate is not None:
+        decision.update(
+            {
+                "elapsed_seconds": time_gate["elapsed_seconds"],
+                "stop_reason": time_gate["stop_reason"],
+                "skipped_expensive_stages": time_gate[
+                    "skipped_expensive_stages"
+                ],
+            }
+        )
     _atomic_json(run_root / "decision.json", decision)
     updated = copy.deepcopy(state)
     for stage in ("review", "evaluation", "decision"):
@@ -3634,8 +3674,93 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
         _candidate_diff(control, run_root, changed, change["scope"]), encoding="utf-8"
     )
 
-    correctness = _run_correctness_commands(control, change, run_root)
-    if correctness["status"] != "passed":
+    runtime = _BUDGET_RUNTIME[control["budget"]]
+    evaluations: dict[str, dict] = {}
+
+    def evaluate_pairs(stage: str, blocks: int) -> dict:
+        timeout = (
+            None
+            if workload.kind == "python"
+            else min(120, max(0.001, state["deadline_epoch"] - time.time()))
+        )
+        evaluation = _load_evaluate_module().evaluate_pairs(
+            workload,
+            control["baseline_candidate"],
+            bound_candidate,
+            blocks=blocks,
+            retries=runtime["retries"],
+            seed=0,
+            timeout=timeout,
+            deadline_epoch=state["deadline_epoch"],
+            bootstrap_samples=runtime["bootstrap"],
+        )
+        evaluations[stage] = evaluation
+        _atomic_json(run_root / f"{stage}_evaluation.json", evaluation)
+        primary = evaluation.get("primary", {})
+        constraints_passed = all(
+            item.get("status") == "passed"
+            for item in evaluation.get("constraints", [])
+        )
+        passed = evaluation.get("status") == "evaluated"
+        if stage == "formal_paired":
+            passed = (
+                passed
+                and primary.get("status") == "confirmed_win"
+                and constraints_passed
+            )
+        return {
+            "status": "passed" if passed else "failed",
+            "estimate": primary.get("estimate_pct"),
+            "lower_bound": primary.get("ci_low_pct"),
+            "upper_bound": primary.get("ci_high_pct"),
+        }
+
+    remaining = max(0.001, state["deadline_epoch"] - time.time())
+    soft_remaining = max(
+        0.001,
+        min(remaining, state.get("soft_target_epoch", time.time()) - time.time()),
+    )
+    gate_contract = {
+        "soft_target_seconds": soft_remaining,
+        "hard_ceiling_seconds": remaining,
+        "minimum_effect": {
+            "mechanism_us": 1.0,
+            "service_pct": max(0.5, float(workload.objective["min_effect_pct"])),
+        },
+    }
+    gate = _load_budget_module().CandidateGate(
+        gate_contract,
+        bound_candidate,
+    )
+    gate_result = gate.run(
+        {
+            "static_review": lambda: {"status": "passed"},
+            "build_correctness": lambda: _run_correctness_commands(
+                control, change, run_root
+            ),
+            "short_paired": lambda: evaluate_pairs(
+                "short_paired", min(2, runtime["blocks"])
+            ),
+            "formal_paired": lambda: evaluate_pairs(
+                "formal_paired", runtime["blocks"]
+            ),
+        }
+    )
+    evaluation = evaluations.get(
+        "formal_paired",
+        evaluations.get(
+            "short_paired",
+            {"schema_version": "cuda-workload-optimizer/evaluation-v1", "status": gate_result["stop_reason"]},
+        ),
+    )
+    _atomic_json(run_root / "evaluation.json", evaluation)
+    _atomic_json(run_root / "time_gate.json", gate_result)
+    if gate_result["decision"] != "PROMOTE":
+        rejection_reason = gate_result["stop_reason"]
+        if rejection_reason == "hard_ceiling_admission_failed":
+            rejection_reason = "budget_expired"
+        if evaluations and evaluation.get("status") != "evaluated":
+            rejection_reason = "workload_failed"
         _atomic_json(
             run_root / "review.json",
             {
@@ -3643,14 +3768,7 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
                 "status": "skipped",
                 "request_digest": None,
                 "response": None,
-                "execution": {"reason": "correctness_failed"},
-            },
-        )
-        _atomic_json(
-            run_root / "evaluation.json",
-            {
-                "schema_version": "cuda-workload-optimizer/evaluation-v1",
-                "status": "correctness_failed",
+                "execution": {"reason": gate_result["stop_reason"]},
             },
         )
         return _finish_rejected(
@@ -3658,50 +3776,17 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
             state,
             control,
             scope=change["scope"],
-            reason="correctness_failed",
-            primary_status=None,
+            reason=rejection_reason,
+            primary_status=evaluation.get("primary", {}).get("status"),
+            time_gate=gate_result,
         )
 
     review_change(
         control,
         run_root,
         change,
-        deadline_epoch=state["deadline_epoch"],
+        deadline_epoch=min(state["deadline_epoch"], time.time() + 180),
     )
-    if time.time() > state["deadline_epoch"]:
-        _atomic_json(
-            run_root / "evaluation.json",
-            {
-                "schema_version": "cuda-workload-optimizer/evaluation-v1",
-                "status": "budget_expired",
-            },
-        )
-        return _finish_rejected(
-            run_root,
-            state,
-            control,
-            scope=change["scope"],
-            reason="budget_expired",
-            primary_status=None,
-        )
-    runtime = _BUDGET_RUNTIME[control["budget"]]
-    timeout = (
-        None
-        if workload.kind == "python"
-        else min(120, max(0.001, state["deadline_epoch"] - time.time()))
-    )
-    evaluation = _load_evaluate_module().evaluate_pairs(
-        workload,
-        control["baseline_candidate"],
-        bound_candidate,
-        blocks=runtime["blocks"],
-        retries=runtime["retries"],
-        seed=0,
-        timeout=timeout,
-        deadline_epoch=state["deadline_epoch"],
-        bootstrap_samples=runtime["bootstrap"],
-    )
-    _atomic_json(run_root / "evaluation.json", evaluation)
     if time.time() > state["deadline_epoch"]:
         return _finish_rejected(
             run_root,
@@ -3759,6 +3844,9 @@ def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
         "candidate_binding_digest": candidate_binding["digest"],
         "after_identity_digest": after["digest"],
         "evaluation_digest": _canonical_digest(evaluation),
+        "elapsed_seconds": gate_result["elapsed_seconds"],
+        "stop_reason": gate_result["stop_reason"],
+        "skipped_expensive_stages": gate_result["skipped_expensive_stages"],
     }
     _atomic_json(run_root / "decision.json", decision)
     updated = copy.deepcopy(state)

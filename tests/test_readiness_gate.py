@@ -527,7 +527,7 @@ class ReadinessGateTests(unittest.TestCase):
             project_root=self.project,
             environment_root=self.environment,
             run_dir=self.root / "install-run",
-            deadline_epoch=time.time() + 5,
+            deadline_epoch=time.time() + 20,
         )
 
         self.assertEqual(result["status"], "succeeded")
@@ -551,7 +551,7 @@ class ReadinessGateTests(unittest.TestCase):
             project_root=self.project,
             environment_root=self.environment,
             run_dir=self.root / "install-drift",
-            deadline_epoch=time.time() + 5,
+            deadline_epoch=time.time() + 20,
         )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "requirements_digest_mismatch")
@@ -571,7 +571,7 @@ class ReadinessGateTests(unittest.TestCase):
             project_root=self.project,
             environment_root=self.environment,
             run_dir=self.root / "python-drift",
-            deadline_epoch=time.time() + 5,
+            deadline_epoch=time.time() + 20,
         )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "python_identity_changed")
@@ -589,10 +589,28 @@ class ReadinessGateTests(unittest.TestCase):
             project_root=self.project,
             environment_root=self.environment,
             run_dir=self.root / "symlink-python",
-            deadline_epoch=time.time() + 5,
+            deadline_epoch=time.time() + 20,
         )
 
         self.assertEqual(result["status"], "succeeded")
+
+    def test_installer_uses_the_shared_maintenance_budget(self) -> None:
+        self.python.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", "utf-8"
+        )
+        self.python.chmod(0o755)
+
+        started = time.monotonic()
+        result = self.install.install_isolated_pip(
+            self.isolated_remediation(),
+            project_root=self.project,
+            environment_root=self.environment,
+            run_dir=self.root / "maintenance-budget",
+            deadline_epoch=time.time() + 2,
+        )
+
+        self.assertEqual(result["reason"], "pip_timeout")
+        self.assertLess(time.monotonic() - started, 1.0)
 
 
 if __name__ == "__main__":

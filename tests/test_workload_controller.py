@@ -249,6 +249,26 @@ def _enable_active_diagnosis(control: dict, root: Path) -> dict:
     return control
 
 
+def _candidate_declaration(name: str, revision: str) -> dict:
+    return {
+        "name": name,
+        "revision": revision,
+        "claim_layer": "workload",
+        "cheapest_falsifier": "static_review",
+        "estimated_cost": {
+            "static_review": 1,
+            "build_correctness": 10,
+            "short_paired": 30,
+            "profiler": 60,
+            "formal_paired": 120,
+            "service": 300,
+        },
+        "minimum_effect": {"metric": "service_pct", "value": 1.0},
+        "rejection_condition": "upper_bound_below_minimum_or_gate_failed",
+        "promotion_condition": "all_required_gates_passed",
+    }
+
+
 def _change_set() -> dict:
     return {
         "schema_version": "cuda-workload-optimizer/change-v1",
@@ -256,7 +276,7 @@ def _change_set() -> dict:
         "hypothesis": "data wait dominates GPU idle time",
         "diagnosis_ids": ["cpu_data:data_wait"],
         "scope": "project",
-        "candidate": {"name": "dataloader-workers-8", "revision": "worktree"},
+        "candidate": _candidate_declaration("dataloader-workers-8", "worktree"),
         "paths": ["configs/serve.json"],
         "commands": [],
         "rollback": "restore_frozen_snapshot",
@@ -287,6 +307,15 @@ class WorkloadControllerContractTests(unittest.TestCase):
             change["paths"].append("src/later.py")
             self.assertNotIn("later", normalized["mutation"]["project_paths"])
             self.assertNotIn("src/later.py", normalized_change["paths"])
+
+    def test_change_set_requires_executable_candidate_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            control = self.controller.validate_control_manifest(_control(Path(tmp)))
+            change = _change_set()
+            change["candidate"] = {"name": "candidate", "revision": "worktree"}
+
+            with self.assertRaisesRegex(ValueError, "candidate declaration"):
+                self.controller.validate_change_set(change, control)
 
     def test_fast_budget_is_a_legacy_alias_for_quick(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1064,7 +1093,7 @@ class WorkloadRoundTests(unittest.TestCase):
 
     def _change(self, revision: str = "optimized", **overrides) -> dict:
         change = _change_set()
-        change["candidate"] = {"name": revision, "revision": revision}
+        change["candidate"] = _candidate_declaration(revision, revision)
         change["paths"] = ["configs/value.json"]
         change["commands"] = []
         change.update(overrides)
@@ -2129,6 +2158,37 @@ class WorkloadRoundTests(unittest.TestCase):
             self.assertEqual(state["status"], "completed")
             self.assertEqual(state["next_action"], "done")
             self.assertTrue((run_dir / "evaluation.json").is_file())
+
+    def test_short_screen_below_threshold_skips_formal_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+            evaluator = mock.Mock()
+            evaluator.evaluate_pairs.return_value = {
+                "status": "evaluated",
+                "primary": {
+                    "status": "inconclusive",
+                    "estimate_pct": 0.1,
+                    "ci_low_pct": -0.2,
+                    "ci_high_pct": 0.4,
+                },
+                "constraints": [],
+            }
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                decision = self.controller.evaluate_change(run_dir)
+
+            self.assertEqual(evaluator.evaluate_pairs.call_count, 1)
+            self.assertEqual(evaluator.evaluate_pairs.call_args.kwargs["blocks"], 2)
+            self.assertEqual(decision["stop_reason"], "effect_upper_bound_below_minimum")
+            self.assertIn("formal_paired", decision["skipped_expensive_stages"])
 
     def test_reject_only_positive_screen_is_rolled_back_and_never_promoted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

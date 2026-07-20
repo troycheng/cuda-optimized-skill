@@ -221,6 +221,7 @@ def _stop_group(process: subprocess.Popen) -> None:
             pass
         deadline = time.monotonic() + 0.2
         while time.monotonic() < deadline and _group_exists(process_group):
+            process.poll()
             time.sleep(0.01)
         if _group_exists(process_group):
             try:

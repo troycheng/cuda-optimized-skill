@@ -1037,6 +1037,10 @@ def _budget_from_json(text: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("--budget-json must be a JSON object")
     fields = set(BudgetPolicy.__dataclass_fields__)
+    if "soft_target_seconds" not in payload and isinstance(
+        payload.get("max_seconds"), int
+    ):
+        payload["soft_target_seconds"] = max(1, payload["max_seconds"] // 3)
     missing = sorted(fields - set(payload))
     unknown = sorted(set(payload) - fields)
     if missing:
@@ -1058,6 +1062,7 @@ def _budget_from_json(text: str) -> dict:
             max_cases=declared.max_cases,
             sanitizer_mode=declared.sanitizer_mode,
             reserve_seconds=declared.reserve_seconds,
+            soft_target_seconds=declared.soft_target_seconds,
         )
     except (TypeError, ValueError) as error:
         raise ValueError(f"--budget-json is invalid: {error}") from error

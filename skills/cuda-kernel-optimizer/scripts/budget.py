@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import math
+import os
+import signal
+import subprocess
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
 class BudgetPolicy:
     name: str
+    soft_target_seconds: int
     max_seconds: int
     branches: int
     max_rounds: int
@@ -22,9 +28,9 @@ class BudgetPolicy:
 
 
 PRESETS = {
-    "quick": BudgetPolicy("quick", 2700, 4, 2, 20, 50, 1, 3, "targeted"),
-    "balanced": BudgetPolicy("balanced", 10800, 8, 4, 20, 100, 2, 10, "targeted"),
-    "thorough": BudgetPolicy("thorough", 36000, 16, 8, 30, 200, 3, None, "full"),
+    "quick": BudgetPolicy("quick", 900, 2700, 4, 2, 20, 50, 1, 3, "targeted"),
+    "balanced": BudgetPolicy("balanced", 3600, 10800, 8, 4, 20, 100, 2, 10, "targeted"),
+    "thorough": BudgetPolicy("thorough", 14400, 36000, 16, 8, 30, 200, 3, None, "full"),
 }
 
 _REQUIRED_POSITIVE_FIELDS = (
@@ -35,7 +41,12 @@ _REQUIRED_POSITIVE_FIELDS = (
     "max_pairs",
     "outer_candidates",
 )
-_OPTIONAL_OVERRIDE_FIELDS = {"max_cases", "sanitizer_mode", "reserve_seconds"}
+_OPTIONAL_OVERRIDE_FIELDS = {
+    "max_cases",
+    "sanitizer_mode",
+    "reserve_seconds",
+    "soft_target_seconds",
+}
 _VALID_SANITIZER_MODES = {"targeted", "full"}
 
 
@@ -76,6 +87,10 @@ def _validate_policy(policy: BudgetPolicy) -> None:
         raise ValueError("reserve_seconds must be a non-negative integer")
     if policy.reserve_seconds >= policy.max_seconds:
         raise ValueError("reserve_seconds must be less than max_seconds")
+    if not _is_positive_int(policy.soft_target_seconds):
+        raise ValueError("soft_target_seconds must be a positive integer")
+    if policy.soft_target_seconds > policy.max_seconds:
+        raise ValueError("soft_target_seconds must not exceed max_seconds")
 
 
 def resolve_budget(name: str, **overrides: object) -> BudgetPolicy:
@@ -94,6 +109,10 @@ def resolve_budget(name: str, **overrides: object) -> BudgetPolicy:
             raise ValueError(f"custom budget requires {', '.join(missing)}")
         policy = BudgetPolicy(
             name="custom",
+            soft_target_seconds=overrides.get(
+                "soft_target_seconds",
+                max(1, int(overrides["max_seconds"]) // 3),
+            ),
             max_seconds=overrides["max_seconds"],
             branches=overrides["branches"],
             max_rounds=overrides["max_rounds"],
@@ -145,3 +164,326 @@ class BudgetClock:
 
     def remaining_seconds(self, *, now: float) -> float:
         return max(0.0, self.policy.max_seconds - self.elapsed(now=now))
+
+    def soft_remaining_seconds(self, *, now: float) -> float:
+        return max(0.0, self.policy.soft_target_seconds - self.elapsed(now=now))
+
+
+_CANDIDATE_STAGES = (
+    "static_review",
+    "build_correctness",
+    "short_paired",
+    "profiler",
+    "formal_paired",
+    "service",
+)
+_CLAIM_LAST_STAGE = {
+    "kernel": "formal_paired",
+    "workload": "formal_paired",
+    "serving": "service",
+}
+
+
+def maintenance_budget_seconds(hard_ceiling_seconds: float) -> float:
+    hard = _validate_time(hard_ceiling_seconds, "hard_ceiling_seconds")
+    if hard <= 0.0:
+        raise ValueError("hard_ceiling_seconds must be positive")
+    return min(180.0, hard * 0.1)
+
+
+def _positive_number(value: object, field: str) -> float:
+    parsed = _validate_time(value, field)
+    if parsed <= 0.0:
+        raise ValueError(f"{field} must be positive")
+    return parsed
+
+
+def _validate_gate_contract(value: Mapping) -> dict:
+    if not isinstance(value, Mapping):
+        raise ValueError("time gate contract must be a mapping")
+    required = {"soft_target_seconds", "hard_ceiling_seconds", "minimum_effect"}
+    if set(value) != required:
+        raise ValueError("time gate contract fields are invalid")
+    soft = _positive_number(value["soft_target_seconds"], "soft_target_seconds")
+    hard = _positive_number(value["hard_ceiling_seconds"], "hard_ceiling_seconds")
+    if soft > hard:
+        raise ValueError("soft_target_seconds must not exceed hard_ceiling_seconds")
+    thresholds = value["minimum_effect"]
+    if not isinstance(thresholds, Mapping) or set(thresholds) != {
+        "mechanism_us",
+        "service_pct",
+    }:
+        raise ValueError("minimum_effect must define mechanism_us and service_pct")
+    return {
+        "soft_target_seconds": soft,
+        "hard_ceiling_seconds": hard,
+        "minimum_effect": {
+            "mechanism_us": _positive_number(
+                thresholds["mechanism_us"], "minimum_effect.mechanism_us"
+            ),
+            "service_pct": _positive_number(
+                thresholds["service_pct"], "minimum_effect.service_pct"
+            ),
+        },
+    }
+
+
+def _validate_candidate(value: Mapping, contract: Mapping) -> dict:
+    if not isinstance(value, Mapping):
+        raise ValueError("candidate declaration must be a mapping")
+    required = {
+        "claim_layer",
+        "cheapest_falsifier",
+        "estimated_cost",
+        "minimum_effect",
+        "rejection_condition",
+        "promotion_condition",
+    }
+    if not required.issubset(value):
+        raise ValueError("candidate declaration is incomplete")
+    claim = value["claim_layer"]
+    if claim not in _CLAIM_LAST_STAGE:
+        raise ValueError("claim_layer must be kernel, workload, or serving")
+    if value["cheapest_falsifier"] not in _CANDIDATE_STAGES:
+        raise ValueError("cheapest_falsifier is invalid")
+    costs = value["estimated_cost"]
+    if not isinstance(costs, Mapping) or set(costs) != set(_CANDIDATE_STAGES):
+        raise ValueError("estimated_cost must cover every candidate stage")
+    clean_costs = {
+        stage: _positive_number(costs[stage], f"estimated_cost.{stage}")
+        for stage in _CANDIDATE_STAGES
+    }
+    effect = value["minimum_effect"]
+    if not isinstance(effect, Mapping) or set(effect) != {"metric", "value"}:
+        raise ValueError("candidate minimum_effect fields are invalid")
+    expected_metric = "mechanism_us" if claim == "kernel" else "service_pct"
+    if effect["metric"] != expected_metric:
+        raise ValueError("candidate minimum_effect metric does not match claim_layer")
+    minimum = _positive_number(effect["value"], "candidate minimum_effect.value")
+    if minimum < contract["minimum_effect"][expected_metric]:
+        raise ValueError("candidate minimum_effect is below the project contract")
+    for field in ("rejection_condition", "promotion_condition"):
+        if not isinstance(value[field], str) or not value[field].strip():
+            raise ValueError(f"{field} must be a non-empty string")
+    return {
+        **dict(value),
+        "estimated_cost": clean_costs,
+        "minimum_effect": {"metric": expected_metric, "value": minimum},
+    }
+
+
+def validate_candidate_declaration(value: Mapping, contract: Mapping) -> dict:
+    """Validate the executable evidence declaration attached to a candidate."""
+    return _validate_candidate(value, _validate_gate_contract(contract))
+
+
+class CandidateGate:
+    """Run the cheapest eligible evidence first and stop on a conclusive gate."""
+
+    def __init__(
+        self,
+        contract: Mapping,
+        candidate: Mapping,
+        *,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.contract = _validate_gate_contract(contract)
+        self.candidate = _validate_candidate(candidate, self.contract)
+        if not callable(now):
+            raise ValueError("now must be callable")
+        self.now = now
+
+    def _result(
+        self,
+        *,
+        started_at: float,
+        decision: str,
+        stop_reason: str,
+        completed: Sequence[str],
+    ) -> dict:
+        elapsed = max(0.0, float(self.now()) - started_at)
+        last_stage = _CLAIM_LAST_STAGE[self.candidate["claim_layer"]]
+        applicable = _CANDIDATE_STAGES[: _CANDIDATE_STAGES.index(last_stage) + 1]
+        skipped = [stage for stage in applicable if stage not in completed]
+        return {
+            "decision": decision,
+            "elapsed_seconds": float(elapsed),
+            "stop_reason": stop_reason,
+            "skipped_expensive_stages": skipped,
+            "completed_stages": list(completed),
+            "soft_target_exceeded": elapsed
+            > self.contract["soft_target_seconds"],
+        }
+
+    def run(self, actions: Mapping[str, Callable[[], Mapping]]) -> dict:
+        if not isinstance(actions, Mapping):
+            raise ValueError("actions must be a mapping")
+        started = float(self.now())
+        completed: list[str] = []
+        last_stage = _CLAIM_LAST_STAGE[self.candidate["claim_layer"]]
+        applicable = _CANDIDATE_STAGES[: _CANDIDATE_STAGES.index(last_stage) + 1]
+        threshold = self.candidate["minimum_effect"]["value"]
+        for stage in applicable:
+            action = actions.get(stage)
+            if action is None and stage == "profiler":
+                continue
+            if not callable(action):
+                return self._result(
+                    started_at=started,
+                    decision="STOP",
+                    stop_reason=f"missing_{stage}_action",
+                    completed=completed,
+                )
+            elapsed = max(0.0, float(self.now()) - started)
+            remaining = self.contract["hard_ceiling_seconds"] - elapsed
+            if remaining <= 0.0 or self.candidate["estimated_cost"][stage] > remaining:
+                return self._result(
+                    started_at=started,
+                    decision="STOP",
+                    stop_reason="hard_ceiling_admission_failed",
+                    completed=completed,
+                )
+            outcome = action()
+            if not isinstance(outcome, Mapping):
+                raise ValueError(f"{stage} result must be a mapping")
+            completed.append(stage)
+            status = outcome.get("status")
+            if status not in {"passed", "not_applicable"}:
+                reason = {
+                    "static_review": "static_falsified",
+                    "build_correctness": "correctness_failed",
+                    "short_paired": "short_pair_failed",
+                    "profiler": "profiler_failed",
+                    "formal_paired": "formal_pair_failed",
+                    "service": "service_failed",
+                }[stage]
+                return self._result(
+                    started_at=started,
+                    decision="STOP",
+                    stop_reason=reason,
+                    completed=completed,
+                )
+            if stage == "short_paired":
+                upper = outcome.get("upper_bound")
+                if isinstance(upper, bool) or not isinstance(upper, (int, float)):
+                    return self._result(
+                        started_at=started,
+                        decision="STOP",
+                        stop_reason="short_pair_missing_upper_bound",
+                        completed=completed,
+                    )
+                if float(upper) < threshold:
+                    return self._result(
+                        started_at=started,
+                        decision="STOP",
+                        stop_reason="effect_upper_bound_below_minimum",
+                        completed=completed,
+                    )
+            if stage in {"formal_paired", "service"}:
+                lower = outcome.get("lower_bound")
+                if isinstance(lower, bool) or not isinstance(lower, (int, float)):
+                    return self._result(
+                        started_at=started,
+                        decision="STOP",
+                        stop_reason=f"{stage}_missing_lower_bound",
+                        completed=completed,
+                    )
+                if float(lower) < threshold:
+                    return self._result(
+                        started_at=started,
+                        decision="STOP",
+                        stop_reason="effect_not_confirmed",
+                        completed=completed,
+                    )
+        return self._result(
+            started_at=started,
+            decision="PROMOTE",
+            stop_reason="promotion_condition_satisfied",
+            completed=completed,
+        )
+
+
+def _terminate_process_group(
+    process: subprocess.Popen, *, grace_seconds: float
+) -> tuple[str | None, str | None]:
+    group = process.pid
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    try:
+        os.killpg(group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not group_exists():
+            break
+        process.poll()
+        time.sleep(0.01)
+    if group_exists():
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return process.communicate()
+
+
+def run_budgeted_command(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float,
+    grace_seconds: float = 0.2,
+    input_value: str | None = None,
+    check: bool = False,
+    popen_options: Mapping | None = None,
+) -> subprocess.CompletedProcess:
+    timeout = _positive_number(timeout_seconds, "timeout_seconds")
+    grace = _positive_number(grace_seconds, "grace_seconds")
+    options = dict(popen_options or {})
+    options.setdefault("text", True)
+    options.setdefault("stdout", subprocess.PIPE)
+    options.setdefault("stderr", subprocess.PIPE)
+    options["start_new_session"] = True
+    process = subprocess.Popen(list(command), **options)
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(input=input_value, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        stdout, stderr = _terminate_process_group(process, grace_seconds=grace)
+    except BaseException:
+        _terminate_process_group(process, grace_seconds=grace)
+        raise
+    result = subprocess.CompletedProcess(
+        list(command), 124 if timed_out else process.returncode, stdout, stderr
+    )
+    result.timed_out = timed_out
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            list(command),
+            output=stdout,
+            stderr=stderr,
+        )
+    return result
+
+
+def run_maintenance_command(
+    command: Sequence[str],
+    *,
+    hard_ceiling_seconds: float,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    """Run infrastructure repair inside min(180 s, 10% of the hard ceiling)."""
+    return run_budgeted_command(
+        command,
+        timeout_seconds=maintenance_budget_seconds(hard_ceiling_seconds),
+        **kwargs,
+    )
