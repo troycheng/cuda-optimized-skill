@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import math
@@ -18,6 +19,9 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ACTIVE_DIAGNOSIS_FIXTURE = (
+    ROOT / "tests" / "fixtures" / "active_diagnosis" / "emit_global_scan.py"
+)
 SCRIPT_PATH = (
     ROOT
     / "skills"
@@ -139,6 +143,49 @@ def _enable_v2_readiness(
     return control
 
 
+def _enable_active_diagnosis(control: dict, root: Path) -> dict:
+    project = Path(control["project_root"])
+    adapter = project / "active_diagnosis_scan.py"
+    shutil.copyfile(ACTIVE_DIAGNOSIS_FIXTURE, adapter)
+    contract_path = project / "active-diagnosis.json"
+    contract_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "cuda-optimizer/active-diagnosis-contract-v1",
+                "global_scan_probe_id": "timeline",
+                "adapter_path": str(adapter),
+                "analysis_policy_sha256": "a" * 64,
+                "source": {
+                    "profiler": "nsys",
+                    "profiler_version": "2026.3",
+                    "export_schema": "sqlite-v1",
+                    "adapter_id": "fixture-adapter",
+                    "adapter_version": "1.0.0",
+                    "adapter_sha256": hashlib.sha256(
+                        adapter.read_bytes()
+                    ).hexdigest(),
+                },
+                "selection_policy": {
+                    "schema_version": "cuda-optimizer/evidence-selection-policy-v1",
+                    "max_cost": "high",
+                    "max_perturbation": "high",
+                    "max_risk": "low",
+                    "remaining_profile_actions": 2,
+                    "available_capability_ids": [
+                        "ncu.counter_access",
+                        "nsys.timeline",
+                        "pytorch.profiler",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    control["analysis_contract"] = str(contract_path)
+    control["probes"][0]["argv"] = [sys.executable, str(adapter)]
+    return control
+
+
 def _change_set() -> dict:
     return {
         "schema_version": "cuda-workload-optimizer/change-v1",
@@ -203,6 +250,26 @@ class WorkloadControllerContractTests(unittest.TestCase):
                 normalized["schema_version"],
                 "cuda-workload-optimizer/control-v2",
             )
+
+    def test_active_diagnosis_requires_explicit_contained_v2_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control = _control(root)
+            (root / "project").mkdir()
+            control["analysis_contract"] = str(
+                root / "project" / "active-diagnosis.json"
+            )
+            with self.assertRaisesRegex(ValueError, "control-v1.*analysis_contract"):
+                self.controller.validate_control_manifest(control)
+
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            normalized = self.controller.validate_control_manifest(control)
+            self.assertEqual(normalized["analysis_contract"], control["analysis_contract"])
+
+            control["analysis_contract"] = str(root / "outside.json")
+            with self.assertRaisesRegex(ValueError, "analysis_contract.*project_root"):
+                self.controller.validate_control_manifest(control)
 
     def test_cli_new_run_rejects_v1_but_validate_keeps_compatibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -933,6 +1000,90 @@ class WorkloadRoundTests(unittest.TestCase):
         change.update(overrides)
         return change
 
+    def _active_proposal(self, run_dir: Path) -> tuple[dict, dict]:
+        active = run_dir / "active_diagnosis"
+        epoch = json.loads((active / "epoch.json").read_text("utf-8"))
+        context = json.loads((run_dir / "diagnosis_context.json").read_text("utf-8"))
+        hypothesis = {
+            "schema_version": "cuda-optimizer/hypothesis-set-v1",
+            "set_id": "hypotheses-0001",
+            "epoch_id": epoch["epoch_id"],
+            "epoch_sha256": context["epoch_sha256"],
+            "execution_map_sha256": context["execution_map_sha256"],
+            "hypotheses": [
+                {
+                    "hypothesis_id": "h-framework-gap",
+                    "kind": "mechanism",
+                    "scope_node_ids": ["cpu-launch", "gpu-kernel"],
+                    "statement": "CPU launch serialization delays the GPU kernel.",
+                    "mechanism": "framework_launch_overhead",
+                    "disposition": "active",
+                    "confidence": "plausible",
+                    "support_evidence_ids": ["ev-global-scan"],
+                    "oppose_evidence_ids": [],
+                    "missing_evidence_kinds": ["framework_trace"],
+                    "falsification_question": "Does the launch gap remain after a framework trace?",
+                },
+                {
+                    "hypothesis_id": "h-kernel-bound",
+                    "kind": "mechanism",
+                    "scope_node_ids": ["gpu-kernel"],
+                    "statement": "Kernel execution dominates the critical GPU lane.",
+                    "mechanism": "kernel_execution",
+                    "disposition": "active",
+                    "confidence": "inconclusive",
+                    "support_evidence_ids": [],
+                    "oppose_evidence_ids": [],
+                    "missing_evidence_kinds": ["ncu_kernel"],
+                    "falsification_question": "Does kernel evidence show no dominant stall?",
+                },
+            ],
+            "relationships": [
+                {
+                    "relation": "exclusive",
+                    "left": "h-framework-gap",
+                    "right": "h-kernel-bound",
+                }
+            ],
+        }
+        hypothesis_result = self.controller._load_hypothesis_space_module().validate_hypothesis_set(
+            hypothesis,
+            epoch=epoch,
+            execution_map=json.loads((active / "execution_map.json").read_text("utf-8")),
+            evidence_catalog=json.loads((active / "evidence_catalog.json").read_text("utf-8")),
+        )
+        request = {
+            "schema_version": "cuda-optimizer/evidence-request-set-v1",
+            "request_set_id": "requests-0001",
+            "epoch_id": epoch["epoch_id"],
+            "epoch_sha256": context["epoch_sha256"],
+            "hypothesis_set_sha256": hypothesis_result["hypothesis_set_sha256"],
+            "requests": [
+                {
+                    "request_id": "req-framework",
+                    "action_id": "pytorch-operator-trace",
+                    "question": "Is launch serialization the cause rather than kernel execution?",
+                    "target_hypothesis_ids": ["h-framework-gap", "h-kernel-bound"],
+                    "exclusive_pairs": [
+                        {"left": "h-framework-gap", "right": "h-kernel-bound"}
+                    ],
+                    "outcomes": [
+                        {
+                            "outcome_id": "gap-present",
+                            "supports": ["h-framework-gap"],
+                            "opposes": ["h-kernel-bound"],
+                        },
+                        {
+                            "outcome_id": "kernel-dominant",
+                            "supports": ["h-kernel-bound"],
+                            "opposes": ["h-framework-gap"],
+                        },
+                    ],
+                }
+            ],
+        }
+        return hypothesis, request
+
     def test_v2_blocked_readiness_never_measures_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -986,6 +1137,114 @@ class WorkloadRoundTests(unittest.TestCase):
                 (run_dir / "readiness" / "report.complete.json").is_file()
             )
             self.assertTrue((run_dir / "baseline" / "observation.json").is_file())
+
+    def test_active_diagnosis_builds_hash_bound_context_and_waits_for_ai(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+
+            state = self.controller.start_run(control, run_dir)
+
+            self.assertEqual(state["stage"], "active_diagnosis")
+            self.assertEqual(state["next_action"], "propose_hypotheses")
+            self.assertEqual(
+                state["completed_stages"],
+                ["readiness", "baseline", "probes", "diagnosis", "diagnosis_context"],
+            )
+            context = json.loads((run_dir / "diagnosis_context.json").read_text("utf-8"))
+            self.assertEqual(
+                context["schema_version"],
+                "cuda-optimizer/diagnosis-context-v1",
+            )
+            for field in (
+                "epoch_sha256",
+                "execution_map_sha256",
+                "evidence_catalog_sha256",
+                "action_catalog_sha256",
+                "selection_policy_sha256",
+            ):
+                self.assertEqual(len(context[field]), 64)
+            self.assertTrue((run_dir / "active_diagnosis" / "ledger" / "000001-context.json").is_file())
+
+    def test_active_diagnosis_rejects_adapter_digest_mismatch_before_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            contract["source"]["adapter_sha256"] = "0" * 64
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "adapter.*digest"):
+                self.controller.start_run(control, run_dir)
+
+            self.assertFalse((run_dir / "baseline" / "observation.json").exists())
+
+    def test_active_diagnosis_resume_does_not_repeat_global_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            first = self.controller.start_run(control, run_dir)
+            scan = run_dir / "active_diagnosis" / "global_scan.json"
+            scan_mtime = scan.stat().st_mtime_ns
+            Path(control["analysis_contract"]).unlink()
+
+            second = self.controller.resume_run(run_dir)
+
+            self.assertEqual(second, first)
+            self.assertEqual(scan.stat().st_mtime_ns, scan_mtime)
+
+    def test_active_diagnosis_proposal_is_replayed_and_chained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+
+            state = self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+
+            self.assertEqual(state["next_action"], "collect_evidence")
+            selection = json.loads(
+                (run_dir / "active_diagnosis" / "evidence_selection.json").read_text("utf-8")
+            )
+            self.assertEqual(selection["status"], "selected")
+            self.assertEqual(selection["selected_request"]["request_id"], "req-framework")
+            self.assertTrue(
+                (run_dir / "active_diagnosis" / "ledger" / "000002-proposal.json").is_file()
+            )
+
+    def test_active_diagnosis_rejects_stale_epoch_and_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            request["epoch_id"] = "epoch-stale"
+            with self.assertRaisesRegex(ValueError, "epoch"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
+
+            hypothesis, request = self._active_proposal(run_dir)
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 99}\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "identity drifted"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
 
     def test_v2_project_drift_during_readiness_blocks_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

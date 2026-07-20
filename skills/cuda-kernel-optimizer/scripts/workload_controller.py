@@ -68,6 +68,12 @@ _READINESS_CONTRACT_MODULE = None
 _READINESS_GATE_MODULE = None
 _READINESS_IDENTITY_MODULE = None
 _CHECK_ENV_MODULE = None
+_ANALYSIS_EPOCH_MODULE = None
+_EXECUTION_MAP_MODULE = None
+_HYPOTHESIS_SPACE_MODULE = None
+_EVIDENCE_SELECTOR_MODULE = None
+_ACTIVE_DIAGNOSIS_CONTRACT_SCHEMA = "cuda-optimizer/active-diagnosis-contract-v1"
+_GLOBAL_SCAN_DRAFT_SCHEMA = "cuda-optimizer/global-scan-draft-v1"
 _BUDGET_RUNTIME = {
     "fast": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
     "balanced": {
@@ -242,6 +248,62 @@ def _string_list(value: Any, field: str, *, identifiers: bool = False) -> list[s
     return result
 
 
+def _sha256(value: Any, field: str) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValidationError(f"{field} must be lowercase SHA-256")
+    return value
+
+
+def _validate_active_diagnosis_contract(value: Mapping[str, Any]) -> dict:
+    contract = _object(value, "analysis_contract")
+    fields = {
+        "schema_version",
+        "global_scan_probe_id",
+        "adapter_path",
+        "analysis_policy_sha256",
+        "source",
+        "selection_policy",
+    }
+    _closed(contract, fields, "analysis_contract")
+    _required(contract, fields, "analysis_contract")
+    if contract["schema_version"] != _ACTIVE_DIAGNOSIS_CONTRACT_SCHEMA:
+        raise ValidationError(
+            f"analysis_contract.schema_version must be {_ACTIVE_DIAGNOSIS_CONTRACT_SCHEMA}"
+        )
+    _identifier(contract["global_scan_probe_id"], "analysis_contract.global_scan_probe_id")
+    _absolute(contract["adapter_path"], "analysis_contract.adapter_path")
+    _sha256(
+        contract["analysis_policy_sha256"],
+        "analysis_contract.analysis_policy_sha256",
+    )
+    source = _object(contract["source"], "analysis_contract.source")
+    source_fields = {
+        "profiler",
+        "profiler_version",
+        "export_schema",
+        "adapter_id",
+        "adapter_version",
+        "adapter_sha256",
+    }
+    _closed(source, source_fields, "analysis_contract.source")
+    _required(source, source_fields, "analysis_contract.source")
+    if source["profiler"] not in {"nsys", "pytorch", "perfetto", "custom"}:
+        raise ValidationError("analysis_contract.source.profiler is unsupported")
+    for field in ("profiler_version", "export_schema", "adapter_version"):
+        _string(source[field], f"analysis_contract.source.{field}", max_length=256)
+    _identifier(source["adapter_id"], "analysis_contract.source.adapter_id")
+    _sha256(source["adapter_sha256"], "analysis_contract.source.adapter_sha256")
+    try:
+        policy = _load_evidence_selector_module()._validate_policy(
+            contract["selection_policy"]
+        )
+    except ValueError as error:
+        raise ValidationError(f"invalid analysis selection policy: {error}") from error
+    normalized = copy.deepcopy(dict(contract))
+    normalized["selection_policy"] = policy
+    return normalized
+
+
 def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dict:
     """Validate and detach the closed v2.4 controller manifest."""
     control = _object(value, "control")
@@ -256,19 +318,27 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         "probes",
         "reviewer",
         "readiness_contract",
+        "analysis_contract",
     }
     schema_version = control.get("schema_version")
     if schema_version not in {CONTROL_SCHEMA_V1, CONTROL_SCHEMA_V2}:
         raise ValidationError(
             f"schema_version must be {CONTROL_SCHEMA_V1} or {CONTROL_SCHEMA_V2}"
         )
-    required = allowed - {"reviewer", "evaluation_gate", "readiness_contract"}
+    required = allowed - {
+        "reviewer",
+        "evaluation_gate",
+        "readiness_contract",
+        "analysis_contract",
+    }
     if schema_version == CONTROL_SCHEMA_V2:
         required.add("readiness_contract")
     _closed(control, allowed, "control")
     _required(control, required, "control")
     if schema_version == CONTROL_SCHEMA_V1 and "readiness_contract" in control:
         raise ValidationError("control-v1 must not contain readiness_contract")
+    if schema_version == CONTROL_SCHEMA_V1 and "analysis_contract" in control:
+        raise ValidationError("control-v1 must not contain analysis_contract")
 
     project_root = _absolute(control["project_root"], "project_root")
     workload_manifest = _absolute(
@@ -284,6 +354,14 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
             raise ValidationError(
                 "readiness_contract must be inside project_root"
             )
+        if "analysis_contract" in control:
+            analysis_contract = _absolute(
+                control["analysis_contract"], "analysis_contract"
+            )
+            if not _is_within(analysis_contract, project_root):
+                raise ValidationError(
+                    "analysis_contract must be inside project_root"
+                )
     baseline = _object(control["baseline_candidate"], "baseline_candidate")
     if not baseline:
         raise ValidationError("baseline_candidate must not be empty")
@@ -582,6 +660,42 @@ def _load_check_env_module():
     return _CHECK_ENV_MODULE
 
 
+def _load_analysis_epoch_module():
+    global _ANALYSIS_EPOCH_MODULE
+    if _ANALYSIS_EPOCH_MODULE is None:
+        _ANALYSIS_EPOCH_MODULE = _load_sibling_module(
+            "analysis_epoch.py", "cuda_optimizer_analysis_epoch_controller"
+        )
+    return _ANALYSIS_EPOCH_MODULE
+
+
+def _load_execution_map_module():
+    global _EXECUTION_MAP_MODULE
+    if _EXECUTION_MAP_MODULE is None:
+        _EXECUTION_MAP_MODULE = _load_sibling_module(
+            "execution_map.py", "cuda_optimizer_execution_map_controller"
+        )
+    return _EXECUTION_MAP_MODULE
+
+
+def _load_hypothesis_space_module():
+    global _HYPOTHESIS_SPACE_MODULE
+    if _HYPOTHESIS_SPACE_MODULE is None:
+        _HYPOTHESIS_SPACE_MODULE = _load_sibling_module(
+            "hypothesis_space.py", "cuda_optimizer_hypothesis_space_controller"
+        )
+    return _HYPOTHESIS_SPACE_MODULE
+
+
+def _load_evidence_selector_module():
+    global _EVIDENCE_SELECTOR_MODULE
+    if _EVIDENCE_SELECTOR_MODULE is None:
+        _EVIDENCE_SELECTOR_MODULE = _load_sibling_module(
+            "evidence_selector.py", "cuda_optimizer_evidence_selector_controller"
+        )
+    return _EVIDENCE_SELECTOR_MODULE
+
+
 def _canonical_digest(value: Any) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -762,17 +876,37 @@ def run_probe(
     probes_dir = run_root / "probes"
     probes_dir.mkdir(parents=True, exist_ok=True)
     output_path = probes_dir / f".{selected['id']}.output.json"
-    try:
-        output_path.unlink()
-    except FileNotFoundError:
-        pass
-    environment, secret_values = _probe_environment(
-        {
-            "CUDA_OPTIMIZER_OUTPUT": str(output_path),
-            "CUDA_OPTIMIZER_RUN_DIR": str(run_root),
-            "CUDA_OPTIMIZER_PROJECT_ROOT": normalized_control["project_root"],
-        }
-    )
+    active_output_path = None
+    environment_overrides = {
+        "CUDA_OPTIMIZER_OUTPUT": str(output_path),
+        "CUDA_OPTIMIZER_RUN_DIR": str(run_root),
+        "CUDA_OPTIMIZER_PROJECT_ROOT": normalized_control["project_root"],
+    }
+    if "analysis_contract" in normalized_control:
+        frozen_analysis_contract = (
+            run_root / "active_diagnosis" / "analysis_contract.json"
+        )
+        contract_path = (
+            frozen_analysis_contract
+            if frozen_analysis_contract.is_file()
+            else Path(normalized_control["analysis_contract"])
+        )
+        active_contract = _validate_active_diagnosis_contract(
+            load_json_object(contract_path)
+        )
+        if selected["id"] == active_contract["global_scan_probe_id"]:
+            active_output_path = probes_dir / ".active-diagnosis.output.json"
+            environment_overrides["CUDA_OPTIMIZER_ACTIVE_DIAGNOSIS_OUTPUT"] = str(
+                active_output_path
+            )
+    for transient in (output_path, active_output_path):
+        if transient is None:
+            continue
+        try:
+            transient.unlink()
+        except FileNotFoundError:
+            pass
+    environment, secret_values = _probe_environment(environment_overrides)
     stdout = _BoundedLog(log_limit_bytes)
     stderr = _BoundedLog(log_limit_bytes)
     started = time.monotonic()
@@ -846,6 +980,26 @@ def run_probe(
     finally:
         try:
             output_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    if active_output_path is not None and result.get("status") in {"ok", "degraded"}:
+        try:
+            active_draft = _read_probe_output(active_output_path)
+            _atomic_json(
+                run_root / "active_diagnosis" / "global_scan.json",
+                active_draft,
+            )
+        except (ValidationError, ValueError) as error:
+            result = _failure_probe(
+                selected,
+                "failed",
+                "environment:active-diagnosis-output",
+                f"invalid active diagnosis output: {error}",
+            )
+    if active_output_path is not None:
+        try:
+            active_output_path.unlink()
         except FileNotFoundError:
             pass
 
@@ -1324,6 +1478,305 @@ def _verify_readiness_report(
     return ready_ids == required_ids
 
 
+def _load_frozen_analysis_contract(run_root: Path, state: Mapping[str, Any]) -> dict:
+    contract = _validate_active_diagnosis_contract(
+        load_json_object(run_root / "active_diagnosis" / "analysis_contract.json")
+    )
+    if _canonical_digest(contract) != state.get("analysis_contract_digest"):
+        raise ValidationError("frozen analysis contract digest does not match state")
+    return contract
+
+
+def _validate_global_scan_draft(value: Mapping[str, Any]) -> dict:
+    draft = _object(value, "global_scan")
+    fields = {
+        "schema_version",
+        "regime",
+        "boundary_ambiguous",
+        "window",
+        "coverage",
+        "nodes",
+        "edges",
+        "hot_path",
+        "uncovered_intervals",
+        "conclusion_level",
+    }
+    _closed(draft, fields, "global_scan")
+    _required(draft, fields, "global_scan")
+    if draft["schema_version"] != _GLOBAL_SCAN_DRAFT_SCHEMA:
+        raise ValidationError(
+            f"global_scan.schema_version must be {_GLOBAL_SCAN_DRAFT_SCHEMA}"
+        )
+    regime = _object(draft["regime"], "global_scan.regime")
+    regime_fields = {
+        "shape_distribution_sha256",
+        "dynamic_branch_sha256",
+        "execution_regime_sha256",
+    }
+    _closed(regime, regime_fields, "global_scan.regime")
+    _required(regime, regime_fields, "global_scan.regime")
+    for field in regime_fields:
+        _sha256(regime[field], f"global_scan.regime.{field}")
+    if type(draft["boundary_ambiguous"]) is not bool:
+        raise ValidationError("global_scan.boundary_ambiguous must be a boolean")
+    window = _object(draft["window"], "global_scan.window")
+    _closed(window, {"start_us", "end_us"}, "global_scan.window")
+    _required(window, {"start_us", "end_us"}, "global_scan.window")
+    for field in ("start_us", "end_us"):
+        value = window[field]
+        if type(value) not in {int, float} or not math.isfinite(float(value)):
+            raise ValidationError(f"global_scan.window.{field} must be finite")
+    if float(window["start_us"]) < 0 or float(window["end_us"]) <= float(
+        window["start_us"]
+    ):
+        raise ValidationError("global_scan window must be positive")
+    return _json_copy(draft, "global_scan", reject_sensitive=True)
+
+
+def _verify_active_diagnosis_ledger(run_root: Path) -> list[dict]:
+    ledger_dir = run_root / "active_diagnosis" / "ledger"
+    if not ledger_dir.exists():
+        return []
+    events = []
+    previous = None
+    for expected_sequence, path in enumerate(sorted(ledger_dir.glob("*.json")), 1):
+        event = load_json_object(path)
+        fields = {
+            "schema_version",
+            "sequence",
+            "event_type",
+            "previous_event_sha256",
+            "payload_sha256",
+            "created_at_epoch",
+        }
+        _closed(event, fields, f"active diagnosis ledger event {path.name}")
+        _required(event, fields, f"active diagnosis ledger event {path.name}")
+        if event["schema_version"] != "cuda-optimizer/active-diagnosis-event-v1":
+            raise ValidationError("active diagnosis ledger schema is invalid")
+        if event["sequence"] != expected_sequence:
+            raise ValidationError("active diagnosis ledger sequence is not contiguous")
+        _identifier(event["event_type"], "active diagnosis event_type")
+        if event["previous_event_sha256"] != previous:
+            raise ValidationError("active diagnosis ledger hash chain is invalid")
+        _sha256(event["payload_sha256"], "active diagnosis payload_sha256")
+        created = event["created_at_epoch"]
+        if type(created) not in {int, float} or not math.isfinite(float(created)):
+            raise ValidationError("active diagnosis event time must be finite")
+        previous = _canonical_digest(event)
+        events.append(event)
+    return events
+
+
+def _append_active_diagnosis_event(
+    run_root: Path, event_type: str, payload: Mapping[str, Any]
+) -> dict:
+    event_type = _identifier(event_type, "active diagnosis event_type")
+    payload_sha = _canonical_digest(_json_copy(payload, "active diagnosis payload"))
+    events = _verify_active_diagnosis_ledger(run_root)
+    if events and events[-1]["event_type"] == event_type and events[-1][
+        "payload_sha256"
+    ] == payload_sha:
+        return events[-1]
+    sequence = len(events) + 1
+    event = {
+        "schema_version": "cuda-optimizer/active-diagnosis-event-v1",
+        "sequence": sequence,
+        "event_type": event_type,
+        "previous_event_sha256": (
+            None if not events else _canonical_digest(events[-1])
+        ),
+        "payload_sha256": payload_sha,
+        "created_at_epoch": time.time(),
+    }
+    path = (
+        run_root
+        / "active_diagnosis"
+        / "ledger"
+        / f"{sequence:06d}-{event_type}.json"
+    )
+    if path.exists():
+        raise ValidationError("active diagnosis ledger event already exists")
+    _atomic_json(path, event)
+    return event
+
+
+def _build_active_diagnosis_context(
+    control: Mapping[str, Any], run_root: Path, state: Mapping[str, Any]
+) -> dict:
+    contract = _load_frozen_analysis_contract(run_root, state)
+    active_root = run_root / "active_diagnosis"
+    scan_path = active_root / "global_scan.json"
+    draft = _validate_global_scan_draft(load_json_object(scan_path))
+    identities = {
+        "workload_contract_sha256": _sha256_path(Path(control["workload_manifest"])),
+        "environment_sha256": _sha256(
+            state.get("baseline_environment_identity_digest"),
+            "baseline environment identity",
+        ),
+        "source_sha256": _sha256(
+            state.get("baseline_identity_digest"), "baseline source identity"
+        ),
+        "analysis_policy_sha256": contract["analysis_policy_sha256"],
+    }
+    epoch_seed = {
+        "identities": identities,
+        "source": contract["source"],
+        "regime": draft["regime"],
+        "boundary_ambiguous": draft["boundary_ambiguous"],
+    }
+    epoch_id = f"epoch-{_canonical_digest(epoch_seed)[:16]}"
+    epoch = {
+        "schema_version": "cuda-optimizer/analysis-epoch-v1",
+        "epoch_id": epoch_id,
+        "sequence": 1,
+        "trigger": "initial",
+        "parent_epoch_id": None,
+        "started_at": state["started_at_epoch"],
+        "identities": identities,
+        "source": copy.deepcopy(contract["source"]),
+        "regime": copy.deepcopy(draft["regime"]),
+        "boundary_ambiguous": draft["boundary_ambiguous"],
+    }
+    epoch_module = _load_analysis_epoch_module()
+    try:
+        epoch = epoch_module.validate_epoch(epoch, expected_identities=identities)
+    except ValueError as error:
+        raise ValidationError(f"invalid Controller analysis epoch: {error}") from error
+    epoch_sha = epoch_module.epoch_digest(epoch)
+    evidence_catalog = {
+        "ev-global-scan": {
+            "epoch_id": epoch_id,
+            "kind": "nsys_timeline" if contract["source"]["profiler"] == "nsys" else "global_scan",
+            "artifact_sha256": _sha256_path(scan_path),
+        }
+    }
+    execution_map = {
+        "schema_version": "cuda-optimizer/execution-map-v1",
+        "map_id": f"map-{epoch_id.removeprefix('epoch-')}",
+        "epoch_id": epoch_id,
+        "epoch_sha256": epoch_sha,
+        "identities": copy.deepcopy(identities),
+        "window": {
+            **copy.deepcopy(draft["window"]),
+            "boundary_ambiguous": draft["boundary_ambiguous"],
+        },
+        "coverage": copy.deepcopy(draft["coverage"]),
+        "nodes": copy.deepcopy(draft["nodes"]),
+        "edges": copy.deepcopy(draft["edges"]),
+        "hot_path": copy.deepcopy(draft["hot_path"]),
+        "uncovered_intervals": copy.deepcopy(draft["uncovered_intervals"]),
+        "conclusion_level": draft["conclusion_level"],
+    }
+    map_module = _load_execution_map_module()
+    try:
+        map_result = map_module.validate_execution_map(
+            execution_map, epoch=epoch, evidence_catalog=evidence_catalog
+        )
+    except ValueError as error:
+        raise ValidationError(f"invalid global scan execution map: {error}") from error
+    execution_map = map_result["execution_map"]
+    action_catalog = load_json_object(
+        Path(__file__).resolve().parents[1]
+        / "references"
+        / "evidence_action_catalog.json"
+    )
+    selection_policy = copy.deepcopy(contract["selection_policy"])
+    # Replay both Controller-owned inputs now, before an AI proposal exists.
+    selector = _load_evidence_selector_module()
+    try:
+        action_catalog = selector._validate_catalog(action_catalog)[0]
+        selection_policy = selector._validate_policy(selection_policy)
+    except ValueError as error:
+        raise ValidationError(f"invalid active diagnosis selection inputs: {error}") from error
+    _atomic_json(active_root / "epoch.json", epoch)
+    _atomic_json(active_root / "evidence_catalog.json", evidence_catalog)
+    _atomic_json(active_root / "execution_map.json", execution_map)
+    _atomic_json(active_root / "action_catalog.json", action_catalog)
+    _atomic_json(active_root / "selection_policy.json", selection_policy)
+    diagnosis = load_json_object(run_root / "diagnosis.json")
+    context = {
+        "schema_version": "cuda-optimizer/diagnosis-context-v1",
+        "epoch_id": epoch_id,
+        "epoch_sha256": epoch_sha,
+        "execution_map_sha256": map_module.execution_map_digest(
+            execution_map, epoch=epoch, evidence_catalog=evidence_catalog
+        ),
+        "evidence_catalog_sha256": _canonical_digest(evidence_catalog),
+        "action_catalog_sha256": _canonical_digest(action_catalog),
+        "selection_policy_sha256": _canonical_digest(selection_policy),
+        "diagnosis_sha256": _canonical_digest(diagnosis),
+        "requires_unmodeled_hypothesis": map_result[
+            "requires_unmodeled_hypothesis"
+        ],
+    }
+    _atomic_json(run_root / "diagnosis_context.json", context)
+    _append_active_diagnosis_event(run_root, "context", context)
+    return context
+
+
+def _load_active_diagnosis_context(
+    control: Mapping[str, Any], run_root: Path, state: Mapping[str, Any]
+) -> tuple[dict, dict, dict, dict, dict, dict]:
+    if _identity(control, "project")["digest"] != state.get(
+        "baseline_identity_digest"
+    ):
+        raise ValidationError("project identity drifted after diagnosis context")
+    workload = _normalize_frozen_workload(control)
+    if workload.source_hash != state.get("workload_source_hash"):
+        raise ValidationError("workload identity drifted after diagnosis context")
+    if _identity(control, "isolated_environment")["digest"] != state.get(
+        "baseline_environment_identity_digest"
+    ):
+        raise ValidationError("environment identity drifted after diagnosis context")
+    _load_frozen_analysis_contract(run_root, state)
+    _verify_active_diagnosis_ledger(run_root)
+    active_root = run_root / "active_diagnosis"
+    epoch = load_json_object(active_root / "epoch.json")
+    evidence_catalog = load_json_object(active_root / "evidence_catalog.json")
+    execution_map = load_json_object(active_root / "execution_map.json")
+    action_catalog = load_json_object(active_root / "action_catalog.json")
+    selection_policy = load_json_object(active_root / "selection_policy.json")
+    context = load_json_object(run_root / "diagnosis_context.json")
+    epoch_module = _load_analysis_epoch_module()
+    expected_identities = {
+        "workload_contract_sha256": _sha256_path(Path(control["workload_manifest"])),
+        "environment_sha256": state["baseline_environment_identity_digest"],
+        "source_sha256": state["baseline_identity_digest"],
+        "analysis_policy_sha256": _load_frozen_analysis_contract(run_root, state)[
+            "analysis_policy_sha256"
+        ],
+    }
+    try:
+        epoch = epoch_module.validate_epoch(
+            epoch, expected_identities=expected_identities
+        )
+        execution_map = _load_execution_map_module().validate_execution_map(
+            execution_map, epoch=epoch, evidence_catalog=evidence_catalog
+        )["execution_map"]
+    except ValueError as error:
+        raise ValidationError(f"active diagnosis context validation failed: {error}") from error
+    expected = {
+        "epoch_sha256": epoch_module.epoch_digest(epoch),
+        "execution_map_sha256": _load_execution_map_module().execution_map_digest(
+            execution_map, epoch=epoch, evidence_catalog=evidence_catalog
+        ),
+        "evidence_catalog_sha256": _canonical_digest(evidence_catalog),
+        "action_catalog_sha256": _canonical_digest(action_catalog),
+        "selection_policy_sha256": _canonical_digest(selection_policy),
+    }
+    for field, digest in expected.items():
+        if context.get(field) != digest:
+            raise ValidationError(f"diagnosis context {field} drifted")
+    return (
+        context,
+        epoch,
+        execution_map,
+        evidence_catalog,
+        action_catalog,
+        selection_policy,
+    )
+
+
 def start_run(
     control: Mapping[str, Any], run_dir: os.PathLike[str] | str
 ) -> dict:
@@ -1342,6 +1795,9 @@ def start_run(
         _load_frozen_control(run_root, state)
         if state["next_action"] in {
             "readiness_action",
+            "propose_hypotheses",
+            "collect_evidence",
+            "evidence_gap",
             "register_change",
             "edit_then_evaluate",
             "done",
@@ -1352,6 +1808,8 @@ def start_run(
         run_root.mkdir(parents=True, exist_ok=True)
         readiness_contract = None
         readiness_contract_digest = None
+        analysis_contract = None
+        analysis_contract_digest = None
         if normalized["schema_version"] == CONTROL_SCHEMA_V2:
             readiness_module = _load_readiness_contract_module()
             readiness_contract = readiness_module.validate_contract(
@@ -1364,6 +1822,46 @@ def start_run(
             readiness_contract_digest = readiness_module.contract_digest(
                 readiness_contract
             )
+        if "analysis_contract" in normalized:
+            analysis_contract = _validate_active_diagnosis_contract(
+                load_json_object(normalized["analysis_contract"])
+            )
+            matching_global_probes = [
+                item
+                for item in normalized["probes"]
+                if item["id"] == analysis_contract["global_scan_probe_id"]
+            ]
+            if len(matching_global_probes) != 1:
+                raise ValidationError(
+                    "analysis_contract global_scan_probe_id must name a control probe"
+                )
+            adapter_path = _absolute(
+                analysis_contract["adapter_path"],
+                "analysis_contract.adapter_path",
+            )
+            if not _is_within(adapter_path, project_root):
+                raise ValidationError(
+                    "analysis_contract adapter_path must be inside project_root"
+                )
+            if (
+                not adapter_path.is_file()
+                or adapter_path.is_symlink()
+                or adapter_path.stat().st_uid != os.getuid()
+            ):
+                raise ValidationError(
+                    "analysis_contract adapter must be a user-owned regular file"
+                )
+            if str(adapter_path) not in matching_global_probes[0]["argv"]:
+                raise ValidationError(
+                    "analysis_contract adapter_path must be executed by the global scan probe"
+                )
+            if _sha256_path(adapter_path) != analysis_contract["source"][
+                "adapter_sha256"
+            ]:
+                raise ValidationError(
+                    "analysis_contract adapter digest does not match adapter_path"
+                )
+            analysis_contract_digest = _canonical_digest(analysis_contract)
         baseline_identity = _identity(normalized, "project")
         environment_root = Path(normalized["mutation"]["environment_root"])
         environment_identity = None
@@ -1418,6 +1916,12 @@ def start_run(
             )
             state["readiness_contract_digest"] = readiness_contract_digest
             state["readiness_report_digest"] = None
+        if analysis_contract is not None:
+            _atomic_json(
+                run_root / "active_diagnosis" / "analysis_contract.json",
+                analysis_contract,
+            )
+            state["analysis_contract_digest"] = analysis_contract_digest
         _atomic_json(run_root / "baseline_identity.json", baseline_identity)
         state["baseline_identity_digest"] = baseline_identity["digest"]
         state["baseline_environment_identity_digest"] = (
@@ -1554,14 +2058,120 @@ def start_run(
     _check_deadline(state)
     if "diagnosis" not in state["completed_stages"]:
         diagnose_run(run_root)
+        if "analysis_contract" in normalized:
+            state = _advance(
+                run_root,
+                state,
+                "diagnosis",
+                stage="active_diagnosis",
+                next_action="diagnosis_context",
+            )
+        else:
+            state = _advance(
+                run_root,
+                state,
+                "diagnosis",
+                stage="change",
+                next_action="register_change",
+            )
+    if (
+        "analysis_contract" in normalized
+        and "diagnosis_context" not in state["completed_stages"]
+    ):
+        context = _build_active_diagnosis_context(normalized, run_root, state)
         state = _advance(
             run_root,
             state,
-            "diagnosis",
-            stage="change",
-            next_action="register_change",
+            "diagnosis_context",
+            stage="active_diagnosis",
+            next_action="propose_hypotheses",
         )
+        updated = copy.deepcopy(state)
+        updated["diagnosis_context_sha256"] = _canonical_digest(context)
+        state = _write_state(run_root, updated)
     return state
+
+
+def register_active_diagnosis_proposal(
+    control: Mapping[str, Any],
+    run_dir: os.PathLike[str] | str,
+    hypothesis_set: Mapping[str, Any],
+    request_set: Mapping[str, Any],
+) -> dict:
+    """Replay an AI proposal against Controller-owned context and policy."""
+    normalized = validate_control_manifest(control)
+    if "analysis_contract" not in normalized:
+        raise ValidationError("control does not enable active diagnosis")
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    state = read_run_state(run_root)
+    if state["control_digest"] != _canonical_digest(normalized):
+        raise ValidationError("control manifest drifted before diagnosis proposal")
+    _load_frozen_control(run_root, state)
+    if state["next_action"] != "propose_hypotheses":
+        raise ValidationError("run is not ready for an active diagnosis proposal")
+    _check_deadline(state)
+    (
+        context,
+        epoch,
+        execution_map,
+        evidence_catalog,
+        action_catalog,
+        selection_policy,
+    ) = _load_active_diagnosis_context(normalized, run_root, state)
+    try:
+        hypothesis_result = _load_hypothesis_space_module().validate_hypothesis_set(
+            hypothesis_set,
+            epoch=epoch,
+            execution_map=execution_map,
+            evidence_catalog=evidence_catalog,
+        )
+        selection = _load_evidence_selector_module().select_evidence_request(
+            request_set,
+            epoch=epoch,
+            hypothesis_result=hypothesis_result,
+            evidence_catalog=evidence_catalog,
+            action_catalog=action_catalog,
+            policy=selection_policy,
+            request_history=[],
+        )
+    except ValueError as error:
+        raise ValidationError(f"active diagnosis proposal rejected: {error}") from error
+    active_root = run_root / "active_diagnosis"
+    _atomic_json(active_root / "hypothesis_result.json", hypothesis_result)
+    _atomic_json(
+        active_root / "request_set.json",
+        _json_copy(request_set, "request_set", reject_sensitive=True),
+    )
+    _atomic_json(active_root / "evidence_selection.json", selection)
+    proposal_binding = {
+        "context_sha256": _canonical_digest(context),
+        "hypothesis_set_sha256": hypothesis_result["hypothesis_set_sha256"],
+        "request_set_sha256": _canonical_digest(request_set),
+        "selection_sha256": _canonical_digest(selection),
+    }
+    _append_active_diagnosis_event(run_root, "proposal", proposal_binding)
+    next_action = {
+        "selected": "collect_evidence",
+        "sufficient": "register_change",
+        "evidence_gap": "evidence_gap",
+    }[selection["status"]]
+    updated = copy.deepcopy(state)
+    updated.update(
+        {
+            "stage": "active_diagnosis",
+            "next_action": next_action,
+            "updated_at_epoch": time.time(),
+            "hypothesis_set_sha256": hypothesis_result["hypothesis_set_sha256"],
+            "evidence_selection_sha256": _canonical_digest(selection),
+        }
+    )
+    if selection["selected_request"] is not None:
+        updated["selected_request_signature"] = selection["selected_request"][
+            "request_signature"
+        ]
+    if "diagnosis_proposal" not in updated["completed_stages"]:
+        updated["completed_stages"].append("diagnosis_proposal")
+    return _write_state(run_root, updated)
 
 
 def register_change(
@@ -2089,6 +2699,9 @@ def resume_run(run_dir: os.PathLike[str] | str) -> dict:
     state = read_run_state(run_root)
     _load_frozen_control(run_root, state)
     if state["next_action"] in {
+        "propose_hypotheses",
+        "collect_evidence",
+        "evidence_gap",
         "register_change",
         "edit_then_evaluate",
         "done",
@@ -2128,6 +2741,14 @@ def _build_parser() -> argparse.ArgumentParser:
     register.add_argument("--control", required=True)
     register.add_argument("--run-dir", required=True)
     register.add_argument("--change-set", required=True)
+    diagnosis_proposal = subparsers.add_parser(
+        "register-diagnosis",
+        help="validate and freeze an active diagnosis proposal",
+    )
+    diagnosis_proposal.add_argument("--control", required=True)
+    diagnosis_proposal.add_argument("--run-dir", required=True)
+    diagnosis_proposal.add_argument("--hypothesis-set", required=True)
+    diagnosis_proposal.add_argument("--request-set", required=True)
     evaluate = subparsers.add_parser(
         "evaluate", help="verify, evaluate, promote, or roll back a candidate"
     )
@@ -2199,6 +2820,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         load_json_object(args.control),
                         args.run_dir,
                         load_json_object(args.change_set),
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "register-diagnosis":
+            print(
+                json.dumps(
+                    register_active_diagnosis_proposal(
+                        load_json_object(args.control),
+                        args.run_dir,
+                        load_json_object(args.hypothesis_set),
+                        load_json_object(args.request_set),
                     ),
                     sort_keys=True,
                 )
