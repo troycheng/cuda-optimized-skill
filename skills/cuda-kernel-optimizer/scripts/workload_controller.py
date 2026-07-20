@@ -262,6 +262,7 @@ def _validate_active_diagnosis_contract(value: Mapping[str, Any]) -> dict:
         "adapter_path",
         "analysis_policy_sha256",
         "source",
+        "actions",
         "selection_policy",
     }
     _closed(contract, fields, "analysis_contract")
@@ -293,6 +294,50 @@ def _validate_active_diagnosis_contract(value: Mapping[str, Any]) -> dict:
         _string(source[field], f"analysis_contract.source.{field}", max_length=256)
     _identifier(source["adapter_id"], "analysis_contract.source.adapter_id")
     _sha256(source["adapter_sha256"], "analysis_contract.source.adapter_sha256")
+    if type(contract["actions"]) is not list or not contract["actions"]:
+        raise ValidationError("analysis_contract.actions must be a non-empty array")
+    actions = []
+    action_ids = set()
+    for index, raw in enumerate(contract["actions"]):
+        action = _object(raw, f"analysis_contract.actions[{index}]")
+        action_fields = {
+            "action_id",
+            "adapter_path",
+            "adapter_sha256",
+            "argv",
+            "timeout_seconds",
+        }
+        _closed(action, action_fields, f"analysis_contract.actions[{index}]")
+        _required(action, action_fields, f"analysis_contract.actions[{index}]")
+        action_id = _identifier(
+            action["action_id"], f"analysis_contract.actions[{index}].action_id"
+        )
+        if action_id in action_ids:
+            raise ValidationError("analysis_contract action ids must be unique")
+        action_ids.add(action_id)
+        actions.append(
+            {
+                "action_id": action_id,
+                "adapter_path": str(
+                    _absolute(
+                        action["adapter_path"],
+                        f"analysis_contract.actions[{index}].adapter_path",
+                    )
+                ),
+                "adapter_sha256": _sha256(
+                    action["adapter_sha256"],
+                    f"analysis_contract.actions[{index}].adapter_sha256",
+                ),
+                "argv": _argv(
+                    action["argv"], f"analysis_contract.actions[{index}]"
+                ),
+                "timeout_seconds": _timeout(
+                    action["timeout_seconds"],
+                    f"analysis_contract.actions[{index}].timeout_seconds",
+                ),
+            }
+        )
+    actions.sort(key=lambda item: item["action_id"])
     try:
         policy = _load_evidence_selector_module()._validate_policy(
             contract["selection_policy"]
@@ -300,6 +345,10 @@ def _validate_active_diagnosis_contract(value: Mapping[str, Any]) -> dict:
     except ValueError as error:
         raise ValidationError(f"invalid analysis selection policy: {error}") from error
     normalized = copy.deepcopy(dict(contract))
+    normalized["actions"] = actions
+    # Capability admission is Controller-owned and is rebuilt from the current
+    # readiness report when the diagnosis context is created.
+    policy["available_capability_ids"] = []
     normalized["selection_policy"] = policy
     return normalized
 
@@ -1680,7 +1729,31 @@ def _build_active_diagnosis_context(
         / "references"
         / "evidence_action_catalog.json"
     )
+    enabled_action_ids = {item["action_id"] for item in contract["actions"]}
+    action_catalog["actions"] = [
+        item
+        for item in action_catalog["actions"]
+        if item.get("action_id") in enabled_action_ids
+    ]
+    if not action_catalog["actions"]:
+        raise ValidationError("analysis contract enables no catalog evidence action")
     selection_policy = copy.deepcopy(contract["selection_policy"])
+    readiness_report = _load_readiness_gate_module()._load_prior_report(
+        run_root / "readiness"
+    )
+    if readiness_report is None:
+        raise ValidationError("active diagnosis requires a completed readiness report")
+    now = time.time()
+    identity_digest = readiness_report.get("environment_identity_digest")
+    selection_policy["available_capability_ids"] = sorted(
+        item["requirement_id"]
+        for item in readiness_report.get("results", [])
+        if type(item) is dict
+        and item.get("admission_status") == "ready"
+        and item.get("identity_digest") == identity_digest
+        and type(item.get("valid_until")) in {int, float}
+        and float(item["valid_until"]) > now
+    )
     # Replay both Controller-owned inputs now, before an AI proposal exists.
     selector = _load_evidence_selector_module()
     try:
@@ -1693,6 +1766,16 @@ def _build_active_diagnosis_context(
     _atomic_json(active_root / "execution_map.json", execution_map)
     _atomic_json(active_root / "action_catalog.json", action_catalog)
     _atomic_json(active_root / "selection_policy.json", selection_policy)
+    _atomic_json(active_root / "request_history.json", [])
+    _atomic_json(
+        active_root / "completed_action_ids.json",
+        (
+            ["nsys-global-timeline"]
+            if contract["source"]["profiler"] == "nsys"
+            and "nsys-global-timeline" in enabled_action_ids
+            else []
+        ),
+    )
     diagnosis = load_json_object(run_root / "diagnosis.json")
     context = {
         "schema_version": "cuda-optimizer/diagnosis-context-v1",
@@ -1861,6 +1944,28 @@ def start_run(
                 raise ValidationError(
                     "analysis_contract adapter digest does not match adapter_path"
                 )
+            for action in analysis_contract["actions"]:
+                action_adapter = Path(action["adapter_path"])
+                if not _is_within(action_adapter, project_root):
+                    raise ValidationError(
+                        "analysis_contract action adapter_path must be inside project_root"
+                    )
+                if (
+                    not action_adapter.is_file()
+                    or action_adapter.is_symlink()
+                    or action_adapter.stat().st_uid != os.getuid()
+                ):
+                    raise ValidationError(
+                        "analysis_contract action adapter must be a user-owned regular file"
+                    )
+                if str(action_adapter) not in action["argv"]:
+                    raise ValidationError(
+                        "analysis_contract action adapter_path must appear in argv"
+                    )
+                if _sha256_path(action_adapter) != action["adapter_sha256"]:
+                    raise ValidationError(
+                        "analysis_contract action adapter digest does not match adapter_path"
+                    )
             analysis_contract_digest = _canonical_digest(analysis_contract)
         baseline_identity = _identity(normalized, "project")
         environment_root = Path(normalized["mutation"]["environment_root"])
@@ -2132,7 +2237,16 @@ def register_active_diagnosis_proposal(
             evidence_catalog=evidence_catalog,
             action_catalog=action_catalog,
             policy=selection_policy,
-            request_history=[],
+            request_history=json.loads(
+                (run_root / "active_diagnosis" / "request_history.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            completed_action_ids=json.loads(
+                (run_root / "active_diagnosis" / "completed_action_ids.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
         )
     except ValueError as error:
         raise ValidationError(f"active diagnosis proposal rejected: {error}") from error
@@ -2171,6 +2285,308 @@ def register_active_diagnosis_proposal(
         ]
     if "diagnosis_proposal" not in updated["completed_stages"]:
         updated["completed_stages"].append("diagnosis_proposal")
+    return _write_state(run_root, updated)
+
+
+def _validate_evidence_result(
+    value: Mapping[str, Any], selected: Mapping[str, Any]
+) -> dict:
+    result = _object(value, "evidence_result")
+    fields = {
+        "schema_version",
+        "request_signature",
+        "status",
+        "outcome_id",
+        "observations",
+        "artifacts",
+    }
+    _closed(result, fields, "evidence_result")
+    _required(result, fields, "evidence_result")
+    if result["schema_version"] != "cuda-optimizer/evidence-result-v1":
+        raise ValidationError("evidence_result schema_version is unsupported")
+    if result["request_signature"] != selected["request_signature"]:
+        raise ValidationError("evidence result request signature does not match selection")
+    if result["status"] not in {"observed", "inconclusive", "unavailable", "failed"}:
+        raise ValidationError("evidence_result.status is unsupported")
+    outcome_ids = {item["outcome_id"] for item in selected["outcomes"]}
+    outcome_id = result["outcome_id"]
+    if result["status"] == "observed":
+        if outcome_id not in outcome_ids:
+            raise ValidationError("observed evidence must name a selected outcome")
+    elif outcome_id is not None:
+        raise ValidationError("non-observed evidence must use a null outcome_id")
+    observations = _object(result["observations"], "evidence_result.observations")
+    artifacts = result["artifacts"]
+    if type(artifacts) is not list:
+        raise ValidationError("evidence_result.artifacts must be an array")
+    for index, item in enumerate(artifacts):
+        artifact = _object(item, f"evidence_result.artifacts[{index}]")
+        _closed(artifact, {"path"}, f"evidence_result.artifacts[{index}]")
+        _required(artifact, {"path"}, f"evidence_result.artifacts[{index}]")
+        _string(artifact["path"], f"evidence_result.artifacts[{index}].path")
+    return {
+        **copy.deepcopy(dict(result)),
+        "observations": _json_copy(
+            observations, "evidence_result.observations", reject_sensitive=True
+        ),
+        "artifacts": copy.deepcopy(artifacts),
+    }
+
+
+def _run_active_evidence_adapter(
+    control: Mapping[str, Any],
+    run_root: Path,
+    state: Mapping[str, Any],
+    action: Mapping[str, Any],
+    selected: Mapping[str, Any],
+    attempt_root: Path,
+) -> tuple[dict, dict]:
+    output_path = attempt_root / ".output.json"
+    request_path = attempt_root / "request.json"
+    _atomic_json(request_path, selected)
+    try:
+        output_path.unlink()
+    except FileNotFoundError:
+        pass
+    environment, secret_values = _probe_environment(
+        {
+            "CUDA_OPTIMIZER_EVIDENCE_OUTPUT": str(output_path),
+            "CUDA_OPTIMIZER_EVIDENCE_REQUEST": str(request_path),
+            "CUDA_OPTIMIZER_EVIDENCE_DIR": str(attempt_root),
+            "CUDA_OPTIMIZER_RUN_DIR": str(run_root),
+            "CUDA_OPTIMIZER_PROJECT_ROOT": control["project_root"],
+        }
+    )
+    stdout = _BoundedLog(_DEFAULT_LOG_LIMIT)
+    stderr = _BoundedLog(_DEFAULT_LOG_LIMIT)
+    timeout = min(
+        float(action["timeout_seconds"]),
+        max(0.001, float(state["deadline_epoch"]) - time.time()),
+    )
+    started = time.monotonic()
+    exit_code = None
+    timed_out = False
+    process = subprocess.Popen(
+        action["argv"],
+        cwd=control["project_root"],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    readers = [
+        threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        exit_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _stop_group(process)
+        exit_code = process.returncode
+    else:
+        if _process_group_exists(process.pid):
+            _stop_group(process)
+    for reader in readers:
+        reader.join(timeout=1)
+    execution = {
+        "schema_version": "cuda-optimizer/evidence-execution-v1",
+        "action_id": action["action_id"],
+        "argv_sha256": _canonical_digest(action["argv"]),
+        "adapter_sha256": action["adapter_sha256"],
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_seconds": time.monotonic() - started,
+        "stdout": _redact_log(stdout.text(), secret_values),
+        "stderr": _redact_log(stderr.text(), secret_values),
+    }
+    _atomic_json(attempt_root / "execution.json", execution)
+    if timed_out:
+        result = {
+            "schema_version": "cuda-optimizer/evidence-result-v1",
+            "request_signature": selected["request_signature"],
+            "status": "unavailable",
+            "outcome_id": None,
+            "observations": {"reason": "timeout"},
+            "artifacts": [],
+        }
+    elif exit_code != 0:
+        result = {
+            "schema_version": "cuda-optimizer/evidence-result-v1",
+            "request_signature": selected["request_signature"],
+            "status": "failed",
+            "outcome_id": None,
+            "observations": {"reason": "nonzero_exit"},
+            "artifacts": [],
+        }
+    else:
+        result = _validate_evidence_result(_read_probe_output(output_path), selected)
+    try:
+        output_path.unlink()
+    except FileNotFoundError:
+        pass
+    return result, execution
+
+
+def _refresh_active_diagnosis_context(
+    run_root: Path,
+    context: Mapping[str, Any],
+    epoch: Mapping[str, Any],
+    execution_map: Mapping[str, Any],
+    evidence_catalog: Mapping[str, Any],
+    selection_policy: Mapping[str, Any],
+) -> dict:
+    refreshed = copy.deepcopy(dict(context))
+    refreshed["evidence_catalog_sha256"] = _canonical_digest(evidence_catalog)
+    refreshed["selection_policy_sha256"] = _canonical_digest(selection_policy)
+    refreshed["execution_map_sha256"] = (
+        _load_execution_map_module().execution_map_digest(
+            execution_map, epoch=epoch, evidence_catalog=evidence_catalog
+        )
+    )
+    _atomic_json(run_root / "diagnosis_context.json", refreshed)
+    return refreshed
+
+
+def collect_active_diagnosis_evidence(
+    control: Mapping[str, Any], run_dir: os.PathLike[str] | str
+) -> dict:
+    """Execute one frozen evidence action and checkpoint the next diagnosis round."""
+    normalized = validate_control_manifest(control)
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    state = read_run_state(run_root)
+    if state["control_digest"] != _canonical_digest(normalized):
+        raise ValidationError("control manifest drifted before evidence collection")
+    if state["next_action"] != "collect_evidence":
+        raise ValidationError("run is not ready to collect active diagnosis evidence")
+    _check_deadline(state)
+    (
+        context,
+        epoch,
+        execution_map,
+        evidence_catalog,
+        _action_catalog,
+        selection_policy,
+    ) = _load_active_diagnosis_context(normalized, run_root, state)
+    selection = load_json_object(
+        run_root / "active_diagnosis" / "evidence_selection.json"
+    )
+    if _canonical_digest(selection) != state.get("evidence_selection_sha256"):
+        raise ValidationError("evidence selection digest drifted before collection")
+    selected = selection.get("selected_request")
+    if type(selected) is not dict or selection.get("status") != "selected":
+        raise ValidationError("evidence selection contains no executable request")
+    signature = selected["request_signature"]
+    contract = _load_frozen_analysis_contract(run_root, state)
+    action_by_id = {item["action_id"]: item for item in contract["actions"]}
+    action = action_by_id.get(selected["action_id"])
+    if action is None:
+        raise ValidationError("selected evidence action has no frozen adapter")
+    required = set(selected["controller_action"]["required_capability_ids"])
+    available = set(selection_policy["available_capability_ids"])
+    if not required.issubset(available):
+        raise ValidationError("selected evidence capability is no longer ready")
+    adapter_path = Path(action["adapter_path"])
+    if _sha256_path(adapter_path) != action["adapter_sha256"]:
+        raise ValidationError("evidence action adapter drifted before execution")
+
+    attempt_root = run_root / "active_diagnosis" / "evidence" / signature
+    intent_path = attempt_root / "intent.json"
+    complete_path = attempt_root / "complete.json"
+    if intent_path.exists() and not complete_path.exists():
+        updated = copy.deepcopy(state)
+        updated.update(
+            {
+                "status": "blocked",
+                "stage": "active_diagnosis",
+                "next_action": "manual_recovery",
+                "updated_at_epoch": time.time(),
+                "manual_recovery_reason": "evidence_action_interrupted_not_reexecuted",
+            }
+        )
+        return _write_state(run_root, updated)
+    if complete_path.exists():
+        raise ValidationError("completed evidence action cannot be executed again")
+    intent = {
+        "schema_version": "cuda-optimizer/evidence-intent-v1",
+        "request_signature": signature,
+        "selection_sha256": _canonical_digest(selection),
+        "action_sha256": _canonical_digest(action),
+        "created_at_epoch": time.time(),
+    }
+    _atomic_json(intent_path, intent)
+    result, execution = _run_active_evidence_adapter(
+        normalized, run_root, state, action, selected, attempt_root
+    )
+    _atomic_json(attempt_root / "result.json", result)
+    if result["status"] == "observed":
+        evidence_id = f"ev-{signature[:16]}"
+        evidence_catalog[evidence_id] = {
+            "epoch_id": epoch["epoch_id"],
+            "kind": selected["controller_action"]["evidence_kind"],
+            "artifact_sha256": _sha256_path(attempt_root / "result.json"),
+        }
+    _atomic_json(run_root / "active_diagnosis" / "evidence_catalog.json", evidence_catalog)
+    history_path = run_root / "active_diagnosis" / "request_history.json"
+    history = json.loads(history_path.read_text(encoding="utf-8"))
+    if type(history) is not list:
+        raise ValidationError("active diagnosis request history is invalid")
+    if signature not in history:
+        history.append(signature)
+    history.sort()
+    _atomic_json(history_path, history)
+    completed_path = run_root / "active_diagnosis" / "completed_action_ids.json"
+    completed_actions = json.loads(completed_path.read_text(encoding="utf-8"))
+    if type(completed_actions) is not list:
+        raise ValidationError("active diagnosis completed action history is invalid")
+    if selected["action_id"] not in completed_actions:
+        completed_actions.append(selected["action_id"])
+    completed_actions.sort()
+    _atomic_json(completed_path, completed_actions)
+    selection_policy = copy.deepcopy(selection_policy)
+    selection_policy["remaining_profile_actions"] = max(
+        0, int(selection_policy["remaining_profile_actions"]) - 1
+    )
+    _atomic_json(
+        run_root / "active_diagnosis" / "selection_policy.json", selection_policy
+    )
+    refreshed_context = _refresh_active_diagnosis_context(
+        run_root,
+        context,
+        epoch,
+        execution_map,
+        evidence_catalog,
+        selection_policy,
+    )
+    event_payload = {
+        "request_signature": signature,
+        "result_sha256": _canonical_digest(result),
+        "execution_sha256": _canonical_digest(execution),
+        "context_sha256": _canonical_digest(refreshed_context),
+    }
+    _append_active_diagnosis_event(run_root, "evidence", event_payload)
+    _atomic_json(
+        complete_path,
+        {
+            "schema_version": "cuda-optimizer/evidence-completion-v1",
+            **event_payload,
+            "completed_at_epoch": time.time(),
+        },
+    )
+    updated = copy.deepcopy(state)
+    updated.update(
+        {
+            "stage": "active_diagnosis",
+            "next_action": "propose_hypotheses",
+            "updated_at_epoch": time.time(),
+            "diagnosis_context_sha256": _canonical_digest(refreshed_context),
+            "last_request_signature": signature,
+            "active_diagnosis_round": int(state.get("active_diagnosis_round", 1)) + 1,
+        }
+    )
     return _write_state(run_root, updated)
 
 
@@ -2698,9 +3114,12 @@ def resume_run(run_dir: os.PathLike[str] | str) -> dict:
     run_root = Path(run_dir).expanduser().resolve(strict=False)
     state = read_run_state(run_root)
     _load_frozen_control(run_root, state)
+    if state["next_action"] == "collect_evidence":
+        return collect_active_diagnosis_evidence(
+            _load_frozen_control(run_root), run_root
+        )
     if state["next_action"] in {
         "propose_hypotheses",
-        "collect_evidence",
         "evidence_gap",
         "register_change",
         "edit_then_evaluate",
@@ -2749,6 +3168,12 @@ def _build_parser() -> argparse.ArgumentParser:
     diagnosis_proposal.add_argument("--run-dir", required=True)
     diagnosis_proposal.add_argument("--hypothesis-set", required=True)
     diagnosis_proposal.add_argument("--request-set", required=True)
+    collect_evidence = subparsers.add_parser(
+        "collect-evidence",
+        help="execute the selected frozen active-diagnosis evidence action",
+    )
+    collect_evidence.add_argument("--control", required=True)
+    collect_evidence.add_argument("--run-dir", required=True)
     evaluate = subparsers.add_parser(
         "evaluate", help="verify, evaluate, promote, or roll back a candidate"
     )
@@ -2833,6 +3258,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.run_dir,
                         load_json_object(args.hypothesis_set),
                         load_json_object(args.request_set),
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "collect-evidence":
+            print(
+                json.dumps(
+                    collect_active_diagnosis_evidence(
+                        load_json_object(args.control), args.run_dir
                     ),
                     sort_keys=True,
                 )

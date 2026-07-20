@@ -44,6 +44,7 @@ def catalog_fixture() -> dict:
                 "perturbation": "high",
                 "risk": "low",
                 "control_scope": "read_only",
+                "repeatable": True,
             },
             {
                 "action_id": "framework-targeted",
@@ -53,6 +54,7 @@ def catalog_fixture() -> dict:
                 "perturbation": "low",
                 "risk": "none",
                 "control_scope": "read_only",
+                "repeatable": False,
             },
             {
                 "action_id": "os-runtime-targeted",
@@ -62,6 +64,7 @@ def catalog_fixture() -> dict:
                 "perturbation": "medium",
                 "risk": "none",
                 "control_scope": "read_only",
+                "repeatable": True,
             },
         ],
     }
@@ -148,7 +151,9 @@ class EvidenceSelectorTests(unittest.TestCase):
         value["hypothesis_set_sha256"] = self.hypothesis_result["hypothesis_set_sha256"]
         return value
 
-    def select(self, value: dict, *, catalog=None, policy=None, history=()):
+    def select(
+        self, value: dict, *, catalog=None, policy=None, history=(), completed_actions=()
+    ):
         return self.module.select_evidence_request(
             value,
             epoch=self.epoch,
@@ -157,6 +162,7 @@ class EvidenceSelectorTests(unittest.TestCase):
             action_catalog=catalog_fixture() if catalog is None else catalog,
             policy=policy_fixture() if policy is None else policy,
             request_history=list(history),
+            completed_action_ids=list(completed_actions),
         )
 
     def test_exclusive_discrimination_wins_before_lower_level_falsification(self) -> None:
@@ -203,6 +209,17 @@ class EvidenceSelectorTests(unittest.TestCase):
         result = self.select(value, history=[signature])
         self.assertEqual(result["status"], "evidence_gap")
         self.assertEqual(result["rejections"][0]["reason"], "equivalent_request_already_attempted")
+
+    def test_non_repeatable_action_cannot_be_selected_twice(self) -> None:
+        value = self.requests()
+        value["requests"] = [value["requests"][0]]
+        result = self.select(
+            value, completed_actions=["framework-targeted"]
+        )
+        self.assertEqual(result["status"], "evidence_gap")
+        self.assertEqual(
+            result["rejections"][0]["reason"], "action_is_not_repeatable"
+        )
 
     def test_request_must_change_at_least_one_hypothesis(self) -> None:
         value = self.requests()

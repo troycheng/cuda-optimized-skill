@@ -9,7 +9,8 @@
       "cost": "low",
       "perturbation": "none",
       "risk": "none",
-      "control_scope": "read_only"
+      "control_scope": "read_only",
+      "repeatable": true
     },
     {
       "action_id": "ncu-targeted-kernel",
@@ -18,7 +19,8 @@
       "cost": "high",
       "perturbation": "high",
       "risk": "low",
-      "control_scope": "read_only"
+      "control_scope": "read_only",
+      "repeatable": true
     },
     {
       "action_id": "nsys-global-timeline",
@@ -27,7 +29,8 @@
       "cost": "medium",
       "perturbation": "medium",
       "risk": "none",
-      "control_scope": "read_only"
+      "control_scope": "read_only",
+      "repeatable": false
     },
     {
       "action_id": "nsys-os-runtime-slice",
@@ -36,7 +39,8 @@
       "cost": "medium",
       "perturbation": "medium",
       "risk": "none",
-      "control_scope": "read_only"
+      "control_scope": "read_only",
+      "repeatable": true
     },
     {
       "action_id": "pytorch-operator-trace",
@@ -45,7 +49,8 @@
       "cost": "low",
       "perturbation": "low",
       "risk": "none",
-      "control_scope": "read_only"
+      "control_scope": "read_only",
+      "repeatable": true
     }
   ]
 }

@@ -97,6 +97,7 @@ def _validate_catalog(value: Mapping[str, Any]) -> tuple[dict, dict[str, dict]]:
                 "perturbation",
                 "risk",
                 "control_scope",
+                "repeatable",
             },
             f"action_catalog.actions[{index}]",
         )
@@ -114,6 +115,8 @@ def _validate_catalog(value: Mapping[str, Any]) -> tuple[dict, dict[str, dict]]:
                 raise ValidationError(f"actions[{index}].{field} is unsupported")
         if item["control_scope"] != "read_only":
             raise ValidationError("evidence action catalog must remain read_only")
+        if type(item["repeatable"]) is not bool:
+            raise ValidationError(f"actions[{index}].repeatable must be a boolean")
         normalized = {**copy.deepcopy(dict(item)), "required_capability_ids": capabilities}
         actions.append(normalized)
         by_id[action_id] = normalized
@@ -199,6 +202,7 @@ def select_evidence_request(
     action_catalog: Mapping[str, Any],
     policy: Mapping[str, Any],
     request_history: Sequence[str],
+    completed_action_ids: Sequence[str] = (),
 ) -> dict:
     """Validate AI requests, replay Controller costs, and choose deterministically."""
     if type(epoch) is not dict:
@@ -221,6 +225,11 @@ def select_evidence_request(
         _identifier(evidence_id, "evidence_catalog id")
         _identifier(kind, "evidence_catalog kind")
     history = {_sha(item, "request_history signature") for item in request_history}
+    completed_actions = set(
+        _ids(list(completed_action_ids), "completed_action_ids", allow_empty=True)
+    )
+    if not completed_actions.issubset(actions):
+        raise ValidationError("completed_action_ids contains an unknown action")
 
     root = _closed(
         value,
@@ -375,6 +384,8 @@ def select_evidence_request(
                     reason = f"{field}_exceeds_policy"
                     break
         signature = _request_signature(epoch_id, action, request)
+        if reason is None and not action["repeatable"] and action["action_id"] in completed_actions:
+            reason = "action_is_not_repeatable"
         if reason is None and signature in history:
             reason = "equivalent_request_already_attempted"
         if reason is not None:

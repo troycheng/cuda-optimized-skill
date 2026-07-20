@@ -254,6 +254,10 @@ def validate_hypothesis_set(
                 raise ValidationError("ambiguous epoch cannot support a direction")
             if len(evidence_kinds) < 2:
                 raise ValidationError("direction requires two independent evidence kinds")
+            if missing:
+                raise ValidationError("direction cannot retain missing evidence kinds")
+            if oppose:
+                raise ValidationError("direction cannot retain opposing evidence")
         if item["kind"] == "unmodeled" and confidence != "inconclusive":
             raise ValidationError("unmodeled hypothesis must remain inconclusive")
         if disposition == "rejected":
@@ -319,6 +323,17 @@ def validate_hypothesis_set(
         relationships.append(dict(item))
     if _has_cycle(set(by_id), dependency_edges):
         raise ValidationError("depends_on relationship graph contains a cycle")
+    for item in relationships:
+        if item["relation"] != "exclusive":
+            continue
+        if all(
+            by_id[hypothesis_id]["disposition"] == "active"
+            and by_id[hypothesis_id]["confidence"] == "direction_supported"
+            for hypothesis_id in (item["left"], item["right"])
+        ):
+            raise ValidationError(
+                "exclusive hypotheses cannot both support a direction"
+            )
     relationships.sort(key=lambda item: (item["relation"], item["left"], item["right"]))
 
     normalized_set = {

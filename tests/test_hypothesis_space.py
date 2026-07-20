@@ -142,10 +142,33 @@ class HypothesisSpaceTests(unittest.TestCase):
             self.validate(value)
 
         item["support_evidence_ids"] = ["ev-cpu", "ev-gpu"]
+        item["missing_evidence_kinds"] = []
         self.assertEqual(
             self.validate(value)["hypothesis_set"]["hypotheses"][0]["confidence"],
             "direction_supported",
         )
+
+    def test_direction_requires_resolved_gaps_and_no_opposing_evidence(self) -> None:
+        value = hypothesis_fixture(self.module, self.map_module)
+        item = value["hypotheses"][0]
+        item["confidence"] = "direction_supported"
+        item["support_evidence_ids"] = ["ev-cpu", "ev-gpu"]
+        with self.assertRaisesRegex(self.module.ValidationError, "missing evidence"):
+            self.validate(value)
+
+        item["missing_evidence_kinds"] = []
+        item["oppose_evidence_ids"] = ["ev-edge"]
+        with self.assertRaisesRegex(self.module.ValidationError, "opposing evidence"):
+            self.validate(value)
+
+    def test_exclusive_hypotheses_cannot_both_support_a_direction(self) -> None:
+        value = hypothesis_fixture(self.module, self.map_module)
+        for item in value["hypotheses"]:
+            item["confidence"] = "direction_supported"
+            item["support_evidence_ids"] = ["ev-cpu", "ev-gpu"]
+            item["missing_evidence_kinds"] = []
+        with self.assertRaisesRegex(self.module.ValidationError, "exclusive.*direction"):
+            self.validate(value)
 
     def test_ambiguous_epoch_cannot_support_direction(self) -> None:
         epoch = epoch_fixture()
