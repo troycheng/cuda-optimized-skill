@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v3.1/evidence-action-catalog.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "catalog_id", "actions"],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/evidence-action-catalog-v1"},
+    "catalog_id": {"$ref": "#/$defs/id"},
+    "actions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/action"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "level": {"enum": ["none", "low", "medium", "high"]},
+    "ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action_id", "evidence_kind", "required_capability_ids", "cost", "perturbation", "risk", "control_scope"],
+      "properties": {
+        "action_id": {"$ref": "#/$defs/id"},
+        "evidence_kind": {"$ref": "#/$defs/id"},
+        "required_capability_ids": {"$ref": "#/$defs/ids"},
+        "cost": {"$ref": "#/$defs/level"},
+        "perturbation": {"$ref": "#/$defs/level"},
+        "risk": {"$ref": "#/$defs/level"},
+        "control_scope": {"const": "read_only"}
+      }
+    }
+  }
+}

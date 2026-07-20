@@ -264,6 +264,7 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertEqual(result["analysis_epoch_schema"], "passed")
         self.assertEqual(result["execution_map_schema"], "passed")
         self.assertEqual(result["hypothesis_set_schema"], "passed")
+        self.assertEqual(result["evidence_selection_schema"], "passed")
         self.assertIn("v3_1_active_diagnosis", result["checks"])
 
 

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v3.1/evidence-selection.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "epoch_id", "hypothesis_set_sha256", "action_catalog_sha256", "selection_policy_sha256", "selected_request", "rejections", "missing_capability_ids", "gap_reason"],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/evidence-selection-v1"},
+    "status": {"enum": ["selected", "sufficient", "evidence_gap"]},
+    "epoch_id": {"$ref": "#/$defs/id"},
+    "hypothesis_set_sha256": {"$ref": "#/$defs/sha"},
+    "action_catalog_sha256": {"$ref": "#/$defs/sha"},
+    "selection_policy_sha256": {"$ref": "#/$defs/sha"},
+    "selected_request": {"oneOf": [{"type": "object"}, {"type": "null"}]},
+    "rejections": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["request_id", "reason"],
+        "properties": {"request_id": {"$ref": "#/$defs/id"}, "reason": {"$ref": "#/$defs/id"}}
+      }
+    },
+    "missing_capability_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "gap_reason": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -89,6 +89,7 @@ _V3_1_SCRIPTS = (
     "analysis_epoch.py",
     "execution_map.py",
     "hypothesis_space.py",
+    "evidence_selector.py",
 )
 _V3_1_SCHEMAS = (
     "readiness_contract.schema.json",
@@ -97,6 +98,10 @@ _V3_1_SCHEMAS = (
     "analysis_epoch.schema.json",
     "execution_map.schema.json",
     "hypothesis_set.schema.json",
+    "evidence_action_catalog.schema.json",
+    "evidence_selection_policy.schema.json",
+    "evidence_request.schema.json",
+    "evidence_selection.schema.json",
 )
 
 
@@ -425,6 +430,9 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
     hypothesis_runtime = _load_installed_module(
         root, "hypothesis_space.py", "installed_hypothesis_space"
     )
+    selector_runtime = _load_installed_module(
+        root, "evidence_selector.py", "installed_evidence_selector"
+    )
     epoch = json.loads(
         _read_safe_file(root, Path("templates") / "analysis_epoch.schema.json")
     )
@@ -434,6 +442,15 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
     hypothesis = json.loads(
         _read_safe_file(root, Path("templates") / "hypothesis_set.schema.json")
     )
+    selector_schemas = {
+        name: json.loads(_read_safe_file(root, Path("templates") / name))
+        for name in (
+            "evidence_action_catalog.schema.json",
+            "evidence_selection_policy.schema.json",
+            "evidence_request.schema.json",
+            "evidence_selection.schema.json",
+        )
+    }
     if (
         epoch.get("properties", {}).get("schema_version", {}).get("const")
         != epoch_runtime.EPOCH_SCHEMA
@@ -465,10 +482,30 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
     )
     if relationship_values != set(hypothesis_runtime._RELATIONS):
         raise ValueError("hypothesis relationship vocabulary differs from runtime")
+    expected_selector_versions = {
+        "evidence_action_catalog.schema.json": selector_runtime.CATALOG_SCHEMA,
+        "evidence_selection_policy.schema.json": selector_runtime.POLICY_SCHEMA,
+        "evidence_request.schema.json": selector_runtime.REQUEST_SCHEMA,
+        "evidence_selection.schema.json": selector_runtime.SELECTION_SCHEMA,
+    }
+    for name, expected in expected_selector_versions.items():
+        actual = (
+            selector_schemas[name]
+            .get("properties", {})
+            .get("schema_version", {})
+            .get("const")
+        )
+        if actual != expected:
+            raise ValueError(f"{name} version differs from runtime")
+    catalog = json.loads(
+        _read_safe_file(root, Path("references") / "evidence_action_catalog.json")
+    )
+    selector_runtime._validate_catalog(catalog)
     for label, item in (
         ("analysis epoch", epoch),
         ("execution map", execution_map),
         ("hypothesis set", hypothesis),
+        *[(name, item) for name, item in selector_schemas.items()],
     ):
         if "v3.1" not in item.get("$id", ""):
             raise ValueError(f"{label} schema does not declare V3.1 identity")
@@ -568,6 +605,7 @@ def check_installation(skill_dir: Path | str) -> dict:
         "analysis_epoch_schema": "passed",
         "execution_map_schema": "passed",
         "hypothesis_set_schema": "passed",
+        "evidence_selection_schema": "passed",
         "gpu_environment_validated": False,
     }
 

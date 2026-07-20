@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v3.1/evidence-request.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_set_id", "epoch_id", "epoch_sha256", "hypothesis_set_sha256", "requests"],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/evidence-request-set-v1"},
+    "request_set_id": {"$ref": "#/$defs/id"},
+    "epoch_id": {"$ref": "#/$defs/id"},
+    "epoch_sha256": {"$ref": "#/$defs/sha"},
+    "hypothesis_set_sha256": {"$ref": "#/$defs/sha"},
+    "requests": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/request"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "pair": {
+      "type": "object", "additionalProperties": false, "required": ["left", "right"],
+      "properties": {"left": {"$ref": "#/$defs/id"}, "right": {"$ref": "#/$defs/id"}}
+    },
+    "outcome": {
+      "type": "object", "additionalProperties": false, "required": ["outcome_id", "supports", "opposes"],
+      "properties": {"outcome_id": {"$ref": "#/$defs/id"}, "supports": {"$ref": "#/$defs/ids"}, "opposes": {"$ref": "#/$defs/ids"}}
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "action_id", "question", "target_hypothesis_ids", "exclusive_pairs", "outcomes"],
+      "properties": {
+        "request_id": {"$ref": "#/$defs/id"},
+        "action_id": {"$ref": "#/$defs/id"},
+        "question": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "target_hypothesis_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "exclusive_pairs": {"type": "array", "items": {"$ref": "#/$defs/pair"}},
+        "outcomes": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"$ref": "#/$defs/outcome"}}
+      }
+    }
+  }
+}

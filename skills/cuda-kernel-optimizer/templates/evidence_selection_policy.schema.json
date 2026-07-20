@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troycheng/cuda-optimized-skill/schemas/v3.1/evidence-selection-policy.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "max_cost", "max_perturbation", "max_risk", "remaining_profile_actions", "available_capability_ids"],
+  "properties": {
+    "schema_version": {"const": "cuda-optimizer/evidence-selection-policy-v1"},
+    "max_cost": {"$ref": "#/$defs/level"},
+    "max_perturbation": {"$ref": "#/$defs/level"},
+    "max_risk": {"$ref": "#/$defs/level"},
+    "remaining_profile_actions": {"type": "integer", "minimum": 0},
+    "available_capability_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "level": {"enum": ["none", "low", "medium", "high"]}
+  }
+}

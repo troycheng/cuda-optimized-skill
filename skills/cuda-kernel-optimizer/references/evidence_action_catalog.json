@@ -1,0 +1,51 @@
+{
+  "schema_version": "cuda-optimizer/evidence-action-catalog-v1",
+  "catalog_id": "v3.1-default",
+  "actions": [
+    {
+      "action_id": "compiler-sass-inspection",
+      "evidence_kind": "compiler_sass",
+      "required_capability_ids": ["cuda.disassembler"],
+      "cost": "low",
+      "perturbation": "none",
+      "risk": "none",
+      "control_scope": "read_only"
+    },
+    {
+      "action_id": "ncu-targeted-kernel",
+      "evidence_kind": "ncu_kernel",
+      "required_capability_ids": ["ncu.counter_access"],
+      "cost": "high",
+      "perturbation": "high",
+      "risk": "low",
+      "control_scope": "read_only"
+    },
+    {
+      "action_id": "nsys-global-timeline",
+      "evidence_kind": "nsys_timeline",
+      "required_capability_ids": ["nsys.timeline"],
+      "cost": "medium",
+      "perturbation": "medium",
+      "risk": "none",
+      "control_scope": "read_only"
+    },
+    {
+      "action_id": "nsys-os-runtime-slice",
+      "evidence_kind": "os_runtime",
+      "required_capability_ids": ["nsys.timeline"],
+      "cost": "medium",
+      "perturbation": "medium",
+      "risk": "none",
+      "control_scope": "read_only"
+    },
+    {
+      "action_id": "pytorch-operator-trace",
+      "evidence_kind": "framework_trace",
+      "required_capability_ids": ["pytorch.profiler"],
+      "cost": "low",
+      "perturbation": "low",
+      "risk": "none",
+      "control_scope": "read_only"
+    }
+  ]
+}
