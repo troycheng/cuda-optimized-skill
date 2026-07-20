@@ -24,7 +24,7 @@
         "cost": {"$ref": "#/$defs/level"},
         "perturbation": {"$ref": "#/$defs/level"},
         "risk": {"$ref": "#/$defs/level"},
-        "control_scope": {"const": "read_only"},
+        "control_scope": {"enum": ["read_only", "project_copy"]},
         "repeatable": {"type": "boolean"}
       }
     }

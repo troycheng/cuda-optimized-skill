@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import difflib
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import math
 import os
 import re
 import signal
+import stat
 import shutil
 import subprocess
 import sys
@@ -20,6 +22,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +31,7 @@ CONTROL_SCHEMA_V1 = "cuda-workload-optimizer/control-v1"
 CONTROL_SCHEMA_V2 = "cuda-workload-optimizer/control-v2"
 CONTROL_SCHEMA = CONTROL_SCHEMA_V1
 CHANGE_SCHEMA = "cuda-workload-optimizer/change-v1"
-_BUDGETS = {"fast", "balanced", "thorough"}
+_BUDGETS = {"fast", "quick", "balanced", "thorough"}
 _PROBE_KINDS = {
     "environment",
     "timeline",
@@ -75,7 +78,7 @@ _EVIDENCE_SELECTOR_MODULE = None
 _ACTIVE_DIAGNOSIS_CONTRACT_SCHEMA = "cuda-optimizer/active-diagnosis-contract-v1"
 _GLOBAL_SCAN_DRAFT_SCHEMA = "cuda-optimizer/global-scan-draft-v1"
 _BUDGET_RUNTIME = {
-    "fast": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
+    "quick": {"deadline_seconds": 900, "blocks": 3, "retries": 0, "bootstrap": 200},
     "balanced": {
         "deadline_seconds": 3600,
         "blocks": 5,
@@ -416,7 +419,7 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         raise ValidationError("baseline_candidate must not be empty")
     _json_copy(baseline, "baseline_candidate", reject_sensitive=True)
     if control["budget"] not in _BUDGETS:
-        raise ValidationError("budget must be fast, balanced, or thorough")
+        raise ValidationError("budget must be quick, balanced, or thorough")
     if control.get("evaluation_gate", "promotion") not in {
         "promotion",
         "reject_only",
@@ -510,7 +513,10 @@ def validate_control_manifest(value: Mapping[str, Any], source_path=None) -> dic
         if "include_diff" in reviewer and type(reviewer["include_diff"]) is not bool:
             raise ValidationError("reviewer.include_diff must be a boolean")
 
-    return _json_copy(control, "control", reject_sensitive=True)
+    normalized = _json_copy(control, "control", reject_sensitive=True)
+    if normalized["budget"] == "fast":
+        normalized["budget"] = "quick"
+    return normalized
 
 
 def validate_change_set(value: Mapping[str, Any], control: Mapping[str, Any]) -> dict:
@@ -745,6 +751,12 @@ def _load_evidence_selector_module():
     return _EVIDENCE_SELECTOR_MODULE
 
 
+def _load_diagnostic_knowledge_module():
+    return _load_sibling_module(
+        "diagnostic_knowledge.py", "cuda_optimizer_diagnostic_knowledge_controller"
+    )
+
+
 def _canonical_digest(value: Any) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -769,6 +781,24 @@ def _atomic_json(path: Path, value: Any) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+@contextmanager
+def _active_diagnosis_lock(run_root: Path):
+    """Serialize Controller mutations for one active-diagnosis run."""
+    lock_path = run_root / ".active-diagnosis.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValidationError("active diagnosis lock must be a regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 class _BoundedLog:
@@ -1142,7 +1172,7 @@ def review_change(
     change_path = run_root / "change_set.json"
     _atomic_json(change_path, change)
     reviewer = _load_reviewer_module()
-    blocks = {"fast": 3, "balanced": 5, "thorough": 9}[normalized["budget"]]
+    blocks = {"quick": 3, "balanced": 5, "thorough": 9}[normalized["budget"]]
     request = reviewer.build_review_request(
         diagnosis=diagnosis,
         change_set=change,
@@ -1536,6 +1566,20 @@ def _load_frozen_analysis_contract(run_root: Path, state: Mapping[str, Any]) -> 
     return contract
 
 
+def _ready_capability_ids(report: Mapping[str, Any], *, now: float | None = None) -> list[str]:
+    current = time.time() if now is None else float(now)
+    identity_digest = report.get("environment_identity_digest")
+    return sorted(
+        item["requirement_id"]
+        for item in report.get("results", [])
+        if type(item) is dict
+        and item.get("admission_status") == "ready"
+        and item.get("identity_digest") == identity_digest
+        and type(item.get("valid_until")) in {int, float}
+        and float(item["valid_until"]) > current
+    )
+
+
 def _validate_global_scan_draft(value: Mapping[str, Any]) -> dict:
     draft = _object(value, "global_scan")
     fields = {
@@ -1743,16 +1787,8 @@ def _build_active_diagnosis_context(
     )
     if readiness_report is None:
         raise ValidationError("active diagnosis requires a completed readiness report")
-    now = time.time()
-    identity_digest = readiness_report.get("environment_identity_digest")
-    selection_policy["available_capability_ids"] = sorted(
-        item["requirement_id"]
-        for item in readiness_report.get("results", [])
-        if type(item) is dict
-        and item.get("admission_status") == "ready"
-        and item.get("identity_digest") == identity_digest
-        and type(item.get("valid_until")) in {int, float}
-        and float(item["valid_until"]) > now
+    selection_policy["available_capability_ids"] = _ready_capability_ids(
+        readiness_report
     )
     # Replay both Controller-owned inputs now, before an AI proposal exists.
     selector = _load_evidence_selector_module()
@@ -1777,6 +1813,10 @@ def _build_active_diagnosis_context(
         ),
     )
     diagnosis = load_json_object(run_root / "diagnosis.json")
+    knowledge_context = _load_diagnostic_knowledge_module().route_cards(
+        diagnosis, execution_map, limit=3
+    )
+    _atomic_json(active_root / "knowledge_context.json", knowledge_context)
     context = {
         "schema_version": "cuda-optimizer/diagnosis-context-v1",
         "epoch_id": epoch_id,
@@ -1788,9 +1828,11 @@ def _build_active_diagnosis_context(
         "action_catalog_sha256": _canonical_digest(action_catalog),
         "selection_policy_sha256": _canonical_digest(selection_policy),
         "diagnosis_sha256": _canonical_digest(diagnosis),
+        "knowledge_context": knowledge_context,
         "requires_unmodeled_hypothesis": map_result[
             "requires_unmodeled_hypothesis"
         ],
+        "evidence_results": [],
     }
     _atomic_json(run_root / "diagnosis_context.json", context)
     _append_active_diagnosis_event(run_root, "context", context)
@@ -1820,6 +1862,47 @@ def _load_active_diagnosis_context(
     action_catalog = load_json_object(active_root / "action_catalog.json")
     selection_policy = load_json_object(active_root / "selection_policy.json")
     context = load_json_object(run_root / "diagnosis_context.json")
+    if _canonical_digest(context) != state.get("diagnosis_context_sha256"):
+        raise ValidationError("diagnosis context digest does not match state")
+    result_summaries = context.get("evidence_results", [])
+    if type(result_summaries) is not list:
+        raise ValidationError("diagnosis context evidence_results is invalid")
+    for index, raw_summary in enumerate(result_summaries):
+        summary = _object(raw_summary, f"evidence_results[{index}]")
+        _closed(
+            summary,
+            {
+                "request_signature",
+                "action_id",
+                "evidence_id",
+                "status",
+                "outcome_id",
+                "result_path",
+                "result_sha256",
+            },
+            f"evidence_results[{index}]",
+        )
+        relative = _relative(summary["result_path"], f"evidence_results[{index}].result_path")
+        result_path = run_root / relative
+        resolved_result = result_path.resolve(strict=False)
+        if (
+            not _is_within(resolved_result, run_root)
+            or result_path.is_symlink()
+            or not result_path.is_file()
+        ):
+            raise ValidationError("evidence result path is not a contained regular file")
+        result = load_json_object(result_path)
+        if _canonical_digest(result) != summary["result_sha256"]:
+            raise ValidationError("evidence result content digest does not match context")
+        if result.get("request_signature") != summary["request_signature"]:
+            raise ValidationError("evidence result request signature does not match context")
+        evidence_id = summary["evidence_id"]
+        if evidence_id is not None:
+            catalog_item = evidence_catalog.get(evidence_id)
+            if type(catalog_item) is not dict:
+                raise ValidationError("evidence result is missing from evidence catalog")
+            if catalog_item.get("artifact_sha256") != _sha256_path(result_path):
+                raise ValidationError("evidence result artifact digest does not match catalog")
     epoch_module = _load_analysis_epoch_module()
     expected_identities = {
         "workload_contract_sha256": _sha256_path(Path(control["workload_manifest"])),
@@ -2203,6 +2286,19 @@ def register_active_diagnosis_proposal(
     hypothesis_set: Mapping[str, Any],
     request_set: Mapping[str, Any],
 ) -> dict:
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    with _active_diagnosis_lock(run_root):
+        return _register_active_diagnosis_proposal_unlocked(
+            control, run_root, hypothesis_set, request_set
+        )
+
+
+def _register_active_diagnosis_proposal_unlocked(
+    control: Mapping[str, Any],
+    run_dir: os.PathLike[str] | str,
+    hypothesis_set: Mapping[str, Any],
+    request_set: Mapping[str, Any],
+) -> dict:
     """Replay an AI proposal against Controller-owned context and policy."""
     normalized = validate_control_manifest(control)
     if "analysis_contract" not in normalized:
@@ -2348,13 +2444,39 @@ def _run_active_evidence_adapter(
         output_path.unlink()
     except FileNotFoundError:
         pass
+    project_root = Path(control["project_root"])
+    execution_root = project_root
+    execution_argv = list(action["argv"])
+    project_identity_before = _identity(control, "project")
+    if selected["controller_action"]["control_scope"] == "project_copy":
+        execution_root = attempt_root / "project_copy"
+        if execution_root.exists() or execution_root.is_symlink():
+            raise ValidationError("direction experiment project copy already exists")
+        shutil.copytree(
+            project_root,
+            execution_root,
+            symlinks=False,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+        )
+        mapped_argv = []
+        for token in execution_argv:
+            token_path = Path(token)
+            if token_path.is_absolute() and _is_within(
+                token_path.resolve(strict=False), project_root
+            ):
+                mapped_argv.append(
+                    str(execution_root / token_path.resolve(strict=False).relative_to(project_root))
+                )
+            else:
+                mapped_argv.append(token)
+        execution_argv = mapped_argv
     environment, secret_values = _probe_environment(
         {
             "CUDA_OPTIMIZER_EVIDENCE_OUTPUT": str(output_path),
             "CUDA_OPTIMIZER_EVIDENCE_REQUEST": str(request_path),
             "CUDA_OPTIMIZER_EVIDENCE_DIR": str(attempt_root),
             "CUDA_OPTIMIZER_RUN_DIR": str(run_root),
-            "CUDA_OPTIMIZER_PROJECT_ROOT": control["project_root"],
+            "CUDA_OPTIMIZER_PROJECT_ROOT": str(execution_root),
         }
     )
     stdout = _BoundedLog(_DEFAULT_LOG_LIMIT)
@@ -2367,8 +2489,8 @@ def _run_active_evidence_adapter(
     exit_code = None
     timed_out = False
     process = subprocess.Popen(
-        action["argv"],
-        cwd=control["project_root"],
+        execution_argv,
+        cwd=execution_root,
         env=environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -2396,6 +2518,7 @@ def _run_active_evidence_adapter(
         "schema_version": "cuda-optimizer/evidence-execution-v1",
         "action_id": action["action_id"],
         "argv_sha256": _canonical_digest(action["argv"]),
+        "execution_argv_sha256": _canonical_digest(execution_argv),
         "adapter_sha256": action["adapter_sha256"],
         "exit_code": exit_code,
         "timed_out": timed_out,
@@ -2404,6 +2527,8 @@ def _run_active_evidence_adapter(
         "stderr": _redact_log(stderr.text(), secret_values),
     }
     _atomic_json(attempt_root / "execution.json", execution)
+    if _identity(control, "project")["digest"] != project_identity_before["digest"]:
+        raise ValidationError("evidence action modified the frozen project")
     if timed_out:
         result = {
             "schema_version": "cuda-optimizer/evidence-result-v1",
@@ -2438,6 +2563,7 @@ def _refresh_active_diagnosis_context(
     execution_map: Mapping[str, Any],
     evidence_catalog: Mapping[str, Any],
     selection_policy: Mapping[str, Any],
+    result_summary: Mapping[str, Any],
 ) -> dict:
     refreshed = copy.deepcopy(dict(context))
     refreshed["evidence_catalog_sha256"] = _canonical_digest(evidence_catalog)
@@ -2447,11 +2573,24 @@ def _refresh_active_diagnosis_context(
             execution_map, epoch=epoch, evidence_catalog=evidence_catalog
         )
     )
+    evidence_results = refreshed.get("evidence_results", [])
+    if type(evidence_results) is not list:
+        raise ValidationError("diagnosis context evidence_results is invalid")
+    evidence_results.append(copy.deepcopy(dict(result_summary)))
+    refreshed["evidence_results"] = evidence_results
     _atomic_json(run_root / "diagnosis_context.json", refreshed)
     return refreshed
 
 
 def collect_active_diagnosis_evidence(
+    control: Mapping[str, Any], run_dir: os.PathLike[str] | str
+) -> dict:
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    with _active_diagnosis_lock(run_root):
+        return _collect_active_diagnosis_evidence_unlocked(control, run_root)
+
+
+def _collect_active_diagnosis_evidence_unlocked(
     control: Mapping[str, Any], run_dir: os.PathLike[str] | str
 ) -> dict:
     """Execute one frozen evidence action and checkpoint the next diagnosis round."""
@@ -2460,9 +2599,35 @@ def collect_active_diagnosis_evidence(
     state = read_run_state(run_root)
     if state["control_digest"] != _canonical_digest(normalized):
         raise ValidationError("control manifest drifted before evidence collection")
+    if (
+        state["next_action"] == "propose_hypotheses"
+        and state.get("last_request_signature")
+    ):
+        return state
     if state["next_action"] != "collect_evidence":
         raise ValidationError("run is not ready to collect active diagnosis evidence")
     _check_deadline(state)
+    if not _verify_readiness_report(normalized, run_root, state):
+        report = _run_readiness_gate(normalized, run_root, state)
+        refreshed_state = copy.deepcopy(state)
+        refreshed_state["readiness_report_digest"] = _readiness_report_digest(
+            run_root, report
+        )
+        refreshed_state["readiness_environment_identity_digest"] = report.get(
+            "environment_identity_digest"
+        )
+        refreshed_state["updated_at_epoch"] = time.time()
+        if not report.get("can_start_diagnosis"):
+            refreshed_state["stage"] = "readiness"
+            refreshed_state["next_action"] = "readiness_action"
+            return _write_state(run_root, refreshed_state)
+        if report.get("environment_identity_digest") != state.get(
+            "baseline_environment_identity_digest"
+        ):
+            raise ValidationError(
+                "environment identity changed after baseline; create a child run"
+            )
+        state = _write_state(run_root, refreshed_state)
     (
         context,
         epoch,
@@ -2486,9 +2651,23 @@ def collect_active_diagnosis_evidence(
     if action is None:
         raise ValidationError("selected evidence action has no frozen adapter")
     required = set(selected["controller_action"]["required_capability_ids"])
-    available = set(selection_policy["available_capability_ids"])
+    readiness_report = _load_readiness_gate_module()._load_prior_report(
+        run_root / "readiness"
+    )
+    if readiness_report is None:
+        raise ValidationError("evidence collection requires a readiness report")
+    available = set(_ready_capability_ids(readiness_report))
     if not required.issubset(available):
-        raise ValidationError("selected evidence capability is no longer ready")
+        updated = copy.deepcopy(state)
+        updated.update(
+            {
+                "stage": "active_diagnosis",
+                "next_action": "evidence_gap",
+                "updated_at_epoch": time.time(),
+                "missing_capability_ids": sorted(required - available),
+            }
+        )
+        return _write_state(run_root, updated)
     adapter_path = Path(action["adapter_path"])
     if _sha256_path(adapter_path) != action["adapter_sha256"]:
         raise ValidationError("evidence action adapter drifted before execution")
@@ -2522,12 +2701,18 @@ def collect_active_diagnosis_evidence(
         normalized, run_root, state, action, selected, attempt_root
     )
     _atomic_json(attempt_root / "result.json", result)
+    evidence_id = None
     if result["status"] == "observed":
         evidence_id = f"ev-{signature[:16]}"
+        outcome = next(
+            item for item in selected["outcomes"] if item["outcome_id"] == result["outcome_id"]
+        )
         evidence_catalog[evidence_id] = {
             "epoch_id": epoch["epoch_id"],
             "kind": selected["controller_action"]["evidence_kind"],
             "artifact_sha256": _sha256_path(attempt_root / "result.json"),
+            "supports_hypothesis_ids": sorted(outcome["supports"]),
+            "opposes_hypothesis_ids": sorted(outcome["opposes"]),
         }
     _atomic_json(run_root / "active_diagnosis" / "evidence_catalog.json", evidence_catalog)
     history_path = run_root / "active_diagnosis" / "request_history.json"
@@ -2560,6 +2745,17 @@ def collect_active_diagnosis_evidence(
         execution_map,
         evidence_catalog,
         selection_policy,
+        {
+            "request_signature": signature,
+            "action_id": selected["action_id"],
+            "evidence_id": evidence_id,
+            "status": result["status"],
+            "outcome_id": result["outcome_id"],
+            "result_path": str(
+                (attempt_root / "result.json").relative_to(run_root)
+            ),
+            "result_sha256": _canonical_digest(result),
+        },
     )
     event_payload = {
         "request_signature": signature,

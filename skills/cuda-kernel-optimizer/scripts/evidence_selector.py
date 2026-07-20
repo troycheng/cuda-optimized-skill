@@ -113,8 +113,15 @@ def _validate_catalog(value: Mapping[str, Any]) -> tuple[dict, dict[str, dict]]:
         for field in ("cost", "perturbation", "risk"):
             if item[field] not in _LEVELS:
                 raise ValidationError(f"actions[{index}].{field} is unsupported")
-        if item["control_scope"] != "read_only":
-            raise ValidationError("evidence action catalog must remain read_only")
+        if item["control_scope"] not in {"read_only", "project_copy"}:
+            raise ValidationError("evidence action control_scope is unsupported")
+        if (
+            item["control_scope"] == "project_copy"
+            and item["evidence_kind"] != "direction_experiment"
+        ):
+            raise ValidationError(
+                "project_copy is reserved for a direction experiment"
+            )
         if type(item["repeatable"]) is not bool:
             raise ValidationError(f"actions[{index}].repeatable must be a boolean")
         normalized = {**copy.deepcopy(dict(item)), "required_capability_ids": capabilities}

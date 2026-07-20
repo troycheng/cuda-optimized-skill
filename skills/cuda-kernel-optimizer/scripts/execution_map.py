@@ -129,15 +129,45 @@ def _catalog(value: Mapping[str, Any]) -> dict[str, dict]:
     result = {}
     for raw_id, raw in value.items():
         evidence_id = _identifier(raw_id, "evidence_catalog id")
+        if type(raw) is not dict:
+            raise ValidationError(f"evidence_catalog.{evidence_id} must be an object")
+        raw = {
+            **raw,
+            "supports_hypothesis_ids": raw.get("supports_hypothesis_ids", []),
+            "opposes_hypothesis_ids": raw.get("opposes_hypothesis_ids", []),
+        }
         item = _closed(
             raw,
-            {"epoch_id", "kind", "artifact_sha256"},
+            {
+                "epoch_id",
+                "kind",
+                "artifact_sha256",
+                "supports_hypothesis_ids",
+                "opposes_hypothesis_ids",
+            },
             f"evidence_catalog.{evidence_id}",
         )
+        effects = {}
+        for field in ("supports_hypothesis_ids", "opposes_hypothesis_ids"):
+            values = item.get(field, [])
+            if type(values) is not list:
+                raise ValidationError(f"evidence_catalog.{evidence_id}.{field} must be an array")
+            normalized = [
+                _identifier(value, f"evidence_catalog.{evidence_id}.{field}")
+                for value in values
+            ]
+            if len(normalized) != len(set(normalized)):
+                raise ValidationError(f"evidence_catalog.{evidence_id}.{field} has duplicates")
+            effects[field] = sorted(normalized)
+        if set(effects["supports_hypothesis_ids"]) & set(
+            effects["opposes_hypothesis_ids"]
+        ):
+            raise ValidationError("evidence outcome cannot support and oppose the same hypothesis")
         result[evidence_id] = {
             "epoch_id": _identifier(item["epoch_id"], "evidence epoch_id"),
             "kind": _identifier(item["kind"], "evidence kind"),
             "artifact_sha256": _sha(item["artifact_sha256"], "evidence artifact_sha256"),
+            **effects,
         }
     return result
 

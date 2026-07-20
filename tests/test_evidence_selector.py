@@ -221,6 +221,16 @@ class EvidenceSelectorTests(unittest.TestCase):
             result["rejections"][0]["reason"], "action_is_not_repeatable"
         )
 
+    def test_project_copy_is_reserved_for_direction_experiments(self) -> None:
+        catalog = catalog_fixture()
+        catalog["actions"][0]["control_scope"] = "project_copy"
+        with self.assertRaisesRegex(self.module.ValidationError, "direction experiment"):
+            self.select(self.requests(), catalog=catalog)
+
+        catalog["actions"][0]["evidence_kind"] = "direction_experiment"
+        normalized, _ = self.module._validate_catalog(catalog)
+        self.assertEqual(normalized["actions"][1]["control_scope"], "project_copy")
+
     def test_request_must_change_at_least_one_hypothesis(self) -> None:
         value = self.requests()
         value["requests"][0]["outcomes"] = [

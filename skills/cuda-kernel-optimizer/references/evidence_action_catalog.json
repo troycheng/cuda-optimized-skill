@@ -13,6 +13,16 @@
       "repeatable": true
     },
     {
+      "action_id": "direction-experiment-project-copy",
+      "evidence_kind": "direction_experiment",
+      "required_capability_ids": ["workload.smoke"],
+      "cost": "medium",
+      "perturbation": "low",
+      "risk": "low",
+      "control_scope": "project_copy",
+      "repeatable": true
+    },
+    {
       "action_id": "ncu-targeted-kernel",
       "evidence_kind": "ncu_kernel",
       "required_capability_ids": ["ncu.counter_access"],

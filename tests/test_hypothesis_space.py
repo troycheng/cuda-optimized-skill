@@ -170,6 +170,24 @@ class HypothesisSpaceTests(unittest.TestCase):
         with self.assertRaisesRegex(self.module.ValidationError, "exclusive.*direction"):
             self.validate(value)
 
+    def test_outcome_bound_evidence_cannot_be_reinterpreted(self) -> None:
+        catalog = evidence_catalog()
+        catalog["ev-outcome"] = {
+            "epoch_id": self.epoch["epoch_id"],
+            "kind": "framework_trace",
+            "artifact_sha256": "9" * 64,
+            "supports_hypothesis_ids": ["h-framework-gap"],
+            "opposes_hypothesis_ids": ["h-kernel-bound"],
+        }
+        value = hypothesis_fixture(self.module, self.map_module)
+        value["hypotheses"][1]["support_evidence_ids"] = ["ev-outcome"]
+        with self.assertRaisesRegex(self.module.ValidationError, "cannot support"):
+            self.validate(value, catalog=catalog)
+
+        value = hypothesis_fixture(self.module, self.map_module)
+        with self.assertRaisesRegex(self.module.ValidationError, "must acknowledge"):
+            self.validate(value, catalog=catalog)
+
     def test_ambiguous_epoch_cannot_support_direction(self) -> None:
         epoch = epoch_fixture()
         epoch.update(

@@ -32,12 +32,17 @@
       "type": "string",
       "minLength": 1
     },
+    "analysis_contract": {
+      "type": "string",
+      "minLength": 1
+    },
     "baseline_candidate": {
       "type": "object",
       "minProperties": 1
     },
     "budget": {
-      "enum": ["fast", "balanced", "thorough"]
+      "enum": ["quick", "fast", "balanced", "thorough"],
+      "description": "quick is canonical; fast is a deprecated input alias"
     },
     "evaluation_gate": {
       "enum": ["promotion", "reject_only"],
@@ -129,7 +134,14 @@
         }
       },
       "then": {"required": ["readiness_contract"]},
-      "else": {"not": {"required": ["readiness_contract"]}}
+      "else": {
+        "not": {
+          "anyOf": [
+            {"required": ["readiness_contract"]},
+            {"required": ["analysis_contract"]}
+          ]
+        }
+      }
     }
   ],
   "$defs": {

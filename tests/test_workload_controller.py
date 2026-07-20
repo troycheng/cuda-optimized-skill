@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -284,6 +285,13 @@ class WorkloadControllerContractTests(unittest.TestCase):
             change["paths"].append("src/later.py")
             self.assertNotIn("later", normalized["mutation"]["project_paths"])
             self.assertNotIn("src/later.py", normalized_change["paths"])
+
+    def test_fast_budget_is_a_legacy_alias_for_quick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            control = _control(Path(tmp).resolve())
+            control["budget"] = "fast"
+            normalized = self.controller.validate_control_manifest(control)
+            self.assertEqual(normalized["budget"], "quick")
 
     def test_v2_requires_contained_readiness_contract_but_v1_remains_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1106,11 +1114,22 @@ class WorkloadRoundTests(unittest.TestCase):
                 }
             ],
         }
+        evidence_catalog = json.loads(
+            (active / "evidence_catalog.json").read_text("utf-8")
+        )
+        hypotheses_by_id = {
+            item["hypothesis_id"]: item for item in hypothesis["hypotheses"]
+        }
+        for evidence_id, evidence in evidence_catalog.items():
+            for hypothesis_id in evidence.get("opposes_hypothesis_ids", []):
+                hypotheses_by_id[hypothesis_id]["oppose_evidence_ids"].append(
+                    evidence_id
+                )
         hypothesis_result = self.controller._load_hypothesis_space_module().validate_hypothesis_set(
             hypothesis,
             epoch=epoch,
             execution_map=json.loads((active / "execution_map.json").read_text("utf-8")),
-            evidence_catalog=json.loads((active / "evidence_catalog.json").read_text("utf-8")),
+            evidence_catalog=evidence_catalog,
         )
         request = {
             "schema_version": "cuda-optimizer/evidence-request-set-v1",
@@ -1226,6 +1245,10 @@ class WorkloadRoundTests(unittest.TestCase):
                 "selection_policy_sha256",
             ):
                 self.assertEqual(len(context[field]), 64)
+            self.assertLessEqual(len(context["knowledge_context"]["cards"]), 3)
+            self.assertEqual(
+                context["knowledge_context"]["promotion_authority"], "none"
+            )
             self.assertTrue((run_dir / "active_diagnosis" / "ledger" / "000001-context.json").is_file())
 
     def test_active_diagnosis_rejects_adapter_digest_mismatch_before_baseline(self) -> None:
@@ -1312,6 +1335,14 @@ class WorkloadRoundTests(unittest.TestCase):
                 (run_dir / "active_diagnosis" / "selection_policy.json").read_text("utf-8")
             )
             self.assertEqual(policy["remaining_profile_actions"], 1)
+            context = json.loads(
+                (run_dir / "diagnosis_context.json").read_text("utf-8")
+            )
+            self.assertEqual(len(context["evidence_results"]), 1)
+            self.assertEqual(context["evidence_results"][0]["status"], "observed")
+            self.assertEqual(
+                context["evidence_results"][0]["outcome_id"], "gap-present"
+            )
 
     def test_resume_collects_once_and_never_reexecutes_completed_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1342,6 +1373,51 @@ class WorkloadRoundTests(unittest.TestCase):
 
             self.assertEqual(first["next_action"], "propose_hypotheses")
             self.assertEqual(second, first)
+            self.assertEqual(counter.read_text("utf-8").splitlines(), ["1"])
+
+    def test_concurrent_resume_serializes_one_evidence_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            adapter = Path(contract["actions"][0]["adapter_path"])
+            counter = project / "concurrent-evidence-count.txt"
+            adapter.write_text(
+                "import time\n"
+                + adapter.read_text("utf-8")
+                + f"\nopen({str(counter)!r}, 'a').write('1\\n')\ntime.sleep(0.2)\n",
+                encoding="utf-8",
+            )
+            contract["actions"][0]["adapter_sha256"] = hashlib.sha256(
+                adapter.read_bytes()
+            ).hexdigest()
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            results = []
+            errors = []
+
+            def resume() -> None:
+                try:
+                    results.append(self.controller.resume_run(run_dir))
+                except BaseException as error:  # surfaced below with full repr
+                    errors.append(error)
+
+            workers = [threading.Thread(target=resume) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(item["next_action"] == "propose_hypotheses" for item in results))
             self.assertEqual(counter.read_text("utf-8").splitlines(), ["1"])
 
     def test_resume_never_reexecutes_an_interrupted_evidence_intent(self) -> None:
@@ -1414,6 +1490,105 @@ class WorkloadRoundTests(unittest.TestCase):
                 control, run_dir, hypothesis, request
             )
             self.assertEqual(state["next_action"], "evidence_gap")
+
+    def test_direction_experiment_runs_only_in_a_project_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            experiment = project / "direction_experiment.py"
+            experiment.write_text(
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['CUDA_OPTIMIZER_PROJECT_ROOT'], 'experiment-marker').write_text('sandbox')\n"
+                "request = json.load(open(os.environ['CUDA_OPTIMIZER_EVIDENCE_REQUEST']))\n"
+                "json.dump({\n"
+                " 'schema_version': 'cuda-optimizer/evidence-result-v1',\n"
+                " 'request_signature': request['request_signature'],\n"
+                " 'status': 'observed', 'outcome_id': 'gap-present',\n"
+                " 'observations': {'intervention': 'positive'}, 'artifacts': []},\n"
+                " open(os.environ['CUDA_OPTIMIZER_EVIDENCE_OUTPUT'], 'w'))\n",
+                encoding="utf-8",
+            )
+            contract_path = Path(control["analysis_contract"])
+            contract = json.loads(contract_path.read_text("utf-8"))
+            contract["actions"].append(
+                {
+                    "action_id": "direction-experiment-project-copy",
+                    "adapter_path": str(experiment),
+                    "adapter_sha256": hashlib.sha256(experiment.read_bytes()).hexdigest(),
+                    "argv": [sys.executable, str(experiment)],
+                    "timeout_seconds": 5,
+                }
+            )
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+            readiness_path = Path(control["readiness_contract"])
+            readiness = json.loads(readiness_path.read_text("utf-8"))
+            readiness["requirements"].append(
+                {
+                    "id": "workload.smoke",
+                    "necessity": "required",
+                    "control_scope": "project",
+                    "phase": "workload",
+                    "kind": "workload_smoke",
+                    "max_age_seconds": 300,
+                    "probe": {
+                        "argv": [
+                            sys.executable,
+                            str(project / "readiness_probe.py"),
+                            "workload.smoke",
+                        ],
+                        "timeout_seconds": 5,
+                    },
+                    "remediation": {"mode": "none"},
+                }
+            )
+            readiness_path.write_text(json.dumps(readiness), encoding="utf-8")
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            request["requests"][0]["action_id"] = "direction-experiment-project-copy"
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+
+            self.assertFalse((project / "experiment-marker").exists())
+            markers = list(
+                (run_dir / "active_diagnosis" / "evidence").glob(
+                    "*/project_copy/experiment-marker"
+                )
+            )
+            self.assertEqual(len(markers), 1)
+            catalog = json.loads(
+                (run_dir / "active_diagnosis" / "evidence_catalog.json").read_text("utf-8")
+            )
+            self.assertIn("direction_experiment", {item["kind"] for item in catalog.values()})
+
+    def test_tampered_evidence_result_invalidates_the_next_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, _project = self._workspace(root)
+            _enable_v2_readiness(control, root)
+            _enable_active_diagnosis(control, root)
+            self.controller.start_run(control, run_dir)
+            hypothesis, request = self._active_proposal(run_dir)
+            self.controller.register_active_diagnosis_proposal(
+                control, run_dir, hypothesis, request
+            )
+            self.controller.collect_active_diagnosis_evidence(control, run_dir)
+            context = json.loads((run_dir / "diagnosis_context.json").read_text("utf-8"))
+            result_path = run_dir / context["evidence_results"][0]["result_path"]
+            result = json.loads(result_path.read_text("utf-8"))
+            result["observations"]["launch_gap_us"] = 0
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            hypothesis, request = self._active_proposal(run_dir)
+
+            with self.assertRaisesRegex(ValueError, "evidence result.*digest"):
+                self.controller.register_active_diagnosis_proposal(
+                    control, run_dir, hypothesis, request
+                )
 
     def test_active_diagnosis_rejects_stale_epoch_and_identity_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

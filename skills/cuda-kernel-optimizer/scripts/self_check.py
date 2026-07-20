@@ -90,6 +90,7 @@ _V3_1_SCRIPTS = (
     "execution_map.py",
     "hypothesis_space.py",
     "evidence_selector.py",
+    "diagnostic_knowledge.py",
 )
 _V3_1_SCHEMAS = (
     "readiness_contract.schema.json",
@@ -102,6 +103,9 @@ _V3_1_SCHEMAS = (
     "evidence_selection_policy.schema.json",
     "evidence_request.schema.json",
     "evidence_selection.schema.json",
+    "active_diagnosis_contract.schema.json",
+    "evidence_result.schema.json",
+    "workload_control.schema.json",
 )
 
 
@@ -451,6 +455,28 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
             "evidence_selection.schema.json",
         )
     }
+    active_contract = json.loads(
+        _read_safe_file(
+            root, Path("templates") / "active_diagnosis_contract.schema.json"
+        )
+    )
+    evidence_result = json.loads(
+        _read_safe_file(root, Path("templates") / "evidence_result.schema.json")
+    )
+    if (
+        active_contract.get("properties", {})
+        .get("schema_version", {})
+        .get("const")
+        != "cuda-optimizer/active-diagnosis-contract-v1"
+    ):
+        raise ValueError("active diagnosis contract schema version differs from runtime")
+    if (
+        evidence_result.get("properties", {})
+        .get("schema_version", {})
+        .get("const")
+        != "cuda-optimizer/evidence-result-v1"
+    ):
+        raise ValueError("evidence result schema version differs from runtime")
     if (
         epoch.get("properties", {}).get("schema_version", {}).get("const")
         != epoch_runtime.EPOCH_SCHEMA
@@ -506,6 +532,8 @@ def _validate_active_diagnosis_schema_contract(root: Path) -> None:
         ("execution map", execution_map),
         ("hypothesis set", hypothesis),
         *[(name, item) for name, item in selector_schemas.items()],
+        ("active diagnosis contract", active_contract),
+        ("evidence result", evidence_result),
     ):
         if "v3.1" not in item.get("$id", ""):
             raise ValueError(f"{label} schema does not declare V3.1 identity")

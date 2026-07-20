@@ -93,18 +93,45 @@ def _catalog(value: Mapping[str, Any], epoch_id: str) -> dict[str, dict]:
     result = {}
     for raw_id, raw in value.items():
         evidence_id = _identifier(raw_id, "evidence_catalog id")
+        if type(raw) is not dict:
+            raise ValidationError(f"evidence_catalog.{evidence_id} must be an object")
+        raw = {
+            **raw,
+            "supports_hypothesis_ids": raw.get("supports_hypothesis_ids", []),
+            "opposes_hypothesis_ids": raw.get("opposes_hypothesis_ids", []),
+        }
         item = _closed(
             raw,
-            {"epoch_id", "kind", "artifact_sha256"},
+            {
+                "epoch_id",
+                "kind",
+                "artifact_sha256",
+                "supports_hypothesis_ids",
+                "opposes_hypothesis_ids",
+            },
             f"evidence_catalog.{evidence_id}",
         )
         item_epoch = _identifier(item["epoch_id"], "evidence epoch_id")
         if item_epoch != epoch_id:
             raise ValidationError("evidence_catalog contains evidence outside the current epoch")
+        normalized_support = _identifier_list(
+            item["supports_hypothesis_ids"],
+            f"evidence_catalog.{evidence_id}.supports_hypothesis_ids",
+            allow_empty=True,
+        )
+        normalized_oppose = _identifier_list(
+            item["opposes_hypothesis_ids"],
+            f"evidence_catalog.{evidence_id}.opposes_hypothesis_ids",
+            allow_empty=True,
+        )
+        if set(normalized_support) & set(normalized_oppose):
+            raise ValidationError("evidence outcome cannot support and oppose the same hypothesis")
         result[evidence_id] = {
             "epoch_id": item_epoch,
             "kind": _identifier(item["kind"], "evidence kind"),
             "artifact_sha256": _sha(item["artifact_sha256"], "evidence artifact_sha256"),
+            "supports_hypothesis_ids": normalized_support,
+            "opposes_hypothesis_ids": normalized_oppose,
         }
     return result
 
@@ -240,6 +267,25 @@ def validate_hypothesis_set(
         )
         if set(support) & set(oppose):
             raise ValidationError("the same evidence cannot support and oppose a hypothesis")
+        for evidence_id in support:
+            if hypothesis_id in catalog[evidence_id]["opposes_hypothesis_ids"]:
+                raise ValidationError("outcome-bound evidence cannot support this hypothesis")
+            bound_support = catalog[evidence_id]["supports_hypothesis_ids"]
+            if bound_support and hypothesis_id not in bound_support:
+                raise ValidationError("outcome-bound evidence cannot support this hypothesis")
+        for evidence_id in oppose:
+            if hypothesis_id in catalog[evidence_id]["supports_hypothesis_ids"]:
+                raise ValidationError("outcome-bound evidence cannot oppose this hypothesis")
+            bound_oppose = catalog[evidence_id]["opposes_hypothesis_ids"]
+            if bound_oppose and hypothesis_id not in bound_oppose:
+                raise ValidationError("outcome-bound evidence cannot oppose this hypothesis")
+        required_opposition = {
+            evidence_id
+            for evidence_id, evidence in catalog.items()
+            if hypothesis_id in evidence["opposes_hypothesis_ids"]
+        }
+        if not required_opposition.issubset(oppose):
+            raise ValidationError("hypothesis must acknowledge outcome-bound opposing evidence")
         missing = _identifier_list(
             item["missing_evidence_kinds"],
             f"hypotheses[{index}].missing_evidence_kinds",
