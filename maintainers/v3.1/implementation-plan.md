@@ -601,24 +601,24 @@ git commit -m "test(v3.1): validate readiness on sm120"
 - 修改：`README.md`、`README.zh-CN.md`
 - 测试：`tests/test_public_docs.py`、`tests/test_readme_sync.py`
 
-- [ ] **步骤 1：先写文档行为测试**
+- [x] **步骤 1：先写文档行为测试**
 
 中英文都必须说明：AI 自动执行 readiness；用户提供 workload 和授权；required 未通过不开始；
 隔离 pip 是唯一自动修复；宿主机只建议；self-check 不代表 GPU ready；3.1 未发布时 Release Notes
 标为 development。
 
-- [ ] **步骤 2：运行并确认失败**
+- [x] **步骤 2：运行并确认失败**
 
 ```bash
 python3 -m unittest tests.test_public_docs tests.test_readme_sync -v
 ```
 
-- [ ] **步骤 3：更新文档**
+- [x] **步骤 3：更新文档**
 
 README 讲用户能获得什么和 AI 如何运行，不要求用户手工复制 readiness CLI。CLI、schema 和
 状态细节放 `docs/environment-readiness.md`，skill reference 只保留代理决策规则。
 
-- [ ] **步骤 4：全量验证并提交**
+- [x] **步骤 4：全量验证并提交**
 
 ```bash
 python3 -m unittest tests.test_public_docs tests.test_readme_sync -v

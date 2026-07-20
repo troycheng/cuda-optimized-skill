@@ -76,6 +76,48 @@ class PublicDocsTests(unittest.TestCase):
             self.assertIn(marker, text)
         self.assertIn("must be supplied by the user", text)
 
+    def test_environment_readiness_is_ai_run_and_fail_closed(self) -> None:
+        public = (ROOT / "docs/environment-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        agent = (
+            ROOT
+            / "skills"
+            / "cuda-kernel-optimizer"
+            / "references"
+            / "environment_readiness.md"
+        ).read_text(encoding="utf-8")
+        public_prose = " ".join(public.split())
+        for marker in (
+            "The AI runs readiness automatically",
+            "user-provided workload",
+            "explicit authorization",
+            "required",
+            "baseline",
+            "hash-locked isolated pip",
+            "only automatic repair",
+            "host changes remain recommendations",
+            "self_check",
+            "does not prove that the GPU environment is ready",
+            "readiness_contract.schema.json",
+            "readiness_report.schema.json",
+            "ready",
+            "degraded",
+            "user_action_required",
+            "blocked",
+        ):
+            self.assertIn(marker, public_prose)
+        agent_prose = " ".join(agent.split())
+        for marker in (
+            "Run capability readiness before baseline",
+            "required",
+            "isolated_pip",
+            "recommend_only",
+            "readiness_action",
+            "Do not ask the user to run these commands manually",
+        ):
+            self.assertIn(marker, agent_prose)
+
     def test_workflows_define_four_distinct_claims(self) -> None:
         text = (ROOT / "docs/workflows.md").read_text(encoding="utf-8")
         for marker in (
@@ -152,6 +194,19 @@ class PublicDocsTests(unittest.TestCase):
             "Nsight Compute",
             "references/compatibility.md",
             "ERR_NVGPUCTRPERM",
+        ):
+            self.assertIn(marker, text)
+
+    def test_validation_records_v3_1_readiness_without_speed_claim(self) -> None:
+        text = (ROOT / "docs/validation.md").read_text(encoding="utf-8")
+        for marker in (
+            "18 of 18",
+            "52.141",
+            "8.793",
+            "9.297",
+            "Nsys",
+            "ERR_NVGPUCTRPERM",
+            "not evidence that V3.1 finds a useful direction faster",
         ):
             self.assertIn(marker, text)
 

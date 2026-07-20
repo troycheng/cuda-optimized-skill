@@ -22,7 +22,7 @@ catalog or all evidence protocols.
 
 | Situation | First action | Read on demand |
 |---|---|---|
-| Missing workload, reference, benchmark, or environment | Run `scripts/readiness.py`; stop at its claim ceiling | `references/environment_readiness.md` |
+| Missing workload, reference, benchmark, or environment | Inventory gaps, then run capability readiness before baseline | `references/environment_readiness.md` |
 | Single CUDA, CUTLASS, or Triton kernel | Establish correctness and paired kernel timing | `references/performance_iteration.md` |
 | Bottleneck unknown across a full workload | Run workload diagnosis before choosing a mutation | `examples/workload-controller.md` |
 | Serving KPI validation | Freeze strata, identities, guards, and experiment design | `references/serving_evidence_protocol.md` |
@@ -46,18 +46,24 @@ Inventory these facts before mutation:
 - allowed project paths, constraints, and host boundaries.
 
 Create a small JSON inventory with `requested_claim` set to `kernel`, `workload`,
-or `serving`. `source_available` means the source is accessible to the current
-task, not merely that the user owns it. Pass the inventory by file or stdin:
+or `serving`. `source_available` means the current task can read the source. Use
+`python3 <skill>/scripts/readiness.py --help` and report missing foundations.
 
-```bash
-python3 <skill>/scripts/readiness.py --input readiness-input.json --out readiness.json
-```
+Before a new baseline, create a closed readiness contract and use Controller
+`control-v2`. Run foundation capabilities before workload capabilities. If a
+`required` item fails, return `readiness_action`; do not start the baseline or
+high-cost profiling. Diagnostic failure may continue only as a recorded lower
+evidence layer.
 
 Only missing items required by the requested claim should be reported. If only
 source is available, provide static hypotheses and a foundation plan;
 do not call them optimization results. A kernel benchmark supports only a kernel
 claim. A representative workload is required for an end-to-end claim. Never
 download, invent, or silently substitute a workload.
+
+The only automatic repair is explicitly authorized, hash-locked `isolated_pip`
+inside the declared environment. Host changes remain `recommend_only`. Run
+readiness yourself; do not hand internal commands to the user.
 
 ## Choose the budget
 

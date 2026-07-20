@@ -20,6 +20,9 @@ set. It covers:
   eight real identical-kernel pairs, binds the calibration to source,
   environment, and contract identities, and refuses to leave `CALIBRATING`
   when noise or minimum detectable effect is too high;
+- a V3.1 readiness round that inventories required and diagnostic capabilities,
+  runs a user-workload smoke test, and blocks baseline collection when a
+  required check, dependency identity, or time budget fails;
 - a target-bounded Nsight Compute attempt. It must either collect real metrics
   with readable counters or record exactly `ERR_NVGPUCTRPERM`; no other
   degraded result is accepted. The test never adds capabilities or changes
@@ -32,7 +35,7 @@ The no-op check uses the production `run_paired`, `classify_pairs`, and
 
 ## Local and current-lane execution
 
-Without opt-in, nine CPU helper regressions pass and all six GPU tests are
+Without opt-in, ten CPU helper regressions pass and all eight GPU tests are
 reported as skipped:
 
 ```bash
@@ -43,10 +46,10 @@ On the isolated checkout, a current host environment can run the same suite
 directly:
 
 ```bash
-cd /data/tcheng/cuda-skill-e2e/v2.2/repo
-CUDA_VISIBLE_DEVICES=1 \
+cd /data/tcheng/cuda-skill-e2e/v3.1/repo
+CUDA_VISIBLE_DEVICES=7 \
 CUDA_SM120_E2E=1 \
-CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v2.2/artifacts/current-host \
+CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v3.1/artifacts/current-host \
 CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
 python3 -m unittest tests.gpu.sm120.test_sm120_acceptance -v
 ```
@@ -54,8 +57,8 @@ python3 -m unittest tests.gpu.sm120.test_sm120_acceptance -v
 ## Disposable current and compatibility containers
 
 `remote/run_lane.sh` accepts `current` or `compat` (default). It requires the
-exact repository path `/data/tcheng/cuda-skill-e2e/v2.2/repo`, an artifact lane
-below `/data/tcheng/cuda-skill-e2e/v2.2/artifacts`, and the physical CUTLASS
+exact repository path `/data/tcheng/cuda-skill-e2e/v3.1/repo`, an artifact lane
+below `/data/tcheng/cuda-skill-e2e/v3.1/artifacts`, and the physical CUTLASS
 checkout `/data/tcheng/cuda-skill-e2e/deps/cutlass` with both
 `include/cutlass/cutlass.h` and `include/cutlass/version.h`. CUTLASS must not
 overlap the repository or `/data/vllm-opt`, and the version header must report
@@ -71,14 +74,14 @@ remain available while compiler binaries and evidence stay out of the
 repository.
 
 ```bash
-cd /data/tcheng/cuda-skill-e2e/v2.2/repo
-CUDA_E2E_GPU=1 \
-CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v2.2/artifacts/current \
+cd /data/tcheng/cuda-skill-e2e/v3.1/repo
+CUDA_E2E_GPU=7 \
+CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v3.1/artifacts/current \
 CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
 tests/gpu/sm120/remote/run_lane.sh current
 
-CUDA_E2E_GPU=1 \
-CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v2.2/artifacts/compatibility \
+CUDA_E2E_GPU=7 \
+CUDA_E2E_ARTIFACTS=/data/tcheng/cuda-skill-e2e/v3.1/artifacts/compatibility \
 CUTLASS_PATH=/data/tcheng/cuda-skill-e2e/deps/cutlass \
 tests/gpu/sm120/remote/run_lane.sh compat
 ```
@@ -154,3 +157,14 @@ effect against a frozen 0.5% practical effect. The calibrated state was
 controller detected that the environment could not support the requested
 claim and did not begin candidate exploration. NCU again returned
 `ERR_NVGPUCTRPERM`; no host permission or driver policy was changed.
+
+The V3.1 development readiness lane ran on an idle physical RTX 5090 on
+2026-07-20. A fresh lane passed 18/18 checks in 52.141 seconds with the same
+immutable image. Readiness took 8.793 seconds and the first baseline artifact
+appeared after 9.297 seconds. CUDA 13.3 target compilation, SM120 execution and
+SASS, Compute Sanitizer, and the user-workload smoke passed. Nsys was absent and
+NCU returned `ERR_NVGPUCTRPERM`; both were recorded as diagnostic limitations,
+with no package, host-policy, or driver change. Injected timeout, workload
+failure, and requirements-identity drift each blocked the baseline as designed.
+The historical V3.0 path had no readiness stage, so this run proves admission
+behavior, not faster diagnosis or optimization.

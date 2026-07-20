@@ -161,6 +161,30 @@ class ReadmeSyncTests(unittest.TestCase):
         self.assertIn("never changes host-level settings automatically", self.english)
         self.assertIn("不会自动修改宿主机配置", self.chinese)
 
+    def test_readmes_explain_automatic_readiness_admission(self) -> None:
+        english = " ".join(self.english.split()).replace("`", "")
+        for marker in (
+            "The AI runs readiness automatically",
+            "required capability",
+            "does not start the baseline",
+            "hash-locked isolated pip",
+            "only automatic repair",
+            "explicit authorization",
+            "self_check does not prove that the GPU environment is ready",
+        ):
+            self.assertIn(marker, english)
+        chinese = "".join(self.chinese.split()).replace("`", "")
+        for marker in (
+            "AI会自动完成环境准入检查",
+            "必需能力",
+            "不会启动baseline",
+            "带哈希锁定的隔离环境pip",
+            "唯一允许自动执行的修复",
+            "明确授权",
+            "self_check通过不代表GPU环境已经可用",
+        ):
+            self.assertIn(marker, chinese)
+
     def test_readmes_explain_the_performance_first_iteration_loop(self) -> None:
         english = " ".join(self.english.split())
         chinese = "".join(self.chinese.split())
@@ -187,7 +211,7 @@ class ReadmeSyncTests(unittest.TestCase):
     def test_readmes_publish_matching_release_notes_from_v2_2(self) -> None:
         english = self.english[self.english.index("## Release notes"):]
         chinese = self.chinese[self.chinese.index("## 版本记录"):]
-        versions = ("### V3.0.1", "### V3.0") + tuple(
+        versions = ("### V3.1 (development)", "### V3.0.1", "### V3.0") + tuple(
             f"### V2.{minor}" for minor in range(9, 1, -1)
         )
         assert_in_order(self, english, versions)
@@ -198,6 +222,8 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertEqual(len(heading.findall(chinese)), 1)
         self.assertIn("maintained release history starts with V2.2", english)
         self.assertIn("从 V2.2 开始维护", chinese)
+        self.assertIn("Readiness admission is under development", english)
+        self.assertIn("环境准入仍在开发中", chinese)
         for marker in (
             "nonstationary",
             "direction-level",
@@ -225,7 +251,15 @@ class ReadmeSyncTests(unittest.TestCase):
             self.assertIn("docs/case-studies.md", text)
         validation = (ROOT / "docs/validation.md").read_text(encoding="utf-8")
         cases = (ROOT / "docs/case-studies.md").read_text(encoding="utf-8")
-        for fact in ("935", "929", "15 of 15", "34.307", "ERR_NVGPUCTRPERM"):
+        for fact in (
+            "997",
+            "989",
+            "15 of 15",
+            "34.307",
+            "18 of 18",
+            "52.141",
+            "ERR_NVGPUCTRPERM",
+        ):
             self.assertIn(fact, validation)
         for fact in ("60.4616%", "26.3287%", "-0.0097%", "140"):
             self.assertIn(fact, cases)

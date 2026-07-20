@@ -5,14 +5,29 @@ predict the speedup of a new workload.
 
 ## Automated checks
 
-The current suite contains 935 tests. In the local CPU/static lane on
-2026-07-19, 929 passed, six physical RTX 5090 opt-in tests were skipped, and
+The current suite contains 997 tests. In the local CPU/static lane on
+2026-07-20, 989 passed, eight physical RTX 5090 opt-in tests were skipped, and
 none failed. These checks cover input validation, state recovery, evidence
 binding, shared-host guards, timeouts, restoration, capability retrieval,
 stability calibration, audit cadence, and deterministic decision logic. They
 do not validate the reader's CUDA environment.
 
 ## Physical GPU lane
+
+The V3.1 development readiness lane completed 18 of 18 checks in 52.141 seconds
+on 2026-07-20 with the same immutable image listed below. Readiness itself took
+8.793 seconds; the first baseline artifact appeared 9.297 seconds after the run
+started. CUDA 13.3 target compilation, SM120 execution and SASS, Compute
+Sanitizer, and the Triton correctness/KPI smoke passed. Nsys was absent and was
+recorded as diagnostic degradation. A real NCU target range returned
+`ERR_NVGPUCTRPERM`, so the report requested user action without changing host
+policy. All required capabilities passed and the baseline ran afterward.
+
+The historical V3.0 controller produced its first baseline artifact in about
+0.014 seconds because it had no readiness stage. The added 9-second startup cost
+is not evidence that V3.1 finds a useful direction faster. That claim still
+requires a long user workload showing fewer tool repairs, repeated probes, and
+unproductive profiling rounds.
 
 The V3 RTX 5090 lane completed 15 of 15 checks in 34.307 seconds using immutable
 container image

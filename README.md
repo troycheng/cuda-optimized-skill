@@ -28,11 +28,14 @@ correctness, and compares paired measurements. It also checks framework
 scheduling, CPU and data work, transfers, communication, I/O, allocator behavior,
 and runtime state when the evidence points outside a kernel.
 
-Version 3.0 adds a deterministic long-run Controller. A frozen Workload Contract
-defines the objective, files, environment, budget, measurement policy, and
-allowed scope. The AI proposes candidates; signed evidence and an append-only
-ledger decide what may continue. Interrupted, noisy, or drifted runs stop or
-resume without silently changing the experiment.
+Version 3.0 adds a deterministic long-run Controller. A frozen Workload Contract defines
+the objective, environment, budget, measurement policy, and allowed scope. Signed evidence
+and an append-only ledger keep interrupted, noisy, or drifted runs from silently changing the experiment.
+
+The AI runs readiness automatically before the baseline in V3.1 development. If a
+required capability fails, it does not start the baseline. The user supplies the real
+workload and explicit authorization. A hash-locked isolated pip install is the only
+automatic repair; host changes remain recommendations, and `self_check` does not prove that the GPU environment is ready.
 
 The skill never changes host-level settings automatically. Drivers, counter
 permissions, clocks, power limits, services, and system configuration remain
@@ -134,6 +137,11 @@ separate. Neither page predicts the speedup of a new project.
 
 The maintained release history starts with V2.2. These are project versions;
 not every historical version has a matching Git tag.
+
+### V3.1 (development)
+
+Readiness admission is under development. It checks real build, GPU execution, profiling,
+sanitizer, and workload-smoke capabilities before the baseline with bounded isolated repair and stable environment identity.
 
 ### V3.0.1
 
