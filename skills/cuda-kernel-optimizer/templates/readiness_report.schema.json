@@ -58,7 +58,8 @@
       "additionalProperties": false,
       "required": [
         "requirement_id", "necessity", "phase", "kind", "probe_status",
-        "admission_status", "valid_until", "identity_digest", "unsupported_capabilities"
+        "admission_status", "valid_until", "identity_digest", "unsupported_capabilities",
+        "evidence_path"
       ],
       "properties": {
         "requirement_id": {
@@ -81,6 +82,10 @@
           "type": "array",
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
+        },
+        "evidence_path": {
+          "type": ["string", "null"],
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
         }
       }
     }

@@ -160,6 +160,29 @@ requirements 摘要、隔离根和控制范围。
 由 Controller 要求容器/PID namespace 等外部隔离；runner 不自行创建 cgroup、不修改宿主机，
 也不把 stdout/stderr 当成结构化 readiness 证据。并发上限和总体资源预算留到 Controller。
 
+### Gemini：readiness gate 与隔离修复质证
+
+提交的是公开 gate 摘要，不含代码、路径、账号、日志或 workload，并禁止搜索和工具调用。
+评审最有价值的反例不是某个状态映射，而是修复与崩溃会改变证据的时间边界：隔离 pip 安装
+改变环境后，如果仍用安装前的 identity 重跑，报告会把新能力绑定到旧工具链；如果只在最终
+report 记录修复次数，安装过程中崩溃又会让 resume 重复消费授权和预算。
+
+采纳并加入故障注入：安装成功后必须通过 identity provider 重新生成完整环境摘要；摘要未变
+直接 blocked，摘要变化则让本轮全部结果失效并从 foundation 开头重跑。gate 在第一项 probe
+前持久化绝对 `started_at`，并在调用 installer 前先持久化 `repairs_used`；中断后的 resume 用
+墙上时间计算剩余预算，不能重置次数。每次 probe 使用独立 attempt，report 保存相对
+`evidence_path`，旧证据不覆盖。report 与 completion marker 的篡改测试也已补充。
+
+已有实现覆盖：`artifact_store` 对临时文件、目标文件和父目录执行 fsync 后再发布 marker；当前
+预算本来就按 `now - started_at` 计算，而不是把各动作 duration 相加。
+
+不直接采纳把 persistence mode、ECC 计数和 clock throttling 等波动状态全部塞进环境 identity。
+它们是需要按时效复核的运行条件，不是稳定身份；无选择地纳入会让正常波动触发全量重跑。
+同样不引入通用 probe DAG：capability probe 必须独立，不能依赖前一个进程留下的 CUDA context
+或 IPC 状态；真实共享前置应封装进同一个原子 probe。也不对整个 site-packages 做 Merkle 扫描，
+锁文件摘要负责安装输入，刷新后的工具链摘要与安装后真实 capability probe 负责可用性；恶意
+环境完整性验证不扩入当前本地同用户信任边界。
+
 ## 3. 第一轮开发决定
 
 - 先交付一个独立的 readiness vertical slice，不同时实现知识卡和行动规划器；

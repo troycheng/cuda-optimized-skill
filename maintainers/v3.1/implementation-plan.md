@@ -293,12 +293,13 @@ git commit -m "feat(v3.1): run bounded capability probes"
 - 创建：`skills/cuda-kernel-optimizer/scripts/readiness_install.py`
 - 测试：`tests/test_readiness_gate.py`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 覆盖 foundation 先于 workload；required foundation 失败后 workload 不执行；diagnostic 可降级；
-host 只输出 user action；预算单调；requirements hash 漂移、Python 越界、安装失败、安装后仍失败
-均 blocked；有效且 identity 未变时 resume 不重复 probe 或安装；证据过期时只重跑对应 probe；
-工具链 digest、uid、容器、GPU identity、可见设备和权限状态任一变化时重跑全部所需 probe。
+host 只输出 user action；预算单调且崩溃不重置；requirements hash/Python identity 漂移、安装失败、
+安装后 identity 未刷新或 probe 仍失败均 blocked；有效且 identity 未变时 resume 不重复 probe 或
+安装；证据过期时只重跑对应 probe；环境 identity 变化或修复成功时从 foundation 重跑全部所需
+probe；report/marker 篡改拒绝；每个结果保留不覆盖旧证据的相对 `evidence_path`。
 
 ```python
 def test_required_foundation_failure_skips_workload_phase(self):
@@ -312,13 +313,13 @@ def test_required_foundation_failure_skips_workload_phase(self):
     self.assertEqual(called_probe_ids(), ["gpu"])
 ```
 
-- [ ] **步骤 2：运行并确认失败**
+- [x] **步骤 2：运行并确认失败**
 
 ```bash
 python3 -m unittest tests.test_readiness_gate -v
 ```
 
-- [ ] **步骤 3：实现 gate**
+- [x] **步骤 3：实现 gate**
 
 ```python
 def evaluate_result(requirement: Mapping[str, Any], probe: Mapping[str, Any],
@@ -327,14 +328,15 @@ def evaluate_result(requirement: Mapping[str, Any], probe: Mapping[str, Any],
 
 def run_gate(*, contract: Mapping[str, Any], control: Mapping[str, Any],
              run_dir: Path, probe_runner=run_requirement,
-             installer=install_isolated_pip, now=time.time) -> dict:
+             installer=install_isolated_pip, identity_provider=None,
+             now=time.time) -> dict:
     """按阶段执行、修复、重试并原子发布 readiness/report.json。"""
 ```
 
 不使用模型评分或概率。排序固定为 phase 在前、原合同数组顺序在后。required foundation 未通过
-立即停止。
+立即停止。gate 在执行动作前持久化绝对开始时间，并在 installer 前先扣减和持久化修复次数。
 
-- [ ] **步骤 4：实现唯一自动修复**
+- [x] **步骤 4：实现唯一自动修复**
 
 ```python
 def install_isolated_pip(remediation: Mapping[str, Any], *, project_root: Path,
@@ -345,9 +347,11 @@ def install_isolated_pip(remediation: Mapping[str, Any], *, project_root: Path,
     # 先复核 containment 和 requirements SHA-256；使用安全环境、进程组超时和限长日志。
 ```
 
-installer 不接受 shell、任意 argv 或 sudo。修复后只重跑对应 requirement；再次失败即 blocked。
+installer 不接受 shell、任意 argv 或 sudo。修复成功后必须通过 `identity_provider` 刷新完整环境
+身份；身份未变化即 blocked，变化后废弃本轮已有结果并从 foundation 开头重跑。修复预算耗尽后
+不再次安装。
 
-- [ ] **步骤 5：验证并提交**
+- [x] **步骤 5：验证并提交**
 
 ```bash
 python3 -m unittest tests.test_readiness_gate tests.test_readiness_probe -v
@@ -435,12 +439,15 @@ git commit -m "feat(v3.1): require readiness before workload baseline"
 **文件：**
 
 - 修改：`skills/cuda-kernel-optimizer/scripts/check_env.py`
+- 创建：`skills/cuda-kernel-optimizer/scripts/readiness_identity.py`
 - 测试：`tests/test_check_env.py`
 
 - [ ] **步骤 1：编写失败测试**
 
 覆盖 `nsys`、`compute-sanitizer`、`ptxas`、`cuobjdump`、`nvdisasm`、`cmake`、`ninja`、C/C++
-编译器。工具存在但版本失败时仍 `available=true`、`usable=null`，不能标记 ready。
+编译器。工具存在但版本失败时仍 `available=true`、`usable=null`，不能标记 ready。环境 identity
+必须绑定实际工具路径/版本/摘要、隔离 Python 与已安装 distribution 清单、uid、容器、GPU、
+可见设备和权限状态；隔离 pip 后重新生成 identity 时必须发生可解释的摘要变化。
 
 ```python
 def test_inventory_never_claims_tool_capability(self):
@@ -471,12 +478,15 @@ def _detect_tool(name: str, version_args: list[str], timeout: int = 10) -> dict:
 ```
 
 NCU 的 `can_read_counters` 保持 `None`；真实状态只来自 readiness 或 `profile_ncu.py`。
+`readiness_identity.py` 提供 gate 的 `identity_provider`；它只读库存，不运行 profile，不把 ECC
+计数、瞬时 clock throttling 等波动指标混入稳定身份。
 
 - [ ] **步骤 4：验证并提交**
 
 ```bash
 python3 -m unittest tests.test_check_env tests.test_profile_ncu -v
-git add skills/cuda-kernel-optimizer/scripts/check_env.py tests/test_check_env.py
+git add skills/cuda-kernel-optimizer/scripts/check_env.py \
+  skills/cuda-kernel-optimizer/scripts/readiness_identity.py tests/test_check_env.py
 git commit -m "feat(v3.1): inventory GPU diagnostic tools"
 ```
 
