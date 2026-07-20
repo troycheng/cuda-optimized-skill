@@ -1,179 +1,80 @@
-# Workload controller example
+# Workload Controller example
 
-This example starts with a runnable workload, diagnoses why the GPU is idle,
-and evaluates one project-scoped change. Replace the absolute paths and probe argv
-with the user's real environment; keep the schemas and boundaries unchanged.
+This page shows what the AI and Controller exchange during a V3.1 workload run.
+It is not a command list for the user. The user supplies the runnable workload,
+reference, target environment, objective, constraints, and allowed project paths;
+the AI prepares and operates the contracts.
 
-## 1. Describe the run
+## What is frozen
 
-`control.json`:
+The AI creates a `control-v2` manifest that binds:
 
-```json
-{
-  "schema_version": "cuda-workload-optimizer/control-v1",
-  "project_root": "/workspace/service",
-  "workload_manifest": "/workspace/service/workload.json",
-  "baseline_candidate": {"name": "baseline", "revision": "abc123"},
-  "budget": "balanced",
-  "evaluation_gate": "promotion",
-  "mutation": {
-    "project_paths": ["src", "configs"],
-    "environment_root": "/workspace/service-env-copy",
-    "host_policy": "recommend_only"
-  },
-  "probes": [
-    {
-      "id": "timeline",
-      "kind": "timeline",
-      "argv": ["python3", "/workspace/tools/collect_timeline.py"],
-      "timeout_seconds": 300
-    }
-  ],
-  "reviewer": {
-    "argv": ["reviewer-cli", "--json"],
-    "timeout_seconds": 120,
-    "include_diff": false
-  }
-}
+- the user-provided workload and baseline candidate;
+- the readiness and active-diagnosis contracts;
+- `quick`, `balanced`, or `thorough` budget (`balanced` by default);
+- project mutation roots and an isolated environment root;
+- `host_policy: recommend_only`;
+- the global workload probes used to build the first diagnosis context.
+
+The active-diagnosis contract separately freezes each user-owned evidence adapter,
+its SHA-256 digest, argv, timeout, and Controller action ID. A claimed capability in
+that file is not trusted: current readiness results decide what can actually run.
+
+## The active diagnosis exchange
+
+```mermaid
+sequenceDiagram
+    participant AI
+    participant C as Controller
+    participant A as Frozen adapter
+    C->>C: Readiness, baseline, global scan
+    C-->>AI: Hash-bound context and up to 3 routing cards
+    AI->>C: Competing hypotheses and evidence requests
+    C->>C: Validate epoch, outcomes, cost, history, capabilities
+    C->>A: Execute one selected action
+    A-->>C: Strict evidence-result object
+    C->>C: Bind outcome, artifact digest, budget and ledger
+    C-->>AI: Next diagnosis context
 ```
 
-The budget is explicit in the file. Use `balanced` when the user has not chosen
-between `fast`, `balanced`, and `thorough`. `project_paths` must not overlap.
-`environment_root` is a user-owned isolated copy, not a host Python, CUDA, or
-driver directory. Set `evaluation_gate` to `reject_only` for a quick screening
-stage; even a statistically positive result is then rolled back and cannot be
-promoted. Omit it only for backward-compatible promotion behavior.
+An evidence request states the question, target hypotheses, exclusive pairs, and
+the support/opposition effect of every possible outcome. The model does not assign
+cost, risk, perturbation, or an information-gain score. The Controller obtains those
+facts from its catalog and selects deterministically.
 
-Start the controller:
+The adapter writes one `cuda-optimizer/evidence-result-v1` object. An `observed`
+result must name one preregistered outcome; non-observed results use a null outcome.
+The Controller binds the selected outcome to the evidence catalog, so the next model
+round cannot reinterpret opposing evidence as support.
 
-```bash
-python3 scripts/workload_controller.py run \
-  --control /workspace/control.json \
-  --run-dir /workspace/workload_run
-```
+## Resume and failure behavior
 
-The probe command receives `CUDA_OPTIMIZER_OUTPUT`,
-`CUDA_OPTIMIZER_RUN_DIR`, and `CUDA_OPTIMIZER_PROJECT_ROOT`. It writes one strict
-object to `CUDA_OPTIMIZER_OUTPUT`:
+The Controller serializes active-diagnosis mutations per run. A repeated resume after
+completion returns the current state and does not execute the adapter again. If an
+intent exists without a completion marker, the run enters `manual_recovery`; partial
+files are kept only for investigation and never enter the evidence catalog. Recovery
+starts a child or new run rather than accepting or replaying that partial result.
 
-```json
-{
-  "schema_version": "cuda-workload-optimizer/probe-v1",
-  "probe_id": "timeline",
-  "kind": "timeline",
-  "status": "ok",
-  "metrics": {
-    "gpu_busy_pct": 43.2,
-    "cpu_busy_pct": 91.0,
-    "data_wait_pct": 38.5
-  },
-  "issues": [],
-  "artifacts": [
-    {
-      "name": "raw/timeline.sqlite",
-      "sha256": "0f4a3a2e445d6f40f31071f0f0892b64debd2bd8242a2ce3b63d508a878ad19d"
-    }
-  ]
-}
-```
+Equivalent request signatures and non-repeatable action IDs persist across rounds.
+Tampered result content, artifact digests, ledger entries, source identity, workload
+identity, or environment identity fail closed.
 
-Missing metrics stay missing; do not write zero for evidence that was not
-collected. Supported percentage fields are listed in
-`references/workload_diagnosis_policy.json` and the control design. The
-controller stores bounded stdout and stderr separately from the probe facts.
+## Direction experiments and host changes
 
-## 2. Register one bounded change
+A direction experiment may execute in a fresh copy of the declared project. Absolute
+argv entries inside the project are remapped to the copy, and the original project
+identity must remain unchanged. This protects the frozen experiment from ordinary
+project edits; it is not containment for untrusted or malicious code. Adapters run with
+the current user's OS permissions and require the same trust as other local tooling.
 
-Read `workload_run/diagnosis.json`. If data wait dominates, a ChangeSet can look
-like this:
+Drivers, GPU counter permissions, clocks, power, services, container runtime, and
+other host settings are never changed by this Controller. They are reported as user
+actions with supporting evidence.
 
-```json
-{
-  "schema_version": "cuda-workload-optimizer/change-v1",
-  "id": "round-1-dataloader-workers",
-  "hypothesis": "The input pipeline leaves the GPU idle between batches.",
-  "diagnosis_ids": ["cpu_data:data-wait"],
-  "scope": "project",
-  "candidate": {"name": "dataloader-workers-8", "revision": "worktree"},
-  "paths": ["configs/serve.json"],
-  "commands": [],
-  "rollback": "restore_frozen_snapshot",
-  "expected_metrics": [
-    "data_wait_pct",
-    "gpu_busy_pct",
-    "p50_latency_ms"
-  ]
-}
-```
+## What counts as a result
 
-Register before editing:
-
-```bash
-python3 scripts/workload_controller.py register-change \
-  --control /workspace/control.json \
-  --run-dir /workspace/workload_run \
-  --change-set /workspace/change.json
-```
-
-Codex now edits only `configs/serve.json`. For dependency or container changes,
-set `scope` to `isolated_environment`; paths then resolve inside the declared
-environment copy. `host` is not a valid scope.
-
-## 3. Review and evaluate
-
-The optional reviewer receives a digest-bound request on stdin. It may return:
-
-```json
-{
-  "schema_version": "cuda-workload-optimizer/review-v1",
-  "request_digest": "the-digest-from-the-request",
-  "verdict": "challenge",
-  "concerns": [
-    {
-      "severity": "medium",
-      "category": "experiment",
-      "message": "Repeat after a fixed warmup window."
-    }
-  ],
-  "suggested_experiments": ["Use the same request trace for both roles."]
-}
-```
-
-Only `support`, `challenge`, and `insufficient` are valid verdicts. The reviewer
-cannot return commands or approve promotion. Source diff content is withheld by
-default; set `include_diff` to `true` only when the selected reviewer may receive
-it. The local process still has the current user's OS permissions; put it in a
-read-only sandbox when that matters.
-
-Evaluate the registered candidate:
-
-```bash
-python3 scripts/workload_controller.py evaluate \
-  --run-dir /workspace/workload_run
-```
-
-The controller checks the actual diff, records a separate binding between the
-unchanged candidate descriptor and post-change identity, reviews the proposal,
-and evaluates
-randomized baseline/candidate pairs on the frozen workload. `commands` must be
-empty: correctness comes from the workload adapter's `validate()` contract, so
-the controller does not add an unrestricted same-user command surface.
-Promotion requires a confirmed primary-metric win and all constraints passing.
-Otherwise the frozen project or environment snapshot is restored.
-
-The adapter owns the semantic mapping from its candidate descriptor to the
-implementation it measures. Its `validate()` must reject a descriptor that does
-not select the registered candidate. `candidate_binding.json` makes the
-descriptor, ChangeSet digest, and filesystem identity auditable without adding
-private keys to the user candidate object.
-
-Inspect or resume without replaying completed stages:
-
-```bash
-python3 scripts/workload_controller.py status --run-dir /workspace/workload_run
-python3 scripts/workload_controller.py resume --run-dir /workspace/workload_run
-```
-
-Host-level opportunities belong in `host_recommendations.md`. Include evidence,
-risk, expected effect, and a manual verification command; never apply them from
-the workload controller.
+Active diagnosis can decide that evidence is sufficient to try a bounded project
+change. It does not prove that the change is faster. Promotion still requires the
+frozen correctness checks, paired workload measurements, declared constraints, and
+evidence-integrity gates. Without a user-provided representative workload, the result
+stops at environment preparation or a bounded diagnostic hypothesis.

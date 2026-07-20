@@ -11,10 +11,13 @@ flowchart TD
     user["User workload, objective, constraints"] --> contract["Workload Contract"]
     contract --> calibration["Noise and MDE calibration"]
     calibration --> controller["Deterministic Controller"]
-    controller --> evidence["Verified observations"]
-    evidence --> registry["Capability Registry"]
-    registry --> planner["AI proposes one bounded candidate"]
-    planner --> controller
+    controller --> evidence["Verified observations and execution map"]
+    evidence --> planner["AI states competing hypotheses"]
+    planner --> selector["Controller selects one evidence action"]
+    selector --> evidence
+    planner --> registry["Load a few matching cards"]
+    registry --> candidate["AI proposes one bounded candidate"]
+    candidate --> controller
     controller --> measure["Correctness and paired measurement"]
     measure --> ledger["Append-only ledger"]
     ledger --> controller
@@ -34,6 +37,19 @@ The **Capability Registry** is a small, searchable library of methods. Queries
 match exact architecture, task, observed signals, and available evidence before
 loading a playbook. A card can suggest what to try and how to disprove it; it
 cannot authorize execution or promotion.
+
+V3.1 adds the active-diagnosis loop between the first global scan and candidate
+admission. The Controller freezes user-owned evidence adapters, obtains available
+capabilities from the current readiness report, and deterministically chooses one
+request from the AI's competing hypotheses. The selected outcome has predefined
+support and opposition effects. Those effects, the artifact digest, equivalent-request
+history, and remaining profile budget become part of the next hash-bound context.
+
+Each run has an exclusive mutation lock. A completed request is idempotent on resume.
+An intent without a completion marker is never executed again or accepted manually;
+the run stops at `manual_recovery` and a child or new run is required. A direction
+experiment may use a project copy, but that copy is only cooperative isolation and
+does not contain untrusted code.
 
 ## Measuring whether small changes are visible
 

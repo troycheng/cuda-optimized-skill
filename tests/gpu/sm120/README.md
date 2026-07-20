@@ -158,7 +158,7 @@ controller detected that the environment could not support the requested
 claim and did not begin candidate exploration. NCU again returned
 `ERR_NVGPUCTRPERM`; no host permission or driver policy was changed.
 
-The V3.1 development readiness lane ran on an idle physical RTX 5090 on
+The V3.1 readiness lane ran on an idle physical RTX 5090 on
 2026-07-20. A fresh lane passed 18/18 checks in 52.141 seconds with the same
 immutable image. Readiness took 8.793 seconds and the first baseline artifact
 appeared after 9.297 seconds. CUDA 13.3 target compilation, SM120 execution and

@@ -32,10 +32,14 @@ Version 3.0 adds a deterministic long-run Controller. A frozen Workload Contract
 the objective, environment, budget, measurement policy, and allowed scope. Signed evidence
 and an append-only ledger keep interrupted, noisy, or drifted runs from silently changing the experiment.
 
-The AI runs readiness automatically before the baseline in V3.1 development. If a
-required capability fails, it does not start the baseline. The user supplies the real
-workload and explicit authorization. A hash-locked isolated pip install is the only
-automatic repair; host changes remain recommendations, and `self_check` does not prove that the GPU environment is ready.
+V3.1 joins environment readiness and bottleneck analysis into a resumable active-
+diagnosis loop. The AI checks required build, GPU, profiler, and workload-smoke
+capabilities, then proposes competing explanations that measurements can disprove.
+The Controller executes only frozen evidence actions, verifies outcome meaning and
+digests, and carries valid results into the next round without spending budget twice.
+The user still supplies the real workload and authorization. The only automatic repair
+is a hash-locked pip install inside the declared isolated environment; host changes stay
+recommendations, and `self_check` does not prove that the GPU environment is ready.
 
 The skill never changes host-level settings automatically. Drivers, counter
 permissions, clocks, power limits, services, and system configuration remain
@@ -83,8 +87,11 @@ recovery behavior.
 flowchart LR
     goal["Goal, code, and constraints"] --> environment["Check the test environment"]
     environment --> baseline["Freeze and calibrate the baseline"]
-    baseline --> profiling["Profile and locate the bottleneck"]
-    profiling --> change["Create a bounded change"]
+    baseline --> context["Build the execution map and evidence catalog"]
+    context --> hypothesis["State falsifiable competing explanations"]
+    hypothesis --> evidence["Run the most discriminating evidence action"]
+    evidence --> hypothesis
+    hypothesis --> change["Evidence is sufficient: create a bounded change"]
     change --> evaluation["Check correctness and paired performance"]
     evaluation --> keep["Evidence is sufficient: keep the change"]
     evaluation --> restore["Evidence is insufficient: restore the original"]
@@ -138,73 +145,63 @@ separate. Neither page predicts the speedup of a new project.
 The maintained release history starts with V2.2. These are project versions;
 not every historical version has a matching Git tag.
 
-### V3.1 (development)
+### V3.1
 
-Readiness admission is under development. It checks real build, GPU execution, profiling,
-sanitizer, and workload-smoke capabilities before the baseline with bounded isolated repair and stable environment identity.
+Added pre-baseline readiness and a resumable active-diagnosis loop. The Controller
+freezes evidence adapters and arguments, derives available capabilities from current
+readiness results, executes one action under a per-run lock, and binds its outcome,
+artifact, request history, and remaining budget to the next context. Exclusive
+explanations cannot both pass. Tampered results, interrupted execution, identity drift,
+and missing capabilities stop closed. Direction experiments run in a project copy;
+this is cooperative isolation, not an OS security sandbox.
+
+Mechanism tests and target-machine smoke are complete. Whether V3.1 finds a useful
+direction faster than V3.0 still requires a user-supplied long-running workload; sample
+data is not a workload-performance result.
 
 ### V3.0.1
-
 Added a fail-closed single-variable software-stack audit, permanent invalid-
 evidence quarantine, explicit composition rules, and a stop rule for measurement
 runner maintenance. These changes came from a real Triton upgrade investigation.
 
 ### V3.0
-
 Added a frozen Workload Contract, deterministic Controller, append-only replay,
 evidence-bound Planner admission, a context-budgeted Capability Registry, and
 noise/MDE calibration with mandatory periodic audits. External research remains
 optional and local evidence remains decisive.
 
 ### V2.9
-
 Reorganized public docs around user tasks; added readiness claim ceilings,
 bounded offline knowledge, primary-source manifests, and optional independent review.
 
 ### V2.8
-
 Added nonstationary serving comparability checks for balanced AB/BA evidence.
 
 ### V2.7
-
 Added direction-level admission, conservative headroom, and stop/reopen history.
 
 ### V2.6
-
 Added the performance-first iteration gate and bounded tool repair.
 
 ### V2.5
-
 Added formal evidence automation, continuous guards, sealing, and audit.
 
 ### V2.4
-
 Added the workload controller, bounded ChangeSets, and advisory host review.
 
 ### V2.3
-
 Expanded portable CUDA, CUTLASS, Triton, report analysis, and systems coverage.
 
 ### V2.2
-
 Established the dual-loop kernel/workload optimizer and RTX 5090 test lane.
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md)
-- [Preparing a workload](docs/environment-readiness.md)
-- [Workflow selection](docs/workflows.md)
-- [Long-running optimization](docs/long-running-optimization.md)
-- [Evidence and safety](docs/evidence-and-safety.md)
-- [Compatibility](docs/compatibility.md)
-- [Validation status](docs/validation.md) and [case studies](docs/case-studies.md)
-- [Knowledge and research](docs/knowledge-and-research.md)
-- [Agent protocol](skills/cuda-kernel-optimizer/SKILL.md) and [walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md)
-- [Performance iteration](skills/cuda-kernel-optimizer/references/performance_iteration.md), [direction admission](skills/cuda-kernel-optimizer/references/direction_admission.md), and [long-run control](skills/cuda-kernel-optimizer/references/long_running_control.md)
-- [Software-stack comparison](skills/cuda-kernel-optimizer/references/version_stack_audit.md)
-- [Formal evidence](skills/cuda-kernel-optimizer/references/evidence_automation.md) and [canonical compatibility](skills/cuda-kernel-optimizer/references/compatibility.md)
-- [RTX 5090 opt-in guide](tests/gpu/sm120/README.md)
-- [MIT License](LICENSE)
+- Start with [Getting Started](docs/getting-started.md), [Preparing a workload](docs/environment-readiness.md), and [Workflow selection](docs/workflows.md).
+- Read [Long-running optimization](docs/long-running-optimization.md), [Evidence and safety](docs/evidence-and-safety.md), [Compatibility](docs/compatibility.md), and [Knowledge and research](docs/knowledge-and-research.md) for operating details.
+- Project evidence is in [Validation status](docs/validation.md), [case studies](docs/case-studies.md), and the [RTX 5090 opt-in guide](tests/gpu/sm120/README.md).
+- The AI protocol is [SKILL.md](skills/cuda-kernel-optimizer/SKILL.md); detailed contracts cover [performance iteration](skills/cuda-kernel-optimizer/references/performance_iteration.md), [direction admission](skills/cuda-kernel-optimizer/references/direction_admission.md), [long-run control](skills/cuda-kernel-optimizer/references/long_running_control.md), [software-stack comparison](skills/cuda-kernel-optimizer/references/version_stack_audit.md), [formal evidence](skills/cuda-kernel-optimizer/references/evidence_automation.md), and [canonical compatibility](skills/cuda-kernel-optimizer/references/compatibility.md).
+- [Walkthrough](skills/cuda-kernel-optimizer/examples/walkthrough.md) · [MIT License](LICENSE)
 
 This project is independent of CUDA, CUTLASS, Triton, and Nsight Compute. Use
 those dependencies under their respective licenses.

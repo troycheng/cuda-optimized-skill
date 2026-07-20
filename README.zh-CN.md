@@ -30,9 +30,11 @@ allocator 与运行状态。
 测量规则和修改范围；签名证据与只增不改的账本负责决定是否继续。任务中断、环境噪声
 升高或身份漂移时，系统不会悄悄改变实验。
 
-在 3.1 开发版本中，AI 会自动完成环境准入检查。必需能力没有通过时，不会启动 baseline。
-真实 workload 和明确授权由用户提供。带哈希锁定的隔离环境 pip 是唯一允许自动执行的修复；
-宿主机改动仍然只给建议。`self_check` 通过不代表 GPU 环境已经可用。
+3.1 把环境检查和瓶颈定位连成了一个可恢复的主动诊断闭环。AI 先确认编译、GPU、profiler
+和 workload smoke 等必需能力，再根据当前证据提出互相竞争、可以被实测推翻的解释。Controller
+只执行合同中冻结的证据动作，校验结果含义和摘要后再进入下一轮；等价采集不会重复消耗预算。
+真实 workload 和明确授权仍由用户提供。带哈希锁定的隔离环境 pip 是唯一允许自动执行的修复，
+宿主机改动只给建议。`self_check` 通过不代表 GPU 环境已经可用。
 
 Skill 不会自动修改宿主机配置。驱动、counter 权限、频率、功耗限制、服务和系统设置
 都只给建议，除非用户另行明确授权。
@@ -74,8 +76,11 @@ Skill 不会自动修改宿主机配置。驱动、counter 权限、频率、功
 flowchart LR
     goal["目标、代码和约束"] --> environment["检查测试环境"]
     environment --> baseline["冻结并校准 baseline"]
-    baseline --> profiling["Profiling 并定位瓶颈"]
-    profiling --> change["创建限定范围的修改"]
+    baseline --> context["建立执行图和证据目录"]
+    context --> hypothesis["提出可证伪的竞争解释"]
+    hypothesis --> evidence["选择并执行最有区分力的证据动作"]
+    evidence --> hypothesis
+    hypothesis --> change["证据充分：创建限定范围的修改"]
     change --> evaluation["检查正确性和成对性能"]
     evaluation --> keep["证据充分：保留修改"]
     evaluation --> restore["证据不足：恢复原实现"]
@@ -121,10 +126,15 @@ workload 结果。两者都不承诺新项目能获得相同提速。
 
 本项目从 V2.2 开始维护版本记录。这里记录项目版本，并不表示每个历史版本都有 Git tag。
 
-### V3.1 (development)
+### V3.1
 
-环境准入仍在开发中。AI 会在 baseline 前验证真实编译、GPU 执行、profiling、sanitizer 和
-workload smoke；隔离修复有明确上限，环境身份变化后会重新检查。
+增加 baseline 前的环境准入和可恢复主动诊断闭环。Controller 现在会冻结证据 adapter 与
+执行参数，按 readiness 实际结果限制能力，串行执行一次证据动作，并把 outcome、artifact、
+请求历史和剩余预算绑定到下一轮上下文。互斥解释不能同时成立；结果被修改、执行中断、身份漂移
+或缺少能力时会停止而不是猜测。方向实验只在项目副本中运行；这是协作式隔离，不是 OS 安全沙箱。
+
+本版本已经通过机制与目标机 smoke 验证；“比 3.0 更快找到有效方向”仍需用用户提供的真实长
+workload 评估，示例数据不代替业务结论。
 
 ### V3.0.1
 

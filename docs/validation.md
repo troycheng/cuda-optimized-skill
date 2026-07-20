@@ -5,16 +5,18 @@ predict the speedup of a new workload.
 
 ## Automated checks
 
-The current suite contains 1031 tests. In the local CPU/static lane on
-2026-07-20, 1023 passed, eight physical RTX 5090 opt-in tests were skipped, and
-none failed. These checks cover input validation, state recovery, evidence
-binding, shared-host guards, timeouts, restoration, capability retrieval,
-stability calibration, audit cadence, and deterministic decision logic. They
-do not validate the reader's CUDA environment.
+The local CPU/static suite ran 1,061 tests on 2026-07-20: 1,053 passed, eight
+physical RTX 5090 opt-in tests were skipped, and none failed. It covers input
+validation, state recovery, evidence binding, shared-host guards, timeouts, restoration, capability retrieval,
+stability calibration, audit cadence, and deterministic decision logic. V3.1 adds
+closed-loop adapter execution, outcome-bound support/opposition, cross-round request
+history, result-tamper detection, interruption handling, concurrent resume, readiness-
+capability replay, and project-copy direction experiments. These checks do not
+validate the reader's CUDA environment.
 
 ## Physical GPU lane
 
-The V3.1 development readiness lane completed 18 of 18 checks in 52.141 seconds
+The V3.1 readiness lane completed 18 of 18 checks in 52.141 seconds
 on 2026-07-20 with the same immutable image listed below. Readiness itself took
 8.793 seconds; the first baseline artifact appeared 9.297 seconds after the run
 started. CUDA 13.3 target compilation, SM120 execution and SASS, Compute

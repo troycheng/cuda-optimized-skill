@@ -24,6 +24,12 @@ Each card names counter-signals, required gates, verification steps, and stop
 conditions. A hard UTF-8 byte budget limits the loaded playbooks; the complete
 catalog never enters the Planner context.
 
+During V3.1 active diagnosis, a smaller routing catalog supplies at most three
+diagnostic cards for the current layer and bottleneck. The cards name likely signals,
+counter-signals, and the next evidence family; they contain no commands and have
+`promotion_authority: none`. They help the model read the context without loading the
+full knowledge base and cannot override an observed outcome.
+
 Registry matches propose methods. They cannot admit an experiment or promote a
 candidate. The Controller re-reads sealed local artifacts and decides whether
 the required gates are satisfied.
