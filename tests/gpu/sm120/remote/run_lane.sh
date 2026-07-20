@@ -15,7 +15,7 @@ case "$lane" in
     ;;
 esac
 
-readonly allowed_root="/data/tcheng/cuda-skill-e2e/v2.2"
+readonly allowed_root="/data/tcheng/cuda-skill-e2e/v3.1"
 readonly allowed_cutlass="/data/tcheng/cuda-skill-e2e/deps/cutlass"
 readonly expected_cutlass_version="4.6.1"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"

@@ -24,6 +24,7 @@ SCRIPTS = ROOT / "skills" / "cuda-kernel-optimizer" / "scripts"
 RUNNER = Path(__file__).resolve().parent / "remote" / "run_lane.sh"
 ARTIFACTS = Path(os.environ.get("CUDA_E2E_ARTIFACTS", "/tmp/cuda-sm120-acceptance"))
 WORKLOAD_CONTROLLER = SCRIPTS / "workload_controller.py"
+READINESS_SMOKE = FIXTURES / "readiness_smoke.py"
 
 
 @dataclass(frozen=True)
@@ -288,11 +289,319 @@ class Sm120AcceptanceHelperTests(unittest.TestCase):
         ):
             self.assertIn(marker, source)
 
+    def test_v3_1_lane_gates_real_workload_on_readiness(self) -> None:
+        source = inspect.getsource(
+            Sm120AcceptanceTests.test_readiness_gate_precedes_real_workload
+        )
+        self.assertTrue(READINESS_SMOKE.is_file())
+        combined = source + READINESS_SMOKE.read_text("utf-8")
+        for marker in (
+            "cuda-foundation",
+            "nsys",
+            "ncu",
+            "sanitizer",
+            "workload-smoke",
+            "foundation-complete",
+            "workload-smoke-start",
+        ):
+            self.assertIn(marker, combined)
+
+
 @unittest.skipUnless(
     os.environ.get("CUDA_SM120_E2E") == "1",
     "set CUDA_SM120_E2E=1 on an SM120 CUDA host",
 )
 class Sm120AcceptanceTests(unittest.TestCase):
+    def _readiness_control(
+        self,
+        case_root: Path,
+        workspace: Path,
+        requirements: list[dict],
+        *,
+        max_repairs: int = 0,
+    ) -> tuple[dict, Path]:
+        environment = case_root / "isolated-environment"
+        environment.mkdir(parents=True, exist_ok=True)
+        workload_manifest = workspace / "readiness_workload.json"
+        workload_manifest.write_text(
+            json.dumps(
+                {
+                    "kind": "python",
+                    "source": "workload_smoke.py",
+                    "objective": json.loads(
+                        (workspace / "objective.json").read_text("utf-8")
+                    ),
+                    "cases": [{"N": 1_048_576}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        contract_path = workspace / "readiness.json"
+        contract_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "cuda-workload-optimizer/readiness-contract-v1",
+                    "requested_claim": "workload",
+                    "budget": {
+                        "max_seconds": 240,
+                        "max_repairs": max_repairs,
+                    },
+                    "requirements": requirements,
+                }
+            ),
+            encoding="utf-8",
+        )
+        control = {
+            "schema_version": "cuda-workload-optimizer/control-v2",
+            "project_root": str(workspace),
+            "workload_manifest": str(workload_manifest),
+            "readiness_contract": str(contract_path),
+            "baseline_candidate": {
+                "name": "readiness-baseline",
+                "revision": "fixture-current",
+                "path": str(workspace / "triton_vector.py"),
+            },
+            "budget": "fast",
+            "mutation": {
+                "project_paths": ["triton_vector.py"],
+                "environment_root": str(environment),
+                "host_policy": "recommend_only",
+            },
+            "probes": [
+                {
+                    "id": "timeline",
+                    "kind": "timeline",
+                    "argv": [sys.executable, str(workspace / "workload_probe.py")],
+                    "timeout_seconds": 60,
+                }
+            ],
+        }
+        return control, case_root / "run"
+
+    def _readiness_requirement(
+        self,
+        workspace: Path,
+        work_dir: Path,
+        requirement_id: str,
+        mode: str,
+        *,
+        necessity: str,
+        phase: str,
+        kind: str,
+        timeout: float = 90,
+        remediation: dict | None = None,
+        extra: tuple[str, ...] = (),
+    ) -> dict:
+        return {
+            "id": requirement_id,
+            "necessity": necessity,
+            "control_scope": "host" if remediation else "project",
+            "phase": phase,
+            "kind": kind,
+            "max_age_seconds": 300,
+            "probe": {
+                "argv": [
+                    sys.executable,
+                    str(workspace / "readiness_smoke.py"),
+                    "--mode",
+                    mode,
+                    "--requirement-id",
+                    requirement_id,
+                    "--work-dir",
+                    str(work_dir),
+                    *extra,
+                ],
+                "timeout_seconds": timeout,
+            },
+            "remediation": remediation or {"mode": "none"},
+        }
+
+    def test_readiness_gate_precedes_real_workload(self) -> None:
+        controller = _load_script("workload_controller")
+        case_root = ARTIFACTS / "readiness_v31"
+        workspace = _stage_fixture_workspace("workspace", artifacts=case_root)
+        work_dir = case_root / "probe-work"
+        requirements = [
+            self._readiness_requirement(
+                workspace,
+                work_dir,
+                "cuda-foundation",
+                "cuda-foundation",
+                necessity="required",
+                phase="foundation",
+                kind="target_compile",
+            ),
+            self._readiness_requirement(
+                workspace,
+                work_dir,
+                "nsys",
+                "nsys",
+                necessity="diagnostic",
+                phase="workload",
+                kind="nsys_trace",
+            ),
+            self._readiness_requirement(
+                workspace,
+                work_dir,
+                "ncu",
+                "ncu",
+                necessity="diagnostic",
+                phase="workload",
+                kind="ncu_counters",
+                remediation={
+                    "mode": "user_action",
+                    "message": (
+                        "Grant GPU performance-counter access or use lower evidence."
+                    ),
+                },
+            ),
+            self._readiness_requirement(
+                workspace,
+                work_dir,
+                "sanitizer",
+                "sanitizer",
+                necessity="diagnostic",
+                phase="workload",
+                kind="sanitizer",
+            ),
+            self._readiness_requirement(
+                workspace,
+                work_dir,
+                "workload-smoke",
+                "workload-smoke",
+                necessity="required",
+                phase="workload",
+                kind="workload_smoke",
+                extra=("--workload", str(workspace / "triton_vector.py")),
+            ),
+        ]
+        control, run_dir = self._readiness_control(
+            case_root, workspace, requirements
+        )
+
+        state = controller.start_run(control, run_dir)
+
+        self.assertEqual(state["next_action"], "register_change")
+        env_path = case_root / "env.json"
+        _run([sys.executable, str(CHECK_ENV), "--out", str(env_path)], env_path)
+        env = json.loads(env_path.read_text("utf-8"))
+        self.assertEqual(env["primary_sm_arch"], "sm_120")
+        report = json.loads(
+            (run_dir / "readiness" / "report.json").read_text("utf-8")
+        )
+        self.assertTrue(report["can_start_diagnosis"])
+        results = {item["requirement_id"]: item for item in report["results"]}
+        self.assertEqual(results["cuda-foundation"]["admission_status"], "ready")
+        self.assertEqual(results["workload-smoke"]["admission_status"], "ready")
+        self.assertEqual(results["nsys"]["admission_status"], "degraded")
+        self.assertIn(
+            results["ncu"]["admission_status"], {"ready", "user_action_required"}
+        )
+        self.assertIn(
+            results["sanitizer"]["admission_status"], {"ready", "degraded"}
+        )
+        events = [
+            json.loads(line)["event"]
+            for line in (work_dir / "events.jsonl").read_text("utf-8").splitlines()
+        ]
+        self.assertLess(
+            events.index("foundation-complete"),
+            events.index("workload-smoke-start"),
+        )
+        self.assertTrue((run_dir / "baseline" / "observation.json").is_file())
+
+    def test_readiness_faults_fail_closed_before_baseline(self) -> None:
+        controller = _load_script("workload_controller")
+
+        timeout_root = ARTIFACTS / "readiness_v31_timeout"
+        timeout_workspace = _stage_fixture_workspace(
+            "workspace", artifacts=timeout_root
+        )
+        timeout_requirement = self._readiness_requirement(
+            timeout_workspace,
+            timeout_root / "probe-work",
+            "probe-timeout",
+            "sleep",
+            necessity="required",
+            phase="foundation",
+            kind="gpu_execute",
+            timeout=0.1,
+        )
+        timeout_control, timeout_run = self._readiness_control(
+            timeout_root, timeout_workspace, [timeout_requirement]
+        )
+        timeout_state = controller.start_run(timeout_control, timeout_run)
+        self.assertEqual(timeout_state["next_action"], "readiness_action")
+        self.assertFalse((timeout_run / "baseline" / "observation.json").exists())
+
+        workload_root = ARTIFACTS / "readiness_v31_workload_failure"
+        workload_workspace = _stage_fixture_workspace(
+            "workspace", artifacts=workload_root
+        )
+        workload_requirement = self._readiness_requirement(
+            workload_workspace,
+            workload_root / "probe-work",
+            "workload-failure",
+            "workload-smoke",
+            necessity="required",
+            phase="workload",
+            kind="workload_smoke",
+            extra=(
+                "--workload",
+                str(workload_workspace / "triton_vector.py"),
+                "--fail",
+            ),
+        )
+        workload_control, workload_run = self._readiness_control(
+            workload_root, workload_workspace, [workload_requirement]
+        )
+        workload_state = controller.start_run(workload_control, workload_run)
+        self.assertEqual(workload_state["next_action"], "readiness_action")
+        self.assertFalse((workload_run / "baseline" / "observation.json").exists())
+
+        hash_root = ARTIFACTS / "readiness_v31_hash_failure"
+        hash_workspace = _stage_fixture_workspace("workspace", artifacts=hash_root)
+        hash_environment = hash_root / "isolated-environment"
+        python_path = hash_environment / "bin" / "python"
+        python_path.parent.mkdir(parents=True)
+        shutil.copy2(sys.executable, python_path)
+        requirements_path = hash_workspace / "requirements.txt"
+        requirements_path.write_text(
+            "packaging==24.2 --hash=sha256:" + "a" * 64 + "\n"
+        )
+        hash_requirement = self._readiness_requirement(
+            hash_workspace,
+            hash_root / "probe-work",
+            "hash-failure",
+            "cuda-foundation",
+            necessity="required",
+            phase="foundation",
+            kind="target_compile",
+            remediation={
+                "mode": "isolated_pip",
+                "authorization_id": "sm120-hash-fault",
+                "python": str(python_path),
+                "requirements_file": str(requirements_path),
+                "requirements_sha256": "0" * 64,
+                "timeout_seconds": 10,
+            },
+            extra=("--fail",),
+        )
+        hash_requirement["control_scope"] = "isolated_environment"
+        hash_control, hash_run = self._readiness_control(
+            hash_root,
+            hash_workspace,
+            [hash_requirement],
+            max_repairs=1,
+        )
+        hash_state = controller.start_run(hash_control, hash_run)
+        self.assertEqual(hash_state["next_action"], "readiness_action")
+        self.assertFalse((hash_run / "baseline" / "observation.json").exists())
+        receipts = list(hash_run.glob("readiness/attempts/**/installs/*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text("utf-8"))
+        self.assertEqual(receipt["reason"], "requirements_digest_mismatch")
+
     def test_environment_and_fixture_matrix(self) -> None:
         ARTIFACTS.mkdir(parents=True, exist_ok=True)
         env_path = ARTIFACTS / "env.json"

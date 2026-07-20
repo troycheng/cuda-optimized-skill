@@ -544,7 +544,7 @@ git commit -m "test(v3.1): exercise readiness admission locally"
 - 修改：`tests/gpu/sm120/test_sm120_acceptance.py`
 - 修改：`tests/gpu/sm120/remote/run_lane.sh`
 
-- [ ] **步骤 1：先写 GPU acceptance**
+- [x] **步骤 1：先写 GPU acceptance**
 
 固定五条路径：target compile/GPU execute/SASS；Nsys report + stats；NCU 真实 target range；
 Compute Sanitizer memcheck；foundation 之后的 workload correctness/KPI smoke。
@@ -558,13 +558,13 @@ def test_readiness_gate_precedes_real_workload(self):
                     report["events"].index("workload-smoke-start"))
 ```
 
-- [ ] **步骤 2：本机确认只跳过物理 GPU**
+- [x] **步骤 2：本机确认只跳过物理 GPU**
 
 ```bash
 python3 -m unittest tests.gpu.sm120.test_sm120_acceptance -v
 ```
 
-- [ ] **步骤 3：5090 新鲜临时目录运行**
+- [x] **步骤 3：5090 新鲜临时目录运行**
 
 ```bash
 CUDA_SM120_E2E=1 bash tests/gpu/sm120/remote/run_lane.sh
@@ -573,17 +573,17 @@ CUDA_SM120_E2E=1 bash tests/gpu/sm120/remote/run_lane.sh
 不修改驱动、counter 权限、频率、功耗和服务。NCU 成功时记录 counter；无权限时精确记录
 `ERR_NVGPUCTRPERM` 和 user action，不尝试 sudo。`--query-metrics` 不算通过。
 
-- [ ] **步骤 4：故障注入**
+- [x] **步骤 4：故障注入**
 
 隐藏 `nsys`、让 NCU 返回权限错误、破坏 requirements hash、让 probe 超时、让 workload smoke
 错误。每种情况必须得到预期 degraded/blocked，且 baseline 不被错误启动。
 
-- [ ] **步骤 5：冻结 3.0 对照**
+- [x] **步骤 5：冻结 3.0 对照**
 
 同机器、workload、容器记录环境准备耗时、首次 baseline 时间、首个方向前 profile 轮次、工具
 修复数和重复 probe 数。先保存分布，再冻结 3.1 门槛，不预设改善百分比。
 
-- [ ] **步骤 6：提交**
+- [x] **步骤 6：提交**
 
 ```bash
 git add tests/gpu/sm120/fixtures/readiness_smoke.py \
