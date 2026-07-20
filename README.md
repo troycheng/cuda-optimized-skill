@@ -36,7 +36,8 @@ V3.1 joins environment readiness and bottleneck analysis into a resumable active
 diagnosis loop. The AI checks required build, GPU, profiler, and workload-smoke
 capabilities, then proposes competing explanations that measurements can disprove.
 The Controller executes only frozen evidence actions, verifies outcome meaning and
-digests, and carries valid results into the next round without spending budget twice.
+content digests, including the actual launcher identity, and carries valid results into
+the next round without spending budget twice.
 The user still supplies the real workload and authorization. The only automatic repair
 is a hash-locked pip install inside the declared isolated environment; host changes stay
 recommendations, and `self_check` does not prove that the GPU environment is ready.
@@ -152,8 +153,9 @@ freezes evidence adapters and arguments, derives available capabilities from cur
 readiness results, executes one action under a per-run lock, and binds its outcome,
 artifact, request history, and remaining budget to the next context. Exclusive
 explanations cannot both pass. Tampered results, interrupted execution, identity drift,
-and missing capabilities stop closed. Direction experiments run in a project copy;
-this is cooperative isolation, not an OS security sandbox.
+and missing capabilities stop closed. Project content, adapter launchers, hypothesis
+generations, and the committed ledger head are digest-bound. Direction experiments run
+in a project copy; this is cooperative isolation, not an OS security sandbox.
 
 Mechanism tests and target-machine smoke are complete. Whether V3.1 finds a useful
 direction faster than V3.0 still requires a user-supplied long-running workload; sample

@@ -172,8 +172,8 @@ The historical V3.0 path had no readiness stage, so this run proves admission
 behavior, not faster diagnosis or optimization.
 
 The V3.1 completion lane ran on 2026-07-20 using the same immutable image and
-passed 20/20 checks in 60.619 seconds. Its new active-diagnosis check executed a
-real PyTorch CPU/CUDA profile action on the RTX 5090, sealed a 14,346-byte Chrome
+passed 20/20 checks in 58.876 seconds. Its new active-diagnosis check executed a
+real PyTorch CPU/CUDA profile action on the RTX 5090, sealed a 14,341-byte Chrome
 trace and an observed outcome, bound the outcome as support for the framework-gap
 hypothesis and opposition to the kernel-bound hypothesis, then returned to
 `propose_hypotheses`. This proves the new adapter path on the target GPU; it does

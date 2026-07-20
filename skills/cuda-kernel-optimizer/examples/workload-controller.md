@@ -17,8 +17,10 @@ The AI creates a `control-v2` manifest that binds:
 - the global workload probes used to build the first diagnosis context.
 
 The active-diagnosis contract separately freezes each user-owned evidence adapter,
-its SHA-256 digest, argv, timeout, and Controller action ID. A claimed capability in
-that file is not trusted: current readiness results decide what can actually run.
+its SHA-256 digest, argv, timeout, and Controller action ID. The Controller also binds
+the actual executable or matching Python/shell interpreter and verifies it again before
+execution. A claimed capability in the contract is not trusted: current readiness
+results decide what can actually run.
 
 ## The active diagnosis exchange
 
@@ -49,15 +51,17 @@ round cannot reinterpret opposing evidence as support.
 
 ## Resume and failure behavior
 
-The Controller serializes active-diagnosis mutations per run. A repeated resume after
-completion returns the current state and does not execute the adapter again. If an
-intent exists without a completion marker, the run enters `manual_recovery`; partial
-files are kept only for investigation and never enter the evidence catalog. Recovery
-starts a child or new run rather than accepting or replaying that partial result.
+The Controller serializes active-diagnosis mutations per run. If a completion marker
+was sealed before a crash but state advancement did not finish, resume verifies and
+commits that result without executing the adapter again. If an intent exists without a
+completion marker, the run enters `manual_recovery`; partial files are kept only for
+investigation and never enter the evidence catalog. Recovery starts a child or new run
+rather than accepting or replaying that partial result.
 
 Equivalent request signatures and non-repeatable action IDs persist across rounds.
-Tampered result content, artifact digests, ledger entries, source identity, workload
-identity, or environment identity fail closed.
+Tampered result content, artifacts, committed ledger entries, hypothesis generations,
+project content, adapter/launcher identity, workload identity, or environment identity
+fail closed.
 
 ## Direction experiments and host changes
 
