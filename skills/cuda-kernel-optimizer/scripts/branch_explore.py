@@ -22,6 +22,7 @@ import json
 import math
 import os
 import shutil
+import statistics as statistics_module
 import subprocess
 import sys
 import tempfile
@@ -38,7 +39,8 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from paired_benchmark import run_paired  # noqa: E402
 from paired_stats import classify_pairs  # noqa: E402
-from artifact_store import sha256_file, write_paired_samples  # noqa: E402
+from artifact_store import read_regular_bytes, sha256_file, write_paired_samples  # noqa: E402
+from budget import CandidateGate  # noqa: E402
 
 
 _PAIRED_STATUSES = {"confirmed_win", "confirmed_loss", "inconclusive", "invalid"}
@@ -123,6 +125,35 @@ def _ptr_size_argv(ptr_size: int) -> list[str]:
     return ["--ptr-size", str(ptr_size)] if ptr_size and ptr_size > 0 else []
 
 
+def _validated_benchmark_payload(value) -> dict:
+    if not isinstance(value, Mapping):
+        raise ValueError("root must be an object")
+    correctness = value.get("correctness")
+    if not isinstance(correctness, Mapping):
+        raise ValueError("correctness must be an object")
+    if type(correctness.get("passed")) is not bool:
+        raise ValueError("correctness.passed must be a boolean")
+    kernel = value.get("kernel")
+    if correctness["passed"] and not isinstance(kernel, Mapping):
+        raise ValueError("a passing result requires kernel statistics")
+    if kernel is not None and not isinstance(kernel, Mapping):
+        raise ValueError("kernel must be an object")
+    for field in ("average_ms", "median_ms", "p95_ms", "cv_pct"):
+        if not isinstance(kernel, Mapping) or field not in kernel:
+            continue
+        number = kernel[field]
+        if isinstance(number, bool) or not isinstance(number, Real):
+            raise ValueError(f"kernel.{field} must be a finite number")
+        parsed = float(number)
+        if not math.isfinite(parsed):
+            raise ValueError(f"kernel.{field} must be a finite number")
+        minimum = 0.0 if field == "cv_pct" else 0.0
+        if parsed < minimum or (field != "cv_pct" and parsed == 0.0):
+            qualifier = "non-negative" if field == "cv_pct" else "positive"
+            raise ValueError(f"kernel.{field} must be {qualifier}")
+    return dict(value)
+
+
 def _bench_kernel(
     benchmark_py: str,
     kernel_path: str,
@@ -145,6 +176,16 @@ def _bench_kernel(
     Path(json_out).parent.mkdir(parents=True, exist_ok=True)
     stderr_out = json_out.replace(".json", ".stderr.txt")
 
+    output_path = Path(json_out)
+    try:
+        if output_path.is_symlink() or output_path.exists():
+            output_path.unlink()
+    except OSError as error:
+        return {
+            "error": f"cannot_clear_benchmark_output: {error}",
+            "passed": False,
+        }
+
     try:
         r = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -160,14 +201,28 @@ def _bench_kernel(
         f.write("\n---STDERR---\n")
         f.write(r.stderr or "")
 
-    if os.path.isfile(json_out):
-        return _load_json(json_out)
+    if r.returncode != 0:
+        try:
+            if output_path.is_symlink() or output_path.is_file():
+                output_path.unlink()
+        except OSError:
+            pass
+        return {
+            "error": "benchmark_failed",
+            "returncode": r.returncode,
+            "stderr": (r.stderr or "")[-2000:],
+            "passed": False,
+        }
 
-    return {
-        "error": "no_json_output",
-        "stderr": (r.stderr or "")[-2000:],
-        "passed": False,
-    }
+    try:
+        payload = json.loads(read_regular_bytes(output_path).decode("utf-8"))
+        return _validated_benchmark_payload(payload)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return {
+            "error": f"invalid_json_output: {error}",
+            "stderr": (r.stderr or "")[-2000:],
+            "passed": False,
+        }
 
 
 def _paired_candidate(
@@ -227,9 +282,20 @@ def _paired_candidate(
         bootstrap_samples=bootstrap_samples,
         seed=seed,
     )
+    valid_baselines = [
+        float(pair["baseline"])
+        for pair in paired["pairs"]
+        if pair.get("valid", True) is True
+    ]
+    result = {
+        "statistics": statistics,
+        "baseline_median_ms": (
+            statistics_module.median(valid_baselines) if valid_baselines else None
+        ),
+    }
     evidence_args = (artifact_path, input_hash, iteration, candidate_id)
     if all(value is None for value in evidence_args):
-        return statistics
+        return result
     if any(value is None for value in evidence_args):
         raise ValueError("paired sample persistence binding is incomplete")
     evidence = write_paired_samples(
@@ -249,7 +315,8 @@ def _paired_candidate(
             "seed": seed,
         },
     )
-    return {"statistics": statistics, "paired_samples": evidence}
+    result["paired_samples"] = evidence
+    return result
 
 
 def _finite_statistic(value, field: str, *, required: bool) -> float | None:
@@ -283,6 +350,40 @@ def _validate_statistics(payload) -> dict:
             payload[field], field, required=numeric_required
         )
     return clean
+
+
+def _paired_result_payload(value, *, fallback_baseline_ms) -> tuple[dict, dict | None, float | None]:
+    if isinstance(value, Mapping) and isinstance(value.get("statistics"), Mapping):
+        statistics_payload = value["statistics"]
+        paired_samples = value.get("paired_samples")
+        baseline_median_ms = value.get("baseline_median_ms")
+    else:
+        statistics_payload = value
+        paired_samples = None
+        baseline_median_ms = fallback_baseline_ms
+    statistics = _validate_statistics(statistics_payload)
+    if baseline_median_ms is None:
+        baseline_median_ms = fallback_baseline_ms
+    if isinstance(baseline_median_ms, bool) or not isinstance(
+        baseline_median_ms, Real
+    ):
+        baseline_median_ms = None
+    elif not math.isfinite(float(baseline_median_ms)) or float(baseline_median_ms) <= 0:
+        baseline_median_ms = None
+    else:
+        baseline_median_ms = float(baseline_median_ms)
+    return statistics, copy.deepcopy(paired_samples), baseline_median_ms
+
+
+def _improvement_us(percent, baseline_median_ms: float | None) -> float | None:
+    if baseline_median_ms is None:
+        return None
+    if isinstance(percent, bool) or not isinstance(percent, Real):
+        return None
+    parsed = float(percent)
+    if not math.isfinite(parsed):
+        return None
+    return parsed * baseline_median_ms * 10.0
 
 
 def _state_arch(state: dict) -> str:
@@ -376,7 +477,43 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
 
     print(f"[branch_explore] Found {len(branch_dirs)} branches", file=sys.stderr)
 
-    # Correctness-check and then statistically compare all passing branches.
+    hard_ceiling_seconds = float(budget.get("max_seconds", 2700.0))
+    soft_target_seconds = float(
+        budget.get("soft_target_seconds", min(900.0, hard_ceiling_seconds))
+    )
+    minimum_effect_us = float(state.get("minimum_effect_us", 1.0))
+    short_blocks = min(2, blocks)
+
+    def paired_candidate(branch, *, pair_blocks: int, artifact_name: str, candidate_id):
+        binding = {}
+        if isinstance(state.get("input_hash"), str) and state["input_hash"].strip():
+            binding = {
+                "artifact_path": os.path.join(branch["dir"], artifact_name),
+                "input_hash": state["input_hash"],
+                "iteration": iteration,
+                "candidate_id": str(candidate_id),
+            }
+        return _paired_candidate(
+            baseline_file,
+            branch["kernel"],
+            backend=backend,
+            dims=copy.deepcopy(dims),
+            ptr_size=ptr_size,
+            arch=arch,
+            nvcc_bin=nvcc_bin,
+            seed=seed,
+            blocks=pair_blocks,
+            warmup=warmup,
+            min_effect_pct=min_effect_pct,
+            confidence=confidence,
+            bootstrap_samples=bootstrap_samples,
+            max_temperature_delta_c=max_temperature_delta_c,
+            max_clock_delta_pct=max_clock_delta_pct,
+            expected_baseline_sha256=baseline_sha256,
+            **binding,
+        )
+
+    # Run every branch through the same fail-closed, low-to-high cost gate.
     results = []
     for branch in branch_dirs:
         idx = branch["index"]
@@ -386,86 +523,204 @@ def run(state_path: str, iteration: int, benchmark_py: str = None,
         print(f"[branch {idx}] Benchmarking {os.path.basename(kernel)}...",
               file=sys.stderr)
 
-        bench_result = _bench_kernel(
-            bench_py, kernel, ref_file, dims, ptr_size, json_out, warmup, repeat,
-        )
-
-        passed = bool(bench_result.get("correctness", {}).get("passed", False))
-        kernel_stats = bench_result.get("kernel") or {}
-        average_ms = kernel_stats.get("average_ms")
-        median_ms = kernel_stats.get("median_ms")
-        ms = median_ms if median_ms is not None else average_ms
-
         result = {
             "branch_index": idx,
             "kernel": kernel,
-            "correctness": "passed" if passed else "failed",
-            "passed": passed,
-            "ms": ms,
-            "average_ms": average_ms,
-            "median_ms": median_ms,
-            "p95_ms": kernel_stats.get("p95_ms"),
-            "cv_pct": kernel_stats.get("cv_pct"),
-            "error": bench_result.get("error"),
+            "correctness": "not_run",
+            "passed": False,
+            "ms": None,
+            "average_ms": None,
+            "median_ms": None,
+            "p95_ms": None,
+            "cv_pct": None,
+            "error": None,
             "statistics": None,
-            "status": "rejected_correctness" if not passed else "invalid",
+            "status": "invalid",
             "baseline_file": baseline_file,
             "baseline_sha256": baseline_sha256,
-            "candidate_sha256": sha256_file(kernel),
+            "candidate_sha256": None,
+            "profiler": None,
         }
 
-        if passed:
+        def static_review():
+            candidate_path = Path(kernel)
+            if (
+                candidate_path.is_symlink()
+                or not candidate_path.is_file()
+                or candidate_path.suffix not in {".cu", ".py"}
+            ):
+                result["error"] = "candidate source is not a safe regular kernel file"
+                return {"status": "failed"}
             try:
-                paired_result = _paired_candidate(
-                        baseline_file,
-                        kernel,
-                        backend=backend,
-                        dims=copy.deepcopy(dims),
-                        ptr_size=ptr_size,
-                        arch=arch,
-                        nvcc_bin=nvcc_bin,
-                        seed=seed,
-                        blocks=blocks,
-                        warmup=warmup,
-                        min_effect_pct=min_effect_pct,
-                        confidence=confidence,
-                        bootstrap_samples=bootstrap_samples,
-                        max_temperature_delta_c=max_temperature_delta_c,
-                        max_clock_delta_pct=max_clock_delta_pct,
-                        expected_baseline_sha256=baseline_sha256,
-                        **(
-                            {
-                                "artifact_path": os.path.join(
-                                    branch["dir"], "paired_samples.jsonl"
-                                ),
-                                "input_hash": state["input_hash"],
-                                "iteration": iteration,
-                                "candidate_id": str(idx),
-                            }
-                            if isinstance(state.get("input_hash"), str)
-                            and state["input_hash"].strip()
-                            else {}
-                        ),
-                    )
-                if isinstance(paired_result, Mapping) and isinstance(
-                    paired_result.get("statistics"), Mapping
-                ):
-                    statistics_payload = paired_result["statistics"]
-                    result["paired_samples"] = copy.deepcopy(
-                        paired_result.get("paired_samples")
-                    )
-                else:
-                    statistics_payload = paired_result
-                statistics = _validate_statistics(statistics_payload)
+                candidate_sha256 = sha256_file(candidate_path)
             except Exception as error:
                 result["error"] = _bounded_candidate_error(error)
-            else:
-                result["statistics"] = statistics
-                result["status"] = statistics["status"]
+                return {"status": "failed"}
+            if candidate_sha256 == baseline_sha256:
+                result["error"] = "candidate source is identical to the current champion"
+                return {"status": "failed"}
+            result["candidate_sha256"] = candidate_sha256
+            return {"status": "passed"}
+
+        def build_correctness():
+            raw_bench_result = _bench_kernel(
+                bench_py,
+                kernel,
+                ref_file,
+                dims,
+                ptr_size,
+                json_out,
+                min(warmup, 1),
+                1,
+            )
+            try:
+                bench_result = _validated_benchmark_payload(raw_bench_result)
+            except ValueError as error:
+                result.update(
+                    {
+                        "correctness": "failed",
+                        "passed": False,
+                        "error": f"invalid_benchmark_output: {error}",
+                        "status": "rejected_correctness",
+                    }
+                )
+                return {"status": "failed"}
+            passed = bool(bench_result.get("correctness", {}).get("passed", False))
+            kernel_stats = bench_result.get("kernel") or {}
+            average_ms = kernel_stats.get("average_ms")
+            median_ms = kernel_stats.get("median_ms")
+            result.update(
+                {
+                    "correctness": "passed" if passed else "failed",
+                    "passed": passed,
+                    "ms": median_ms if median_ms is not None else average_ms,
+                    "average_ms": average_ms,
+                    "median_ms": median_ms,
+                    "p95_ms": kernel_stats.get("p95_ms"),
+                    "cv_pct": kernel_stats.get("cv_pct"),
+                    "error": bench_result.get("error"),
+                    "status": "invalid" if passed else "rejected_correctness",
+                }
+            )
+            return {"status": "passed" if passed else "failed"}
+
+        def short_paired():
+            try:
+                paired_result = paired_candidate(
+                    branch,
+                    pair_blocks=short_blocks,
+                    artifact_name="short_paired_samples.jsonl",
+                    candidate_id=f"{idx}:short",
+                )
+                statistics, evidence, baseline_median_ms = _paired_result_payload(
+                    paired_result, fallback_baseline_ms=result["ms"]
+                )
+            except Exception as error:
+                result["error"] = _bounded_candidate_error(error)
+                return {"status": "failed"}
+            result["short_statistics"] = statistics
+            if evidence is not None:
+                result["short_paired_samples"] = evidence
+            upper_bound_us = _improvement_us(
+                statistics.get("ci_high_pct"), baseline_median_ms
+            )
+            return {
+                "status": "passed" if upper_bound_us is not None else "failed",
+                "upper_bound": upper_bound_us,
+            }
+
+        def profiler():
+            artifact = {
+                "status": "not_applicable",
+                "reason": "formal_pairing_resolves_the_remaining_effect_uncertainty",
+            }
+            result["profiler"] = artifact
+            return artifact
+
+        def formal_paired():
+            try:
+                paired_result = paired_candidate(
+                    branch,
+                    pair_blocks=blocks,
+                    artifact_name="paired_samples.jsonl",
+                    candidate_id=idx,
+                )
+                statistics, evidence, baseline_median_ms = _paired_result_payload(
+                    paired_result, fallback_baseline_ms=result["ms"]
+                )
+            except Exception as error:
+                result["error"] = _bounded_candidate_error(error)
+                return {"status": "failed"}
+            result["statistics"] = statistics
+            result["status"] = statistics["status"]
+            if evidence is not None:
+                result["paired_samples"] = evidence
+            lower_bound_us = _improvement_us(
+                statistics.get("ci_low_pct"), baseline_median_ms
+            )
+            return {
+                "status": (
+                    "passed" if statistics["status"] == "confirmed_win" else "failed"
+                ),
+                "lower_bound": lower_bound_us,
+            }
+
+        formal_cost = max(2.0, float(blocks))
+        gate = CandidateGate(
+            {
+                "soft_target_seconds": soft_target_seconds,
+                "hard_ceiling_seconds": hard_ceiling_seconds,
+                "minimum_effect": {
+                    "mechanism_us": minimum_effect_us,
+                    "service_pct": max(0.5, float(min_effect_pct)),
+                },
+            },
+            {
+                "claim_layer": "kernel",
+                "cheapest_falsifier": "static_review",
+                "estimated_cost": {
+                    "static_review": 0.01,
+                    "build_correctness": 1.0,
+                    "short_paired": 2.0,
+                    "profiler": 2.0,
+                    "formal_paired": formal_cost,
+                    "service": formal_cost,
+                },
+                "minimum_effect": {
+                    "metric": "mechanism_us",
+                    "value": minimum_effect_us,
+                },
+                "rejection_condition": (
+                    "Stop when correctness fails or the short-screen upper bound "
+                    "is below the minimum useful kernel effect."
+                ),
+                "promotion_condition": (
+                    "Promote only after the formal paired lower bound reaches the "
+                    "minimum useful kernel effect."
+                ),
+            },
+        )
+        gate_result = gate.run(
+            {
+                "static_review": static_review,
+                "build_correctness": build_correctness,
+                "short_paired": short_paired,
+                "profiler": profiler,
+                "formal_paired": formal_paired,
+            }
+        )
+        gate_result["candidate_sha256"] = result.get("candidate_sha256")
+        formal_evidence = result.get("paired_samples")
+        if isinstance(formal_evidence, Mapping):
+            gate_result["formal_paired_sha256"] = formal_evidence.get("sha256")
+        result["candidate_gate"] = gate_result
+        if gate_result["decision"] != "PROMOTE" and result["status"] == "confirmed_win":
+            result["status"] = "inconclusive"
 
         results.append(result)
 
-        status = "PASS" if passed else "FAIL"
+        status = "PASS" if result["passed"] else "FAIL"
+        ms = result["ms"]
         ms_str = f"{ms:.4f} ms" if ms else "N/A"
         print(f"[branch {idx}] {status}  {ms_str}", file=sys.stderr)
 

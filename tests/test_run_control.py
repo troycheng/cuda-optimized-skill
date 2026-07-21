@@ -187,6 +187,105 @@ class RunControlTests(unittest.TestCase):
         self.assertNotIn("mechanism_id", legacy["active_candidate"])
         self.assertEqual(self.control._validate_state(legacy), legacy)
 
+    def test_legacy_history_deduplicates_new_schema_candidate_for_same_mechanism(self) -> None:
+        legacy_proposal = _proposal(candidate_id="legacy-fastsort")
+        legacy_proposal.pop("mechanism_id")
+        state = self.control._register_candidate_state(
+            _exploring(self.control),
+            legacy_proposal,
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=3.0,
+            allow_legacy=True,
+        )
+        state = self.control.resolve_candidate(
+            state,
+            candidate_id="legacy-fastsort",
+            outcome="KILL",
+            correctness_ok=True,
+            performance_gate_passed=False,
+            now=4.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "mechanism.*already"):
+            self.control._register_candidate_state(
+                state,
+                _proposal(candidate_id="new-fastsort"),
+                contract_sha256="a" * 64,
+                evidence_age_seconds=0.0,
+                now=5.0,
+            )
+
+    def test_legacy_multi_capability_history_deduplicates_any_matching_mechanism(self) -> None:
+        legacy_proposal = _proposal(candidate_id="legacy-fastsort")
+        legacy_proposal.pop("mechanism_id")
+        legacy_proposal["capability_ids"] = [
+            "triton.coalesced-load",
+            "support.telemetry",
+        ]
+        state = self.control._register_candidate_state(
+            _exploring(self.control),
+            legacy_proposal,
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=3.0,
+            allow_legacy=True,
+        )
+        state = self.control.resolve_candidate(
+            state,
+            candidate_id="legacy-fastsort",
+            outcome="KILL",
+            correctness_ok=True,
+            performance_gate_passed=False,
+            now=4.0,
+        )
+        new_proposal = _proposal(candidate_id="renamed-fastsort")
+        new_proposal["mechanism_id"] = "triton.coalesced-load"
+
+        with self.assertRaisesRegex(ValueError, "mechanism.*already"):
+            self.control._register_candidate_state(
+                state,
+                new_proposal,
+                contract_sha256="a" * 64,
+                evidence_age_seconds=0.0,
+                now=5.0,
+            )
+
+    def test_distinct_legacy_mechanisms_may_share_a_support_capability(self) -> None:
+        first = _proposal(candidate_id="legacy-a")
+        first.pop("mechanism_id")
+        first["capability_ids"] = ["mechanism.a", "support.telemetry"]
+        state = self.control._register_candidate_state(
+            _exploring(self.control),
+            first,
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=3.0,
+            allow_legacy=True,
+        )
+        state = self.control.resolve_candidate(
+            state,
+            candidate_id="legacy-a",
+            outcome="KILL",
+            correctness_ok=True,
+            performance_gate_passed=False,
+            now=4.0,
+        )
+        second = _proposal(candidate_id="legacy-b")
+        second.pop("mechanism_id")
+        second["capability_ids"] = ["mechanism.b", "support.telemetry"]
+
+        registered = self.control._register_candidate_state(
+            state,
+            second,
+            contract_sha256="a" * 64,
+            evidence_age_seconds=0.0,
+            now=5.0,
+            allow_legacy=True,
+        )
+
+        self.assertEqual(registered["active_candidate"]["candidate_id"], "legacy-b")
+
     def test_pass_cannot_bypass_correctness_or_performance_gate(self) -> None:
         state = self.control._register_candidate_state(
             _exploring(self.control),

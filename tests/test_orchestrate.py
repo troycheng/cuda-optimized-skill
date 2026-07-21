@@ -624,6 +624,28 @@ class BudgetedParserTests(unittest.TestCase):
                     )
             self.assertEqual(baseline.read_bytes(), original)
 
+    def test_business_baseline_cannot_delete_the_original_and_is_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec, baseline, run_dir = self._python_baseline_fixture(
+                root,
+                prepare_body="Path(candidate).unlink()",
+            )
+            original = baseline.read_bytes()
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(ValueError, "modified"):
+                    self.orchestrate._run_original_business_baseline(
+                        spec,
+                        baseline=str(baseline),
+                        expected_baseline_sha256=self.orchestrate.sha256_file(
+                            baseline
+                        ),
+                        policy=self.orchestrate.resolve_budget("quick"),
+                        run_dir=run_dir,
+                        deadline_monotonic=time.monotonic() + 5.0,
+                    )
+            self.assertEqual(baseline.read_bytes(), original)
+
     def test_setup_freezes_full_workload_and_places_every_artifact_in_run_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1870,6 +1892,135 @@ class LifecycleIntegrationTests(unittest.TestCase):
             self.assertEqual(evidence["candidate_sanitizer"]["status"], "deferred")
             self.assertEqual(evidence["workload_paired"]["status"], "not_applicable")
             self.assertEqual(evidence["decision"]["status"], "kernel_only_win")
+
+    def test_branch_gate_profiler_not_applicable_skips_post_formal_ncu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+            branch_path = run_dir / "iterv1" / "branch_results.json"
+            branch_payload = json.loads(branch_path.read_text("utf-8"))
+            branch_payload["champion"]["profiler"] = {
+                "status": "not_applicable",
+                "reason": "formal_pairing_resolves_the_remaining_effect_uncertainty",
+            }
+            branch_payload["champion"]["candidate_sha256"] = branch_payload[
+                "champion"
+            ]["paired_samples"]["candidate_sha256"]
+            branch_payload["champion"]["candidate_gate"] = {
+                "decision": "PROMOTE",
+                "stop_reason": "promotion_condition_satisfied",
+                "completed_stages": [
+                    "static_review",
+                    "build_correctness",
+                    "short_paired",
+                    "profiler",
+                    "formal_paired",
+                ],
+                "skipped_expensive_stages": [],
+                "candidate_sha256": branch_payload["champion"][
+                    "paired_samples"
+                ]["candidate_sha256"],
+                "formal_paired_sha256": branch_payload["champion"][
+                    "paired_samples"
+                ]["sha256"],
+            }
+            branch_path.write_text(json.dumps(branch_payload), encoding="utf-8")
+            calls = []
+
+            def runner(command, **_kwargs):
+                script = Path(command[1]).name
+                calls.append(script)
+                self._write_mock_ncu_top(command, run_dir)
+                if script == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            self.assertNotIn("profile_ncu.py", calls)
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(
+                checkpoint["stage_evidence"]["candidate_profile"]["status"],
+                "not_applicable",
+            )
+
+    def test_unbound_profiler_not_applicable_claim_does_not_skip_ncu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, _state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+            branch_path = run_dir / "iterv1" / "branch_results.json"
+            branch_payload = json.loads(branch_path.read_text("utf-8"))
+            branch_payload["champion"]["profiler"] = {
+                "status": "not_applicable",
+                "reason": "unbound claim",
+            }
+            branch_payload["champion"]["candidate_gate"] = {
+                "decision": "PROMOTE",
+                "completed_stages": ["profiler"],
+            }
+            branch_path.write_text(json.dumps(branch_payload), encoding="utf-8")
+            calls = []
+
+            def runner(command, **_kwargs):
+                script = Path(command[1]).name
+                calls.append(script)
+                self._write_mock_ncu_top(command, run_dir)
+                if script == "state.py":
+                    return subprocess.run(command, capture_output=True, text=True)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(
+                self.orchestrate, "_run", side_effect=runner
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.orchestrate.cmd_close_iter(self._close_args(run_dir))
+
+            self.assertIn("profile_ncu.py", calls)
+            checkpoint = json.loads((run_dir / "checkpoint.json").read_text("utf-8"))
+            self.assertEqual(
+                checkpoint["stage_evidence"]["candidate_profile"]["status"],
+                "passed",
+            )
+
+    def test_fabricated_paired_digest_cannot_skip_ncu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, state_path = self._setup(Path(tmp))
+            self._write_winner_artifacts(run_dir)
+            branch_payload = json.loads(
+                (run_dir / "iterv1" / "branch_results.json").read_text("utf-8")
+            )
+            candidate = branch_payload["champion"]
+            actual_candidate_sha = candidate["paired_samples"]["candidate_sha256"]
+            fabricated_digest = "f" * 64
+            candidate["candidate_sha256"] = actual_candidate_sha
+            candidate["paired_samples"]["sha256"] = fabricated_digest
+            candidate["profiler"] = {
+                "status": "not_applicable",
+                "reason": "formal_pairing_resolves_the_remaining_effect_uncertainty",
+            }
+            candidate["candidate_gate"] = {
+                "decision": "PROMOTE",
+                "stop_reason": "promotion_condition_satisfied",
+                "completed_stages": [
+                    "static_review",
+                    "build_correctness",
+                    "short_paired",
+                    "profiler",
+                    "formal_paired",
+                ],
+                "skipped_expensive_stages": [],
+                "candidate_sha256": actual_candidate_sha,
+                "formal_paired_sha256": fabricated_digest,
+            }
+            state = json.loads(state_path.read_text("utf-8"))
+
+            self.assertFalse(
+                self.orchestrate._candidate_profiler_not_applicable(
+                    candidate, state=state, iteration=1
+                )
+            )
 
     def test_expired_before_branch_writes_inconclusive_checkpoint_without_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

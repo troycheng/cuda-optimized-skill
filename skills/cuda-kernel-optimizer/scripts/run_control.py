@@ -213,11 +213,15 @@ def mechanism_fingerprint(proposal: Mapping[str, Any]) -> str:
     candidate = validate_candidate_proposal(
         {field: proposal[field] for field in fields}, allow_legacy=True
     )
-    if candidate.get("mechanism_id") is not None:
-        basis = {"mechanism_id": candidate["mechanism_id"]}
+    mechanism_id = candidate.get("mechanism_id")
+    legacy_capabilities = sorted(candidate["capability_ids"])
+    if mechanism_id is None and len(legacy_capabilities) == 1:
+        mechanism_id = legacy_capabilities[0]
+    if mechanism_id is not None:
+        basis = {"mechanism_id": mechanism_id}
     else:
         basis = {
-            "capability_ids": sorted(candidate["capability_ids"]),
+            "capability_ids": legacy_capabilities,
             "paths": sorted(candidate["paths"]),
             "expected_metric": candidate["expected_metric"],
         }
@@ -229,6 +233,25 @@ def mechanism_fingerprint(proposal: Mapping[str, Any]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_new_mechanism_overlap(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    """Match legacy capabilities to a new ID without conflating two legacies."""
+    left_id = left.get("mechanism_id")
+    right_id = right.get("mechanism_id")
+    if bool(left_id) == bool(right_id):
+        return False
+    modern = left if left_id else right
+    legacy = right if left_id else left
+    modern_id = modern.get("mechanism_id")
+    capabilities = legacy.get("capability_ids")
+    return (
+        isinstance(modern_id, str)
+        and isinstance(capabilities, list)
+        and modern_id in capabilities
+    )
 
 
 def _validate_contract_subset(
@@ -574,6 +597,7 @@ def _register_candidate_state(
     fingerprint = mechanism_fingerprint(candidate)
     if any(
         mechanism_fingerprint(item) == fingerprint
+        or _legacy_new_mechanism_overlap(candidate, item)
         for item in current["candidate_history"]
     ):
         raise ValidationError("candidate mechanism was already attempted")

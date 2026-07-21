@@ -3904,6 +3904,13 @@ def _validated_identity_artifact(value: Mapping[str, Any], expected_digest: str)
 
 
 def evaluate_change(run_dir: os.PathLike[str] | str) -> dict:
+    """Serialize and evaluate one registered ChangeSet exactly once."""
+    run_root = Path(run_dir).expanduser().resolve(strict=False)
+    with _run_lock(run_root):
+        return _evaluate_change_unlocked(run_root)
+
+
+def _evaluate_change_unlocked(run_dir: os.PathLike[str] | str) -> dict:
     """Verify the bounded diff, review it, run paired evaluation, and decide."""
     run_root = Path(run_dir).expanduser().resolve(strict=False)
     state = read_run_state(run_root)
