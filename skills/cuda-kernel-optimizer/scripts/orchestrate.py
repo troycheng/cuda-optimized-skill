@@ -198,6 +198,30 @@ def _run_original_business_baseline(
     backup = run_dir / "baseline" / "original-input"
     backup.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(baseline, backup)
+
+    def baseline_is_unchanged() -> bool:
+        try:
+            return sha256_file(baseline) == expected_baseline_sha256
+        except (OSError, ValueError):
+            return False
+
+    def restore_baseline() -> None:
+        destination = Path(baseline)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.restore-",
+            dir=str(destination.parent),
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copy2(backup, temporary)
+            os.replace(temporary, destination)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
     observations = []
     for index, case in enumerate(cases, 1):
         remaining = deadline_monotonic - time.monotonic()
@@ -230,8 +254,8 @@ def _run_original_business_baseline(
                 hard_timeout=timeout,
                 term_grace=min(0.5, timeout),
             )
-            if sha256_file(baseline) != expected_baseline_sha256:
-                shutil.copy2(backup, baseline)
+            if not baseline_is_unchanged():
+                restore_baseline()
                 raise ValueError(
                     "original business baseline was modified by the workload"
                 )
@@ -252,11 +276,11 @@ def _run_original_business_baseline(
                     timeout=timeout,
                 )
             except BaseException:
-                if sha256_file(baseline) != expected_baseline_sha256:
-                    shutil.copy2(backup, baseline)
+                if not baseline_is_unchanged():
+                    restore_baseline()
                 raise
-        if sha256_file(baseline) != expected_baseline_sha256:
-            shutil.copy2(backup, baseline)
+        if not baseline_is_unchanged():
+            restore_baseline()
             raise ValueError("original business baseline was modified by the workload")
         if not isinstance(observation, Mapping):
             raise ValueError("business baseline must return an observation mapping")
@@ -2230,6 +2254,106 @@ def _select_lifecycle_candidate(
     raise ValueError("state mode must be full or kernel-only")
 
 
+def _candidate_profiler_not_applicable(
+    candidate: Mapping, *, state: Mapping, iteration: int
+) -> bool:
+    profiler = candidate.get("profiler")
+    gate = candidate.get("candidate_gate")
+    paired = candidate.get("paired_samples")
+    candidate_sha256 = candidate.get("candidate_sha256")
+    expected_stages = [
+        "static_review",
+        "build_correctness",
+        "short_paired",
+        "profiler",
+        "formal_paired",
+    ]
+    structurally_bound = (
+        isinstance(profiler, Mapping)
+        and profiler.get("status") == "not_applicable"
+        and profiler.get("reason")
+        == "formal_pairing_resolves_the_remaining_effect_uncertainty"
+        and isinstance(gate, Mapping)
+        and gate.get("decision") == "PROMOTE"
+        and gate.get("stop_reason") == "promotion_condition_satisfied"
+        and gate.get("completed_stages") == expected_stages
+        and gate.get("skipped_expensive_stages") == []
+        and isinstance(paired, Mapping)
+        and isinstance(candidate_sha256, str)
+        and bool(candidate_sha256)
+        and gate.get("candidate_sha256") == candidate_sha256
+        and paired.get("candidate_sha256") == candidate_sha256
+        and isinstance(paired.get("sha256"), str)
+        and bool(paired["sha256"])
+        and gate.get("formal_paired_sha256") == paired["sha256"]
+    )
+    if not structurally_bound:
+        return False
+
+    def is_sha256(value) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    candidate_id = _candidate_checkpoint_id(candidate)
+    input_hash = state.get("input_hash")
+    if (
+        candidate_id is None
+        or not isinstance(iteration, int)
+        or isinstance(iteration, bool)
+        or iteration <= 0
+        or not isinstance(input_hash, str)
+        or not input_hash
+        or not is_sha256(candidate_sha256)
+        or not is_sha256(paired.get("sha256"))
+        or paired.get("schema_version") != CURRENT_SCHEMA_VERSION
+        or paired.get("kind") != "kernel"
+        or paired.get("input_hash") != input_hash
+        or paired.get("iteration") != iteration
+        or str(paired.get("candidate_id")) != candidate_id
+        or not isinstance(paired.get("path"), str)
+        or not Path(paired["path"]).is_absolute()
+        or not isinstance(paired.get("candidate_file"), str)
+        or not Path(paired["candidate_file"]).is_absolute()
+        or type(paired.get("pairs")) is not int
+        or paired["pairs"] <= 0
+    ):
+        return False
+    try:
+        snapshot = _candidate_snapshot(candidate)
+        if snapshot["sha256"] != candidate_sha256:
+            return False
+        if sha256_file(paired["candidate_file"]) != candidate_sha256:
+            return False
+        artifact_bytes = read_regular_bytes(paired["path"])
+        if hashlib.sha256(artifact_bytes).hexdigest() != paired["sha256"]:
+            return False
+        lines = artifact_bytes.decode("utf-8").splitlines()
+        if len(lines) != paired["pairs"] or any(not line.strip() for line in lines):
+            return False
+        for index, line in enumerate(lines):
+            record = json.loads(line)
+            if not isinstance(record, Mapping) or any(
+                (
+                    record.get("schema_version") != CURRENT_SCHEMA_VERSION,
+                    record.get("kind") != "kernel",
+                    record.get("input_hash") != input_hash,
+                    record.get("iteration") != iteration,
+                    str(record.get("candidate_id")) != candidate_id,
+                    record.get("candidate_sha256") != candidate_sha256,
+                    record.get("candidate_file") != paired["candidate_file"],
+                    record.get("pair_index") != index,
+                    record.get("classifier") != paired.get("classifier"),
+                )
+            ):
+                return False
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        return False
+    return True
+
+
 def _validate_sanitizer_report(
     report,
     *,
@@ -3385,6 +3509,21 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                 kernel=kernel,
                 candidate_id=candidate_id,
             )
+            if _candidate_profiler_not_applicable(
+                selected, state=state, iteration=args.iter
+            ):
+                checkpoint = _complete_checkpoint_stage(
+                    checkpoint,
+                    next_stage,
+                    {
+                        "status": "not_applicable",
+                        "reason": selected["profiler"].get("reason"),
+                    },
+                    store=store,
+                    clock=clock,
+                    candidate_id=candidate_id,
+                )
+                continue
             admitted, checkpoint = _admit_checkpoint_stage(
                 checkpoint,
                 next_stage,
@@ -3519,11 +3658,16 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
                     kernel=kernel,
                     candidate_id=candidate_id,
                 )
-                needs_profile = selection_changed or not _profile_binding_matches(
-                    iteration_dir,
-                    state=state,
-                    candidate_id=candidate_id,
-                    kernel=kernel,
+                needs_profile = not _candidate_profiler_not_applicable(
+                    selected_candidate, state=state, iteration=args.iter
+                ) and (
+                    selection_changed
+                    or not _profile_binding_matches(
+                        iteration_dir,
+                        state=state,
+                        candidate_id=candidate_id,
+                        kernel=kernel,
+                    )
                 )
                 if needs_profile:
                     _invalidate_candidate_profile(
@@ -3703,11 +3847,17 @@ def _cmd_close_iter_lifecycle(args, state, state_path, iter_dir, methods_json):
             kernel = _publish_outer_candidate(
                 selected_candidate, iter_dir=iteration_dir
             )
-            if eligible_candidates and not _profile_binding_matches(
-                iteration_dir,
-                state=state,
-                candidate_id=candidate_id,
-                kernel=kernel,
+            if (
+                eligible_candidates
+                and not _candidate_profiler_not_applicable(
+                    selected_candidate, state=state, iteration=args.iter
+                )
+                and not _profile_binding_matches(
+                    iteration_dir,
+                    state=state,
+                    candidate_id=candidate_id,
+                    kernel=kernel,
+                )
             ):
                 raise ValueError(
                     "candidate profile evidence is missing, unsafe, or drifted"

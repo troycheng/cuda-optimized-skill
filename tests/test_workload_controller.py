@@ -2840,6 +2840,68 @@ class WorkloadRoundTests(unittest.TestCase):
                 evaluation_mtime,
             )
 
+    def test_concurrent_evaluation_executes_gpu_stages_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            control, run_dir, project = self._workspace(root)
+            self.controller.start_run(control, run_dir)
+            self.controller.register_change(control, run_dir, self._change())
+            (project / "configs" / "value.json").write_text(
+                '{"workers": 8}\n', encoding="utf-8"
+            )
+            first_evaluation_entered = threading.Event()
+            release_first_evaluation = threading.Event()
+            call_lock = threading.Lock()
+            calls = 0
+
+            def evaluate_pairs(*_args, **_kwargs):
+                nonlocal calls
+                with call_lock:
+                    calls += 1
+                    call_number = calls
+                if call_number == 1:
+                    first_evaluation_entered.set()
+                    release_first_evaluation.wait(timeout=2.0)
+                return {
+                    "status": "evaluated",
+                    "primary": {
+                        "status": "confirmed_win",
+                        "estimate_pct": 5.0,
+                        "ci_low_pct": 4.0,
+                        "ci_high_pct": 6.0,
+                    },
+                    "constraints": [],
+                }
+
+            evaluator = mock.Mock()
+            evaluator.evaluate_pairs.side_effect = evaluate_pairs
+            results = []
+            errors = []
+
+            def evaluate() -> None:
+                try:
+                    results.append(self.controller.evaluate_change(run_dir))
+                except BaseException as error:
+                    errors.append(error)
+
+            with mock.patch.object(
+                self.controller, "_load_evaluate_module", return_value=evaluator
+            ):
+                first = threading.Thread(target=evaluate)
+                first.start()
+                self.assertTrue(first_evaluation_entered.wait(timeout=2.0))
+                second = threading.Thread(target=evaluate)
+                second.start()
+                time.sleep(0.1)
+                release_first_evaluation.set()
+                first.join(timeout=5.0)
+                second.join(timeout=5.0)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(calls, 2)
+            self.assertEqual(results[0], results[1])
+
     def test_cli_exposes_the_resumable_state_machine_commands(self) -> None:
         result = subprocess.run(
             [sys.executable, str(SCRIPT_PATH), "--help"],

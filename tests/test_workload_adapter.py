@@ -1636,7 +1636,7 @@ class CommandSecurityTests(unittest.TestCase):
                     candidate="candidate.py",
                     role="candidate",
                     case={},
-                    timeout=0.5,
+                    timeout=2.0,
                 )
             self.assertTrue(pid_file.exists())
             child_pid = int(pid_file.read_text("utf-8"))

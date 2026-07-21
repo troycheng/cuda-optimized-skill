@@ -94,6 +94,34 @@ class BranchExploreTests(unittest.TestCase):
         state_path.write_text(json.dumps(payload), encoding="utf-8")
         return state_path, payload
 
+    def test_failed_benchmark_cannot_reuse_a_stale_passing_result(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            json_out = root / "bench.json"
+            json_out.write_text(
+                json.dumps({"correctness": {"passed": True}}), encoding="utf-8"
+            )
+            failed = mock.Mock(returncode=17, stdout="", stderr="compile failed")
+
+            with mock.patch.object(
+                branch_explore.subprocess, "run", return_value=failed
+            ):
+                result = branch_explore._bench_kernel(
+                    "benchmark.py",
+                    "kernel.py",
+                    "reference.py",
+                    {},
+                    0,
+                    str(json_out),
+                    warmup=1,
+                    repeat=1,
+                )
+
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["error"], "benchmark_failed")
+            self.assertFalse(json_out.exists())
+
     def test_paired_candidate_atomically_persists_bound_raw_pairs(self) -> None:
         branch_explore = _load_branch_explore()
         with tempfile.TemporaryDirectory() as tmp:
@@ -193,6 +221,8 @@ class BranchExploreTests(unittest.TestCase):
                 "_paired_candidate",
                 side_effect=[
                     _statistics("inconclusive", 0.2),
+                    _statistics("inconclusive", 0.2),
+                    _statistics("inconclusive", 3.0),
                     _statistics("confirmed_win", 3.0),
                 ],
             ):
@@ -239,6 +269,77 @@ class BranchExploreTests(unittest.TestCase):
                 ).hexdigest(),
             )
 
+    def test_short_screen_below_minimum_skips_formal_pairing(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path, _payload = self._state(root, branches=1)
+            paired = mock.Mock(
+                return_value={
+                    "statistics": _statistics("inconclusive", -0.20),
+                    "baseline_median_ms": 1.0,
+                }
+            )
+            with mock.patch.object(
+                branch_explore, "_bench_kernel", return_value=_bench()
+            ), mock.patch.object(branch_explore, "_paired_candidate", paired):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output = branch_explore.run(str(state_path), iteration=1)
+
+            self.assertEqual(paired.call_count, 1)
+            self.assertEqual(paired.call_args.kwargs["blocks"], 2)
+            branch = output["branches"][0]
+            self.assertEqual(
+                branch["candidate_gate"]["stop_reason"],
+                "effect_upper_bound_below_minimum",
+            )
+            self.assertIn(
+                "formal_paired",
+                branch["candidate_gate"]["skipped_expensive_stages"],
+            )
+            self.assertEqual(output["status"], "no_confirmed_kernel_win")
+
+    def test_candidate_gate_orders_short_profile_decision_before_formal_pairing(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path, _payload = self._state(root, branches=1)
+            paired = mock.Mock(
+                side_effect=[
+                    {
+                        "statistics": _statistics("inconclusive", 3.0),
+                        "baseline_median_ms": 1.0,
+                    },
+                    {
+                        "statistics": _statistics("confirmed_win", 3.0),
+                        "baseline_median_ms": 1.0,
+                    },
+                ]
+            )
+            with mock.patch.object(
+                branch_explore, "_bench_kernel", return_value=_bench()
+            ), mock.patch.object(branch_explore, "_paired_candidate", paired):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output = branch_explore.run(str(state_path), iteration=1)
+
+            self.assertEqual(
+                [call.kwargs["blocks"] for call in paired.call_args_list], [2, 24]
+            )
+            gate = output["champion"]["candidate_gate"]
+            self.assertEqual(
+                gate["completed_stages"],
+                [
+                    "static_review",
+                    "build_correctness",
+                    "short_paired",
+                    "profiler",
+                    "formal_paired",
+                ],
+            )
+            self.assertEqual(
+                output["champion"]["profiler"]["status"], "not_applicable"
+            )
+
     def test_candidate_exception_is_isolated_and_later_winner_survives(self) -> None:
         branch_explore = _load_branch_explore()
         with tempfile.TemporaryDirectory() as tmp:
@@ -251,6 +352,7 @@ class BranchExploreTests(unittest.TestCase):
                 "_paired_candidate",
                 side_effect=[
                     RuntimeError("CUDA prepare failed " + "x" * 4000),
+                    _statistics("inconclusive", 3.0),
                     _statistics("confirmed_win", 3.0),
                 ],
             ):
@@ -265,6 +367,31 @@ class BranchExploreTests(unittest.TestCase):
             self.assertEqual(output["champion"]["branch_index"], 2)
             self.assertTrue((root / "run" / "iterv1" / "branch_results.json").is_file())
             self.assertTrue((root / "run" / "iterv1" / "decision.json").is_file())
+
+    def test_malformed_benchmark_payload_rejects_only_that_candidate(self) -> None:
+        branch_explore = _load_branch_explore()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path, _payload = self._state(root)
+            with mock.patch.object(
+                branch_explore,
+                "_bench_kernel",
+                side_effect=[{"correctness": []}, _bench()],
+            ), mock.patch.object(
+                branch_explore,
+                "_paired_candidate",
+                side_effect=[
+                    _statistics("inconclusive", 3.0),
+                    _statistics("confirmed_win", 3.0),
+                ],
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output = branch_explore.run(str(state_path), iteration=1)
+
+            by_branch = {item["branch_index"]: item for item in output["branches"]}
+            self.assertEqual(by_branch[1]["status"], "rejected_correctness")
+            self.assertIn("invalid_benchmark_output", by_branch[1]["error"])
+            self.assertEqual(output["champion"]["branch_index"], 2)
 
     def test_control_flow_exceptions_are_never_swallowed(self) -> None:
         branch_explore = _load_branch_explore()
@@ -327,10 +454,14 @@ class BranchExploreTests(unittest.TestCase):
             root = Path(tmp)
             state_path, _payload = self._state(root, branches=5)
             stats = [
+                _statistics("inconclusive", 2.0),
                 _statistics("confirmed_win", 2.0),
                 _statistics("confirmed_loss", -3.0),
+                _statistics("inconclusive", 4.0),
                 _statistics("confirmed_win", 4.0),
+                _statistics("inconclusive", 2.0),
                 _statistics("confirmed_win", 2.0),
+                _statistics("inconclusive", 8.0),
                 _statistics("inconclusive", 8.0),
             ]
             with mock.patch.object(
@@ -351,6 +482,7 @@ class BranchExploreTests(unittest.TestCase):
             paired = mock.Mock(
                 side_effect=[
                     {"status": "confirmed_win", "estimate_pct": True},
+                    _statistics("inconclusive", 3.0),
                     _statistics("invalid", 99.0),
                 ]
             )
@@ -363,7 +495,7 @@ class BranchExploreTests(unittest.TestCase):
                     output = branch_explore.run(str(state_path), iteration=1)
 
         self.assertEqual(output["status"], "no_confirmed_kernel_win")
-        self.assertEqual(paired.call_count, 2)
+        self.assertEqual(paired.call_count, 3)
         by_branch = {item["branch_index"]: item for item in output["branches"]}
         self.assertEqual(by_branch[1]["correctness"], "failed")
         self.assertEqual(by_branch[2]["status"], "invalid")
@@ -376,16 +508,18 @@ class BranchExploreTests(unittest.TestCase):
             root = Path(tmp)
             state_path, payload = self._state(root)
             original = copy.deepcopy(payload)
+            bench = mock.Mock(side_effect=[_bench(), _bench()])
             paired = mock.Mock(side_effect=[
                 _statistics("inconclusive", None),
                 _statistics("inconclusive", None),
             ])
             with mock.patch.object(
-                branch_explore, "_bench_kernel", side_effect=[_bench(), _bench()]
+                branch_explore, "_bench_kernel", bench
             ), mock.patch.object(branch_explore, "_paired_candidate", paired):
                 with contextlib.redirect_stdout(io.StringIO()):
                     branch_explore.run(str(state_path), iteration=1, warmup=3, repeat=7)
 
+            self.assertEqual(bench.call_args_list[0].args[-2:], (1, 1))
             args, kwargs = paired.call_args_list[0]
             self.assertEqual(args[0], payload["best_file"])
             self.assertTrue(args[1].endswith("branches/b1/kernel.py"))
@@ -395,7 +529,7 @@ class BranchExploreTests(unittest.TestCase):
             self.assertEqual(kwargs["arch"], "sm_120")
             self.assertEqual(kwargs["nvcc_bin"], "/opt/cuda/bin/nvcc")
             self.assertEqual(kwargs["seed"], 17)
-            self.assertEqual(kwargs["blocks"], 24)
+            self.assertEqual(kwargs["blocks"], 2)
             self.assertEqual(kwargs["warmup"], 3)
             self.assertEqual(kwargs["min_effect_pct"], 0.5)
             self.assertEqual(payload, original)
@@ -444,6 +578,7 @@ class BranchExploreTests(unittest.TestCase):
                 branch_explore,
                 "_paired_candidate",
                 side_effect=[
+                    _statistics("inconclusive", 3.0),
                     _statistics("confirmed_win", 3.0),
                     _statistics("inconclusive", 0.0),
                 ],
