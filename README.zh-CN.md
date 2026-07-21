@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> 这是已归档的历史仓库。后续开发已迁移到
+> [troycheng/cuda-kernel-optimizer](https://github.com/troycheng/cuda-kernel-optimizer)，
+> 新项目从干净的 V1.0.0 历史开始；本仓库保留 V1 之前的完整开发记录。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="asset/logo-wordmark-dark.svg">

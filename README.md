@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> This historical repository is archived. Active development moved to
+> [troycheng/cuda-kernel-optimizer](https://github.com/troycheng/cuda-kernel-optimizer),
+> which starts with a clean V1.0.0 history. This repository preserves the
+> complete pre-V1 development history.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="asset/logo-wordmark-dark.svg">
